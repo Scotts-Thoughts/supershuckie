@@ -93,6 +93,10 @@ impl EmulatorCore for NullEmulatorCore {
         "Null"
     }
 
+    fn frame_rate(&self) -> (u32, u32) {
+        (60, 1)
+    }
+
     fn is_null(&self) -> bool {
         true
     }

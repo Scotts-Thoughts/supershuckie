@@ -83,7 +83,13 @@ pub trait EmulatorCore: Send + 'static {
 
     /// Get the current core name.
     fn core_name(&self) -> &'static str;
-    
+
+    /// Native video refresh rate as `(numerator, denominator)` frames per second.
+    ///
+    /// Used for video export so the output is constant-frame-rate at the console's exact native
+    /// refresh, with no rounding drift. This is the *video* rate, not affected by emulation speed.
+    fn frame_rate(&self) -> (u32, u32);
+
     /// Return true if the core is a null core.
     #[inline]
     fn is_null(&self) -> bool {

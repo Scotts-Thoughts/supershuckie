@@ -28,6 +28,7 @@ add_library(supershuckie-cpp-static STATIC
     src/theme.cpp
     src/replay_playback_controls.cpp
     src/nds_date_dialog.cpp
+    src/video_export_dialog.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

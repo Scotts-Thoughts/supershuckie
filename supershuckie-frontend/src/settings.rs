@@ -10,6 +10,7 @@ use std::hint::unreachable_unchecked;
 use std::io::{Read, Seek, SeekFrom};
 use std::num::{NonZeroIsize, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use std::path::Path;
+use std::path::PathBuf;
 use supershuckie_core::emulator::Input;
 use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
 
@@ -71,6 +72,9 @@ pub struct Settings {
 
     #[serde(default = "SimpleEnabledByDefaultSettings::default")]
     pub external_commands: SimpleEnabledByDefaultSettings,
+
+    #[serde(default = "ExportSettings::default")]
+    pub export: ExportSettings,
 
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -169,6 +173,69 @@ impl ReplaySettings {
     const AUTO_RESYNC_KEYFRAMES_IN_REPLAYS: fn() -> bool = || false;
     const DISABLE_SAVE_STATES_WHEN_RECORDING: fn() -> bool = || false;
     const DISABLE_SPEED_CHANGES_WHEN_RECORDING: fn() -> bool = || false;
+}
+
+/// Settings for the "export video from replay" feature.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct ExportSettings {
+    /// Path to the `ffmpeg` binary. Defaults to `"ffmpeg"` (resolved on `PATH`); the user can
+    /// override this with a full path to a specific `ffmpeg` executable.
+    #[serde(default = "ExportSettings::FFMPEG_PATH")]
+    pub ffmpeg_path: String,
+
+    /// The default encoding preset to use for exports.
+    #[serde(default = "ExportPreset::default")]
+    pub default_preset: ExportPreset,
+
+    /// The default integer (nearest-neighbour) upscale factor. Defaults to 1.
+    #[serde(default = "ExportSettings::DEFAULT_SCALE")]
+    pub default_scale: NonZeroU8,
+
+    /// The default constant rate factor (CRF) for H.264 exports. Defaults to 18.
+    #[serde(default = "ExportSettings::DEFAULT_CRF")]
+    pub default_crf: u8,
+
+    /// The default directory to write exported videos to. `None` means alongside the replays.
+    #[serde(default = "ExportSettings::OUTPUT_DIR")]
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            ffmpeg_path: Self::FFMPEG_PATH(),
+            default_preset: ExportPreset::default(),
+            default_scale: Self::DEFAULT_SCALE(),
+            default_crf: Self::DEFAULT_CRF(),
+            output_dir: Self::OUTPUT_DIR()
+        }
+    }
+}
+
+impl ExportSettings {
+    const FFMPEG_PATH: fn() -> String = || "ffmpeg".to_owned();
+    const DEFAULT_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(1) };
+    const DEFAULT_CRF: fn() -> u8 = || 18;
+    const OUTPUT_DIR: fn() -> Option<PathBuf> = || None;
+}
+
+/// A preset describing how an exported video should be encoded.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub enum ExportPreset {
+    /// MP4 container with H.264 video.
+    Mp4H264,
+
+    /// Matroska (MKV) container with lossless FFV1 video.
+    LosslessFfv1Mkv,
+
+    /// Custom: the contained string is split on whitespace into extra ffmpeg output arguments.
+    Custom(String)
+}
+
+impl Default for ExportPreset {
+    fn default() -> Self {
+        ExportPreset::Mp4H264
+    }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]

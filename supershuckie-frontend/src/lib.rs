@@ -16,9 +16,12 @@ use std::path::{absolute, Path, PathBuf};
 use std::sync::Arc;
 use std::io::BufWriter;
 use std::time::Duration;
+use std::borrow::Cow;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use num_enum::TryFromPrimitive;
 use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, PartialReplayRecordMetadata, ScreenData, NullEmulatorCore, NintendoDS, GameBoyAdvance};
 use supershuckie_core::{std_timestamp_provider, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
+use supershuckie_core::{ExportRange, ScreenLayout, VideoExportError, VideoExportHandle, VideoFrameSink};
 use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShuckieWebserver};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{blake3_hash, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
@@ -127,6 +130,9 @@ pub struct SuperShuckieFrontend {
 
     last_replay_and_frame: Option<(UTF8CString, u32)>,
 
+    /// In-progress video export, if any (owned here so the C/Qt layer just polls/cancels).
+    current_export: Option<VideoExportHandle>,
+
     settings: Settings
 }
 
@@ -164,7 +170,8 @@ impl SuperShuckieFrontend {
             last_read_replay_stats: None,
             bios_override: None,
             last_replay_and_frame: None,
-            current_replay: None
+            current_replay: None,
+            current_export: None
         };
 
         // This is not tied to the core, so we want to immediately enable this.
@@ -1540,6 +1547,184 @@ impl SuperShuckieFrontend {
         self.resume_recording_from_replay(name.as_str(), Some(frame), None)
     }
 
+    /// Export the named replay (for the current ROM) to a video file at `output_path`.
+    ///
+    /// `range` is an inclusive-start, exclusive-end `(start, end)` frame range. When `None`, the
+    /// replay's crop range is used if present, otherwise the entire replay.
+    ///
+    /// `preset`, `scale`, and `layout` control the encoding and (for multi-screen consoles) the
+    /// screen composition. Encoding happens by spawning `ffmpeg` and piping frames to it; the
+    /// returned [`VideoExportHandle`] can be polled for progress, cancelled, or waited on. Note
+    /// that errors from the encoder (e.g. ffmpeg missing) surface through that handle, not here.
+    pub fn export_replay_video(
+        &mut self,
+        replay_name: &str,
+        range: Option<(u32, u32)>,
+        output_path: &Path,
+        preset: ExportPreset,
+        scale: NonZeroU8,
+        layout: ScreenLayout,
+    ) -> Result<VideoExportHandle, UTF8CString> {
+        self.assert_replays_available()?;
+
+        let current_rom_name = self.get_current_rom_name_arc().expect("no rom name when game is running in export_replay_video");
+        let replays_dir = self.get_replays_dir_for_rom(current_rom_name.as_str());
+
+        // Resolve + read the source replay (same path scheme as load_replay_if_exists). We parse it
+        // here only to determine the default export range from the header crop markers.
+        let replay_path = replays_dir.join(format!("{replay_name}.{REPLAY_EXTENSION}"));
+        if !replay_path.is_file() {
+            return Err(format!("Replay {replay_name} does not exist").into());
+        }
+
+        let export_range = match range {
+            Some((start, end)) => ExportRange {
+                start_frame: start as u64,
+                end_frame: Some(end as u64)
+            },
+            None => {
+                let bytes = match std::fs::read(&replay_path) {
+                    Ok(n) => n,
+                    Err(e) => return Err(format!("Failed to read replay {replay_name}:\n\n{e}").into())
+                };
+                let player = match ReplayFilePlayer::new(bytes, true) {
+                    Ok(n) => n,
+                    Err(e) => return Err(format!("Failed to parse replay {replay_name}:\n\n{e:?}").into())
+                };
+                let metadata = player.get_replay_metadata();
+                let start = metadata.crop_start.map(|c| c.0).unwrap_or(0);
+                let end = metadata.crop_end.map(|c| c.0);
+                ExportRange { start_frame: start, end_frame: end }
+            }
+        };
+
+        // Ensure the replay is attached for playback (this also runs the ROM/BIOS/core
+        // compatibility checks). The exporter reuses the attached player.
+        self.load_replay_if_exists(replay_name, true)?;
+
+        let sink = FfmpegVideoSink::new(
+            self.settings.export.ffmpeg_path.clone(),
+            output_path.to_path_buf(),
+            preset,
+            scale,
+            self.settings.export.default_crf,
+        );
+
+        let handle = self.core.export_replay(Box::new(sink), export_range, layout);
+        Ok(handle)
+    }
+
+    /// Begin a video export and retain the handle internally (for the C/Qt layer).
+    ///
+    /// Only one export may be in progress at a time; starting another while one is running returns
+    /// an error. Poll with [`poll_export_progress`](Self::poll_export_progress), finish with
+    /// [`poll_export_finished`](Self::poll_export_finished), and cancel with
+    /// [`cancel_export`](Self::cancel_export).
+    pub fn start_replay_video_export(
+        &mut self,
+        replay_name: &str,
+        range: Option<(u32, u32)>,
+        output_path: &Path,
+        preset: ExportPreset,
+        scale: NonZeroU8,
+        layout: ScreenLayout,
+    ) -> Result<(), UTF8CString> {
+        if self.current_export.is_some() {
+            return Err("An export is already in progress".into());
+        }
+        let handle = self.export_replay_video(replay_name, range, output_path, preset, scale, layout)?;
+        self.current_export = Some(handle);
+        Ok(())
+    }
+
+    /// Return `true` if a video export is currently in progress.
+    #[inline]
+    pub fn is_exporting(&self) -> bool {
+        self.current_export.is_some()
+    }
+
+    /// Current export progress as `(frames_done, frames_total)`, or `None` if not exporting.
+    pub fn poll_export_progress(&self) -> Option<(u64, u64)> {
+        self.current_export.as_ref().map(|h| h.progress())
+    }
+
+    /// Request cancellation of the in-progress export, if any.
+    pub fn cancel_export(&self) {
+        if let Some(h) = self.current_export.as_ref() {
+            h.cancel();
+        }
+    }
+
+    /// Non-blocking check for export completion.
+    ///
+    /// Returns `None` while still running (or if no export is active). When the export finishes it
+    /// returns `Some(Ok(()))` on success or `Some(Err(message))` on failure, and clears the handle.
+    pub fn poll_export_finished(&mut self) -> Option<Result<(), UTF8CString>> {
+        let done = self.current_export.as_ref()?.poll_done()?;
+        self.current_export = None;
+        Some(done.map_err(|e| format!("Video export failed: {e}").into()))
+    }
+
+    /// Get the configured path to the `ffmpeg` binary used for video exports.
+    #[inline]
+    pub fn get_export_ffmpeg_path(&self) -> &str {
+        self.settings.export.ffmpeg_path.as_str()
+    }
+
+    /// Set the path to the `ffmpeg` binary used for video exports.
+    #[inline]
+    pub fn set_export_ffmpeg_path(&mut self, p: String) {
+        self.settings.export.ffmpeg_path = p;
+    }
+
+    /// Get the default integer upscale factor for video exports.
+    #[inline]
+    pub fn get_export_default_scale(&self) -> NonZeroU8 {
+        self.settings.export.default_scale
+    }
+
+    /// Set the default integer upscale factor for video exports.
+    #[inline]
+    pub fn set_export_default_scale(&mut self, s: NonZeroU8) {
+        self.settings.export.default_scale = s;
+    }
+
+    /// Get the default H.264 CRF for video exports.
+    #[inline]
+    pub fn get_export_default_crf(&self) -> u8 {
+        self.settings.export.default_crf
+    }
+
+    /// Set the default H.264 CRF for video exports.
+    #[inline]
+    pub fn set_export_default_crf(&mut self, c: u8) {
+        self.settings.export.default_crf = c;
+    }
+
+    /// Get the default encoding preset for video exports.
+    #[inline]
+    pub fn get_export_default_preset(&self) -> ExportPreset {
+        self.settings.export.default_preset.clone()
+    }
+
+    /// Set the default encoding preset for video exports.
+    #[inline]
+    pub fn set_export_default_preset(&mut self, p: ExportPreset) {
+        self.settings.export.default_preset = p;
+    }
+
+    /// Get the default output directory for video exports, or `None` to use the replays directory.
+    #[inline]
+    pub fn get_export_output_dir(&self) -> Option<&Path> {
+        self.settings.export.output_dir.as_deref()
+    }
+
+    /// Set the default output directory for video exports. `None` uses the replays directory.
+    #[inline]
+    pub fn set_export_output_dir(&mut self, d: Option<PathBuf>) {
+        self.settings.export.output_dir = d;
+    }
+
     fn assert_replays_available(&self) -> Result<(), UTF8CString> {
         let Some(emulator_type) = self.emulator_type else {
             return Err("No ROM loaded".into());
@@ -1951,3 +2136,191 @@ pub trait SuperShuckieFrontendCallbacks {
 }
 
 fn _ensure_callbacks_are_object_safe(_: Box<dyn SuperShuckieFrontendCallbacks>) {}
+
+/// A [`VideoFrameSink`] that pipes raw frames to a spawned `ffmpeg` process.
+///
+/// The ffmpeg process is spawned lazily in [`VideoFrameSink::begin`] (not in [`Self::new`]), so
+/// "ffmpeg missing" errors surface through the export result rather than at construction time.
+pub struct FfmpegVideoSink {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    output_path: PathBuf,
+    ffmpeg_path: String,
+    preset: ExportPreset,
+    scale: NonZeroU8,
+    crf: u8,
+}
+
+impl FfmpegVideoSink {
+    /// Create a new sink. This only stores the configuration; ffmpeg is spawned in
+    /// [`VideoFrameSink::begin`].
+    pub fn new(ffmpeg_path: String, output_path: PathBuf, preset: ExportPreset, scale: NonZeroU8, crf: u8) -> Self {
+        Self {
+            child: None,
+            stdin: None,
+            output_path,
+            ffmpeg_path,
+            preset,
+            scale,
+            crf,
+        }
+    }
+
+    /// Read whatever is currently available on the child's captured stderr, returning a (possibly
+    /// truncated) tail of it for use in error messages. Best-effort; never fails.
+    fn read_stderr_tail(&mut self) -> String {
+        let Some(child) = self.child.as_mut() else {
+            return String::new();
+        };
+        let Some(mut stderr) = child.stderr.take() else {
+            return String::new();
+        };
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut buf);
+
+        // Keep only the tail so error dialogs stay readable.
+        const MAX_TAIL: usize = 4096;
+        if buf.len() > MAX_TAIL {
+            let start = buf.len() - MAX_TAIL;
+            buf = buf[start..].to_owned();
+        }
+        buf.trim().to_owned()
+    }
+}
+
+impl VideoFrameSink for FfmpegVideoSink {
+    fn begin(&mut self, width: u32, height: u32, fps_num: u32, fps_den: u32) -> Result<(), VideoExportError> {
+        let out = self.output_path.clone();
+        let scale = self.scale.get();
+        let fps = format!("{fps_num}/{fps_den}");
+        let video_size = format!("{width}x{height}");
+
+        let mut command = Command::new(&self.ffmpeg_path);
+
+        // Common input args: a raw bgra stream on stdin at the given geometry/fps.
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-f", "rawvideo",
+            "-pixel_format", "bgra",
+            "-video_size", &video_size,
+            "-framerate", &fps,
+            "-i", "-",
+        ]);
+
+        // Per-preset output args. The caller chooses the output file extension.
+        match &self.preset {
+            ExportPreset::Mp4H264 => {
+                // scale=iw*1:ih*1 is harmless, so the scale filter is applied unconditionally.
+                command.args([
+                    "-vf", &format!("scale=iw*{scale}:ih*{scale}:flags=neighbor,format=yuv420p"),
+                    "-r", &fps,
+                    "-c:v", "libx264",
+                    "-preset", "slow",
+                    "-crf", &self.crf.to_string(),
+                    "-movflags", "+faststart",
+                ]);
+                command.arg(&out);
+            }
+            ExportPreset::LosslessFfv1Mkv => {
+                command.args([
+                    "-vf", &format!("scale=iw*{scale}:ih*{scale}:flags=neighbor"),
+                    "-r", &fps,
+                    "-c:v", "ffv1",
+                    "-level", "3",
+                ]);
+                command.arg(&out);
+            }
+            ExportPreset::Custom(extra) => {
+                // Simple whitespace split is sufficient for v1.
+                for arg in extra.split_whitespace() {
+                    command.arg(arg);
+                }
+                command.arg(&out);
+            }
+        }
+
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|e| VideoExportError::Sink {
+            explanation: Cow::Owned(format!(
+                "Failed to start ffmpeg at '{}': {e}. Check the Export ffmpeg path setting.",
+                self.ffmpeg_path
+            ))
+        })?;
+
+        self.stdin = child.stdin.take();
+        self.child = Some(child);
+
+        Ok(())
+    }
+
+    fn push_frame(&mut self, argb: &[u32]) -> Result<(), VideoExportError> {
+        // SAFETY: u32 slice reinterpreted as bytes; on a little-endian target the in-memory byte
+        // order of 0xAARRGGBB is B, G, R, A, i.e. ffmpeg's `bgra` pixel format. (On a big-endian
+        // target the bytes would be `argb` instead; all currently supported targets are LE.)
+        let bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(argb.as_ptr() as *const u8, argb.len() * 4)
+        };
+
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(VideoExportError::Sink {
+                explanation: Cow::Borrowed("ffmpeg stdin is not available (begin was not called?)")
+            });
+        };
+
+        if let Err(e) = stdin.write_all(bytes) {
+            // ffmpeg likely died (BrokenPipe or otherwise). Capture stderr for a useful message.
+            let tail = self.read_stderr_tail();
+            let explanation = if tail.is_empty() {
+                format!("Failed to write frame to ffmpeg: {e}")
+            } else {
+                format!("Failed to write frame to ffmpeg: {e}\n\nffmpeg said:\n{tail}")
+            };
+            return Err(VideoExportError::Sink { explanation: Cow::Owned(explanation) });
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), VideoExportError> {
+        // Close stdin so ffmpeg flushes and exits.
+        drop(self.stdin.take());
+
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+
+        let status = child.wait().map_err(|e| VideoExportError::Sink {
+            explanation: Cow::Owned(format!("Failed to wait for ffmpeg to finish: {e}"))
+        })?;
+
+        if !status.success() {
+            let tail = self.read_stderr_tail();
+            let code = status.code().map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_owned());
+            let explanation = if tail.is_empty() {
+                format!("ffmpeg exited with a non-zero status ({code}).")
+            } else {
+                format!("ffmpeg exited with a non-zero status ({code}):\n\n{tail}")
+            };
+            return Err(VideoExportError::Sink { explanation: Cow::Owned(explanation) });
+        }
+
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        // Kill the child and close stdin.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(self.stdin.take());
+
+        // Delete the partial output file.
+        let _ = std::fs::remove_file(&self.output_path);
+    }
+}

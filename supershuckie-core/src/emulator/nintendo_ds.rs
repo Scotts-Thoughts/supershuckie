@@ -192,4 +192,12 @@ impl EmulatorCore for NintendoDS {
     fn core_name(&self) -> &'static str {
         "melonDS 1.1 [SUPERSHUCKIE-EXPERIMENTAL-0]"
     }
+
+    #[inline]
+    fn frame_rate(&self) -> (u32, u32) {
+        // NDS ~= 59.8261 Hz. melonDS does not expose a frame-rate getter in the vendored binding,
+        // so this rational (33513982/560190) is used directly; verify against melonDS if it ever
+        // surfaces its own frame timing.
+        (33513982, 560190)
+    }
 }

@@ -213,6 +213,47 @@ bool supershuckie_frontend_resume_recording_from_replay(struct SuperShuckieFront
 bool supershuckie_frontend_resume_recording_from_current_replay(struct SuperShuckieFrontendRaw *frontend, char *result, size_t result_len);
 
 /**
+ * Start a video export of a replay to a file.
+ *
+ * preset: 0 = MP4/H.264, 1 = lossless FFV1/MKV, 2 = custom (uses custom_args, may be null/empty).
+ * layout: 0 = vertical stack, 1 = horizontal stack, 2 = top only, 3 = bottom only (Nintendo DS).
+ * use_range: if true, exports frames [start_frame, end_frame); otherwise uses the replay's crop
+ * range (or the whole replay). scale is the integer upscale factor (values < 1 are treated as 1).
+ *
+ * On failure, writes an error to `error` and returns false. On success returns true; poll progress
+ * with supershuckie_frontend_export_poll() and completion with
+ * supershuckie_frontend_export_poll_finished().
+ *
+ * Safety:
+ * - replay_name and output_path must not be null and must be valid UTF-8.
+ * - error must not be null and must be at least error_len bytes long.
+ */
+bool supershuckie_frontend_export_replay_video(struct SuperShuckieFrontendRaw *frontend, const char *replay_name, const char *output_path, bool use_range, uint32_t start_frame, uint32_t end_frame, uint32_t preset, const char *custom_args, uint32_t scale, uint32_t layout, char *error, size_t error_len);
+
+/**
+ * Poll the in-progress export's progress. Writes frames_done/frames_total when non-null.
+ *
+ * Returns true if an export is currently active, false otherwise.
+ */
+bool supershuckie_frontend_export_poll(const struct SuperShuckieFrontendRaw *frontend, uint64_t *frames_done, uint64_t *frames_total);
+
+/**
+ * Request cancellation of the in-progress export, if any.
+ */
+void supershuckie_frontend_export_cancel(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Non-blocking check for export completion.
+ *
+ * Returns: 0 = still running (or no export active), 1 = finished successfully, 2 = finished with an
+ * error (message written to `error`). On 1 or 2 the export handle is cleared.
+ *
+ * Safety:
+ * - error must not be null and must be at least error_len bytes long.
+ */
+uint32_t supershuckie_frontend_export_poll_finished(struct SuperShuckieFrontendRaw *frontend, char *error, size_t error_len);
+
+/**
  * Stop recording a replay.
  */
 void supershuckie_frontend_stop_recording_replay(struct SuperShuckieFrontendRaw *frontend);

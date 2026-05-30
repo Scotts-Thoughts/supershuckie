@@ -196,4 +196,11 @@ impl EmulatorCore for GameBoyAdvance {
     fn core_name(&self) -> &'static str {
         "mGBA 0.10.5-76d93515629031047ca2b7bcb6237089adcb36d7 with BIOS skipped"
     }
+
+    #[inline]
+    fn frame_rate(&self) -> (u32, u32) {
+        // GBA: 16777216 Hz / 280896 dots per frame, which reduces to 4194304/70224 ~= 59.7275 Hz
+        // (same rational as GB/GBC).
+        (4194304, 70224)
+    }
 }

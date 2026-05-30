@@ -1,4 +1,5 @@
 use crate::emulator::{EmulatorCore, Input, PartialReplayRecordMetadata, ScreenData};
+use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 use crate::{std_timestamp_provider, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
 use spin::RwLock;
@@ -224,6 +225,37 @@ impl ThreadedSuperShuckieCore {
         receiver.recv().ok().unwrap_or(false)
     }
 
+    /// Begin a blocking video export on the core thread.
+    ///
+    /// A replay must already be attached for playback (the export reuses the attached player).
+    /// While the export runs, normal playback/stepping on the core thread is paused. Returns a
+    /// [`VideoExportHandle`] to poll progress, cancel, and retrieve the result.
+    pub fn export_replay(
+        &self,
+        sink: Box<dyn VideoFrameSink>,
+        range: ExportRange,
+        layout: ScreenLayout,
+    ) -> VideoExportHandle {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(RwLock::new((0u64, 0u64)));
+        let (done_sender, done_receiver) = channel();
+
+        self.sender.send(ThreadCommand::ExportVideo {
+            sink,
+            range,
+            layout,
+            cancel: cancel.clone(),
+            progress: progress.clone(),
+            done: done_sender,
+        }).expect("ExportVideo - the core thread has crashed");
+
+        VideoExportHandle {
+            cancel,
+            progress,
+            done: done_receiver,
+        }
+    }
+
     /// Enqueue an input.
     pub fn enqueue_input(&self, input: Input) {
         self.sender.send(ThreadCommand::EnqueueInput(input))
@@ -416,6 +448,38 @@ impl ThreadedSuperShuckieCore {
     }
 }
 
+/// Handle to an in-progress video export started by [`ThreadedSuperShuckieCore::export_replay`].
+pub struct VideoExportHandle {
+    cancel: Arc<AtomicBool>,
+    progress: Arc<RwLock<(u64, u64)>>,
+    done: Receiver<Result<(), VideoExportError>>,
+}
+
+impl VideoExportHandle {
+    /// Current progress as `(frames_done, frames_total)`. `frames_total` is 0 until the export
+    /// loop starts (or for an empty range).
+    pub fn progress(&self) -> (u64, u64) {
+        *self.progress.read()
+    }
+
+    /// Request cancellation. The export loop aborts at the next frame boundary.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Non-blocking check for completion. `None` while still running.
+    pub fn poll_done(&self) -> Option<Result<(), VideoExportError>> {
+        self.done.try_recv().ok()
+    }
+
+    /// Block until the export completes and return its result.
+    pub fn wait(self) -> Result<(), VideoExportError> {
+        self.done.recv().unwrap_or(Err(VideoExportError::Sink {
+            explanation: std::borrow::Cow::Borrowed("core thread closed before export finished"),
+        }))
+    }
+}
+
 impl Drop for ThreadedSuperShuckieCore {
     fn drop(&mut self) {
         // we couldn't really care less if these succeed or fail; we just want to ensure that
@@ -439,6 +503,14 @@ enum ThreadCommand {
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
         allow_corruption: bool,
+    },
+    ExportVideo {
+        sink: Box<dyn VideoFrameSink>,
+        range: ExportRange,
+        layout: ScreenLayout,
+        cancel: Arc<AtomicBool>,
+        progress: Arc<RwLock<(u64, u64)>>,
+        done: Sender<Result<(), VideoExportError>>,
     },
     StopRecordingReplay(Sender<bool>),
     AttachReplayPlayer {
@@ -784,6 +856,12 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::StopRecordingReplay(sender) => {
                 let _ = sender.send(self.core.stop_recording_replay() == Some(true));
+            }
+            ThreadCommand::ExportVideo { mut sink, range, layout, cancel, progress, done } => {
+                let result = self.core.export_frames(range, layout, sink.as_mut(), &cancel, |d, t| {
+                    *progress.write() = (d, t);
+                });
+                let _ = done.send(result);
             }
             ThreadCommand::EnqueueInput(input) => {
                 self.core.enqueue_input(input);

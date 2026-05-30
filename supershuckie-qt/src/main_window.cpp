@@ -33,6 +33,10 @@
 #include "main_window.hpp"
 #include "controller_settings_window.hpp"
 #include "replay_playback_controls.hpp"
+#include "video_export_dialog.hpp"
+
+#include <QProgressDialog>
+#include <QCoreApplication>
 
 using namespace SuperShuckie64;
 
@@ -511,15 +515,21 @@ void MainWindow::set_up_replays_menu() {
     this->play_replay = this->replays_menu->addAction("Play (unset)");
     this->continue_last_replay = this->replays_menu->addAction("Continue last replay");
 
+    this->replays_menu->addSeparator();
+
+    this->export_video = this->replays_menu->addAction("Export video…");
+
     connect(this->record_replay, SIGNAL(triggered()), this, SLOT(do_record_replay()));
     connect(this->resume_replay, SIGNAL(triggered()), this, SLOT(do_resume_replay()));
     connect(this->play_replay, SIGNAL(triggered()), this, SLOT(do_play_replay()));
     connect(this->continue_last_replay, SIGNAL(triggered()), this, SLOT(do_continue_last_replay()));
+    connect(this->export_video, SIGNAL(triggered()), this, SLOT(do_export_video()));
 
     this->record_replay->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_R));
     this->resume_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_R));
     this->play_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_P));
     this->continue_last_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_C));
+    this->export_video->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_E));
 
     this->replays_menu->addSeparator();
 
@@ -711,6 +721,7 @@ void MainWindow::refresh_action_states() {
     this->play_replay->setEnabled(game_loaded);
     this->record_replay->setEnabled(game_loaded);
     this->resume_replay->setEnabled(game_loaded);
+    this->export_video->setEnabled(game_loaded);
     this->game_boy_settings->setEnabled(true);
 
     this->reload_core->setEnabled(game_loaded);
@@ -732,6 +743,7 @@ void MainWindow::refresh_action_states() {
             this->play_replay->setEnabled(false);
             this->resume_replay->setEnabled(false);
             this->reload_core->setEnabled(false);
+            this->export_video->setEnabled(false);
             this->current_state->setText("RECORDING");
             this->current_state->show();
             this->record_replay->setText("Stop recording replay");
@@ -744,6 +756,7 @@ void MainWindow::refresh_action_states() {
             // current playback frame into a new, separate replay.
             this->reload_core->setEnabled(false);
             this->reset_console->setEnabled(false);
+            this->export_video->setEnabled(false);
             this->current_state->setText("PLAYBACK");
             this->current_state->show();
 
@@ -1004,6 +1017,84 @@ void MainWindow::do_play_replay() {
 
     std::snprintf(fmt, sizeof(fmt), "Opened replay file \"%s\"", text->c_str());
     this->set_title(fmt);
+
+    this->refresh_action_states();
+}
+
+void MainWindow::do_export_video() {
+    auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
+    if(replays.empty()) {
+        DISPLAY_ERROR_DIALOG("Export video", "%s", "No replays found for this ROM.");
+        return;
+    }
+
+    VideoExportDialog dlg(this);
+    if(dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    std::string replay = dlg.replay_name();
+    std::string out_path = dlg.output_path();
+    std::string custom = dlg.custom_args();
+    bool use_range = dlg.use_range();
+    std::uint32_t start = dlg.start_frame();
+    std::uint32_t end = dlg.end_frame();
+    std::uint32_t preset = dlg.preset();
+    std::uint32_t scale = dlg.scale();
+    std::uint32_t layout = dlg.layout();
+
+    char err[1024];
+    bool ok = supershuckie_frontend_export_replay_video(this->frontend,
+        replay.c_str(), out_path.c_str(), use_range, start, end, preset,
+        preset == 2 ? custom.c_str() : nullptr, scale, layout, err, sizeof(err));
+    if(!ok) {
+        DISPLAY_ERROR_DIALOG("Export failed to start", "%s", err);
+        return;
+    }
+
+    // Stop the main ticker so it doesn't poll the export while we drive the progress dialog.
+    this->stop_timer();
+
+    QProgressDialog progress("Exporting…", "Cancel", 0, 100, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setValue(0);
+
+    bool success = false;
+    while(true) {
+        std::uint64_t done = 0, total = 0;
+        supershuckie_frontend_export_poll(this->frontend, &done, &total);
+
+        char poll_err[1024];
+        std::uint32_t fin = supershuckie_frontend_export_poll_finished(this->frontend, poll_err, sizeof(poll_err));
+        if(fin == 1) {
+            success = true;
+            break;
+        }
+        if(fin == 2) {
+            DISPLAY_ERROR_DIALOG("Export failed", "%s", poll_err);
+            break;
+        }
+
+        if(total > 0) {
+            progress.setMaximum(static_cast<int>(total));
+            progress.setValue(static_cast<int>(done));
+        }
+
+        if(progress.wasCanceled()) {
+            supershuckie_frontend_export_cancel(this->frontend);
+        }
+
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 16);
+    }
+
+    progress.close();
+
+    this->start_timer();
+
+    if(success) {
+        this->set_title("Exported video");
+    }
 
     this->refresh_action_states();
 }

@@ -22,6 +22,9 @@ use supershuckie_replay_recorder::{ByteVec, Packet, SignedInteger, TimestampMill
 
 pub mod emulator;
 
+pub mod export;
+pub use export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
+
 pub use supershuckie_replay_recorder::Speed;
 
 #[cfg(feature = "std")]

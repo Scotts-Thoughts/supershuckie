@@ -311,6 +311,118 @@ pub unsafe extern "C" fn supershuckie_frontend_stop_recording_replay(
     frontend.stop_recording_replay();
 }
 
+/// Start a video export of a replay.
+///
+/// `preset`: 0 = MP4/H.264, 1 = lossless FFV1/MKV, 2 = custom (uses `custom_args`).
+/// `layout`: 0 = vertical stack, 1 = horizontal stack, 2 = top only, 3 = bottom only (NDS).
+/// `use_range`: if true, export frames [`start_frame`, `end_frame`); otherwise use the replay's
+/// crop range (or the whole replay). `scale` is the integer upscale factor (min 1).
+/// `custom_args` is only read when `preset == 2`.
+///
+/// On failure, writes an error to `error` and returns false. On success returns true; poll progress
+/// with `..._export_poll` and completion with `..._export_poll_finished`.
+///
+/// Safety: `replay_name`/`output_path` must be valid UTF-8 C strings; `error` must be at least
+/// `error_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_export_replay_video(
+    frontend: &mut SuperShuckieFrontend,
+    replay_name: *const c_char,
+    output_path: *const c_char,
+    use_range: bool,
+    start_frame: u32,
+    end_frame: u32,
+    preset: u32,
+    custom_args: *const c_char,
+    scale: u32,
+    layout: u32,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    use supershuckie_core::ScreenLayout;
+    use supershuckie_frontend::settings::ExportPreset;
+
+    let replay_name = unsafe { CStr::from_ptr(replay_name) }.to_str().expect("replay_name not UTF-8");
+    let output_path = unsafe { CStr::from_ptr(output_path) }.to_str().expect("output_path not UTF-8");
+
+    let preset = match preset {
+        1 => ExportPreset::LosslessFfv1Mkv,
+        2 => {
+            let args = if !custom_args.is_null() {
+                unsafe { CStr::from_ptr(custom_args) }.to_str().expect("custom_args not UTF-8").to_owned()
+            } else {
+                String::new()
+            };
+            ExportPreset::Custom(args)
+        }
+        _ => ExportPreset::Mp4H264,
+    };
+
+    let layout = match layout {
+        1 => ScreenLayout::HorizontalStack,
+        2 => ScreenLayout::TopOnly,
+        3 => ScreenLayout::BottomOnly,
+        _ => ScreenLayout::VerticalStack,
+    };
+
+    let scale = NonZeroU8::new(scale.clamp(1, u8::MAX as u32) as u8).unwrap_or(NonZeroU8::new(1).unwrap());
+    let range = if use_range { Some((start_frame, end_frame)) } else { None };
+
+    match frontend.start_replay_video_export(replay_name, range, std::path::Path::new(output_path), preset, scale, layout) {
+        Ok(()) => true,
+        Err(e) => {
+            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            false
+        }
+    }
+}
+
+/// Poll the in-progress export's progress. Writes `frames_done`/`frames_total` (when non-null).
+/// Returns true if an export is currently active.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_export_poll(
+    frontend: &SuperShuckieFrontend,
+    frames_done: *mut u64,
+    frames_total: *mut u64
+) -> bool {
+    match frontend.poll_export_progress() {
+        Some((done, total)) => {
+            if !frames_done.is_null() { unsafe { *frames_done = done; } }
+            if !frames_total.is_null() { unsafe { *frames_total = total; } }
+            true
+        }
+        None => false
+    }
+}
+
+/// Request cancellation of the in-progress export, if any.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_export_cancel(frontend: &SuperShuckieFrontend) {
+    frontend.cancel_export();
+}
+
+/// Non-blocking check for export completion.
+///
+/// Returns: 0 = still running (or no export), 1 = finished successfully, 2 = finished with an error
+/// (the error message is written to `error`). On 1 or 2 the export handle is cleared.
+///
+/// Safety: `error` must be at least `error_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_export_poll_finished(
+    frontend: &mut SuperShuckieFrontend,
+    error: *mut u8,
+    error_len: usize
+) -> u32 {
+    match frontend.poll_export_finished() {
+        None => 0,
+        Some(Ok(())) => 1,
+        Some(Err(e)) => {
+            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            2
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_get_recording_replay_file(
     frontend: &SuperShuckieFrontend

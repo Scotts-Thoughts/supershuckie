@@ -257,6 +257,12 @@ impl EmulatorCore for GameBoyColor {
             safeboy::GB_VERSION
         }
     }
+
+    #[inline]
+    fn frame_rate(&self) -> (u32, u32) {
+        // GB/GBC: 4194304 Hz CPU clock / 70224 dots per frame ~= 59.7275 Hz.
+        (4194304, 70224)
+    }
 }
 
 static GB_VERSION_WITH_HACKS: Lazy<String> = Lazy::new(|| {

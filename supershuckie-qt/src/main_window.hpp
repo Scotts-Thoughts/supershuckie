@@ -26,6 +26,7 @@ class ControlsSettingsWindow;
 class ReplayPlaybackControls;
 class NDSDateDialog;
 class StringAction;
+class VideoExportDialog;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -46,6 +47,7 @@ class MainWindow: public QMainWindow {
     friend ReplayPlaybackControls;
     friend NDSDateDialog;
     friend StringAction;
+    friend VideoExportDialog;
     
 public:
     MainWindow();
@@ -99,6 +101,7 @@ private:
     QAction *record_replay;
     QAction *resume_replay;
     QAction *play_replay;
+    QAction *export_video;
     QAction *auto_stop_replay_on_input;
     QAction *auto_unpause_on_input;
     QAction *auto_pause_on_record;
@@ -197,6 +200,7 @@ private slots:
     void do_record_replay();
     void do_resume_replay();
     void do_play_replay();
+    void do_export_video();
     void do_open_game_speed_dialog() noexcept;
     void do_undo_load_save_state();
     void do_redo_load_save_state();
