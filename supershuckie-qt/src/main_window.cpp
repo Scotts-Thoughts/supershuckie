@@ -233,6 +233,7 @@ MainWindow::MainWindow(): QMainWindow() {
     this->auto_pause_on_record->setChecked(supershuckie_frontend_get_auto_pause_on_record_setting(this->frontend));
     this->sgb_enabled->setChecked(supershuckie_frontend_is_sgb_enabled(this->frontend));
     this->nds_jit->setChecked(supershuckie_frontend_get_nds_jit(this->frontend));
+    this->swap_nds_screens->setChecked(supershuckie_frontend_get_swap_nds_screens(this->frontend));
     this->ignore_speed_changes_in_replay->setChecked(supershuckie_frontend_get_ignore_speed_changes_in_replay(this->frontend));
     this->auto_resync_keyframes_in_replay->setChecked(supershuckie_frontend_get_auto_resync_keyframes_in_replay(this->frontend));
     this->disable_save_states_when_recording->setChecked(supershuckie_frontend_get_disable_save_states_when_recording(this->frontend));
@@ -357,6 +358,9 @@ void MainWindow::tick() {
     }
 
     this->pause->setChecked(supershuckie_frontend_is_paused(this->frontend));
+
+    // Keep the menu checkbox in sync with the setting, which may be toggled via a bound hotkey.
+    this->swap_nds_screens->setChecked(supershuckie_frontend_get_swap_nds_screens(this->frontend));
 
     if(supershuckie_frontend_is_paused(this->frontend)) {
         this->paused_state->show();
@@ -666,6 +670,10 @@ void MainWindow::set_up_settings_menu() {
     this->horizontal_nds = nds_settings->addAction("Arrange horizontally");
     this->horizontal_nds->setCheckable(true);
     connect(this->horizontal_nds, SIGNAL(triggered()), this, SLOT(do_toggle_horizontal_nds()));
+
+    this->swap_nds_screens = nds_settings->addAction("Swap screens");
+    this->swap_nds_screens->setCheckable(true);
+    connect(this->swap_nds_screens, SIGNAL(triggered()), this, SLOT(do_toggle_swap_nds_screens()));
 
     this->nds_jit = nds_settings->addAction("Enable JIT (disables replays)");
     this->nds_jit->setCheckable(true);
@@ -1263,6 +1271,11 @@ void MainWindow::do_toggle_horizontal_nds() {
     // FIXME: this is a hack
     this->set_video_scale(this->render_widget->current_scale+1);
     this->set_video_scale(this->render_widget->current_scale-1);
+}
+
+void MainWindow::do_toggle_swap_nds_screens() {
+    // The setter re-emits the video mode, which drives render_widget to re-lay out the screens.
+    supershuckie_frontend_set_swap_nds_screens(this->frontend, this->swap_nds_screens->isChecked());
 }
 
 void MainWindow::do_toggle_nds_jit() {

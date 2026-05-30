@@ -660,6 +660,16 @@ bool supershuckie_frontend_get_nds_jit(const struct SuperShuckieFrontendRaw *fro
 void supershuckie_frontend_set_nds_jit(struct SuperShuckieFrontendRaw *frontend, bool enabled);
 
 /**
+ * Get whether the DS top/bottom screens are swapped on-screen.
+ */
+bool supershuckie_frontend_get_swap_nds_screens(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set whether the DS top/bottom screens are swapped on-screen.
+ */
+void supershuckie_frontend_set_swap_nds_screens(struct SuperShuckieFrontendRaw *frontend, bool swap);
+
+/**
  * Get if speed changes from the replay should be ignored when playing back replays.
  */
 bool supershuckie_frontend_get_ignore_speed_changes_in_replay(const struct SuperShuckieFrontendRaw *frontend);

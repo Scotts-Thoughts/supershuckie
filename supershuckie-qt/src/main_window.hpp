@@ -107,6 +107,7 @@ private:
     QAction *auto_pause_on_record;
     QAction *keyboard_replay_controls;
     QAction *horizontal_nds;
+    QAction *swap_nds_screens;
     QAction *nds_jit;
     QAction *ignore_speed_changes_in_replay;
     QAction *auto_resync_keyframes_in_replay;
@@ -216,6 +217,7 @@ private slots:
     void do_toggle_sgb();
     void do_open_nds_date_dialog() noexcept;
     void do_toggle_horizontal_nds();
+    void do_toggle_swap_nds_screens();
     void do_toggle_nds_jit();
     void do_clear_recent_roms();
     void do_reload_core();

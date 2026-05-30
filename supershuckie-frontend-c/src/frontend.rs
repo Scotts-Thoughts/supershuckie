@@ -948,6 +948,16 @@ pub extern "C" fn supershuckie_frontend_set_nds_jit(frontend: &mut SuperShuckieF
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_swap_nds_screens(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_swap_nds_screens()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_swap_nds_screens(frontend: &mut SuperShuckieFrontend, swap: bool) {
+    frontend.set_swap_nds_screens(swap)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_get_recent_roms(frontend: &SuperShuckieFrontend) -> *mut SuperShuckieStringArray {
     Box::into_raw(Box::new(SuperShuckieStringArray(frontend.get_recent_roms())))
 }

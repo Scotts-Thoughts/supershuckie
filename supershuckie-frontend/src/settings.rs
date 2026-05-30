@@ -352,6 +352,10 @@ pub struct NintendoDSSettings {
     #[serde(default = "bool::default")]
     pub jit: bool,
 
+    /// Swap the on-screen positions of the top and bottom DS screens.
+    #[serde(default = "bool::default")]
+    pub swap_screens: bool,
+
     #[serde(default = "NintendoDSSettings::DEFAULT_VIDEO_SCALE")]
     pub video_scale: NonZeroU8,
 
@@ -368,6 +372,7 @@ impl Default for NintendoDSSettings {
         Self {
             date: NintendoDSDate::default(),
             jit: false,
+            swap_screens: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
             controls: Controls::default()
         }
@@ -550,7 +555,8 @@ pub enum Control {
 
     Turbo,
     Reset,
-    Pause
+    Pause,
+    SwapScreens
 }
 impl Control {
     pub const fn is_button(self) -> bool {
@@ -569,7 +575,8 @@ impl Control {
             Control::Y => true,
             Control::Turbo => false,
             Control::Reset => false,
-            Control::Pause => false
+            Control::Pause => false,
+            Control::SwapScreens => false
         }
     }
 
@@ -590,6 +597,7 @@ impl Control {
             Control::Turbo => {}
             Control::Reset => {}
             Control::Pause => {}
+            Control::SwapScreens => {}
         }
     }
 
@@ -610,6 +618,7 @@ impl Control {
             Control::Turbo => {}
             Control::Reset => {}
             Control::Pause => {}
+            Control::SwapScreens => {}
         }
     }
 
@@ -639,14 +648,15 @@ impl Control {
             Control::Y => c"Y",
             Control::Turbo => c"Turbo",
             Control::Reset => c"Reset console",
-            Control::Pause => c"Pause"
+            Control::Pause => c"Pause",
+            Control::SwapScreens => c"Swap screens"
         }
     }
 
     pub const fn is_available_for_emulator_type(self, emulator_type: SuperShuckieEmulatorType) -> bool {
         match self {
             Control::L | Control::R => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::GameBoyAdvance),
-            Control::X | Control::Y => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS),
+            Control::X | Control::Y | Control::SwapScreens => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS),
             _ => true
         }
     }

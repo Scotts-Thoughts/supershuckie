@@ -624,6 +624,9 @@ impl SuperShuckieFrontend {
                 Control::Pause => if pressed && self.is_game_running() {
                     self.set_paused(!self.is_paused());
                 }
+                Control::SwapScreens => if pressed {
+                    self.set_swap_nds_screens(!self.get_swap_nds_screens());
+                }
 
                 Control::A => unreachable!(),
                 Control::B => unreachable!(),
@@ -1030,6 +1033,26 @@ impl SuperShuckieFrontend {
             self.core.load_save_state(state);
         }
 
+    }
+
+    /// Get whether the DS top/bottom screens are swapped on-screen.
+    #[inline]
+    pub fn get_swap_nds_screens(&self) -> bool {
+        self.settings.nintendo_ds_settings.swap_screens
+    }
+
+    /// Set whether the DS top/bottom screens are swapped on-screen.
+    ///
+    /// Re-emits the video mode so the frontend can re-lay out the screens immediately.
+    pub fn set_swap_nds_screens(&mut self, swap: bool) {
+        if self.settings.nintendo_ds_settings.swap_screens == swap {
+            return
+        }
+        self.settings.nintendo_ds_settings.swap_screens = swap;
+
+        if self.emulator_type == Some(SuperShuckieEmulatorType::NintendoDS) {
+            self.update_video_mode();
+        }
     }
 
     /// Get a custom setting.

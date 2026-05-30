@@ -34,12 +34,25 @@ void GameRenderWidget::set_dimensions(unsigned screen_count, const SuperShuckieS
     this->total_height = 0;
 
     bool horizontal_nds = this->main_window->horizontal_nds->isChecked();
+    bool swap_screens = this->main_window->frontend != nullptr &&
+        supershuckie_frontend_get_swap_nds_screens(this->main_window->frontend);
 
+    // Create the screen objects in data order so screens[i] stays bound to pixels[i] in
+    // refresh_screen(), and so touch input keeps targeting the bottom screen (screens[1]).
     for(unsigned i = 0; i < screen_count; i++) {
         ScreenData screen;
         screen.width = screen_data[i].width;
         screen.height = screen_data[i].height;
         screen.pixmap_item = this->scene->addPixmap(screen.pixmap);
+        this->screens.emplace_back(screen);
+    }
+
+    // Assign on-screen positions in visual order. When swapping, place the two screens in
+    // reverse so the bottom screen comes first; this works for both orientations and the
+    // stored x/y offsets keep touch mapping correct.
+    for(unsigned visual = 0; visual < screen_count; visual++) {
+        unsigned i = (swap_screens && screen_count == 2) ? (screen_count - 1 - visual) : visual;
+        auto &screen = this->screens[i];
 
         if(horizontal_nds) {
             screen.x = this->total_width;
@@ -53,7 +66,6 @@ void GameRenderWidget::set_dimensions(unsigned screen_count, const SuperShuckieS
         }
 
         screen.pixmap_item->setOffset(screen.x, screen.y);
-        this->screens.emplace_back(screen);
     }
     
     this->setFixedSize(this->total_width * scale, this->total_height * scale);
