@@ -16,7 +16,7 @@ use core::fmt::{Display, Formatter};
 use core::num::NonZeroU64;
 use alloc::collections::BTreeMap;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
-use supershuckie_replay_recorder::replay_file::record::{NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError};
+use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{ByteVec, Packet, SignedInteger, TimestampMillis, UnsignedInteger};
 
@@ -495,6 +495,78 @@ impl SuperShuckieCore {
         Ok(())
     }
 
+    /// Resume recording from an existing replay.
+    ///
+    /// The source replay must already be attached as the active replay player (e.g. via
+    /// `attach_replay_player`). `source_bytes` is the raw replay file, used to spin up a SECOND,
+    /// independent player for the prefix re-feed so cursors don't collide. `resume_at_frame == None`
+    /// resumes from the final frame. Never mutates the source.
+    pub fn resume_recording_replay<FS, TS>(
+        &mut self,
+        source_bytes: &[u8],
+        resume_at_frame: Option<UnsignedInteger>,
+        partial: PartialReplayRecordMetadata<FS, TS>,
+        crop_policy: ResumeCropPolicy,
+        allow_corruption: bool,
+    ) -> Result<(), ReplayResumeError>
+    where
+        FS: ReplayFileSink + Send + Sync + 'static,
+        TS: ReplayFileSink + Send + Sync + 'static,
+    {
+        // Read the source's total frame count into a local before invoking other &mut self
+        // methods (avoids overlapping borrows of `self.replay_player`).
+        let total = self
+            .replay_player
+            .as_ref()
+            .map(|p| p.get_total_frames())
+            .ok_or(ReplayResumeError::BadSource {
+                explanation: alloc::borrow::Cow::Borrowed("no replay player attached to resume from"),
+            })?;
+        let target_for_emulator = resume_at_frame.unwrap_or(total);
+
+        // Position the emulator at the resume frame using the existing seek logic.
+        self.go_to_replay_frame(target_for_emulator);
+
+        // Build the prefix recorder from a FRESH, independent player so the active replay
+        // player's cursor is never disturbed.
+        let mut feed_player = ReplayFilePlayer::new(source_bytes, allow_corruption)
+            .map_err(|error| ReplayResumeError::Read(ReplaySeekError::ReadError { error }))?;
+        let (recorder, info) = build_resumed_recorder(
+            &mut feed_player,
+            resume_at_frame,
+            partial.settings,
+            crop_policy,
+            partial.final_file,
+            partial.temp_file,
+        )?;
+
+        // Drop the source player (keeping the input held at the resume frame intact).
+        self.detach_replay_player_keep_input();
+
+        // Prime the live wall-clock timer to continue from the resume point.
+        self.resume_timer(info.elapsed_millis, info.elapsed_frames);
+
+        // Restore the counters captured at the resume point.
+        self.replay_counters = Some(info.counters.iter().map(|c| (c.name.clone(), c.value)).collect());
+
+        self.frames_since_last_keyframe = 0;
+
+        // Prime the emulator's encoded input from the resume point. The logical `Input` bitflags
+        // cannot be reconstructed without a decoder (none exists), so live input proceeds from the
+        // user's current input on subsequent frames; only the emulator-side encoded state carries
+        // continuity across the resume boundary.
+        self.core.set_input_encoded(info.input.as_slice());
+
+        // Install the resumed recorder.
+        self.replay_file_recorder = Some(Box::new(NonBlockingReplayFileRecorder::new(recorder)));
+        self.frames_per_keyframe = partial.frames_per_keyframe.get();
+
+        // Restore speed (recorder dedups identical speed, so no spurious ChangeSpeed packet).
+        self.set_speed(info.speed);
+
+        Ok(())
+    }
+
     /// Get number of milliseconds
     ///
     /// This will reset to 0 whenever a replay is started.
@@ -575,7 +647,7 @@ impl SuperShuckieCore {
         }
 
         if self.replay_player.is_none() && !self.mid_frame {
-            let ms = self.timestamp_provider.get_timestamp_milliseconds() - self.starting_milliseconds.0;
+            let ms = self.timestamp_provider.get_timestamp_milliseconds().wrapping_sub(self.starting_milliseconds.0);
             self.total_milliseconds = ms.into();
 
             self.with_recorder(|f| f.next_frame(ms.into()));
@@ -658,6 +730,25 @@ impl SuperShuckieCore {
         self.replay_player = None;
         self.replay_counters = None;
         self.reset_input();
+    }
+
+    fn detach_replay_player_keep_input(&mut self) {
+        if self.replay_player.is_none() {
+            return;
+        }
+        self.replay_stalled = false;
+        self.replay_player = None;
+        self.replay_counters = None;
+        // NOTE: intentionally does NOT call reset_input(), so the input held at the
+        // resume frame is not wiped before the first live recorded frame.
+    }
+
+    fn resume_timer(&mut self, resume_millis: TimestampMillis, resume_frames: UnsignedInteger) {
+        let now = self.timestamp_provider.get_timestamp_milliseconds();
+        self.paused_timer_at = None;
+        self.starting_milliseconds = now.wrapping_sub(resume_millis.0).into();
+        self.total_milliseconds = resume_millis;
+        self.total_frames = resume_frames;
     }
 
     /// Reset the current input.

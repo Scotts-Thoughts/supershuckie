@@ -183,6 +183,36 @@ void supershuckie_frontend_set_custom_setting(const struct SuperShuckieFrontendR
 bool supershuckie_frontend_start_recording_replay(struct SuperShuckieFrontendRaw *frontend, const char *name, char *result, size_t result_len);
 
 /**
+ * Resume recording into a NEW replay, continuing from an existing one.
+ *
+ * source_name is the existing replay to continue from. If use_end is true, recording continues from
+ * the final frame; otherwise it continues from resume_at_frame. new_name is the name for the new
+ * replay, or null to auto-generate one (the source is never modified).
+ *
+ * If true is returned, the name of the new replay (besides the extension) is written to result.
+ * If false is returned, an error is written to result instead.
+ *
+ * Safety:
+ * - source_name must not be null. new_name may be null.
+ * - result must not be null and must be at least result_len bytes long.
+ */
+bool supershuckie_frontend_resume_recording_from_replay(struct SuperShuckieFrontendRaw *frontend, const char *source_name, uint32_t resume_at_frame, bool use_end, const char *new_name, char *result, size_t result_len);
+
+/**
+ * Resume recording from the replay currently being watched, continuing from the frame it is
+ * currently playing back at. A new, separate replay is created; the source is never modified.
+ *
+ * Fails if no replay is currently being played back.
+ *
+ * If true is returned, the name of the new replay (besides the extension) is written to result.
+ * If false is returned, an error is written to result instead.
+ *
+ * Safety:
+ * - result must not be null and must be at least result_len bytes long.
+ */
+bool supershuckie_frontend_resume_recording_from_current_replay(struct SuperShuckieFrontendRaw *frontend, char *result, size_t result_len);
+
+/**
  * Stop recording a replay.
  */
 void supershuckie_frontend_stop_recording_replay(struct SuperShuckieFrontendRaw *frontend);

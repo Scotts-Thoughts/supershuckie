@@ -4,6 +4,7 @@ use alloc::format;
 use alloc::string::String;
 use core::ffi::CStr;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use crate::replay_file::record::ResumeCropPolicy;
 use crate::{TimestampMillis, UnsignedInteger};
 
 /// Signature start (all replay headers must start with this)
@@ -18,7 +19,8 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 /// Replay format version (written version)
 pub const REPLAY_VERSION: u32 = 3;
 
-// FIXME: How do we handle resuming?
+// Resume support: see replay_file::record::resume (build_resumed_recorder). A resumed file is an
+// ordinary v3 file; no format change.
 
 /// Blake3 checksum
 pub type ReplayHeaderBlake3Hash = [u8; 32];
@@ -268,6 +270,28 @@ impl ReplayFileMetadata {
             _padding_1: [0u8; _],
             _padding_2: [0u8; _]
         })
+    }
+
+    /// Apply a [`ResumeCropPolicy`] to this metadata's crop / timing markers for a resume at
+    /// `resume_frame`, returning the adjusted metadata.
+    pub fn with_resume_crop(mut self, resume_frame: UnsignedInteger, policy: ResumeCropPolicy) -> Self {
+        match policy {
+            ResumeCropPolicy::PreserveStartDropEnd => {
+                let keep_start = self.crop_start.map(|(frame, _)| frame <= resume_frame).unwrap_or(false);
+                if !keep_start {
+                    self.crop_start = None;
+                    self.timer_offset = None;
+                }
+                self.crop_end = None;
+            }
+            ResumeCropPolicy::DropAll => {
+                self.crop_start = None;
+                self.crop_end = None;
+                self.timer_offset = None;
+            }
+            ResumeCropPolicy::PreserveAll => {}
+        }
+        self
     }
 }
 

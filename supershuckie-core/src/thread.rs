@@ -17,7 +17,7 @@ use supershuckie_pokeabyte_integration::PokeAByteEmulatorCommand;
 #[cfg(feature = "pokeabyte")]
 use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
-use supershuckie_replay_recorder::replay_file::record::ReplayFileWriteError;
+use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 use supershuckie_replay_recorder::{ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
 
@@ -186,6 +186,32 @@ impl ThreadedSuperShuckieCore {
     pub fn start_recording_replay(&self, metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>) {
         self.sender.send(ThreadCommand::StartRecordingReplay(metadata))
             .expect("StopRecordingReplay - the core thread has crashed");
+    }
+
+    /// Resume recording from an existing replay.
+    ///
+    /// `source_bytes` is the raw replay file used to spin up an independent re-feed player.
+    /// `resume_at_frame == None` resumes from the final frame.
+    pub fn resume_recording_replay(
+        &mut self,
+        source_bytes: Vec<u8>,
+        resume_at_frame: Option<UnsignedInteger>,
+        metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
+        crop_policy: ResumeCropPolicy,
+        allow_corruption: bool,
+    ) {
+        // The source replay was attached for positioning; resuming transitions us out of playback
+        // and into live recording, so clear the wrapper's playback state (mirrors detach).
+        self.playback_total_frames = 0;
+        self.playback_total_milliseconds = 0.into();
+        self.playback = false;
+        self.sender.send(ThreadCommand::ResumeRecordingReplay {
+            source_bytes,
+            resume_at_frame,
+            metadata,
+            crop_policy,
+            allow_corruption,
+        }).expect("ResumeRecordingReplay - the core thread has crashed");
     }
 
     /// Stop recording replay.
@@ -407,6 +433,13 @@ enum ThreadCommand {
     SetPlaybackFrozen(bool),
     SetPokeAByteEnabled(bool, Sender<Result<(), String>>),
     StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>),
+    ResumeRecordingReplay {
+        source_bytes: Vec<u8>,
+        resume_at_frame: Option<UnsignedInteger>,
+        metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
+        crop_policy: ResumeCropPolicy,
+        allow_corruption: bool,
+    },
     StopRecordingReplay(Sender<bool>),
     AttachReplayPlayer {
         player: ReplayFilePlayer,
@@ -736,6 +769,15 @@ impl ThreadedSuperShuckieCoreThread {
 
                 // FIXME: error if this fails
                 self.core.start_recording_replay(metadata).expect("FAILED TO START RECORDING REPLAY OH NO");
+                if !self.is_running() {
+                    self.core.pause_timer();
+                }
+            }
+            ThreadCommand::ResumeRecordingReplay { source_bytes, resume_at_frame, metadata, crop_policy, allow_corruption } => {
+                self.replay_errors.lock().expect("resume recording replay failed to get replay errors").clear();
+
+                // FIXME: error if this fails
+                self.core.resume_recording_replay(&source_bytes, resume_at_frame, metadata, crop_policy, allow_corruption).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
                 if !self.is_running() {
                     self.core.pause_timer();
                 }

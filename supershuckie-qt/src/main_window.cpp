@@ -2,6 +2,8 @@
 #define SUPERSHUCKIE_VERSION "0.4.11"
 
 #include <cstdio>
+#include <cstdint>
+#include <string>
 #include <QLayout>
 #include <SDL3/SDL.h>
 #include <QMenuBar>
@@ -514,9 +516,6 @@ void MainWindow::set_up_replays_menu() {
     connect(this->play_replay, SIGNAL(triggered()), this, SLOT(do_play_replay()));
     connect(this->continue_last_replay, SIGNAL(triggered()), this, SLOT(do_continue_last_replay()));
 
-    // TODO: Finally add this!!!
-    this->resume_replay->setVisible(false);
-
     this->record_replay->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_R));
     this->resume_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_R));
     this->play_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_P));
@@ -741,7 +740,8 @@ void MainWindow::refresh_action_states() {
 
         case SuperShuckieReplayState::SuperShuckieReplayState__Playback:
             this->record_replay->setEnabled(false);
-            this->resume_replay->setEnabled(false);
+            // resume_replay stays enabled here: resuming while watching continues from the
+            // current playback frame into a new, separate replay.
             this->reload_core->setEnabled(false);
             this->reset_console->setEnabled(false);
             this->current_state->setText("PLAYBACK");
@@ -944,8 +944,33 @@ void MainWindow::do_load_game() {
 }
 
 void MainWindow::do_resume_replay() {
-    // TODO
-    auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
+    char result[512];
+    bool ok;
+
+    if(supershuckie_frontend_get_replay_state(this->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Playback) {
+        // Watching a replay: resume from the frame currently being played back, no prompts.
+        ok = supershuckie_frontend_resume_recording_from_current_replay(this->frontend, result, sizeof(result));
+    }
+    else {
+        // Not watching a replay: pick one and resume from its end.
+        auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
+        auto source = SelectItemDialog::ask(this, replays, "Resume from replay", "Select a replay to continue recording from its end.");
+        if(source == std::nullopt) {
+            return;
+        }
+        ok = supershuckie_frontend_resume_recording_from_replay(this->frontend, source->c_str(), 0, true, nullptr, result, sizeof(result));
+    }
+
+    if(ok) {
+        char fmt[600];
+        std::snprintf(fmt, sizeof(fmt), "Resumed recording into replay \"%s\"", result);
+        this->set_title(fmt);
+    }
+    else {
+        DISPLAY_ERROR_DIALOG("Failed to resume recording replay", "%s", result);
+    }
+
+    this->refresh_action_states();
 }
 
 void MainWindow::do_play_replay() {

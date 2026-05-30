@@ -23,6 +23,9 @@ mod thread;
 #[cfg(feature = "std")]
 pub use thread::*;
 
+mod resume;
+pub use resume::*;
+
 #[cfg(feature = "std")]
 use std::{
     io::{Seek, SeekFrom, Write},

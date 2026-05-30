@@ -267,6 +267,44 @@ pub unsafe extern "C" fn supershuckie_frontend_start_recording_replay(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_resume_recording_from_replay(
+    frontend: &mut SuperShuckieFrontend,
+    source_name: *const c_char,
+    resume_at_frame: u32,
+    use_end: bool,
+    new_name: *const c_char,
+    result: *mut u8,
+    result_len: usize
+) -> bool {
+    let source_name = unsafe { CStr::from_ptr(source_name) }.to_str().expect("source_name not UTF-8");
+    let new_name = if !new_name.is_null() { Some(unsafe { CStr::from_ptr(new_name) }.to_str().expect("new_name not UTF-8")) } else { None };
+    let frame = if use_end { None } else { Some(resume_at_frame) };
+
+    let (success, msg) = match frontend.resume_recording_from_replay(source_name, frame, new_name) {
+        Ok(n) => (true, n),
+        Err(n) => (false, n)
+    };
+
+    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    success
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_resume_recording_from_current_replay(
+    frontend: &mut SuperShuckieFrontend,
+    result: *mut u8,
+    result_len: usize
+) -> bool {
+    let (success, msg) = match frontend.resume_recording_from_current_replay() {
+        Ok(n) => (true, n),
+        Err(n) => (false, n)
+    };
+
+    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    success
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_stop_recording_replay(
     frontend: &mut SuperShuckieFrontend
 ) {

@@ -23,7 +23,7 @@ use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShu
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{blake3_hash, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
-use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
+use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettings, ResumeCropPolicy};
 
 const SETTINGS_FILE: &str = "settings.json";
 const SAVE_STATE_EXTENSION: &str = "save_state";
@@ -1388,6 +1388,156 @@ impl SuperShuckieFrontend {
         });
 
         Ok(final_replay.into())
+    }
+
+    /// Resume recording from a saved replay.
+    ///
+    /// A new replay is always created; the source replay is never modified.
+    ///
+    /// `resume_at_frame` is the frame to resume from. `None` resumes from the end.
+    ///
+    /// If `new_name` is set, that name is used for the new replay; otherwise a name
+    /// derived from `source_name` is generated that does not collide with the source.
+    ///
+    /// Returns the name of the new replay if started.
+    pub fn resume_recording_from_replay(&mut self, source_name: &str, resume_at_frame: Option<u32>, new_name: Option<&str>) -> Result<UTF8CString, UTF8CString> {
+        self.assert_replays_available()?;
+
+        let current_rom_name = self.get_current_rom_name_arc().expect("no rom name when game is running in resume_recording_from_replay");
+        let replays_dir = self.get_replays_dir_for_rom(current_rom_name.as_str());
+
+        // Read the source replay bytes from disk (same path scheme as load_replay_if_exists).
+        // These owned bytes are handed to the core for the re-feed player.
+        let source_path = replays_dir.join(format!("{source_name}.{REPLAY_EXTENSION}"));
+        if !source_path.is_file() {
+            return Err(format!("Replay {source_name} does not exist").into());
+        }
+        let source_bytes = match std::fs::read(&source_path) {
+            Ok(n) => n,
+            Err(e) => return Err(format!("Failed to read replay {source_name}:\n\n{e}").into())
+        };
+
+        // Attach the source replay for playback so the emulator can be positioned at the
+        // resume point. This also runs the ROM/BIOS/core compatibility checks. Allow
+        // mismatches/corruption (override_errors = true) so resuming is permissive.
+        self.load_replay_if_exists(source_name, true)?;
+
+        // Choose the new replay name, guaranteeing it never collides with the source.
+        let new_name: String = match new_name {
+            Some(n) => n.to_owned(),
+            None => {
+                let base = format!("{source_name}-resume");
+                let mut candidate = base.clone();
+                let mut i = 0u64;
+                loop {
+                    let path = replays_dir.join(format!("{candidate}.{REPLAY_EXTENSION}"));
+                    if path != source_path && !path.exists() {
+                        break;
+                    }
+                    i = i.checked_add(1).ok_or_else(|| UTF8CString::from_str("Maximum number of generics reached."))?;
+                    candidate = format!("{base}-{i}");
+                }
+                candidate
+            }
+        };
+
+        // Never write the source path.
+        let intended_final_path = replays_dir.join(format!("{new_name}.{REPLAY_EXTENSION}"));
+        if intended_final_path == source_path {
+            return Err("The new replay name must not be the same as the source replay".into());
+        }
+
+        // Open both new files. The temp file MUST have a distinct path from the final file:
+        // load_file_or_make_generic ignores the generic prefix when an explicit name is given, so
+        // passing Some(new_name) to both would collapse them onto the same path — which then gets
+        // deleted on stop (it removes the temp file), destroying the recording. Build an explicit,
+        // distinct temp name instead.
+        let temp_name = format!("temp-{new_name}");
+        let (final_file, final_replay, final_replay_path) = self.load_file_or_make_generic(&replays_dir, Some(new_name.as_str()), None, REPLAY_EXTENSION)?;
+        let (temp_file, _, temp_replay) = self.load_file_or_make_generic(&replays_dir, Some(temp_name.as_str()), None, REPLAY_EXTENSION)?;
+
+        let partial = PartialReplayRecordMetadata {
+            rom_name: current_rom_name.to_string(),
+            rom_filename: current_rom_name.to_string(),
+
+            settings: ReplayFileRecorderSettings {
+                minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
+                    .saturating_mul(1024)
+                    .saturating_mul(1024),
+                compression_level: self.settings.replay.zstd_compression_level
+            },
+
+            // TODO: patches
+            patch_format: ReplayPatchFormat::Unpatched,
+            patch_target_checksum: ReplayHeaderBlake3Hash::default(),
+            patch_data: ByteVec::default(),
+
+            frames_per_keyframe: self.settings.replay.frames_per_keyframe,
+
+            // have a buffer so we don't destroy your SSD
+            final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
+            temp_file: BufWriter::with_capacity(8 * 1024 * 1024, temp_file),
+        };
+
+        self.core.resume_recording_replay(
+            source_bytes,
+            resume_at_frame.map(|f| f as u64),
+            partial,
+            ResumeCropPolicy::PreserveStartDropEnd,
+            true,
+        );
+
+        // load_replay_if_exists force-paused the game for playback positioning. Now that we're
+        // recording live, honor auto_pause_on_record: pause if set, otherwise hand control back.
+        self.set_paused(self.settings.replay.auto_pause_on_record);
+
+        // Preserve the source replay's timer markers so the on-screen timer keeps reading the
+        // resumed value (e.g. 35.83) instead of restarting at 0. load_replay_if_exists populated
+        // last_read_replay_stats from the source metadata; mirror the recorder's
+        // PreserveStartDropEnd crop policy: keep crop_start + timer_offset when the start lies
+        // within the kept prefix, and drop crop_end (the run is being extended past it).
+        if let Some(stats) = self.last_read_replay_stats.as_mut() {
+            let keep_start = match (stats.start, resume_at_frame) {
+                (Some((start_frame, _)), Some(resume_frame)) => start_frame <= resume_frame as u64,
+                (Some(_), None) => true, // resuming from the end: the start is always within the prefix
+                (None, _) => false,
+            };
+            if !keep_start {
+                stats.start = None;
+                stats.timer_offset = None;
+            }
+            stats.end = None;
+        }
+        self.last_replay_and_frame = None;
+        self.current_replay = None;
+        self.current_input = Input::default();
+
+        self.recording_replay_file = Some(ReplayFileInfo {
+            final_replay_name: final_replay.clone().into(),
+            temp_replay_path: temp_replay,
+            final_replay_path
+        });
+
+        Ok(final_replay.into())
+    }
+
+    /// Resume recording from the replay currently being watched, continuing from the frame it is
+    /// currently playing back at.
+    ///
+    /// A new, separate replay is always created; the source replay is never modified. Errors if no
+    /// replay is currently being played back.
+    ///
+    /// Returns the name of the new replay if started.
+    pub fn resume_recording_from_current_replay(&mut self) -> Result<UTF8CString, UTF8CString> {
+        let Some(name) = self.current_replay.clone() else {
+            return Err("No replay is currently being watched".into());
+        };
+
+        // Capture the live playback frame BEFORE resuming (the resume re-attaches the source player,
+        // which would otherwise reset the position).
+        let frame = self.core.get_elapsed_time().frames;
+
+        self.resume_recording_from_replay(name.as_str(), Some(frame), None)
     }
 
     fn assert_replays_available(&self) -> Result<(), UTF8CString> {

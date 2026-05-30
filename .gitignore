@@ -11,3 +11,9 @@ build
 
 # macOS might need libMoltenVK.dylib; avoid checking it in by mistake
 *.dylib
+
+# Build logs from manual Windows builds
+build_*.log
+
+# Runtime user data
+UserData/

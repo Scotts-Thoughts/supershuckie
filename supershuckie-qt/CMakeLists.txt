@@ -59,7 +59,8 @@ endif()
 
 
 if(${WIN32})
-    target_link_libraries(supershuckie-cpp-static PUBLIC dwmapi)
+    # dwmapi: window frame theming. shlwapi: mGBA's vfs/config use PathIsRelativeW/PathRemoveFileSpecW.
+    target_link_libraries(supershuckie-cpp-static PUBLIC dwmapi shlwapi)
 endif()
 
 add_executable(supershuckie-debug)
