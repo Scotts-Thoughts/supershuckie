@@ -1,5 +1,5 @@
 // FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.4.11"
+#define SUPERSHUCKIE_VERSION "0.4.11stp"
 
 #include <cstdio>
 #include <cstdint>
@@ -15,6 +15,9 @@
 #include <QStandardPaths>
 #include <QDesktopServices>
 #include <QGridLayout>
+#include <QImage>
+#include <QDateTime>
+#include <QDir>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -408,6 +411,11 @@ void MainWindow::set_up_file_menu() {
     connect(this->unload_rom, SIGNAL(triggered()), this, SLOT(do_unload_rom()));
 
     this->file_menu->addSeparator();
+    this->screenshot = this->file_menu->addAction("Screenshot");
+    this->screenshot->setShortcut(QKeyCombination(Qt::Key_F12));
+    connect(this->screenshot, SIGNAL(triggered()), this, SLOT(do_screenshot()));
+
+    this->file_menu->addSeparator();
     auto *open_user_dir = this->file_menu->addAction("Open data directory");
     connect(open_user_dir, SIGNAL(triggered()), this, SLOT(do_open_user_dir()));
 
@@ -706,6 +714,7 @@ void MainWindow::refresh_action_states() {
     this->replays_menu->setEnabled(game_loaded);
     this->close_rom->setEnabled(game_loaded);
     this->unload_rom->setEnabled(game_loaded);
+    this->screenshot->setEnabled(game_loaded);
 
     for(auto &state : this->quick_save_save_states) {
         state->setEnabled(game_loaded);
@@ -824,6 +833,42 @@ void MainWindow::do_close_rom() {
 void MainWindow::do_unload_rom() {
     supershuckie_frontend_unload_rom(this->frontend);
     supershuckie_frontend_set_paused(this->frontend, false);
+}
+
+void MainWindow::do_screenshot() {
+    if(this->frontend == nullptr) {
+        return;
+    }
+
+    // Capture exactly what's on screen right now. This holds the last frame while paused and
+    // during replay playback, so it works in all of those states.
+    QImage image = this->render_widget->capture();
+    if(image.isNull()) {
+        DISPLAY_ERROR_DIALOG("Screenshot", "%s", "No frame is available to capture. Load a ROM first.");
+        return;
+    }
+
+    // Screenshots live in a "screenshots" folder alongside the ROM's replays and save data.
+    std::size_t len = supershuckie_frontend_get_screenshot_directory(this->frontend, nullptr, 0);
+    if(len == 0) {
+        DISPLAY_ERROR_DIALOG("Screenshot", "%s", "Could not determine where to save the screenshot.");
+        return;
+    }
+    std::vector<char> dir_buf(len, '\0');
+    supershuckie_frontend_get_screenshot_directory(this->frontend, dir_buf.data(), dir_buf.size());
+
+    // Timestamped name (with milliseconds) so rapid captures never collide.
+    QString filename = QString("screenshot_%1.png").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd_HH-mm-ss-zzz"));
+    QString path = QDir(QString::fromUtf8(dir_buf.data())).filePath(filename);
+
+    if(image.save(path, "PNG")) {
+        char title[1024];
+        std::snprintf(title, sizeof(title), "Saved screenshot \"%s\"", filename.toStdString().c_str());
+        this->set_title(title);
+    }
+    else {
+        DISPLAY_ERROR_DIALOG("Screenshot", "Failed to save screenshot to:\n\n%s", path.toStdString().c_str());
+    }
 }
 
 void MainWindow::do_new_game() noexcept {

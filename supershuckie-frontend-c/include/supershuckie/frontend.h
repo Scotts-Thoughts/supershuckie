@@ -710,6 +710,17 @@ struct SuperShuckieStringArrayRaw *supershuckie_frontend_clear_recent_roms(struc
 size_t supershuckie_frontend_get_current_data_directory(const struct SuperShuckieFrontendRaw *frontend, char *dir, size_t dir_len);
 
 /**
+ * Get the screenshots directory for the current ROM, creating it if needed.
+ *
+ * Writes a NUL-terminated path into `dir` (up to `dir_len` bytes) and returns the number of bytes
+ * the path needs (including the NUL). Returns 0 if no ROM is loaded or the directory can't be made.
+ *
+ * Safety:
+ * - `dir` must be valid for at least `dir_len` bytes, only being null if dir_len is 0.
+ */
+size_t supershuckie_frontend_get_screenshot_directory(const struct SuperShuckieFrontendRaw *frontend, char *dir, size_t dir_len);
+
+/**
  * Reload the current core.
  *
  * This will end any replay and automatically save the current game.

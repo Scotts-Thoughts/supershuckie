@@ -3,6 +3,8 @@
 #include <QGraphicsPixmapItem>
 #include <QKeyEvent>
 #include <QMimeData>
+#include <QImage>
+#include <QPainter>
 
 using namespace SuperShuckie64;
 
@@ -70,6 +72,25 @@ void GameRenderWidget::set_dimensions(unsigned screen_count, const SuperShuckieS
     
     this->setFixedSize(this->total_width * scale, this->total_height * scale);
     this->setScene(this->scene);
+}
+
+QImage GameRenderWidget::capture() const {
+    if(this->screens.empty() || this->total_width == 0 || this->total_height == 0) {
+        return QImage();
+    }
+
+    // Paint each screen's current pixmap at its on-screen offset. The offsets already encode the
+    // vertical/horizontal arrangement and the screen-swap setting, so the result matches the view.
+    QImage image(this->total_width, this->total_height, QImage::Format_ARGB32);
+    image.fill(Qt::black);
+
+    QPainter painter(&image);
+    for(const auto &screen : this->screens) {
+        painter.drawPixmap(static_cast<int>(screen.x), static_cast<int>(screen.y), screen.pixmap);
+    }
+    painter.end();
+
+    return image;
 }
 
 void GameRenderWidget::refresh_screen(unsigned screen_count, const uint32_t *const *pixels) {

@@ -37,13 +37,60 @@ target_include_directories(supershuckie-cpp-static
     PRIVATE "${CMAKE_SOURCE_DIR}/../supershuckie-frontend-c/include"
 )
 
-find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
-find_package(SDL3 REQUIRED CONFIG REQUIRED COMPONENTS SDL3)
+# Fold Qt, SDL, and the C/C++ runtime into a single standalone executable.
+# Requires a static Qt6 build (e.g. mingw-w64-ucrt-x86_64-qt6-static) and a static SDL3;
+# point CMAKE_PREFIX_PATH/Qt6_DIR at the static Qt when enabling this.
+option(SUPERSHUCKIE_STATIC "Statically link Qt, SDL, and the runtime into a single exe" OFF)
+
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+if(SUPERSHUCKIE_STATIC)
+    find_package(SDL3 REQUIRED CONFIG COMPONENTS SDL3-static)
+    set(SUPERSHUCKIE_SDL_TARGET SDL3::SDL3-static)
+else()
+    find_package(SDL3 REQUIRED CONFIG COMPONENTS SDL3)
+    set(SUPERSHUCKIE_SDL_TARGET SDL3::SDL3)
+endif()
+
+if(SUPERSHUCKIE_STATIC)
+    # MSYS2's static Qt still references its third-party deps via full-path .dll.a import
+    # libraries, which -static cannot override. Repoint each imported target at the matching
+    # static archive so nothing is pulled from a DLL. Their own transitive deps are supplied
+    # by the --start-group block on the final executable below.
+    set(_SS_LIB "C:/msys64/ucrt64/lib")
+    macro(_ss_repoint tgt archive)
+        if(TARGET ${tgt})
+            set_target_properties(${tgt} PROPERTIES
+                IMPORTED_LOCATION "${_SS_LIB}/${archive}"
+                IMPORTED_LOCATION_RELEASE "${_SS_LIB}/${archive}")
+        endif()
+    endmacro()
+    _ss_repoint(ZLIB::ZLIB libz.a)
+    _ss_repoint(PNG::PNG libpng16.a)
+    _ss_repoint(Freetype::Freetype libfreetype.a)
+    _ss_repoint(harfbuzz::harfbuzz libharfbuzz.a)
+    _ss_repoint(JPEG::JPEG libjpeg.a)
+    _ss_repoint(TIFF::TIFF libtiff.a)
+    _ss_repoint(Libb2::Libb2 libb2.a)
+    _ss_repoint(PCRE2::16BIT libpcre2-16.a)
+    if(TARGET WrapWebP::WrapWebP)
+        set_target_properties(WrapWebP::WrapWebP PROPERTIES INTERFACE_LINK_LIBRARIES
+            "${_SS_LIB}/libwebp.a;${_SS_LIB}/libwebpdemux.a;${_SS_LIB}/libwebpmux.a;${_SS_LIB}/libsharpyuv.a")
+    endif()
+    # libb2 (BLAKE2) and PCRE2 reach Qt6::Core through the Libb2::Libb2 / WrapPCRE2::WrapPCRE2
+    # imported targets, which resolve (via pkg-config) to .dll.a import libraries. Point their
+    # link interfaces straight at the static archives.
+    if(TARGET Libb2::Libb2)
+        set_target_properties(Libb2::Libb2 PROPERTIES INTERFACE_LINK_LIBRARIES "${_SS_LIB}/libb2.a")
+    endif()
+    if(TARGET WrapPCRE2::WrapPCRE2)
+        set_target_properties(WrapPCRE2::WrapPCRE2 PROPERTIES INTERFACE_LINK_LIBRARIES "${_SS_LIB}/libpcre2-16.a")
+    endif()
+endif()
 
 target_link_libraries(supershuckie-cpp-static
     PUBLIC Qt6::Widgets
     PUBLIC Qt6::Core
-    PUBLIC SDL3::SDL3
+    PUBLIC ${SUPERSHUCKIE_SDL_TARGET}
     PUBLIC supershuckie_frontend_c
 )
 
@@ -62,6 +109,19 @@ endif()
 if(${WIN32})
     # dwmapi: window frame theming. shlwapi: mGBA's vfs/config use PathIsRelativeW/PathRemoveFileSpecW.
     target_link_libraries(supershuckie-cpp-static PUBLIC dwmapi shlwapi)
+endif()
+
+if(SUPERSHUCKIE_STATIC)
+    # The repointed static archives (freetype, harfbuzz, glib, tiff, …) carry no link metadata,
+    # so their inter-dependencies (tiff->lzma/jbig/deflate/Lerc/zstd, harfbuzz<->freetype,
+    # harfbuzz->glib/graphite2, freetype->bz2/brotli, glib->pcre2-8/intl/iconv) must be supplied
+    # explicitly. Attaching this as the LAST PUBLIC entry of supershuckie-cpp-static places it
+    # after Qt's static archives in the final link line, so the group resolves what Qt pulls in.
+    # LINK_GROUP/RESCAN emits a --start-group/--end-group (surviving CMake de-duplication) so the
+    # linker resolves the libs in any order. With -static, each plain name resolves to libNAME.a.
+    target_link_libraries(supershuckie-cpp-static PUBLIC
+        "$<LINK_GROUP:RESCAN,freetype,harfbuzz,png16,z,jpeg,tiff,webp,webpdemux,webpmux,sharpyuv,b2,pcre2-16,pcre2-8,glib-2.0,graphite2,brotlidec,brotlicommon,bz2,intl,iconv,lzma,deflate,jbig,Lerc,zstd,rpcrt4,usp10>"
+    )
 endif()
 
 add_executable(supershuckie-debug)
@@ -95,3 +155,16 @@ else()
 endif()
 
 target_link_libraries(supershuckie supershuckie-cpp-static)
+
+if(SUPERSHUCKIE_STATIC)
+    # A static Qt has no plugin DLLs to load at runtime, so the platform integration
+    # plugin must be linked in and registered via Q_IMPORT_PLUGIN (qt6_import_plugins).
+    if(${WIN32})
+        qt6_import_plugins(supershuckie INCLUDE Qt6::QWindowsIntegrationPlugin)
+    endif()
+    # Statically link libgcc/libstdc++/winpthread so no MinGW runtime DLLs are needed.
+    # --allow-multiple-definition: mgba bundles its own crc32, which also lives in zlib
+    # (pulled in statically via Qt's PNG support); both are the standard CRC-32, so taking
+    # the first definition is fine.
+    target_link_options(supershuckie PRIVATE -static -static-libgcc -static-libstdc++ -Wl,--allow-multiple-definition)
+endif()

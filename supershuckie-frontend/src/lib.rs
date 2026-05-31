@@ -757,6 +757,20 @@ impl SuperShuckieFrontend {
         self.get_userdir_for_rom(rom).join("replays")
     }
 
+    fn get_screenshots_dir_for_rom(&self, rom: &str) -> PathBuf {
+        self.get_userdir_for_rom(rom).join("screenshots")
+    }
+
+    /// Get the screenshots directory for the current ROM, creating it if needed.
+    ///
+    /// Returns `None` if no ROM is loaded or the directory could not be created.
+    pub fn get_screenshots_dir_for_current_rom(&self) -> Option<UTF8CString> {
+        let rom = self.get_current_rom_name()?;
+        let dir = self.get_screenshots_dir_for_rom(rom);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir.to_str().expect("screenshot path is not UTF-8").into())
+    }
+
     fn get_userdir_for_rom(&self, filename: &str) -> PathBuf {
         self.user_dir.join(format!("{filename}-data"))
     }

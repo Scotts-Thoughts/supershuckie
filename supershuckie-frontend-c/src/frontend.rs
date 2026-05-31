@@ -984,6 +984,29 @@ pub unsafe extern "C" fn supershuckie_frontend_get_current_data_directory(
     path_bytes_len
 }
 
+/// Get the screenshots directory for the current ROM, creating it if needed.
+///
+/// Writes a NUL-terminated path into `dir` (up to `dir_len` bytes) and returns the number of bytes
+/// the path needs (including the NUL). Returns 0 if no ROM is loaded or the directory can't be made.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_get_screenshot_directory(
+    frontend: &SuperShuckieFrontend,
+    dir: *mut u8,
+    dir_len: usize
+) -> usize {
+    let Some(path) = frontend.get_screenshots_dir_for_current_rom() else {
+        return 0;
+    };
+    let path_bytes = path.as_c_str().to_bytes_with_nul();
+    let path_bytes_len = path_bytes.len();
+
+    if dir_len >= path_bytes_len {
+        unsafe { from_raw_parts_mut(dir, path_bytes_len) }.copy_from_slice(path_bytes)
+    }
+
+    path_bytes_len
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_reload_core(
     frontend: &mut SuperShuckieFrontend

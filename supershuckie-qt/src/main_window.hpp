@@ -88,6 +88,7 @@ private:
     QAction *open_rom;
     QAction *close_rom;
     QAction *unload_rom;
+    QAction *screenshot;
 
     QAction *new_game;
     QAction *load_game;
@@ -191,6 +192,7 @@ private slots:
     void do_open_rom();
     void do_close_rom();
     void do_unload_rom();
+    void do_screenshot();
     void do_new_game() noexcept;
     void do_load_game();
     void do_save_game();

@@ -19,6 +19,10 @@ class GameRenderWidget: public QGraphicsView {
 public:
     void set_dimensions(unsigned screen_count, const SuperShuckieScreenData *screen_data, unsigned scale) noexcept;
 
+    // Composite the current frame into a native-resolution image (screens positioned exactly as
+    // displayed, including swap/horizontal layout). Returns a null QImage if no frame is available.
+    QImage capture() const;
+
 private:
     GameRenderWidget(MainWindow *window, QWidget *parent);
     MainWindow *main_window;
