@@ -191,15 +191,14 @@ impl ThreadedSuperShuckieCore {
 
     /// Resume recording from an existing replay.
     ///
-    /// `source_bytes` is the raw replay file used to spin up an independent re-feed player.
+    /// The source replay must already be attached for playback (e.g. via `attach_replay_player`);
+    /// the core thread consumes that attached player to build the new file's prefix.
     /// `resume_at_frame == None` resumes from the final frame.
     pub fn resume_recording_replay(
         &mut self,
-        source_bytes: Vec<u8>,
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
-        allow_corruption: bool,
     ) {
         // The source replay was attached for positioning; resuming transitions us out of playback
         // and into live recording, so clear the wrapper's playback state (mirrors detach).
@@ -207,11 +206,9 @@ impl ThreadedSuperShuckieCore {
         self.playback_total_milliseconds = 0.into();
         self.playback = false;
         self.sender.send(ThreadCommand::ResumeRecordingReplay {
-            source_bytes,
             resume_at_frame,
             metadata,
             crop_policy,
-            allow_corruption,
         }).expect("ResumeRecordingReplay - the core thread has crashed");
     }
 
@@ -498,11 +495,9 @@ enum ThreadCommand {
     SetPokeAByteEnabled(bool, Sender<Result<(), String>>),
     StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>),
     ResumeRecordingReplay {
-        source_bytes: Vec<u8>,
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
-        allow_corruption: bool,
     },
     ExportVideo {
         sink: Box<dyn VideoFrameSink>,
@@ -845,11 +840,11 @@ impl ThreadedSuperShuckieCoreThread {
                     self.core.pause_timer();
                 }
             }
-            ThreadCommand::ResumeRecordingReplay { source_bytes, resume_at_frame, metadata, crop_policy, allow_corruption } => {
+            ThreadCommand::ResumeRecordingReplay { resume_at_frame, metadata, crop_policy } => {
                 self.replay_errors.lock().expect("resume recording replay failed to get replay errors").clear();
 
                 // FIXME: error if this fails
-                self.core.resume_recording_replay(&source_bytes, resume_at_frame, metadata, crop_policy, allow_corruption).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
+                self.core.resume_recording_replay(resume_at_frame, metadata, crop_policy).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
                 if !self.is_running() {
                     self.core.pause_timer();
                 }

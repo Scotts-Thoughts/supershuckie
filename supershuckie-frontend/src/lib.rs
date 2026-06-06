@@ -1450,16 +1450,13 @@ impl SuperShuckieFrontend {
         let current_rom_name = self.get_current_rom_name_arc().expect("no rom name when game is running in resume_recording_from_replay");
         let replays_dir = self.get_replays_dir_for_rom(current_rom_name.as_str());
 
-        // Read the source replay bytes from disk (same path scheme as load_replay_if_exists).
-        // These owned bytes are handed to the core for the re-feed player.
+        // Resolve the source path (same scheme as load_replay_if_exists). We do NOT read the file
+        // here: the core builds the new file's prefix directly from the attached player below, so a
+        // second in-RAM copy of a (potentially multi-gigabyte) replay is unnecessary.
         let source_path = replays_dir.join(format!("{source_name}.{REPLAY_EXTENSION}"));
         if !source_path.is_file() {
             return Err(format!("Replay {source_name} does not exist").into());
         }
-        let source_bytes = match std::fs::read(&source_path) {
-            Ok(n) => n,
-            Err(e) => return Err(format!("Failed to read replay {source_name}:\n\n{e}").into())
-        };
 
         // Attach the source replay for playback so the emulator can be positioned at the
         // resume point. This also runs the ROM/BIOS/core compatibility checks. Allow
@@ -1524,11 +1521,9 @@ impl SuperShuckieFrontend {
         };
 
         self.core.resume_recording_replay(
-            source_bytes,
             resume_at_frame.map(|f| f as u64),
             partial,
             ResumeCropPolicy::PreserveStartDropEnd,
-            true,
         );
 
         // load_replay_if_exists force-paused the game for playback positioning. Now that we're

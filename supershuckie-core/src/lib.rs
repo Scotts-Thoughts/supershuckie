@@ -501,16 +501,14 @@ impl SuperShuckieCore {
     /// Resume recording from an existing replay.
     ///
     /// The source replay must already be attached as the active replay player (e.g. via
-    /// `attach_replay_player`). `source_bytes` is the raw replay file, used to spin up a SECOND,
-    /// independent player for the prefix re-feed so cursors don't collide. `resume_at_frame == None`
-    /// resumes from the final frame. Never mutates the source.
+    /// `attach_replay_player`); this method consumes that player to build the new file's prefix and
+    /// then continues recording live. `resume_at_frame == None` resumes from the final frame. Never
+    /// mutates the source.
     pub fn resume_recording_replay<FS, TS>(
         &mut self,
-        source_bytes: &[u8],
         resume_at_frame: Option<UnsignedInteger>,
         partial: PartialReplayRecordMetadata<FS, TS>,
         crop_policy: ResumeCropPolicy,
-        allow_corruption: bool,
     ) -> Result<(), ReplayResumeError>
     where
         FS: ReplayFileSink + Send + Sync + 'static,
@@ -530,12 +528,15 @@ impl SuperShuckieCore {
         // Position the emulator at the resume frame using the existing seek logic.
         self.go_to_replay_frame(target_for_emulator);
 
-        // Build the prefix recorder from a FRESH, independent player so the active replay
-        // player's cursor is never disturbed.
-        let mut feed_player = ReplayFilePlayer::new(source_bytes, allow_corruption)
-            .map_err(|error| ReplayResumeError::Read(ReplaySeekError::ReadError { error }))?;
+        // Reuse the attached source player to build the prefix. Positioning the emulator above has
+        // already finished with its cursor, and we are about to detach it anyway, so we take
+        // ownership and feed it directly. This avoids parsing and holding a SECOND full copy of the
+        // replay in RAM — critical for long Nintendo DS replays, which can be many gigabytes.
+        let mut source_player = self.replay_player.take().ok_or(ReplayResumeError::BadSource {
+            explanation: alloc::borrow::Cow::Borrowed("no replay player attached to resume from"),
+        })?;
         let (recorder, info) = build_resumed_recorder(
-            &mut feed_player,
+            &mut source_player,
             resume_at_frame,
             partial.settings,
             crop_policy,
@@ -543,8 +544,13 @@ impl SuperShuckieCore {
             partial.temp_file,
         )?;
 
-        // Drop the source player (keeping the input held at the resume frame intact).
-        self.detach_replay_player_keep_input();
+        // The source player is taken out and dropped here, ending playback. We replicate the
+        // input-preserving detach side effects inline (detach_replay_player_keep_input would now
+        // early-return since replay_player is already None): clear playback state WITHOUT calling
+        // reset_input(), so the input held at the resume frame survives into the first live frame.
+        drop(source_player);
+        self.replay_stalled = false;
+        self.replay_counters = None;
 
         // Prime the live wall-clock timer to continue from the resume point.
         self.resume_timer(info.elapsed_millis, info.elapsed_frames);
@@ -733,17 +739,6 @@ impl SuperShuckieCore {
         self.replay_player = None;
         self.replay_counters = None;
         self.reset_input();
-    }
-
-    fn detach_replay_player_keep_input(&mut self) {
-        if self.replay_player.is_none() {
-            return;
-        }
-        self.replay_stalled = false;
-        self.replay_player = None;
-        self.replay_counters = None;
-        // NOTE: intentionally does NOT call reset_input(), so the input held at the
-        // resume frame is not wiped before the first live recorded frame.
     }
 
     fn resume_timer(&mut self, resume_millis: TimestampMillis, resume_frames: UnsignedInteger) {

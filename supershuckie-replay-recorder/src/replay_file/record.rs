@@ -98,11 +98,46 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     pub fn new_with_metadata(
         replay_file_metadata: ReplayFileMetadata,
         patch_data: ByteVec,
-        mut settings: ReplayFileRecorderSettings,
+        settings: ReplayFileRecorderSettings,
         starting_timestamp: TimestampMillis,
         starting_input: InputBuffer,
         starting_speed: Speed,
         initial_keyframe_state: ByteVec,
+        final_sink: Final,
+        temp_sink: Temp
+    ) -> Result<ReplayFileRecorder<Final, Temp>, ReplayFileWriteError> {
+        let mut recorder = Self::new_blank(
+            replay_file_metadata,
+            patch_data,
+            settings,
+            starting_input,
+            starting_speed,
+            final_sink,
+            temp_sink
+        )?;
+
+        recorder.insert_keyframe(
+            initial_keyframe_state,
+            starting_timestamp
+        )?;
+
+        Ok(recorder)
+    }
+
+    /// Start a new replay file, writing the header and patch to both sinks but WITHOUT inserting an
+    /// initial frame-0 keyframe.
+    ///
+    /// This is the low-level entry point used by the resume machinery (see
+    /// [`build_resumed_recorder`](crate::replay_file::record::build_resumed_recorder)), which fills
+    /// in the leading data itself — either by copying completed compressed blobs verbatim or by
+    /// re-feeding packets. Ordinary recording should use [`Self::new_with_metadata`], which inserts
+    /// the frame-0 keyframe for you.
+    pub(crate) fn new_blank(
+        replay_file_metadata: ReplayFileMetadata,
+        patch_data: ByteVec,
+        mut settings: ReplayFileRecorderSettings,
+        starting_input: InputBuffer,
+        starting_speed: Speed,
         mut final_sink: Final,
         mut temp_sink: Temp
     ) -> Result<ReplayFileRecorder<Final, Temp>, ReplayFileWriteError> {
@@ -126,7 +161,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         temp_sink.write_bytes(patch_data.as_slice())?;
         final_sink.write_bytes(patch_data.as_slice())?;
 
-        let mut recorder = ReplayFileRecorder {
+        Ok(ReplayFileRecorder {
             settings,
             elapsed_frames: 0,
             elapsed_millis: 0.into(),
@@ -145,14 +180,61 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             sink: Some(SinkTuple {
                 final_sink, temp_sink
             })
-        };
+        })
+    }
 
-        recorder.insert_keyframe(
-            initial_keyframe_state,
-            starting_timestamp
-        )?;
+    /// Append an already-compressed blob packet to both sinks verbatim, without decompressing it.
+    ///
+    /// Used by the resume fast path to carry the source replay's completed blobs forward unchanged.
+    /// The blob is re-serialized via its packet-write instructions (the same path
+    /// [`Self::next_blob`] uses), so the result is a byte-for-byte valid blob. `blob` must be a
+    /// [`Packet::CompressedBlob`]; passing anything else is a programming error.
+    ///
+    /// This must only be called while the in-progress blob is empty (i.e. before any packets have
+    /// been written to `current_blob`), which is the case during the verbatim-copy phase of a
+    /// resume.
+    pub(crate) fn append_compressed_blob_verbatim(&mut self, blob: &Packet) -> Result<(), ReplayFileWriteError> {
+        debug_assert!(matches!(blob, Packet::CompressedBlob { .. }), "append_compressed_blob_verbatim given a non-blob packet");
+        debug_assert!(self.current_blob.is_empty(), "append_compressed_blob_verbatim called with a non-empty in-progress blob");
 
-        Ok(recorder)
+        self.do_with_poison(|this| {
+            let write_instructions = blob.write_packet_instructions();
+            let offset = this.current_blob_offset;
+
+            let (final_sink, temp_sink) = this.get_sinks();
+
+            let written = final_sink.write_packet_data(&write_instructions)?;
+            let written = u64::try_from(written).expect("failing to convert written blob size from usize to u64");
+
+            // Keep the temp file identical to the final file during the verbatim-copy phase: there
+            // is no in-progress region yet, so truncating to the current offset is a no-op that
+            // simply guards against any stray trailing bytes before we re-append the blob.
+            temp_sink.truncate(offset)?;
+            temp_sink.write_packet_data(&write_instructions)?;
+
+            this.current_blob_offset = offset.checked_add(written).expect("overflowed adding current_blob_offset");
+            Ok(())
+        })
+    }
+
+    /// Prime the recorder's running state to continue from an existing keyframe (resume support).
+    ///
+    /// Sets the elapsed frame/time counters, the current input/speed, and the counter snapshot to
+    /// the values recorded at `kf`, and clears the in-progress blob so the next inserted keyframe
+    /// begins a fresh blob with a full (undiffed) keyframe — which the reader requires as the first
+    /// packet of every blob.
+    pub(crate) fn prime_for_resume(&mut self, kf: &KeyframeMetadata) {
+        self.elapsed_frames = kf.elapsed_frames;
+        self.elapsed_millis = kf.elapsed_millis;
+        self.last_keyframe_frames = kf.elapsed_frames;
+        self.current_input = kf.input.clone();
+        self.current_speed = kf.speed;
+        self.counters = kf.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
+        self.last_state_to_diff = None;
+        self.current_blob_size_undiffed = 0;
+        self.current_blob.clear();
+        self.current_blob_keyframes.clear();
+        self.current_blob_bookmarks.clear();
     }
 
     /// Returns `true` if the stream was closed.
@@ -171,18 +253,21 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     pub fn close(&mut self) -> Result<(Final, Temp), (Final, Temp, ReplayFileWriteError)> {
         assert!(!self.is_closed(), "Already closed...");
 
-        let _ = self.next_blob();
+        // Flush the final in-progress blob (now a no-op if nothing is buffered). Capture the result
+        // BEFORE taking the sinks; calling next_blob() again after the take would just fail
+        // assert_not_closed and spuriously report the close as failed.
+        let flush_result = self.next_blob();
 
         let Some(SinkTuple { final_sink, temp_sink }) = self.sink.take() else {
             unreachable!();
         };
 
-        if let Err(e) = self.next_blob() {
-            self.poisoned = true;
-            return Err((final_sink, temp_sink, e))
-        }
         self.poisoned = true;
-        Ok((final_sink, temp_sink))
+
+        match flush_result {
+            Ok(()) => Ok((final_sink, temp_sink)),
+            Err(e) => Err((final_sink, temp_sink, e)),
+        }
     }
 
     /// Returns true if an unrecoverable error occurred.
@@ -276,6 +361,12 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
     fn next_blob(&mut self) -> Result<(), ReplayFileWriteError> {
         self.do_with_poison(|this| {
+            // Nothing buffered (e.g. closing immediately after a blob split): a blob with no
+            // keyframes is invalid and would panic below, so there is simply nothing to flush.
+            if this.current_blob_keyframes.is_empty() {
+                return Ok(());
+            }
+
             let uncompressed_size = this.current_blob.len();
             let compressed = crate::compress_data(this.current_blob.as_slice(), this.settings.compression_level)
                 .map_err(|e| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("next_blob failed to compress: {e}")) })?;
