@@ -48,3 +48,17 @@ Run `build.sh` and locate the executables in the `build` directory.
 ### Windows
 
 TODO
+
+## Converting old replays
+
+Replays recorded before format v4 (September 2026) can be re-encoded offline into the current
+format, which is typically 3-6x smaller for Nintendo DS and Game Boy Advance recordings, without
+losing anything: every emulated frame, keyframe, bookmark, counter and the header (crop markers,
+patch) are carried over, and `--verify` re-reads both files packet by packet afterwards.
+
+```
+cargo build --release -p supershuckie-replay-recorder --features convert
+target/release/supershuckie-replay-convert <in.replay> <out.replay> --verify
+```
+
+Run it with `--help` for the encoding options. Keep the original until `--verify` has passed.

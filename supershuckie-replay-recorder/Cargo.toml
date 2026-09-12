@@ -8,6 +8,8 @@ rust-version.workspace = true
 [features]
 default = ["std"]
 std = []
+# The offline `supershuckie-replay-convert` binary (needs `std` and memory-mapped input files).
+convert = ["std", "dep:memmap2"]
 
 [dependencies]
 num_enum = { workspace = true }
@@ -15,3 +17,8 @@ tinyvec = { workspace = true }
 spin = { workspace = true }
 zstd-sys = { workspace = true }
 blake3 = { workspace = true }
+memmap2 = { version = "0.9", optional = true }
+
+[[bin]]
+name = "supershuckie-replay-convert"
+required-features = ["convert"]
