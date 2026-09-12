@@ -2,6 +2,7 @@
 //! typed values and character tables, the RAM search engine and the watch list.
 
 pub mod region;
+pub mod search;
 pub mod table;
 pub mod value;
 

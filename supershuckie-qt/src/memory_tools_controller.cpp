@@ -5,6 +5,7 @@
 
 #include "memory_tools_controller.hpp"
 #include "hex_viewer_window.hpp"
+#include "ram_search_window.hpp"
 #include "main_window.hpp"
 #include "error.hpp"
 
@@ -13,6 +14,7 @@ using namespace SuperShuckie64;
 static const char *RAM_VIEWERS_OPEN = "qt__ram_viewers_open";
 static const char *RAM_VIEWER_STATE_PREFIX = "qt__ram_viewer_";
 static const char *RAM_REFRESH_RATE = "qt__ram_refresh_hz";
+static const char *RAM_SEARCH_STATE = "qt__ram_search_window";
 
 MemoryToolsController::MemoryToolsController(MainWindow *main_window): QObject(main_window), main(main_window) {
     connect(&this->timer, SIGNAL(timeout()), this, SLOT(on_timer()));
@@ -38,7 +40,22 @@ bool MemoryToolsController::any_window_visible() const {
             return true;
         }
     }
-    return false;
+    return this->search != nullptr && this->search->isVisible();
+}
+
+RamSearchWindow *MemoryToolsController::open_search() {
+    if(this->search == nullptr) {
+        this->search = new RamSearchWindow(this);
+    }
+    this->search->show();
+    this->search->raise();
+    this->search->activateWindow();
+    this->visibility_changed();
+    return this->search;
+}
+
+void MemoryToolsController::search_for_value(std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &value) {
+    this->open_search()->prefill(value_type, size, big_endian, value);
 }
 
 void MemoryToolsController::visibility_changed() {
@@ -256,6 +273,11 @@ void MemoryToolsController::save_windows() {
         }
     }
     supershuckie_frontend_set_custom_setting(this->frontend(), RAM_VIEWERS_OPEN, open.join(',').toUtf8().constData());
+
+    if(this->search != nullptr) {
+        QString state = QString("%1|%2").arg(this->search->isVisible() ? "1" : "0", this->search->save_state());
+        supershuckie_frontend_set_custom_setting(this->frontend(), RAM_SEARCH_STATE, state.toUtf8().constData());
+    }
 }
 
 void MemoryToolsController::restore_windows() {
@@ -281,6 +303,19 @@ void MemoryToolsController::restore_windows() {
                 this->viewers[slot] = new HexViewerWindow(this, static_cast<std::uint8_t>(slot));
             }
             this->viewers[slot]->show();
+        }
+    }
+
+    const char *search_state = supershuckie_frontend_get_custom_setting(this->frontend(), RAM_SEARCH_STATE);
+    if(search_state != nullptr) {
+        QString state = QString::fromUtf8(search_state);
+        int split = state.indexOf('|');
+        if(split > 0) {
+            this->search = new RamSearchWindow(this);
+            this->search->restore_state(state.mid(split + 1));
+            if(state.left(split) == "1") {
+                this->search->show();
+            }
         }
     }
     this->visibility_changed();

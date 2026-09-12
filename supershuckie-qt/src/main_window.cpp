@@ -772,6 +772,10 @@ void MainWindow::set_up_tools_menu() {
     auto *new_ram_viewer = this->tools_menu->addAction("New RAM viewer window");
     connect(new_ram_viewer, SIGNAL(triggered()), this, SLOT(do_new_ram_viewer()));
 
+    auto *ram_search = this->tools_menu->addAction("RAM search");
+    ram_search->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_F));
+    connect(ram_search, SIGNAL(triggered()), this, SLOT(do_open_ram_search()));
+
     this->tools_menu->addSeparator();
 
     auto *open_tables = this->tools_menu->addAction("Open character tables folder");
@@ -784,6 +788,12 @@ void MainWindow::set_up_tools_menu() {
 void MainWindow::do_open_ram_viewer() {
     if(this->memory_tools != nullptr) {
         this->memory_tools->open_viewer();
+    }
+}
+
+void MainWindow::do_open_ram_search() {
+    if(this->memory_tools != nullptr) {
+        this->memory_tools->open_search();
     }
 }
 

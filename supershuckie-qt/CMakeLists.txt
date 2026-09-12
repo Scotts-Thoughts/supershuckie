@@ -33,6 +33,7 @@ add_library(supershuckie-cpp-static STATIC
     src/memory_tools_controller.cpp
     src/hex_view_widget.cpp
     src/hex_viewer_window.cpp
+    src/ram_search_window.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

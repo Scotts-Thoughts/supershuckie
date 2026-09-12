@@ -545,6 +545,19 @@ void HexViewerWindow::on_context_menu(QPoint global_position) {
     });
     copy_bytes->setEnabled(this->view->bytes_at(start, length).has_value());
 
+    menu.addSeparator();
+    int group = this->view->group_size();
+    bool big_endian = this->view->is_big_endian();
+    std::uint32_t type = group == 4 ? SuperShuckieMemoryValueType__U32 : group == 2 ? SuperShuckieMemoryValueType__U16 : SuperShuckieMemoryValueType__U8;
+    auto value_bytes = this->view->bytes_at(this->view->cursor_address(), static_cast<std::size_t>(group));
+    if(value_bytes) {
+        QString value = this->controller->format_value(0, type, static_cast<std::uint8_t>(group), big_endian, SuperShuckieMemoryDisplay__Decimal, value_bytes->data(), value_bytes->size());
+        auto *search = menu.addAction(QString("Search for this value (%1)").arg(value));
+        connect(search, &QAction::triggered, this, [this, type, group, big_endian, value]() {
+            this->controller->search_for_value(type, static_cast<std::uint8_t>(group), big_endian, value);
+        });
+    }
+
     menu.exec(global_position);
 }
 

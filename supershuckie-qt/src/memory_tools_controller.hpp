@@ -15,6 +15,7 @@ namespace SuperShuckie64 {
 
 class MainWindow;
 class HexViewerWindow;
+class RamSearchWindow;
 
 /** A memory region of the running game, as the tool windows see it. */
 struct MemoryRegionView {
@@ -50,6 +51,12 @@ public:
 
     /** Show `address` in the viewer used last (opening one if none is open). */
     void show_in_viewer(std::uint32_t address, std::uint32_t length = 1);
+
+    /** Open (or raise) the RAM search window. */
+    RamSearchWindow *open_search();
+
+    /** Open the search window ready to search for `value`. */
+    void search_for_value(std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &value);
 
     /** Re-open the windows that were open when the app last closed. */
     void restore_windows();
@@ -96,6 +103,7 @@ private:
 
     std::array<HexViewerWindow *, SUPERSHUCKIE_MEMORY_MAX_VIEWERS> viewers = {};
     HexViewerWindow *last_viewer = nullptr;
+    RamSearchWindow *search = nullptr;
 
     std::vector<MemoryRegionView> region_cache;
     std::uint64_t cached_regions_generation = 0;

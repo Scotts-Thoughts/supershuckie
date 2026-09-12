@@ -168,6 +168,140 @@ bool supershuckie_frontend_memory_parse_value(
 /** Parse hexadecimal bytes ("12 34 AB", "1234AB", "0x12, 0x34"). */
 bool supershuckie_memory_parse_hex_bytes(const char *text, uint8_t *out, size_t capacity, size_t *out_length, char *error, size_t error_len);
 
+
+/* ----------------------------------------------------------------------------------------------
+ * RAM search
+ *
+ * A search scans a snapshot of every memory region taken at a frame boundary, then narrows its
+ * results with further scans. Scans run on a worker thread; poll supershuckie_frontend_search_status().
+ * ------------------------------------------------------------------------------------------- */
+
+enum SuperShuckieSearchComparison {
+    /* Compared with a value (operand_a; Between also uses operand_b; InSet takes a comma-separated list). */
+    SuperShuckieSearchComparison__Equal = 0,
+    SuperShuckieSearchComparison__NotEqual = 1,
+    SuperShuckieSearchComparison__Less = 2,
+    SuperShuckieSearchComparison__LessOrEqual = 3,
+    SuperShuckieSearchComparison__Greater = 4,
+    SuperShuckieSearchComparison__GreaterOrEqual = 5,
+    SuperShuckieSearchComparison__Between = 6,
+    SuperShuckieSearchComparison__InSet = 7,
+    /* Every aligned address (new searches only). */
+    SuperShuckieSearchComparison__Unknown = 8,
+    /* Bytes: a pattern like "12 ?? 3F" in operand_a. Text: the text in operand_a (through the table). */
+    SuperShuckieSearchComparison__Pattern = 9,
+    /* Compared with the previous scan (refinements only). */
+    SuperShuckieSearchComparison__Changed = 10,
+    SuperShuckieSearchComparison__Unchanged = 11,
+    SuperShuckieSearchComparison__Increased = 12,
+    SuperShuckieSearchComparison__Decreased = 13,
+    SuperShuckieSearchComparison__IncreasedBy = 14,
+    SuperShuckieSearchComparison__DecreasedBy = 15,
+    SuperShuckieSearchComparison__ChangedBy = 16,
+    SuperShuckieSearchComparison__ChangedByAtLeast = 17,
+    /* Compared with the first scan (refinements only). */
+    SuperShuckieSearchComparison__EqualToFirst = 18,
+    SuperShuckieSearchComparison__NotEqualToFirst = 19,
+    SuperShuckieSearchComparison__IncreasedSinceFirst = 20,
+    SuperShuckieSearchComparison__DecreasedSinceFirst = 21
+};
+
+struct SuperShuckieSearchParams {
+    uint32_t value_type;
+    /** BCD: 1-4 bytes. Bytes and text: taken from the pattern for pattern searches. */
+    uint8_t size;
+    bool big_endian;
+    /** 1, 2 or 4. */
+    uint8_t alignment;
+    /** Character table for text searches. */
+    size_t table;
+    /** Region indices to search; none (null or 0) searches all. */
+    const uint32_t *regions;
+    size_t region_count;
+    /** Only addresses in [range_start, range_end). */
+    bool use_range;
+    uint32_t range_start;
+    uint32_t range_end;
+    /** f32 values within this of each other are equal (0 for the default, 0.01). */
+    double epsilon;
+};
+
+struct SuperShuckieSearchStatus {
+    bool active;
+    bool busy;
+    uint32_t progress_per_mille;
+    uint64_t result_count;
+    uint32_t steps;
+    bool can_undo;
+    bool can_redo;
+    /** Frame of the last scan. */
+    uint64_t frame;
+    /** Memory was replaced wholesale (a state load or seek) between the last two scans. */
+    bool state_changed;
+    /** Changes whenever the results change. */
+    uint64_t generation;
+    /** The active search's value type, size, byte order and alignment. */
+    uint32_t value_type;
+    uint8_t size;
+    bool big_endian;
+    uint8_t alignment;
+};
+
+struct SuperShuckieSearchRow {
+    uint32_t address;
+    uint32_t region;
+    uint8_t length;
+    /** The value at the last scan. */
+    uint8_t previous[64];
+    /** The value at the first scan. */
+    uint8_t first[64];
+};
+
+/** Start a new search (replacing any other) at the next frame boundary. `pause` pauses emulation until it is done. */
+bool supershuckie_frontend_search_new(
+    struct SuperShuckieFrontendRaw *frontend,
+    const struct SuperShuckieSearchParams *params,
+    uint32_t comparison,
+    const char *operand_a,
+    const char *operand_b,
+    bool pause,
+    char *error,
+    size_t error_len
+);
+
+/** Narrow the active search at the next frame boundary. */
+bool supershuckie_frontend_search_refine(
+    struct SuperShuckieFrontendRaw *frontend,
+    uint32_t comparison,
+    const char *operand_a,
+    const char *operand_b,
+    size_t table,
+    bool pause,
+    char *error,
+    size_t error_len
+);
+
+/** The search's status. Returns true (and writes it to `message`) if the last operation left a message. */
+bool supershuckie_frontend_search_status(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieSearchStatus *status, char *message, size_t message_len);
+
+/** Up to `capacity` results starting with the `offset`th. Returns how many were written (0 while scanning). */
+size_t supershuckie_frontend_search_results(const struct SuperShuckieFrontendRaw *frontend, uint64_t offset, struct SuperShuckieSearchRow *out, size_t capacity);
+
+/** Which result rows are on screen, so their current values are sampled (at most 512). */
+void supershuckie_frontend_search_set_visible_rows(struct SuperShuckieFrontendRaw *frontend, uint64_t offset, uint32_t count);
+
+/**
+ * The current values of the visible rows: `values` holds `capacity` * 64 bytes (row i at i * 64),
+ * `ok[i]` whether row i's value is known. Returns the number of visible rows; `*first_row` is the
+ * first visible row and `*generation` changes with every sample.
+ */
+size_t supershuckie_frontend_search_read_visible(const struct SuperShuckieFrontendRaw *frontend, uint64_t *first_row, uint64_t *generation, uint8_t *values, bool *ok, size_t capacity);
+
+void supershuckie_frontend_search_undo(const struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_search_redo(const struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_search_cancel(const struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_search_reset(struct SuperShuckieFrontendRaw *frontend);
+
 #ifdef __cplusplus
 }
 #endif

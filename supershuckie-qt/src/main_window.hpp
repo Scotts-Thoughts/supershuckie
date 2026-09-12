@@ -268,6 +268,7 @@ private slots:
     void do_toggle_audio_mute_when_sped_up();
     void do_open_ram_viewer();
     void do_new_ram_viewer();
+    void do_open_ram_search();
     void do_open_tables_folder();
     void do_reload_tables();
 };
