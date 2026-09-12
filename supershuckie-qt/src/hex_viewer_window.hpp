@@ -58,6 +58,8 @@ private slots:
     void on_cursor_changed(std::uint32_t address);
     void on_context_menu(QPoint global_position);
     void on_inspector_activated(int row, int column);
+    void on_bytes_typed(std::uint32_t address, QByteArray bytes);
+    void on_edit_toggled(bool edit);
 
 private:
     MemoryToolsController *controller;
@@ -72,6 +74,7 @@ private:
     QComboBox *endian_combo;
     QComboBox *table_combo;
     QComboBox *rate_combo;
+    QToolButton *edit_button;
     QStackedWidget *stack;
     HexViewWidget *view;
     QLabel *no_game;

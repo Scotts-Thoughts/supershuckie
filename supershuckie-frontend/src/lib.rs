@@ -168,7 +168,8 @@ impl SuperShuckieFrontend {
         ).expect("failed to init user_dir");
 
         let audio_output = Arc::new(AudioOutput::new(settings.audio.latency_ms as u32));
-        let memory_tools = memory_tools::MemoryTools::new(data_dir.join("tables"));
+        let mut memory_tools = memory_tools::MemoryTools::new(data_dir.join("tables"));
+        memory_tools.set_confirm_writes_while_recording(settings.memory_tools.confirm_writes_while_recording);
 
         let mut s = Self {
             core: ThreadedSuperShuckieCore::new(Box::new(NullEmulatorCore)),
@@ -1148,7 +1149,12 @@ impl SuperShuckieFrontend {
         self.refresh_screen(false);
 
         let playing_back = self.core.is_playing_back();
-        self.memory_tools.tick(&self.core, playing_back);
+        let recording = self.recording_replay_file.is_some();
+        let exporting = self.current_export.is_some();
+        self.memory_tools.tick(&self.core, playing_back, recording, exporting);
+        if self.memory_tools.confirm_writes_while_recording() != self.settings.memory_tools.confirm_writes_while_recording {
+            self.settings.memory_tools.confirm_writes_while_recording = self.memory_tools.confirm_writes_while_recording();
+        }
 
         let replay_errors = self.core.get_replay_recording_errors();
         if !replay_errors.is_empty() {

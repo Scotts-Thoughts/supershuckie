@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
-use supershuckie_core::memory_monitor::{AddressPath, FullSnapshot, MemoryMonitorShared, MonitorEvent, MonitorRequest, MonitorSample, Probe, TraceCondition, TraceSpec, ValueDecode, ViewWindow, MAX_PROBES, MAX_TRACES, MAX_VIEW_BYTES, MAX_VIEW_WINDOWS};
+use supershuckie_core::memory_monitor::{AddressPath, FreezeSpec, FullSnapshot, MemoryEdit, MemoryMonitorShared, MonitorEvent, MonitorRequest, MonitorSample, Probe, TraceCondition, TraceSpec, ValueDecode, ViewWindow, WriteFailure, MAX_EDIT_LEN, MAX_FREEZES, MAX_FREEZE_BYTES, MAX_PROBES, MAX_TRACES, MAX_VIEW_BYTES, MAX_VIEW_WINDOWS};
 use supershuckie_core::ThreadedSuperShuckieCore;
 use supershuckie_memory_tools::search::{Comparison, MemorySnapshot, ScanControl, Search, SearchError, SearchRow, SearchSettings, SnapshotRegion};
-use supershuckie_memory_tools::watch::{Watch, WatchCondition, WatchFile, WATCH_FILE_VERSION};
-use supershuckie_memory_tools::{format_value, CharTable, RegionInfo, ValueType};
+use supershuckie_memory_tools::watch::{FreezeState, Watch, WatchAddress, WatchCondition, WatchFile, WATCH_FILE_VERSION};
+use supershuckie_memory_tools::{format_value, CharTable, RegionInfo, ValueFormat, ValueType};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 
 /// Viewer windows that can be open at once.
@@ -285,6 +285,34 @@ pub struct WatchValue {
     pub frames_since_change: Option<u64>
 }
 
+/// Undo steps kept.
+pub const MAX_EDIT_HISTORY: usize = 1000;
+
+/// A change to memory or to a freeze that can be undone.
+#[derive(Clone, Debug)]
+enum EditRecord {
+    Write {
+        address: u32,
+        old: Vec<u8>,
+        new: Vec<u8>,
+        /// State epoch the write was made in; undoing it after a state load would be meaningless.
+        epoch: u64
+    },
+    Freeze {
+        watch_id: u32,
+        before: Option<FreezeState>,
+        after: Option<FreezeState>
+    }
+}
+
+/// Why an edit edit was sent.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum EditOrigin {
+    User,
+    Undo,
+    Redo
+}
+
 /// Value bytes of a traced watch packed into an event (see `MonitorEvent::Changed`).
 fn unpack_event_value(packed: u64, len: usize) -> Option<Vec<u8>> {
     (len <= 8).then(|| packed.to_le_bytes()[..len].to_vec())
@@ -354,7 +382,23 @@ pub struct MemoryTools {
 
     events: Vec<MonitorEvent>,
     log: VecDeque<LogEntry>,
-    log_dropped: u64
+    log_dropped: u64,
+
+    next_edit_id: u64,
+    pending_edits: BTreeMap<u64, EditOrigin>,
+    undo_stack: Vec<EditRecord>,
+    redo_stack: Vec<EditRecord>,
+    edit_message: Option<String>,
+    /// `(watch id, restores, address resolved)` of each active freeze, from the latest sample.
+    freeze_status: Vec<(u32, u32, bool)>,
+    freeze_request_ids: Vec<u32>,
+
+    recording: bool,
+    exporting: bool,
+    confirm_writes_while_recording: bool,
+    record_writes_confirmed: bool,
+    writes_this_recording: u64,
+    restores_at_recording_start: BTreeMap<u32, u32>
 }
 
 impl MemoryTools {
@@ -416,7 +460,20 @@ impl MemoryTools {
             visible_watches: Vec::new(),
             events: Vec::new(),
             log: VecDeque::new(),
-            log_dropped: 0
+            log_dropped: 0,
+            next_edit_id: 1,
+            pending_edits: BTreeMap::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            edit_message: None,
+            freeze_status: Vec::new(),
+            freeze_request_ids: Vec::new(),
+            recording: false,
+            exporting: false,
+            confirm_writes_while_recording: true,
+            record_writes_confirmed: false,
+            writes_this_recording: 0,
+            restores_at_recording_start: BTreeMap::new()
         };
         tools.reload_tables();
         tools
@@ -457,6 +514,9 @@ impl MemoryTools {
         if game_changed {
             self.save_watches();
             self.load_watches(if self.game.is_some() { watch_file } else { None });
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.pending_edits.clear();
         }
 
         // The old core took its half of the monitor with it.
@@ -466,12 +526,19 @@ impl MemoryTools {
     }
 
     /// Call regularly (every frontend tick): picks up new samples.
-    pub fn tick(&mut self, core: &ThreadedSuperShuckieCore, playing_back: bool) {
+    pub fn tick(&mut self, core: &ThreadedSuperShuckieCore, playing_back: bool, recording: bool, exporting: bool) {
         let mut push = false;
         if playing_back != self.playback {
             self.playback = playing_back;
             push = true;
         }
+        if recording != self.recording {
+            self.recording = recording;
+            self.record_writes_confirmed = false;
+            self.writes_this_recording = 0;
+            self.restores_at_recording_start = self.freeze_status.iter().map(|(id, restores, _)| (*id, *restores)).collect();
+        }
+        self.exporting = exporting;
         if self.attached && let Some(generation) = self.shared.take_sample(self.sample_generation, &mut self.sample) {
             self.sample_generation = generation;
             self.absorb_sample();
@@ -538,12 +605,29 @@ impl MemoryTools {
             pause_when: w.pause_when.map(trace_condition)
         }).collect();
 
+        let mut freezes = Vec::new();
+        let mut freeze_bytes = 0;
+        self.freeze_request_ids.clear();
+        for watch in &self.watches {
+            let Some(freeze) = watch.freeze.as_ref().filter(|f| f.active) else { continue };
+            if freezes.len() >= MAX_FREEZES || freeze_bytes + freeze.value.len() > MAX_FREEZE_BYTES {
+                break
+            }
+            if let Some(spec) = FreezeSpec::new(watch.id, watch_path(watch), &freeze.value) {
+                freeze_bytes += freeze.value.len();
+                freezes.push(spec);
+                self.freeze_request_ids.push(watch.id);
+            }
+        }
+
         let request = self.shared.update_request(|request| {
-            request.sampling = viewers.iter().any(Option::is_some) || !probes.is_empty();
+            // Freeze restore counts come with samples, so sample while anything is frozen.
+            request.sampling = viewers.iter().any(Option::is_some) || !probes.is_empty() || !freezes.is_empty();
             request.interval = interval;
             request.windows = viewers;
             request.probes = probes;
             request.traces = traces;
+            request.freezes = freezes;
             request.freezes_suspended = playback;
             request.clone()
         });
@@ -758,6 +842,9 @@ impl MemoryTools {
         if self.sample.request_generation < self.probes_request_generation {
             return
         }
+        self.freeze_status = self.freeze_request_ids.iter().enumerate().map(|(i, id)| {
+            (*id, self.sample.freeze_restores.get(i).copied().unwrap_or(0), self.sample.freeze_ok.get(i).copied().unwrap_or(true))
+        }).collect();
         for (probe, owner) in self.probe_owners.iter().enumerate() {
             let ProbeOwner::Watch(id) = owner else { continue };
             let traced = self.watches.iter().any(|w| w.id == *id && w.is_traced());
@@ -818,8 +905,275 @@ impl MemoryTools {
         self.events.clear();
     }
 
-    /// Edits are handled with editing (see below); nothing to log for them otherwise.
-    fn absorb_write_event(&mut self, _event: &MonitorEvent) {}
+    fn absorb_write_event(&mut self, event: &MonitorEvent) {
+        match event {
+            MonitorEvent::Written { frame, edit_id, address, old, new } => {
+                let origin = self.pending_edits.remove(edit_id).unwrap_or(EditOrigin::User);
+                if self.recording && old != new {
+                    self.writes_this_recording += 1;
+                }
+                let record = EditRecord::Write { address: *address, old: old.clone(), new: new.clone(), epoch: self.sample.state_epoch };
+                match origin {
+                    EditOrigin::User => {
+                        self.undo_stack.push(record);
+                        if self.undo_stack.len() > MAX_EDIT_HISTORY {
+                            self.undo_stack.remove(0);
+                        }
+                        self.redo_stack.clear();
+                    }
+                    EditOrigin::Undo => self.redo_stack.push(EditRecord::Write { address: *address, old: new.clone(), new: old.clone(), epoch: self.sample.state_epoch }),
+                    EditOrigin::Redo => self.undo_stack.push(EditRecord::Write { address: *address, old: new.clone(), new: old.clone(), epoch: self.sample.state_epoch })
+                }
+                let text = format!("edited {}: {} → {}", supershuckie_memory_tools::format_address(*address, &self.regions), supershuckie_memory_tools::format_hex_bytes(old), supershuckie_memory_tools::format_hex_bytes(new));
+                self.push_log(LogEntry { frame: *frame, watch_id: 0, kind: LogKind::Edited, text });
+            }
+            MonitorEvent::WriteFailed { edit_id, reason } => {
+                self.pending_edits.remove(edit_id);
+                let text = match reason {
+                    WriteFailure::Unmapped => "that address is not mapped",
+                    WriteFailure::ReadOnly => "that region is read-only",
+                    WriteFailure::PointerInvalid => "a pointer on the way to that address is not mapped",
+                    WriteFailure::Playback => "memory can't be edited during replay playback",
+                    WriteFailure::BadLength => "that edit is empty or too long"
+                };
+                self.edit_message = Some(format!("Edit failed: {text}"));
+                self.push_log(LogEntry { frame: self.sample.frame, watch_id: 0, kind: LogKind::EditFailed, text: format!("edit failed: {text}") });
+            }
+            _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Editing and freezing
+
+    /// Why memory can't be written right now, if it can't.
+    pub fn write_blocked(&self) -> Option<&'static str> {
+        if self.game.is_none() {
+            Some("No game is loaded")
+        }
+        else if self.playback {
+            Some("Memory can't be edited or frozen during replay playback; stop playback or resume recording first")
+        }
+        else if self.exporting {
+            Some("Memory can't be edited while a video is exporting")
+        }
+        else {
+            None
+        }
+    }
+
+    /// Whether the user should confirm before the next write (recording, not yet confirmed).
+    pub fn needs_record_confirmation(&self) -> bool {
+        self.recording && self.confirm_writes_while_recording && !self.record_writes_confirmed
+    }
+
+    /// The user confirmed writing into the recording.
+    pub fn confirm_record_writes(&mut self, dont_ask_again: bool) {
+        self.record_writes_confirmed = true;
+        if dont_ask_again {
+            self.confirm_writes_while_recording = false;
+        }
+    }
+
+    /// Whether to ask before writing into recordings (a setting).
+    pub fn set_confirm_writes_while_recording(&mut self, confirm: bool) {
+        self.confirm_writes_while_recording = confirm;
+    }
+
+    pub fn confirm_writes_while_recording(&self) -> bool {
+        self.confirm_writes_while_recording
+    }
+
+    /// Tool writes (edits and freeze restores) recorded into the current recording.
+    pub fn writes_this_recording(&self) -> u64 {
+        if !self.recording {
+            return 0
+        }
+        let restores: u64 = self.freeze_status.iter().map(|(id, restores, _)| restores.saturating_sub(*self.restores_at_recording_start.get(id).unwrap_or(&0)) as u64).sum();
+        self.writes_this_recording + restores
+    }
+
+    /// The active freeze on exactly `[address, address + len)`, if any.
+    fn freeze_at(&self, address: &WatchAddress, len: usize) -> Option<u32> {
+        self.watches.iter().find(|w| w.address == *address && w.format.len() == len && w.freeze.as_ref().is_some_and(|f| f.active)).map(|w| w.id)
+    }
+
+    fn send_edit(&mut self, core: &ThreadedSuperShuckieCore, path: AddressPath, data: Vec<u8>, origin: EditOrigin) -> Result<u64, String> {
+        if let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        if data.is_empty() || data.len() > MAX_EDIT_LEN {
+            return Err(format!("Edits are 1 to {MAX_EDIT_LEN} bytes"))
+        }
+        let edit_id = self.next_edit_id;
+        self.next_edit_id += 1;
+        self.pending_edits.insert(edit_id, origin);
+        self.shared.push_edit(MemoryEdit { edit_id, path, data });
+        // Edits need the monitor attached to be applied.
+        self.push_request(core);
+        if !self.attached {
+            core.set_memory_monitor(Some(self.shared.clone()));
+            self.attached = true;
+        }
+        core.wake();
+        Ok(edit_id)
+    }
+
+    /// Write `data` at `address` (through `offsets` pointers). Writing exactly over an active
+    /// freeze changes the frozen value instead, since the freeze would undo a one-time write.
+    pub fn write(&mut self, core: &ThreadedSuperShuckieCore, address: WatchAddress, data: Vec<u8>) -> Result<(), String> {
+        if let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        if let Some(id) = self.freeze_at(&address, data.len()) {
+            return self.set_freeze(core, id, Some(data))
+        }
+        let path = AddressPath::with_derefs(address.base, &address.offsets).ok_or("Pointer path too deep")?;
+        self.send_edit(core, path, data, EditOrigin::User).map(|_| ())
+    }
+
+    /// Freeze watch `id` at `value` (`None`: unfreeze).
+    pub fn set_freeze(&mut self, core: &ThreadedSuperShuckieCore, id: u32, value: Option<Vec<u8>>) -> Result<(), String> {
+        if value.is_some() && let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        let active_count = self.watches.iter().filter(|w| w.id != id && w.freeze.as_ref().is_some_and(|f| f.active)).count();
+        let Some(index) = self.watches.iter().position(|w| w.id == id) else {
+            return Err("No such watch".to_owned())
+        };
+        let watch = &mut self.watches[index];
+        let before = watch.freeze.clone();
+        let after = match value {
+            Some(value) => {
+                if value.len() != watch.format.len() {
+                    return Err(format!("The value is {} bytes but the watch is {}", value.len(), watch.format.len()))
+                }
+                if active_count >= MAX_FREEZES {
+                    return Err(format!("At most {MAX_FREEZES} values can be frozen at once"))
+                }
+                Some(FreezeState { value, active: true })
+            }
+            None => watch.freeze.clone().map(|f| FreezeState { active: false, ..f })
+        };
+        if before == after {
+            return Ok(())
+        }
+        watch.freeze = after.clone();
+        self.undo_stack.push(EditRecord::Freeze { watch_id: id, before, after });
+        if self.undo_stack.len() > MAX_EDIT_HISTORY {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+        self.watches_changed(core);
+        Ok(())
+    }
+
+    /// Freeze `value` at `address` with a new watch (or the existing watch for exactly that
+    /// address and size). Returns the watch's id.
+    pub fn freeze_new(&mut self, core: &ThreadedSuperShuckieCore, address: WatchAddress, format: ValueFormat, value: Vec<u8>, group: &str) -> Result<u32, String> {
+        if let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        let existing = self.watches.iter().find(|w| w.address == address && w.format.len() == format.len()).map(|w| w.id);
+        let id = match existing {
+            Some(id) => id,
+            None => self.upsert_watch(core, Watch {
+                id: 0,
+                label: supershuckie_memory_tools::watch::format_watch_address(&address, &self.regions),
+                address,
+                format,
+                display: Default::default(),
+                table: String::new(),
+                group: group.to_owned(),
+                notes: String::new(),
+                trace: false,
+                pause_when: None,
+                freeze: None
+            })?
+        };
+        self.set_freeze(core, id, Some(value))?;
+        Ok(id)
+    }
+
+    /// Unfreeze everything (one undo step per freeze).
+    pub fn unfreeze_all(&mut self, core: &ThreadedSuperShuckieCore) {
+        let ids: Vec<u32> = self.watches.iter().filter(|w| w.freeze.as_ref().is_some_and(|f| f.active)).map(|w| w.id).collect();
+        for id in ids {
+            let _ = self.set_freeze(core, id, None);
+        }
+    }
+
+    /// Active freezes.
+    pub fn frozen_count(&self) -> usize {
+        self.watches.iter().filter(|w| w.freeze.as_ref().is_some_and(|f| f.active)).count()
+    }
+
+    /// `(address, length)` of active freezes on plain addresses and of pointer freezes whose address
+    /// is known from a sample, for highlighting.
+    pub fn frozen_ranges(&self) -> Vec<(u32, u32)> {
+        self.watches.iter().filter(|w| w.freeze.as_ref().is_some_and(|f| f.active)).filter_map(|w| {
+            let address = if w.address.is_pointer() { self.watch_runtime.get(&w.id)?.resolved? } else { w.address.base };
+            Some((address, w.format.size as u32))
+        }).collect()
+    }
+
+    /// `(restores, resolved)` of watch `id`'s active freeze.
+    pub fn freeze_status(&self, id: u32) -> Option<(u32, bool)> {
+        self.freeze_status.iter().find(|(i, _, _)| *i == id).map(|(_, restores, ok)| (*restores, *ok))
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    fn apply_record(&mut self, core: &ThreadedSuperShuckieCore, record: EditRecord, undo: bool) -> Result<(), String> {
+        match record {
+            EditRecord::Write { address, old, new, epoch } => {
+                if epoch != self.sample.state_epoch {
+                    return Err("That edit was made before a state load or reset, so it can't be undone".to_owned())
+                }
+                let data = if undo { old } else { new };
+                self.send_edit(core, AddressPath::direct(address), data, if undo { EditOrigin::Undo } else { EditOrigin::Redo }).map(|_| ())
+            }
+            EditRecord::Freeze { watch_id, before, after } => {
+                let Some(watch) = self.watches.iter_mut().find(|w| w.id == watch_id) else {
+                    return Err("That watch was deleted".to_owned())
+                };
+                watch.freeze = if undo { before.clone() } else { after.clone() };
+                let reversed = EditRecord::Freeze { watch_id, before, after };
+                if undo { self.redo_stack.push(reversed) } else { self.undo_stack.push(reversed) }
+                self.watches_changed(core);
+                Ok(())
+            }
+        }
+    }
+
+    /// Undo the last edit or freeze change.
+    pub fn undo(&mut self, core: &ThreadedSuperShuckieCore) -> Result<(), String> {
+        if let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        let record = self.undo_stack.pop().ok_or("Nothing to undo")?;
+        self.apply_record(core, record, true)
+    }
+
+    /// Redo the last undone edit or freeze change.
+    pub fn redo(&mut self, core: &ThreadedSuperShuckieCore) -> Result<(), String> {
+        if let Some(reason) = self.write_blocked() {
+            return Err(reason.to_owned())
+        }
+        let record = self.redo_stack.pop().ok_or("Nothing to redo")?;
+        self.apply_record(core, record, false)
+    }
+
+    /// A message about the last edit, cleared when taken.
+    pub fn take_edit_message(&mut self) -> Option<String> {
+        self.edit_message.take()
+    }
 
     /// Load the watch list at `path` (none: clear it).
     fn load_watches(&mut self, path: Option<PathBuf>) {

@@ -14,6 +14,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QSplitter>
 #include <QTreeWidget>
 #include <algorithm>
@@ -36,9 +37,17 @@ RamWatchWindow::RamWatchWindow(MemoryToolsController *controller): QWidget(contr
     this->edit_button = new QPushButton("Edit…", this);
     this->duplicate_button = new QPushButton("Duplicate", this);
     this->delete_button = new QPushButton("Delete", this);
+    this->freeze_button = new QPushButton("Freeze", this);
+    this->freeze_button->setToolTip("Hold the selected watches at their current values");
+    this->unfreeze_button = new QPushButton("Unfreeze", this);
+    auto *unfreeze_all = new QPushButton("Unfreeze all", this);
     auto *import_button = new QPushButton("Import…", this);
     auto *export_button = new QPushButton("Export…", this);
     for(auto *button : { add, this->edit_button, this->duplicate_button, this->delete_button }) {
+        buttons->addWidget(button);
+    }
+    buttons->addSpacing(12);
+    for(auto *button : { this->freeze_button, this->unfreeze_button, unfreeze_all }) {
         buttons->addWidget(button);
     }
     buttons->addStretch(1);
@@ -50,7 +59,7 @@ RamWatchWindow::RamWatchWindow(MemoryToolsController *controller): QWidget(contr
 
     this->tree = new QTreeWidget(this->splitter);
     this->tree->setColumnCount(ColumnCount);
-    this->tree->setHeaderLabels({ "Label", "Region", "Address", "Value", "Previous", "Changed", "" });
+    this->tree->setHeaderLabels({ "Label", "Region", "Address", "Value", "Previous", "Changed", "Frozen", "" });
     this->tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
     this->tree->setContextMenuPolicy(Qt::CustomContextMenu);
     this->tree->setUniformRowHeights(true);
@@ -93,6 +102,18 @@ RamWatchWindow::RamWatchWindow(MemoryToolsController *controller): QWidget(contr
     connect(this->edit_button, SIGNAL(clicked()), this, SLOT(on_edit()));
     connect(this->duplicate_button, SIGNAL(clicked()), this, SLOT(on_duplicate()));
     connect(this->delete_button, SIGNAL(clicked()), this, SLOT(on_delete()));
+    connect(this->freeze_button, SIGNAL(clicked()), this, SLOT(on_freeze()));
+    connect(this->unfreeze_button, SIGNAL(clicked()), this, SLOT(on_unfreeze()));
+    connect(unfreeze_all, &QPushButton::clicked, this, [this]() { this->controller->unfreeze_all(); });
+    connect(this->controller, &MemoryToolsController::message, this, [this](const QString &text) {
+        if(this->isActiveWindow()) {
+            this->status->setText(text);
+        }
+    });
+    auto *undo = new QShortcut(QKeySequence::Undo, this);
+    connect(undo, &QShortcut::activated, this, [this]() { this->controller->undo(this); });
+    auto *redo = new QShortcut(QKeySequence::Redo, this);
+    connect(redo, &QShortcut::activated, this, [this]() { this->controller->redo(this); });
     connect(import_button, SIGNAL(clicked()), this, SLOT(on_import()));
     connect(export_button, SIGNAL(clicked()), this, SLOT(on_export()));
     connect(clear_log, SIGNAL(clicked()), this, SLOT(on_clear_log()));
@@ -107,6 +128,8 @@ RamWatchWindow::RamWatchWindow(MemoryToolsController *controller): QWidget(contr
         this->edit_button->setEnabled(this->selected_ids().size() == 1);
         this->duplicate_button->setEnabled(any);
         this->delete_button->setEnabled(any);
+        this->freeze_button->setEnabled(any);
+        this->unfreeze_button->setEnabled(any);
     });
     connect(this->tree, &QTreeWidget::itemExpanded, this, [this](QTreeWidgetItem *item) {
         this->collapsed_groups.erase(item->text(Label));
@@ -127,6 +150,8 @@ RamWatchWindow::RamWatchWindow(MemoryToolsController *controller): QWidget(contr
     this->edit_button->setEnabled(false);
     this->duplicate_button->setEnabled(false);
     this->delete_button->setEnabled(false);
+    this->freeze_button->setEnabled(false);
+    this->unfreeze_button->setEnabled(false);
     this->resize(760, 520);
 }
 
@@ -194,6 +219,8 @@ void RamWatchWindow::rebuild() {
             flags << "pause";
         }
         item->setText(Flags, flags.join(", "));
+        auto freeze = watch["freeze"].toObject();
+        item->setText(Frozen, freeze["active"].toBool() ? "frozen" : "");
         item->setTextAlignment(Value, Qt::AlignRight | Qt::AlignVCenter);
         item->setTextAlignment(Previous, Qt::AlignRight | Qt::AlignVCenter);
         item->setTextAlignment(Changed, Qt::AlignRight | Qt::AlignVCenter);
@@ -317,6 +344,24 @@ void RamWatchWindow::on_refresh() {
             item->setText(Changed, changed);
         }
         auto watch = this->watches.find(value.id);
+        if(watch != this->watches.end() && watch->second["freeze"].toObject()["active"].toBool()) {
+            std::uint32_t restores = 0;
+            bool resolved = true;
+            QString frozen;
+            char reason[256];
+            if(!supershuckie_frontend_memory_can_write(frontend, reason, sizeof(reason)) && supershuckie_frontend_get_replay_state(frontend) == SuperShuckieReplayState__Playback) {
+                frozen = "suspended";
+            }
+            else if(supershuckie_frontend_watch_freeze_status(frontend, value.id, &restores, &resolved)) {
+                frozen = !resolved ? "unresolved" : restores == 0 ? "frozen" : QString("frozen, restored ×%1").arg(restores);
+            }
+            else {
+                frozen = "frozen";
+            }
+            if(item->text(Frozen) != frozen) {
+                item->setText(Frozen, frozen);
+            }
+        }
         if(watch != this->watches.end() && watch->second["address"].toObject().contains("offsets")) {
             QString address = this->address_text(watch->second);
             if(value.resolved) {
@@ -429,6 +474,34 @@ void RamWatchWindow::on_export() {
     char error[1024];
     if(!supershuckie_frontend_watch_export(this->controller->frontend(), path.toUtf8().constData(), error, sizeof(error))) {
         this->status->setText(QString::fromUtf8(error));
+    }
+}
+
+void RamWatchWindow::on_freeze() {
+    std::vector<SuperShuckieWatchValue> values(this->visible_ids.size() + 1);
+    std::size_t count = supershuckie_frontend_watch_read_values(this->controller->frontend(), values.data(), values.size());
+    for(auto id : this->selected_ids()) {
+        bool found = false;
+        for(std::size_t i = 0; i < count; i++) {
+            if(values[i].id == id && values[i].ok) {
+                found = true;
+                if(!this->controller->set_frozen(this, id, true, QByteArray(reinterpret_cast<const char *>(values[i].value), values[i].length))) {
+                    return;
+                }
+            }
+        }
+        if(!found) {
+            // Not on screen or not readable: freeze at the value it was last frozen at, if any.
+            if(!this->controller->set_frozen(this, id, true)) {
+                return;
+            }
+        }
+    }
+}
+
+void RamWatchWindow::on_unfreeze() {
+    for(auto id : this->selected_ids()) {
+        this->controller->set_frozen(this, id, false);
     }
 }
 

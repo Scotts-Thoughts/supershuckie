@@ -842,3 +842,228 @@ pub unsafe extern "C" fn supershuckie_frontend_watch_format_address(
 pub extern "C" fn supershuckie_frontend_memory_has_traces(frontend: &SuperShuckieFrontend) -> bool {
     frontend.memory_tools().watches().iter().any(|w| w.is_traced())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Editing and freezing
+
+fn address_from_c(address: u32, offsets: *const i32, offset_count: usize) -> WatchAddress {
+    let offsets = if offsets.is_null() { Vec::new() } else { unsafe { from_raw_parts(offsets, offset_count) }.to_vec() };
+    WatchAddress { base: address, offsets }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_can_write(frontend: &SuperShuckieFrontend, reason: *mut u8, reason_len: usize) -> bool {
+    match frontend.memory_tools().write_blocked() {
+        None => true,
+        Some(why) => {
+            unsafe { write_error(why, reason, reason_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_needs_record_confirmation(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.memory_tools().needs_record_confirmation()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_confirm_record_writes(frontend: &mut SuperShuckieFrontend, dont_ask_again: bool) {
+    let (tools, _) = frontend.memory_tools_mut();
+    tools.confirm_record_writes(dont_ask_again);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_get_confirm_writes_while_recording(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.memory_tools().confirm_writes_while_recording()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_set_confirm_writes_while_recording(frontend: &mut SuperShuckieFrontend, confirm: bool) {
+    let (tools, _) = frontend.memory_tools_mut();
+    tools.set_confirm_writes_while_recording(confirm);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_writes_this_recording(frontend: &SuperShuckieFrontend) -> u64 {
+    frontend.memory_tools().writes_this_recording()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_write(
+    frontend: &mut SuperShuckieFrontend,
+    address: u32,
+    offsets: *const i32,
+    offset_count: usize,
+    data: *const u8,
+    length: usize,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    let address = address_from_c(address, offsets, offset_count);
+    let data = if data.is_null() { Vec::new() } else { unsafe { from_raw_parts(data, length) }.to_vec() };
+    let (tools, core) = frontend.memory_tools_mut();
+    match tools.write(core, address, data) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_freeze(
+    frontend: &mut SuperShuckieFrontend,
+    address: u32,
+    offsets: *const i32,
+    offset_count: usize,
+    value_type: u32,
+    size: u8,
+    big_endian: bool,
+    value: *const u8,
+    length: usize,
+    group: *const c_char,
+    error: *mut u8,
+    error_len: usize
+) -> u32 {
+    let address = address_from_c(address, offsets, offset_count);
+    let format = ValueFormat::new(value_type_from_c(value_type), size, big_endian);
+    let value = if value.is_null() { Vec::new() } else { unsafe { from_raw_parts(value, length) }.to_vec() };
+    let group = unsafe { c_str(group) }.to_owned();
+    let (tools, core) = frontend.memory_tools_mut();
+    match tools.freeze_new(core, address, format, value, &group) {
+        Ok(id) => id,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_set_frozen(
+    frontend: &mut SuperShuckieFrontend,
+    id: u32,
+    frozen: bool,
+    value: *const u8,
+    length: usize,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    let (tools, core) = frontend.memory_tools_mut();
+    let value = if !frozen {
+        None
+    }
+    else if value.is_null() {
+        // Freeze again at the value it was frozen at before.
+        match tools.watches().iter().find(|w| w.id == id).and_then(|w| w.freeze.as_ref()) {
+            Some(freeze) => Some(freeze.value.clone()),
+            None => {
+                unsafe { write_error("No value to freeze at", error, error_len) };
+                return false
+            }
+        }
+    }
+    else {
+        Some(unsafe { from_raw_parts(value, length) }.to_vec())
+    };
+    match tools.set_freeze(core, id, value) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_unfreeze_all(frontend: &mut SuperShuckieFrontend) {
+    let (tools, core) = frontend.memory_tools_mut();
+    tools.unfreeze_all(core);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_frozen_count(frontend: &SuperShuckieFrontend) -> u32 {
+    frontend.memory_tools().frozen_count() as u32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_frozen_ranges(
+    frontend: &SuperShuckieFrontend,
+    starts: *mut u32,
+    lengths: *mut u32,
+    capacity: usize
+) -> usize {
+    let ranges = frontend.memory_tools().frozen_ranges();
+    if starts.is_null() || lengths.is_null() {
+        return ranges.len()
+    }
+    let starts = unsafe { from_raw_parts_mut(starts, capacity) };
+    let lengths = unsafe { from_raw_parts_mut(lengths, capacity) };
+    for (i, (start, length)) in ranges.iter().take(capacity).enumerate() {
+        starts[i] = *start;
+        lengths[i] = *length;
+    }
+    ranges.len().min(capacity)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_freeze_status(frontend: &SuperShuckieFrontend, id: u32, restores: *mut u32, resolved: *mut bool) -> bool {
+    match frontend.memory_tools().freeze_status(id) {
+        Some((count, ok)) => {
+            unsafe {
+                if !restores.is_null() { *restores = count; }
+                if !resolved.is_null() { *resolved = ok; }
+            }
+            true
+        }
+        None => false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_can_undo(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.memory_tools().can_undo()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_can_redo(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.memory_tools().can_redo()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_undo(frontend: &mut SuperShuckieFrontend, error: *mut u8, error_len: usize) -> bool {
+    let (tools, core) = frontend.memory_tools_mut();
+    match tools.undo(core) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_redo(frontend: &mut SuperShuckieFrontend, error: *mut u8, error_len: usize) -> bool {
+    let (tools, core) = frontend.memory_tools_mut();
+    match tools.redo(core) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_memory_edit_message(frontend: &mut SuperShuckieFrontend, out: *mut u8, out_len: usize) -> bool {
+    let (tools, _) = frontend.memory_tools_mut();
+    match tools.take_edit_message() {
+        Some(message) => {
+            unsafe { write_error(&message, out, out_len) };
+            true
+        }
+        None => false
+    }
+}

@@ -50,6 +50,9 @@ public:
     /** The row's candidate, if it can be fetched. */
     std::optional<SuperShuckieSearchRow> row(int row) const;
 
+    /** The row's current value, if it is on screen and sampled. */
+    std::optional<std::vector<std::uint8_t>> current_value(int row) const;
+
     const SuperShuckieSearchStatus &search_status() const noexcept { return this->status; }
 
 private:

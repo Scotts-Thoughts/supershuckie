@@ -4,6 +4,7 @@
 #include <QComboBox>
 #include <QEvent>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -105,6 +106,12 @@ HexViewerWindow::HexViewerWindow(MemoryToolsController *controller, std::uint8_t
     this->rate_combo->setToolTip("How often the RAM tools refresh while the game runs (shared by all tool windows)");
     int rate = this->controller->refresh_rate();
     this->rate_combo->setCurrentIndex(rate <= 15 ? 0 : rate <= 30 ? 1 : 2);
+    this->edit_button = new QToolButton(this);
+    this->edit_button->setText("Edit");
+    this->edit_button->setCheckable(true);
+    this->edit_button->setFocusPolicy(Qt::NoFocus);
+    this->edit_button->setToolTip("Type over bytes (Insert). Double-click a value in the inspector to change it.");
+    toolbar->addWidget(this->edit_button);
     layout->addLayout(toolbar);
 
     auto *splitter = new QSplitter(Qt::Horizontal, this);
@@ -135,6 +142,9 @@ HexViewerWindow::HexViewerWindow(MemoryToolsController *controller, std::uint8_t
     }
     this->inspector->setSpan(INSPECTOR_TEXT_ROW, 1, 1, 2);
     this->inspector->item(INSPECTOR_POINTER_ROW, 0)->setToolTip("Double-click a pointer that lands in a region to go there");
+    for(int row = 0; row < INSPECTOR_POINTER_ROW; row++) {
+        this->inspector->item(row, 0)->setToolTip("Double-click a value to change it");
+    }
     splitter->addWidget(this->inspector);
     splitter->setStretchFactor(0, 3);
     splitter->setStretchFactor(1, 1);
@@ -160,6 +170,19 @@ HexViewerWindow::HexViewerWindow(MemoryToolsController *controller, std::uint8_t
     connect(this->controller, &MemoryToolsController::regions_changed, this, &HexViewerWindow::on_regions_changed);
     connect(this->controller, &MemoryToolsController::tables_changed, this, &HexViewerWindow::on_tables_changed);
     connect(this->controller, &MemoryToolsController::refresh, this, &HexViewerWindow::on_refresh);
+    connect(this->view, &HexViewWidget::bytes_typed, this, &HexViewerWindow::on_bytes_typed);
+    connect(this->edit_button, &QToolButton::toggled, this, &HexViewerWindow::on_edit_toggled);
+    connect(this->controller, &MemoryToolsController::message, this, [this](const QString &text) {
+        if(this->isActiveWindow()) {
+            this->status->setText(text);
+        }
+    });
+    auto *insert = new QShortcut(QKeySequence(Qt::Key_Insert), this);
+    connect(insert, &QShortcut::activated, this, [this]() { this->edit_button->toggle(); });
+    auto *undo = new QShortcut(QKeySequence::Undo, this);
+    connect(undo, &QShortcut::activated, this, [this]() { this->controller->undo(this); });
+    auto *redo = new QShortcut(QKeySequence::Redo, this);
+    connect(redo, &QShortcut::activated, this, [this]() { this->controller->redo(this); });
 
     // Region switching: Ctrl+1..9 and Ctrl+PgUp/PgDn; navigation: Ctrl+G, Alt+Left/Right.
     for(int i = 0; i < 9; i++) {
@@ -420,10 +443,20 @@ void HexViewerWindow::on_cursor_changed(std::uint32_t) {
     this->update_inspector();
 }
 
+void HexViewerWindow::on_edit_toggled(bool edit) {
+    this->view->set_edit_mode(edit);
+    this->view->setFocus(Qt::OtherFocusReason);
+}
+
+void HexViewerWindow::on_bytes_typed(std::uint32_t address, QByteArray bytes) {
+    this->controller->write(this, address, bytes);
+}
+
 void HexViewerWindow::on_refresh() {
     if(!this->isVisible() || !this->view->has_region()) {
         return;
     }
+    this->view->set_frozen_ranges(this->controller->frozen_ranges());
     std::uint64_t generation = this->sample_generation;
     std::uint32_t address = 0, length = 0, valid = 0;
     if(!supershuckie_frontend_memory_read_viewer(this->controller->frontend(), this->viewer_slot, &generation, &this->frame, &address, this->buffer.data(), static_cast<std::uint32_t>(this->buffer.size()), &length, &valid)) {
@@ -500,7 +533,44 @@ void HexViewerWindow::update_inspector() {
 }
 
 void HexViewerWindow::on_inspector_activated(int row, int column) {
-    if(row != INSPECTOR_POINTER_ROW || column < 1) {
+    if(column < 1) {
+        return;
+    }
+    std::uint32_t cursor = this->view->cursor_address();
+    if(row < INSPECTOR_POINTER_ROW || row == INSPECTOR_TEXT_ROW) {
+        // Change the value under the cursor.
+        std::uint32_t type;
+        std::uint8_t size;
+        bool big_endian = column == 2;
+        QString label;
+        if(row == INSPECTOR_TEXT_ROW) {
+            type = SuperShuckieMemoryValueType__Text;
+            size = static_cast<std::uint8_t>(std::min<std::uint64_t>(SUPERSHUCKIE_MEMORY_MAX_VALUE_SIZE, static_cast<std::uint64_t>(this->view->region_base()) + this->view->region_size() - cursor));
+            big_endian = false;
+            label = "text";
+        }
+        else {
+            auto &definition = INSPECTOR_ROWS[row];
+            if(column == 2 && !definition.endianness) {
+                return;
+            }
+            type = definition.value_type;
+            size = definition.size;
+            label = QString("%1 %2").arg(definition.label, definition.endianness ? (big_endian ? "big-endian" : "little-endian") : "");
+        }
+        QString current = this->inspector->item(row, column)->text();
+        bool ok = false;
+        QString text = QInputDialog::getText(this, "Change value", QString("%1 at %2:").arg(label.trimmed(), this->controller->format_address(cursor, false)), QLineEdit::Normal, current == "—" ? QString() : current, &ok);
+        if(!ok) {
+            return;
+        }
+        auto bytes = this->controller->parse_value(this, this->table_index(), type, size, big_endian, text);
+        if(bytes && this->controller->write(this, cursor, *bytes)) {
+            this->view->mark_pending(cursor, static_cast<std::size_t>(bytes->size()));
+        }
+        return;
+    }
+    if(row != INSPECTOR_POINTER_ROW) {
         return;
     }
     auto bytes = this->view->bytes_at(this->view->cursor_address(), 4);
@@ -550,6 +620,70 @@ void HexViewerWindow::on_context_menu(QPoint global_position) {
     bool big_endian = this->view->is_big_endian();
     std::uint32_t type = group == 4 ? SuperShuckieMemoryValueType__U32 : group == 2 ? SuperShuckieMemoryValueType__U16 : SuperShuckieMemoryValueType__U8;
     std::uint32_t cursor = this->view->cursor_address();
+    auto selection_bytes = this->view->bytes_at(start, length);
+
+    auto *freeze = menu.addAction(length > 1 ? QString("Freeze %1 bytes").arg(length) : QString("Freeze byte"));
+    freeze->setEnabled(selection_bytes.has_value() && length <= SUPERSHUCKIE_MEMORY_MAX_VALUE_SIZE);
+    connect(freeze, &QAction::triggered, this, [this, start, length, selection_bytes]() {
+        if(!selection_bytes) {
+            return;
+        }
+        QByteArray bytes(reinterpret_cast<const char *>(selection_bytes->data()), static_cast<qsizetype>(selection_bytes->size()));
+        std::uint32_t type = length == 1 ? SuperShuckieMemoryValueType__U8 : length == 2 ? SuperShuckieMemoryValueType__U16 : length == 4 ? SuperShuckieMemoryValueType__U32 : SuperShuckieMemoryValueType__Bytes;
+        this->controller->freeze(this, start, type, static_cast<std::uint8_t>(length), this->view->is_big_endian(), bytes, "Frozen from viewer");
+    });
+    bool any_frozen = false;
+    for(auto &[frozen_start, frozen_length] : this->controller->frozen_ranges()) {
+        if(frozen_start < static_cast<std::uint64_t>(start) + length && static_cast<std::uint64_t>(frozen_start) + frozen_length > start) {
+            any_frozen = true;
+        }
+    }
+    auto *unfreeze = menu.addAction("Unfreeze selection");
+    unfreeze->setEnabled(any_frozen);
+    connect(unfreeze, &QAction::triggered, this, [this, start, length]() {
+        this->controller->unfreeze_range(start, length);
+    });
+
+    auto *paste = menu.addAction("Paste hex over selection");
+    connect(paste, &QAction::triggered, this, [this, start]() {
+        std::uint8_t bytes[4096];
+        std::size_t count = 0;
+        char error[256];
+        if(!supershuckie_memory_parse_hex_bytes(QApplication::clipboard()->text().toUtf8().constData(), bytes, sizeof(bytes), &count, error, sizeof(error))) {
+            this->status->setText(QString("The clipboard does not hold hexadecimal bytes: %1").arg(QString::fromUtf8(error)));
+            return;
+        }
+        std::uint64_t room = static_cast<std::uint64_t>(this->view->region_base()) + this->view->region_size() - start;
+        count = static_cast<std::size_t>(std::min<std::uint64_t>(count, room));
+        if(this->controller->write(this, start, QByteArray(reinterpret_cast<const char *>(bytes), static_cast<qsizetype>(count)))) {
+            this->view->mark_pending(start, count);
+        }
+    });
+    auto *fill = menu.addAction(QString("Fill %1…").arg(length > 1 ? QString("%1 bytes").arg(length) : QString("byte")));
+    fill->setEnabled(length <= 4096);
+    connect(fill, &QAction::triggered, this, [this, start, length]() {
+        bool ok = false;
+        QString pattern = QInputDialog::getText(this, "Fill selection", "Repeat these hexadecimal bytes:", QLineEdit::Normal, "00", &ok);
+        if(!ok) {
+            return;
+        }
+        std::uint8_t bytes[256];
+        std::size_t count = 0;
+        char error[256];
+        if(!supershuckie_memory_parse_hex_bytes(pattern.toUtf8().constData(), bytes, sizeof(bytes), &count, error, sizeof(error)) || count == 0) {
+            this->status->setText(QString("Fill: %1").arg(QString::fromUtf8(error)));
+            return;
+        }
+        QByteArray data(static_cast<qsizetype>(length), '\0');
+        for(std::uint32_t i = 0; i < length; i++) {
+            data[i] = static_cast<char>(bytes[i % count]);
+        }
+        if(this->controller->write(this, start, data)) {
+            this->view->mark_pending(start, length);
+        }
+    });
+    menu.addSeparator();
+
     auto *add_watch = menu.addAction(QString("Add watch at %1…").arg(this->controller->format_address(cursor, true)));
     connect(add_watch, &QAction::triggered, this, [this, cursor, type, group, big_endian]() {
         this->controller->add_watch(this, cursor, type, static_cast<std::uint8_t>(group), big_endian, this->controller->format_address(cursor, true));

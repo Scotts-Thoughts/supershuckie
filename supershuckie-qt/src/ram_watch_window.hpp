@@ -48,6 +48,8 @@ private slots:
     void on_item_double_clicked(QTreeWidgetItem *item, int column);
     void on_context_menu(const QPoint &position);
     void on_visible_changed();
+    void on_freeze();
+    void on_unfreeze();
 
 private:
     MemoryToolsController *controller;
@@ -59,8 +61,10 @@ private:
     QPushButton *edit_button;
     QPushButton *duplicate_button;
     QPushButton *delete_button;
+    QPushButton *freeze_button;
+    QPushButton *unfreeze_button;
 
-    enum Column { Label, Region, Address, Value, Previous, Changed, Flags, ColumnCount };
+    enum Column { Label, Region, Address, Value, Previous, Changed, Frozen, Flags, ColumnCount };
 
     std::uint64_t watch_generation = 0;
     std::map<std::uint32_t, QJsonObject> watches;

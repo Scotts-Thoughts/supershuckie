@@ -28,7 +28,7 @@ fn make_core(path: &str) -> ThreadedSuperShuckieCore {
 fn wait_until(tools: &mut MemoryTools, core: &ThreadedSuperShuckieCore, what: &str, mut done: impl FnMut(&mut MemoryTools) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        tools.tick(core, false);
+        tools.tick(core, false, false, false);
         if done(tools) {
             return
         }
@@ -161,6 +161,54 @@ fn main() {
         }
     }
     assert!(too_many > 0, "the traced watch cap is enforced");
+
+    // Editing: a write lands, undo restores the exact old bytes, redo reapplies.
+    let target = tools.regions()[0].base + 0x100;
+    let edit_watch = Watch { label: "edited".to_owned(), address: WatchAddress::direct(target), format: ValueFormat::new(ValueType::U16, 2, false), trace: false, group: String::new(), ..watch.clone() };
+    // Make room under the trace cap for these checks.
+    let ids: Vec<u32> = tools.watches().iter().skip(1).map(|w| w.id).collect();
+    for id in ids {
+        tools.remove_watch(&core, id);
+    }
+    let edit_id = tools.upsert_watch(&core, edit_watch).expect("edit watch");
+    tools.set_visible_watches(&core, &[edit_id]);
+    wait_until(&mut tools, &core, "the edited watch's value", |t| t.watch_values().first().is_some_and(|v| v.value.is_some()));
+    core.pause();
+    std::thread::sleep(Duration::from_millis(50));
+    wait_until(&mut tools, &core, "a settled value", |_| true);
+    let original = tools.watch_values()[0].value.clone().unwrap();
+    tools.write(&core, WatchAddress::direct(target), vec![0x34, 0x12]).expect("write");
+    wait_until(&mut tools, &core, "the written value", |t| t.watch_values()[0].value.as_deref() == Some(&[0x34, 0x12][..]));
+    assert!(tools.can_undo());
+    tools.undo(&core).expect("undo");
+    wait_until(&mut tools, &core, "the undone value", |t| t.watch_values()[0].value.as_deref() == Some(original.as_slice()));
+    tools.redo(&core).expect("redo");
+    wait_until(&mut tools, &core, "the redone value", |t| t.watch_values()[0].value.as_deref() == Some(&[0x34, 0x12][..]));
+    println!("write, undo and redo ok ({:02X?} -> 34 12)", original);
+
+    // Read-only memory refuses edits.
+    if let Some(read_only) = tools.regions().iter().find(|r| !r.writable).map(|r| r.base) {
+        tools.write(&core, WatchAddress::direct(read_only), vec![1]).unwrap();
+        wait_until(&mut tools, &core, "the refused edit", |t| t.take_edit_message().is_some());
+        println!("read-only edit refused");
+    }
+
+    // Freezing holds a value against the game; editing a frozen value changes the freeze.
+    core.start();
+    let frozen_id = tools.freeze_new(&core, WatchAddress::direct(frame_counter), ValueFormat::new(ValueType::U8, 1, false), vec![0x42], "Frozen").expect("freeze");
+    tools.set_visible_watches(&core, &[edit_id, frozen_id]);
+    wait_until(&mut tools, &core, "the freeze restoring the value", |t| t.freeze_status(frozen_id).is_some_and(|(restores, ok)| ok && restores > 5));
+    let held = tools.watch_values().iter().find(|v| v.id == frozen_id).and_then(|v| v.value.clone());
+    assert_eq!(held.as_deref(), Some(&[0x42][..]), "the frozen value holds at frame boundaries");
+    tools.write(&core, WatchAddress::direct(frame_counter), vec![0x43]).expect("edit frozen");
+    assert_eq!(tools.watches().iter().find(|w| w.id == frozen_id).unwrap().freeze.as_ref().unwrap().value, vec![0x43], "editing a frozen value changes the freeze");
+    wait_until(&mut tools, &core, "the new frozen value", |t| t.watch_values().iter().any(|v| v.id == frozen_id && v.value.as_deref() == Some(&[0x43][..])));
+    assert_eq!(tools.frozen_count(), 1);
+    tools.undo(&core).expect("undo freeze change");
+    assert_eq!(tools.watches().iter().find(|w| w.id == frozen_id).unwrap().freeze.as_ref().unwrap().value, vec![0x42]);
+    tools.unfreeze_all(&core);
+    assert_eq!(tools.frozen_count(), 0);
+    println!("freeze held the value, took an edit, undid it and unfroze");
 
     // Persistence: switching games saves this list and loads the other game's (none yet).
     let count = tools.watches().len();

@@ -77,6 +77,34 @@ public:
     bool edit_watch_value_inline(QWidget *parent, std::uint32_t id, bool value_column);
     void add_watch_actions(QMenu *menu, QWidget *parent, const std::vector<std::uint32_t> &ids);
 
+    /**
+     * Check that memory may be written now, asking the user to confirm writing into a recording
+     * the first time. Shows why not (in `parent`'s status or a dialog) and returns false otherwise.
+     */
+    bool confirm_write(QWidget *parent);
+
+    /** Write bytes (plain address). Returns false with a message shown if refused. */
+    bool write(QWidget *parent, std::uint32_t address, const QByteArray &bytes);
+
+    /** Freeze `bytes` at `address` as a watch in `group`. Returns the watch id or 0. */
+    std::uint32_t freeze(QWidget *parent, std::uint32_t address, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QByteArray &bytes, const char *group);
+
+    /** Freeze (at `bytes`, or its last frozen value when empty) or unfreeze a watch. */
+    bool set_frozen(QWidget *parent, std::uint32_t id, bool frozen, const QByteArray &bytes = {});
+
+    /** Unfreeze every active freeze whose address lies in [address, address + length). */
+    void unfreeze_range(std::uint32_t address, std::uint32_t length);
+
+    void unfreeze_all();
+    void undo(QWidget *parent);
+    void redo(QWidget *parent);
+
+    /** Active freezes' address ranges, refreshed with each tick. */
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> &frozen_ranges() const noexcept { return this->frozen; }
+
+    /** Parse `text` as a value of the given type. */
+    std::optional<QByteArray> parse_value(QWidget *parent, std::size_t table, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &text);
+
     /** Re-open the windows that were open when the app last closed. */
     void restore_windows();
 
@@ -108,6 +136,8 @@ public:
     void visibility_changed();
 
 signals:
+    /** Something went wrong with an edit (for the tool windows' status lines). */
+    void message(const QString &text);
     void regions_changed();
     void tables_changed();
     /** Emitted at the refresh rate while a tool window is visible. */
@@ -132,6 +162,8 @@ private:
     int digits = 8;
 
     std::vector<std::array<QString, 256>> glyph_cache;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> frozen;
+    void update_frozen();
 
     void update_regions();
     bool any_window_visible() const;

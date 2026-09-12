@@ -6,6 +6,8 @@
 #include <QDoubleSpinBox>
 #include <QGridLayout>
 #include <QHeaderView>
+#include <QInputDialog>
+#include <QShortcut>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -233,6 +235,17 @@ void SearchResultsModel::set_current(std::uint64_t first_row, const std::vector<
     }
 }
 
+std::optional<std::vector<std::uint8_t>> SearchResultsModel::current_value(int row) const {
+    if(row < 0 || static_cast<std::uint64_t>(row) < this->current_first) {
+        return std::nullopt;
+    }
+    std::uint64_t i = static_cast<std::uint64_t>(row) - this->current_first;
+    if(i >= this->current.size()) {
+        return std::nullopt;
+    }
+    return this->current[i];
+}
+
 void SearchResultsModel::set_hex(bool hex) {
     this->hex = hex;
     if(this->rowCount() > 0) {
@@ -415,6 +428,15 @@ RamSearchWindow::RamSearchWindow(MemoryToolsController *controller): QWidget(con
     connect(this->controller, &MemoryToolsController::refresh, this, &RamSearchWindow::on_refresh);
     connect(this->controller, &MemoryToolsController::regions_changed, this, &RamSearchWindow::on_regions_changed);
     connect(this->controller, &MemoryToolsController::tables_changed, this, &RamSearchWindow::on_tables_changed);
+    connect(this->controller, &MemoryToolsController::message, this, [this](const QString &text) {
+        if(this->isActiveWindow()) {
+            this->status_label->setText(text);
+        }
+    });
+    auto *undo = new QShortcut(QKeySequence::Undo, this);
+    connect(undo, &QShortcut::activated, this, [this]() { this->controller->undo(this); });
+    auto *redo = new QShortcut(QKeySequence::Redo, this);
+    connect(redo, &QShortcut::activated, this, [this]() { this->controller->redo(this); });
 
     this->on_regions_changed();
     this->on_type_changed();
@@ -789,6 +811,49 @@ void RamSearchWindow::on_context_menu(const QPoint &position) {
     auto *add_watch = menu.addAction(addresses.size() == 1 ? QString("Add to watch list") : QString("Add %1 results to watch list").arg(addresses.size()));
     connect(add_watch, &QAction::triggered, this, [this, addresses, status]() {
         this->controller->add_watches(addresses, status.value_type, status.size, status.big_endian);
+    });
+
+    menu.addSeparator();
+    auto *set_value = menu.addAction(addresses.size() == 1 ? QString("Set value…") : QString("Set %1 values…").arg(addresses.size()));
+    connect(set_value, &QAction::triggered, this, [this, addresses, status]() {
+        bool ok = false;
+        QString text = QInputDialog::getText(this, "Set value", QString("New value for %1 address%2:").arg(addresses.size()).arg(addresses.size() == 1 ? "" : "es"), QLineEdit::Normal, QString(), &ok);
+        if(!ok) {
+            return;
+        }
+        auto bytes = this->controller->parse_value(this, static_cast<std::size_t>(std::max(0, this->table_combo->currentIndex())), status.value_type, status.size, status.big_endian, text);
+        if(!bytes) {
+            return;
+        }
+        if(bytes->size() < status.size) {
+            bytes->append(QByteArray(status.size - bytes->size(), '\0'));
+        }
+        for(auto address : addresses) {
+            if(!this->controller->write(this, address, *bytes)) {
+                break;
+            }
+        }
+    });
+    auto *freeze = menu.addAction(addresses.size() == 1 ? QString("Freeze at current value") : QString("Freeze %1 at their current values").arg(addresses.size()));
+    connect(freeze, &QAction::triggered, this, [this, addresses, status]() {
+        for(auto address : addresses) {
+            // The value on screen if it is sampled, else the value at the last scan.
+            QByteArray value;
+            for(int r = 0; r < this->model->rowCount(); r++) {
+                auto candidate = this->model->row(r);
+                if(candidate && candidate->address == address) {
+                    auto current = this->model->current_value(r);
+                    value = current ? QByteArray(reinterpret_cast<const char *>(current->data()), static_cast<qsizetype>(current->size())) : QByteArray(reinterpret_cast<const char *>(candidate->previous), candidate->length);
+                    break;
+                }
+                if(r > 100000) {
+                    break;
+                }
+            }
+            if(value.isEmpty() || this->controller->freeze(this, address, status.value_type, status.size, status.big_endian, value, "Frozen from search") == 0) {
+                break;
+            }
+        }
     });
     menu.exec(this->table->viewport()->mapToGlobal(position));
 }

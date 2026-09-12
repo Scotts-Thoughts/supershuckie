@@ -13,6 +13,7 @@ class QMenu;
 class QAction;
 class QCloseEvent;
 class QLabel;
+class QToolButton;
 
 namespace SuperShuckie64 {
 
@@ -143,6 +144,13 @@ private:
 
     QLabel *current_state;
     QLabel *paused_state;
+    QToolButton *frozen_state;
+    QLabel *ram_modified_state;
+    QAction *unfreeze_all;
+    QAction *confirm_ram_writes;
+    int memory_status_countdown = 0;
+    void update_memory_status();
+    bool check_freezes_before_recording();
 
     ReplayPlaybackControls *playback_bar;
 
@@ -270,6 +278,8 @@ private slots:
     void do_new_ram_viewer();
     void do_open_ram_search();
     void do_open_ram_watch();
+    void do_unfreeze_all();
+    void do_toggle_confirm_ram_writes();
     void do_open_tables_folder();
     void do_reload_tables();
 };

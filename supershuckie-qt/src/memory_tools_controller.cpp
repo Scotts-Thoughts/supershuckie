@@ -8,8 +8,12 @@
 #include "ram_search_window.hpp"
 #include "ram_watch_window.hpp"
 #include "watch_edit_dialog.hpp"
+#include <QCheckBox>
+#include <QInputDialog>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QMenu>
+#include <QMessageBox>
 #include "main_window.hpp"
 #include "error.hpp"
 
@@ -109,11 +113,123 @@ void MemoryToolsController::add_watches(const std::vector<std::uint32_t> &addres
     }
 }
 
-bool MemoryToolsController::edit_watch_value_inline(QWidget *, std::uint32_t, bool) {
-    return false;
+namespace {
+    const char *WATCH_TYPE_NAMES[] = { "u8", "i8", "u16", "i16", "u32", "i32", "f32", "bcd", "bytes", "text" };
+
+    std::uint32_t watch_type_index(const QString &name) {
+        for(std::uint32_t i = 0; i < 10; i++) {
+            if(name == WATCH_TYPE_NAMES[i]) {
+                return i;
+            }
+        }
+        return 0;
+    }
 }
 
-void MemoryToolsController::add_watch_actions(QMenu *, QWidget *, const std::vector<std::uint32_t> &) {}
+bool MemoryToolsController::edit_watch_value_inline(QWidget *parent, std::uint32_t id, bool value_column) {
+    if(!value_column) {
+        return false;
+    }
+    char *list = supershuckie_frontend_watch_list_json(this->frontend());
+    auto array = QJsonDocument::fromJson(QByteArray(list)).array();
+    supershuckie_string_free(list);
+    QJsonObject watch;
+    for(auto value : array) {
+        if(static_cast<std::uint32_t>(value.toObject()["id"].toInteger()) == id) {
+            watch = value.toObject();
+        }
+    }
+    if(watch.isEmpty()) {
+        return false;
+    }
+
+    auto format = watch["format"].toObject();
+    std::uint32_t type = watch_type_index(format["type"].toString());
+    auto size = static_cast<std::uint8_t>(format["size"].toInt());
+    bool big_endian = format["big_endian"].toBool();
+    std::size_t table = std::max<qsizetype>(0, this->table_names().indexOf(watch["table"].toString()));
+
+    // Start from the value shown.
+    SuperShuckieWatchValue values[512];
+    std::size_t count = supershuckie_frontend_watch_read_values(this->frontend(), values, 512);
+    QString current;
+    for(std::size_t i = 0; i < count; i++) {
+        if(values[i].id == id && values[i].ok) {
+            current = this->format_value(table, type, size, big_endian, type >= 7 ? 0 : SuperShuckieMemoryDisplay__Decimal, values[i].value, values[i].length);
+        }
+    }
+
+    bool frozen = watch["freeze"].toObject()["active"].toBool();
+    bool ok = false;
+    this->main->stop_timer();
+    QString text = QInputDialog::getText(parent, frozen ? "Change frozen value" : "Set value", QString("%1 (%2):").arg(watch["label"].toString(), format["type"].toString()), QLineEdit::Normal, current, &ok);
+    this->main->start_timer();
+    if(!ok) {
+        return true;
+    }
+    auto bytes = this->parse_value(parent, table, type, size, big_endian, text);
+    if(!bytes) {
+        return true;
+    }
+    if(bytes->size() < size) {
+        bytes->append(QByteArray(size - bytes->size(), '\0'));
+    }
+
+    auto address = watch["address"].toObject();
+    if(frozen) {
+        this->set_frozen(parent, id, true, *bytes);
+    }
+    else if(!this->confirm_write(parent)) {
+        return true;
+    }
+    else {
+        std::vector<std::int32_t> offsets;
+        for(auto offset : address["offsets"].toArray()) {
+            offsets.push_back(offset.toInt());
+        }
+        bool parsed = false;
+        std::uint32_t base = address["base"].toString().mid(2).toUInt(&parsed, 16);
+        char error[512] = {};
+        if(!supershuckie_frontend_memory_write(this->frontend(), base, offsets.data(), offsets.size(), reinterpret_cast<const std::uint8_t *>(bytes->constData()), static_cast<std::size_t>(bytes->size()), error, sizeof(error))) {
+            emit this->message(QString::fromUtf8(error));
+        }
+    }
+    return true;
+}
+
+void MemoryToolsController::add_watch_actions(QMenu *menu, QWidget *parent, const std::vector<std::uint32_t> &ids) {
+    if(ids.empty()) {
+        return;
+    }
+    menu->addSeparator();
+    auto *freeze = menu->addAction(ids.size() == 1 ? "Freeze at current value" : QString("Freeze %1 watches at their current values").arg(ids.size()));
+    connect(freeze, &QAction::triggered, this, [this, parent, ids]() {
+        SuperShuckieWatchValue values[512];
+        std::size_t count = supershuckie_frontend_watch_read_values(this->frontend(), values, 512);
+        for(auto id : ids) {
+            for(std::size_t i = 0; i < count; i++) {
+                if(values[i].id == id && values[i].ok) {
+                    if(!this->set_frozen(parent, id, true, QByteArray(reinterpret_cast<const char *>(values[i].value), values[i].length))) {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    auto *unfreeze = menu->addAction(ids.size() == 1 ? "Unfreeze" : QString("Unfreeze %1 watches").arg(ids.size()));
+    connect(unfreeze, &QAction::triggered, this, [this, parent, ids]() {
+        for(auto id : ids) {
+            this->set_frozen(parent, id, false);
+        }
+    });
+    if(ids.size() == 1) {
+        auto *set_value = menu->addAction("Set value…");
+        auto id = ids[0];
+        connect(set_value, &QAction::triggered, this, [this, parent, id]() {
+            this->edit_watch_value_inline(parent, id, true);
+        });
+    }
+}
 
 RamSearchWindow *MemoryToolsController::open_search() {
     if(this->search == nullptr) {
@@ -143,7 +259,139 @@ void MemoryToolsController::visibility_changed() {
 
 void MemoryToolsController::on_timer() {
     this->update_regions();
+    this->update_frozen();
+    char text[512];
+    if(supershuckie_frontend_memory_edit_message(this->frontend(), text, sizeof(text))) {
+        emit this->message(QString::fromUtf8(text));
+    }
     emit this->refresh();
+}
+
+void MemoryToolsController::update_frozen() {
+    std::size_t count = supershuckie_frontend_memory_frozen_ranges(this->frontend(), nullptr, nullptr, 0);
+    std::vector<std::uint32_t> starts(count), lengths(count);
+    count = supershuckie_frontend_memory_frozen_ranges(this->frontend(), starts.data(), lengths.data(), count);
+    this->frozen.clear();
+    for(std::size_t i = 0; i < count; i++) {
+        this->frozen.emplace_back(starts[i], lengths[i]);
+    }
+}
+
+bool MemoryToolsController::confirm_write(QWidget *parent) {
+    char reason[512] = {};
+    if(!supershuckie_frontend_memory_can_write(this->frontend(), reason, sizeof(reason))) {
+        emit this->message(QString::fromUtf8(reason));
+        return false;
+    }
+    if(!supershuckie_frontend_memory_needs_record_confirmation(this->frontend())) {
+        return true;
+    }
+    QMessageBox box(parent);
+    box.setWindowTitle("Edit memory while recording?");
+    box.setIcon(QMessageBox::Question);
+    box.setText("A replay is being recorded. Memory edits and freezes are written into it, and anyone watching the replay will see them happen.");
+    box.setInformativeText("Continue?");
+    auto *dont_ask = new QCheckBox("Don't ask again", &box);
+    box.setCheckBox(dont_ask);
+    box.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+    box.setDefaultButton(QMessageBox::Cancel);
+    this->main->stop_timer();
+    int answer = box.exec();
+    this->main->start_timer();
+    if(answer != QMessageBox::Yes) {
+        return false;
+    }
+    supershuckie_frontend_memory_confirm_record_writes(this->frontend(), dont_ask->isChecked());
+    return true;
+}
+
+bool MemoryToolsController::write(QWidget *parent, std::uint32_t address, const QByteArray &bytes) {
+    if(!this->confirm_write(parent)) {
+        return false;
+    }
+    char error[512] = {};
+    if(!supershuckie_frontend_memory_write(this->frontend(), address, nullptr, 0, reinterpret_cast<const std::uint8_t *>(bytes.constData()), static_cast<std::size_t>(bytes.size()), error, sizeof(error))) {
+        emit this->message(QString::fromUtf8(error));
+        return false;
+    }
+    return true;
+}
+
+std::uint32_t MemoryToolsController::freeze(QWidget *parent, std::uint32_t address, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QByteArray &bytes, const char *group) {
+    if(!this->confirm_write(parent)) {
+        return 0;
+    }
+    char error[512] = {};
+    auto id = supershuckie_frontend_memory_freeze(this->frontend(), address, nullptr, 0, value_type, size, big_endian, reinterpret_cast<const std::uint8_t *>(bytes.constData()), static_cast<std::size_t>(bytes.size()), group, error, sizeof(error));
+    if(id == 0) {
+        emit this->message(QString::fromUtf8(error));
+    }
+    this->update_frozen();
+    return id;
+}
+
+bool MemoryToolsController::set_frozen(QWidget *parent, std::uint32_t id, bool frozen, const QByteArray &bytes) {
+    if(frozen && !this->confirm_write(parent)) {
+        return false;
+    }
+    char error[512] = {};
+    bool ok = supershuckie_frontend_watch_set_frozen(this->frontend(), id, frozen, bytes.isEmpty() ? nullptr : reinterpret_cast<const std::uint8_t *>(bytes.constData()), static_cast<std::size_t>(bytes.size()), error, sizeof(error));
+    if(!ok) {
+        emit this->message(QString::fromUtf8(error));
+    }
+    this->update_frozen();
+    return ok;
+}
+
+void MemoryToolsController::unfreeze_range(std::uint32_t address, std::uint32_t length) {
+    char *list = supershuckie_frontend_watch_list_json(this->frontend());
+    auto array = QJsonDocument::fromJson(QByteArray(list)).array();
+    supershuckie_string_free(list);
+    for(auto value : array) {
+        auto watch = value.toObject();
+        auto freeze = watch["freeze"].toObject();
+        if(!freeze["active"].toBool()) {
+            continue;
+        }
+        bool ok = false;
+        std::uint64_t base = watch["address"].toObject()["base"].toString().mid(2).toUInt(&ok, 16);
+        if(ok && base >= address && base < static_cast<std::uint64_t>(address) + length) {
+            this->set_frozen(nullptr, static_cast<std::uint32_t>(watch["id"].toInteger()), false);
+        }
+    }
+    this->update_frozen();
+}
+
+void MemoryToolsController::unfreeze_all() {
+    supershuckie_frontend_memory_unfreeze_all(this->frontend());
+    this->update_frozen();
+}
+
+void MemoryToolsController::undo(QWidget *) {
+    char error[512] = {};
+    if(!supershuckie_frontend_memory_undo(this->frontend(), error, sizeof(error))) {
+        emit this->message(QString::fromUtf8(error));
+    }
+    this->update_frozen();
+}
+
+void MemoryToolsController::redo(QWidget *) {
+    char error[512] = {};
+    if(!supershuckie_frontend_memory_redo(this->frontend(), error, sizeof(error))) {
+        emit this->message(QString::fromUtf8(error));
+    }
+    this->update_frozen();
+}
+
+std::optional<QByteArray> MemoryToolsController::parse_value(QWidget *, std::size_t table, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &text) {
+    std::uint8_t bytes[SUPERSHUCKIE_MEMORY_MAX_VALUE_SIZE];
+    std::size_t length = 0;
+    char error[512] = {};
+    if(!supershuckie_frontend_memory_parse_value(this->frontend(), table, value_type, size, big_endian, text.toUtf8().constData(), bytes, sizeof(bytes), &length, error, sizeof(error))) {
+        emit this->message(QString::fromUtf8(error));
+        return std::nullopt;
+    }
+    return QByteArray(reinterpret_cast<const char *>(bytes), static_cast<qsizetype>(length));
 }
 
 void MemoryToolsController::update_regions() {

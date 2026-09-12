@@ -80,6 +80,9 @@ pub struct Settings {
     #[serde(default = "AudioSettings::default")]
     pub audio: AudioSettings,
 
+    #[serde(default = "MemoryToolsSettings::default")]
+    pub memory_tools: MemoryToolsSettings,
+
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub custom: BTreeMap<String, UTF8CString>
@@ -266,6 +269,24 @@ impl ReplaySettings {
     /// 60 fps is used for every console.
     pub fn max_frames_per_blob(&self) -> u64 {
         u64::from(self.max_recording_blob_minutes.get()).saturating_mul(60 * 60)
+    }
+}
+
+/// RAM tools settings.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct MemoryToolsSettings {
+    /// Ask before the first RAM edit or freeze of each recording (they are recorded into it).
+    #[serde(default = "MemoryToolsSettings::DEFAULT_CONFIRM_WRITES_WHILE_RECORDING")]
+    pub confirm_writes_while_recording: bool
+}
+
+impl MemoryToolsSettings {
+    const DEFAULT_CONFIRM_WRITES_WHILE_RECORDING: fn() -> bool = || true;
+}
+
+impl Default for MemoryToolsSettings {
+    fn default() -> Self {
+        Self { confirm_writes_while_recording: Self::DEFAULT_CONFIRM_WRITES_WHILE_RECORDING() }
     }
 }
 

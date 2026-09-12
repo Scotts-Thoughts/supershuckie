@@ -41,6 +41,8 @@
 #include "memory_tools_controller.hpp"
 
 #include <QProgressDialog>
+#include <QToolButton>
+#include <QMessageBox>
 #include <QThread>
 #include <QPushButton>
 #include <QCoreApplication>
@@ -143,6 +145,18 @@ MainWindow::MainWindow(): QMainWindow() {
     this->status_bar_time = new SuperShuckieTimestamp(this);
     this->status_bar->addPermanentWidget(this->status_bar_time);
     this->status_bar_time->hide();
+
+    this->frozen_state = new QToolButton(this->status_bar);
+    this->frozen_state->setAutoRaise(true);
+    this->frozen_state->setToolTip("Values frozen by the RAM tools (click to open RAM watch)");
+    this->status_bar->addPermanentWidget(this->frozen_state);
+    this->frozen_state->hide();
+    connect(this->frozen_state, &QToolButton::clicked, this, &MainWindow::do_open_ram_watch);
+
+    this->ram_modified_state = new QLabel("RAM MODIFIED");
+    this->ram_modified_state->setFixedSize(this->ram_modified_state->sizeHint());
+    this->status_bar->addPermanentWidget(this->ram_modified_state);
+    this->ram_modified_state->hide();
 
     this->current_state = new QLabel("RECORDING");
     this->current_state->setFixedSize(this->current_state->sizeHint());
@@ -266,6 +280,7 @@ MainWindow::MainWindow(): QMainWindow() {
 
     this->memory_tools = new MemoryToolsController(this);
     this->memory_tools->restore_windows();
+    this->confirm_ram_writes->setChecked(supershuckie_frontend_memory_get_confirm_writes_while_recording(this->frontend));
 
     this->ticker.start();
 }
@@ -437,6 +452,56 @@ void MainWindow::tick() {
     }
 
     this->playback_bar->tick();
+
+    if(--this->memory_status_countdown <= 0) {
+        this->memory_status_countdown = 100;
+        this->update_memory_status();
+    }
+}
+
+void MainWindow::update_memory_status() {
+    auto frozen = supershuckie_frontend_memory_frozen_count(this->frontend);
+    if(frozen == 0) {
+        this->frozen_state->hide();
+    }
+    else {
+        this->frozen_state->setText(QString("%1 FROZEN").arg(frozen));
+        this->frozen_state->show();
+    }
+    this->unfreeze_all->setEnabled(frozen > 0);
+    bool confirm = supershuckie_frontend_memory_get_confirm_writes_while_recording(this->frontend);
+    if(this->confirm_ram_writes->isChecked() != confirm) {
+        this->confirm_ram_writes->setChecked(confirm);
+    }
+
+    auto writes = supershuckie_frontend_memory_writes_this_recording(this->frontend);
+    this->ram_modified_state->setVisible(writes > 0);
+    if(writes > 0) {
+        this->ram_modified_state->setToolTip(QString("The RAM tools wrote to memory %1 time%2 in this recording (edits and freeze restores are part of the replay)").arg(writes).arg(writes == 1 ? "" : "s"));
+    }
+}
+
+bool MainWindow::check_freezes_before_recording() {
+    auto frozen = supershuckie_frontend_memory_frozen_count(this->frontend);
+    if(frozen == 0) {
+        return true;
+    }
+    QMessageBox box(this);
+    box.setWindowTitle("Values are frozen");
+    box.setIcon(QMessageBox::Question);
+    box.setText(QString("%1 value%2 frozen by the RAM tools.").arg(frozen).arg(frozen == 1 ? " is" : "s are"));
+    box.setInformativeText("While recording, the game changing a frozen value and the freeze restoring it are written into the replay.");
+    auto *keep = box.addButton("Keep freezes", QMessageBox::AcceptRole);
+    auto *unfreeze = box.addButton("Unfreeze all and record", QMessageBox::DestructiveRole);
+    box.addButton(QMessageBox::Cancel);
+    this->stop_timer();
+    box.exec();
+    this->start_timer();
+    if(box.clickedButton() == unfreeze) {
+        supershuckie_frontend_memory_unfreeze_all(this->frontend);
+        return true;
+    }
+    return box.clickedButton() == keep;
 }
 
 void MainWindow::set_up_menu() {
@@ -782,6 +847,17 @@ void MainWindow::set_up_tools_menu() {
 
     this->tools_menu->addSeparator();
 
+    this->unfreeze_all = this->tools_menu->addAction("Unfreeze all");
+    connect(this->unfreeze_all, SIGNAL(triggered()), this, SLOT(do_unfreeze_all()));
+    this->unfreeze_all->setEnabled(false);
+
+    this->confirm_ram_writes = this->tools_menu->addAction("Ask before editing memory while recording");
+    this->confirm_ram_writes->setCheckable(true);
+    this->confirm_ram_writes->setChecked(true);
+    connect(this->confirm_ram_writes, SIGNAL(triggered()), this, SLOT(do_toggle_confirm_ram_writes()));
+
+    this->tools_menu->addSeparator();
+
     auto *open_tables = this->tools_menu->addAction("Open character tables folder");
     connect(open_tables, SIGNAL(triggered()), this, SLOT(do_open_tables_folder()));
 
@@ -799,6 +875,15 @@ void MainWindow::do_open_ram_search() {
     if(this->memory_tools != nullptr) {
         this->memory_tools->open_search();
     }
+}
+
+void MainWindow::do_unfreeze_all() {
+    supershuckie_frontend_memory_unfreeze_all(this->frontend);
+    this->update_memory_status();
+}
+
+void MainWindow::do_toggle_confirm_ram_writes() {
+    supershuckie_frontend_memory_set_confirm_writes_while_recording(this->frontend, this->confirm_ram_writes->isChecked());
 }
 
 void MainWindow::do_open_ram_watch() {
@@ -1196,6 +1281,9 @@ void MainWindow::do_record_replay() {
         this->set_title(saved);
     }
     else {
+        if(!this->check_freezes_before_recording()) {
+            return;
+        }
         char result[256];
         if(supershuckie_frontend_start_recording_replay(this->frontend, nullptr, result, sizeof(result))) {
             char fmt[512];
@@ -1240,6 +1328,10 @@ void MainWindow::do_load_game() {
 void MainWindow::do_resume_replay() {
     char result[512];
     bool ok;
+
+    if(!this->check_freezes_before_recording()) {
+        return;
+    }
 
     if(supershuckie_frontend_get_replay_state(this->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Playback) {
         // Watching a replay: resume from the frame currently being played back, no prompts.

@@ -398,6 +398,80 @@ char *supershuckie_frontend_watch_parse_address(const struct SuperShuckieFronten
 /** Format address JSON as text. Returns the bytes needed including the NUL. */
 size_t supershuckie_frontend_watch_format_address(const struct SuperShuckieFrontendRaw *frontend, const char *json, char *out, size_t out_len);
 
+
+/* ----------------------------------------------------------------------------------------------
+ * Editing and freezing
+ *
+ * Edits are applied at the next frame boundary and frozen values are restored after every frame
+ * on which the game changed them. Both go through the emulator's recorded write path: while
+ * recording they are written into the replay (a freeze only on frames where it had to restore the
+ * value). They are refused during replay playback, where freezes are suspended.
+ * ------------------------------------------------------------------------------------------- */
+
+/** Whether memory can be written right now; otherwise the reason is written to `reason`. */
+bool supershuckie_frontend_memory_can_write(const struct SuperShuckieFrontendRaw *frontend, char *reason, size_t reason_len);
+
+/** Whether to ask the user before the next write (a recording is running and they have not confirmed yet). */
+bool supershuckie_frontend_memory_needs_record_confirmation(const struct SuperShuckieFrontendRaw *frontend);
+
+/** The user agreed to write into the current recording. `dont_ask_again` turns the question off. */
+void supershuckie_frontend_memory_confirm_record_writes(struct SuperShuckieFrontendRaw *frontend, bool dont_ask_again);
+
+bool supershuckie_frontend_memory_get_confirm_writes_while_recording(const struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_memory_set_confirm_writes_while_recording(struct SuperShuckieFrontendRaw *frontend, bool confirm);
+
+/** Edits and freeze restores written into the current recording (0 when not recording). */
+uint64_t supershuckie_frontend_memory_writes_this_recording(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Write `length` bytes (at most 4096) at `address`, reached through `offset_count` pointer offsets
+ * (null/0 for a plain address). Writing exactly over an active freeze changes the frozen value.
+ * The result arrives later: failures show up in supershuckie_frontend_memory_edit_message().
+ */
+bool supershuckie_frontend_memory_write(struct SuperShuckieFrontendRaw *frontend, uint32_t address, const int32_t *offsets, size_t offset_count, const uint8_t *data, size_t length, char *error, size_t error_len);
+
+/**
+ * Freeze a value at `address` (with pointer offsets) as a watch in `group` (the existing watch for
+ * that address and size is used if there is one). Returns the watch id, or 0 with a message.
+ */
+uint32_t supershuckie_frontend_memory_freeze(
+    struct SuperShuckieFrontendRaw *frontend,
+    uint32_t address,
+    const int32_t *offsets,
+    size_t offset_count,
+    uint32_t value_type,
+    uint8_t size,
+    bool big_endian,
+    const uint8_t *value,
+    size_t length,
+    const char *group,
+    char *error,
+    size_t error_len
+);
+
+/** Freeze watch `id` at `value` (null: the value it was last frozen at) or unfreeze it. */
+bool supershuckie_frontend_watch_set_frozen(struct SuperShuckieFrontendRaw *frontend, uint32_t id, bool frozen, const uint8_t *value, size_t length, char *error, size_t error_len);
+
+void supershuckie_frontend_memory_unfreeze_all(struct SuperShuckieFrontendRaw *frontend);
+
+uint32_t supershuckie_frontend_memory_frozen_count(const struct SuperShuckieFrontendRaw *frontend);
+
+/** Addresses and lengths of active freezes (for highlighting). Returns how many (with null arrays: the total). */
+size_t supershuckie_frontend_memory_frozen_ranges(const struct SuperShuckieFrontendRaw *frontend, uint32_t *starts, uint32_t *lengths, size_t capacity);
+
+/** How many frames watch `id`'s freeze had to restore its value on, and whether its address resolves. False if not frozen. */
+bool supershuckie_frontend_watch_freeze_status(const struct SuperShuckieFrontendRaw *frontend, uint32_t id, uint32_t *restores, bool *resolved);
+
+bool supershuckie_frontend_memory_can_undo(const struct SuperShuckieFrontendRaw *frontend);
+bool supershuckie_frontend_memory_can_redo(const struct SuperShuckieFrontendRaw *frontend);
+
+/** Undo/redo the last edit or freeze change (one history shared by all tool windows). */
+bool supershuckie_frontend_memory_undo(struct SuperShuckieFrontendRaw *frontend, char *error, size_t error_len);
+bool supershuckie_frontend_memory_redo(struct SuperShuckieFrontendRaw *frontend, char *error, size_t error_len);
+
+/** A message about an edit that failed after it was sent (cleared when read). */
+bool supershuckie_frontend_memory_edit_message(struct SuperShuckieFrontendRaw *frontend, char *out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif
