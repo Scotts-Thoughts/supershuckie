@@ -296,6 +296,9 @@ pub enum PacketDiscriminator {
     /// Modify the value of a counter
     IncrementCounter = 0xF6,
 
+    /// Describes a keyframe with a region diff (format v4)
+    RegionDeltaKeyframe = 0xF7,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -375,6 +378,7 @@ impl Packet {
             Packet::Bookmark { .. } => PacketDiscriminator::Bookmark as u8,
             Packet::Keyframe { .. } => PacketDiscriminator::Keyframe as u8,
             Packet::DeltaKeyframe { .. } => PacketDiscriminator::DeltaKeyframe as u8,
+            Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframe as u8,
             Packet::CompressedBlob { .. } => PacketDiscriminator::CompressedBlob as u8,
             Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8
         }
@@ -445,6 +449,13 @@ impl PacketIO<'_> for Packet {
             Packet::DeltaKeyframe { diff, metadata } => {
                 commands.extend(metadata.write_packet_instructions());
                 commands.extend(diff.write_packet_instructions());
+            },
+
+            Packet::RegionDeltaKeyframe { metadata, state_len, control, data } => {
+                commands.extend(metadata.write_packet_instructions());
+                commands.extend(state_len.write_packet_instructions());
+                commands.extend(control.write_packet_instructions());
+                commands.extend(data.write_packet_instructions());
             },
 
             Packet::Bookmark { metadata } => {
@@ -518,6 +529,12 @@ impl PacketIO<'_> for Packet {
             PacketDiscriminator::WriteMemoryVar => Ok(Packet::WriteMemory { address: UnsignedInteger::read_all(from, version)?, data: ByteVec::read_all(from, version)? }),
             PacketDiscriminator::Keyframe => Ok(Packet::Keyframe { metadata: KeyframeMetadata::read_all(from, version)?, state: ByteVec::read_all(from, version)? }),
             PacketDiscriminator::DeltaKeyframe => Ok(Packet::DeltaKeyframe { metadata: KeyframeMetadata::read_all(from, version)?, diff: Vec::read_all(from, version)? }),
+            PacketDiscriminator::RegionDeltaKeyframe => Ok(Packet::RegionDeltaKeyframe {
+                metadata: KeyframeMetadata::read_all(from, version)?,
+                state_len: UnsignedInteger::read_all(from, version)?,
+                control: ByteVec::read_all(from, version)?,
+                data: ByteVec::read_all(from, version)?
+            }),
             PacketDiscriminator::Bookmark => Ok(Packet::Bookmark { metadata: BookmarkMetadata::read_all(from, version)? }),
             PacketDiscriminator::ChangeSpeed => Ok(Packet::ChangeSpeed { speed: Speed::read_all(from, version)? }),
             PacketDiscriminator::CompressedBlob => Ok(Packet::CompressedBlob {
@@ -609,5 +626,97 @@ impl PacketIO<'_> for Counter {
             name: String::read_all(from, version)?,
             value: SignedInteger::read_all(from, version)?
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay_file::REPLAY_VERSION;
+    use crate::test_support::{bv, ib};
+    use alloc::vec;
+
+    fn serialize(packet: &Packet) -> Vec<u8> {
+        let mut out = Vec::new();
+        for command in packet.write_packet_instructions() {
+            out.extend_from_slice(command.bytes());
+        }
+        out
+    }
+
+    fn round_trip(packet: &Packet, version: u32) -> Packet {
+        let bytes = serialize(packet);
+        let mut slice = bytes.as_slice();
+        let read = Packet::read_all(&mut slice, version).expect("read_all");
+        assert!(slice.is_empty(), "trailing bytes after {packet:?}");
+        read
+    }
+
+    #[test]
+    fn region_delta_keyframe_round_trips() {
+        let metadata = KeyframeMetadata {
+            input: ib(&[0xAB, 0xCD, 0xEF]),
+            speed: Speed::from_multiplier_float(1.5),
+            elapsed_frames: 123_456,
+            elapsed_millis: 2_000_000_000.into(),
+            counters: vec![Counter { name: "deaths".into(), value: -7 }, Counter { name: "x".into(), value: i64::MAX }],
+        };
+
+        let packet = Packet::RegionDeltaKeyframe {
+            metadata: metadata.clone(),
+            state_len: 19_000_000,
+            control: bv(&[0x85, 0x02, 0x03, 0x00, 0x01]),
+            data: bv(&[7u8; 16]),
+        };
+        assert_eq!(serialize(&packet)[0], PacketDiscriminator::RegionDeltaKeyframe as u8);
+        assert_eq!(round_trip(&packet, REPLAY_VERSION), packet);
+
+        // Empty streams (a keyframe identical to its predecessor) survive too.
+        let empty = Packet::RegionDeltaKeyframe { metadata, state_len: 0, control: bv(&[]), data: bv(&[]) };
+        assert_eq!(round_trip(&empty, REPLAY_VERSION), empty);
+    }
+
+    #[test]
+    fn all_packet_kinds_round_trip() {
+        let metadata = KeyframeMetadata { input: ib(&[1]), speed: Speed::default(), elapsed_frames: 9, elapsed_millis: 10.into(), counters: vec![] };
+        let packets = vec![
+            Packet::NoOp,
+            Packet::NextFrame { timestamp_delta: 17.into() },
+            Packet::WriteMemory { address: 0xC000, data: bv(&[1]) },
+            Packet::WriteMemory { address: 0xC000, data: bv(&[1, 2]) },
+            Packet::WriteMemory { address: 0xC000, data: bv(&[1, 2, 3, 4]) },
+            Packet::WriteMemory { address: 0xC000, data: bv(&[1, 2, 3]) },
+            Packet::ChangeInput { data: ib(&[1]) },
+            Packet::ChangeInput { data: ib(&[1, 2]) },
+            Packet::ChangeInput { data: ib(&[1, 2, 3, 4]) },
+            Packet::ChangeInput { data: ib(&[1, 2, 3, 4, 5]) },
+            Packet::ChangeSpeed { speed: Speed::from_multiplier_float(0.25) },
+            Packet::ResetConsole,
+            Packet::LoadSaveState { state: bv(&[9; 100]) },
+            Packet::Bookmark { metadata: BookmarkMetadata { name: "b".into(), elapsed_frames: 1, elapsed_millis: 2.into() } },
+            Packet::Keyframe { metadata: metadata.clone(), state: bv(&[3; 33]) },
+            Packet::DeltaKeyframe { metadata: metadata.clone(), diff: vec![0, 1 << 32 | 5, u64::MAX] },
+            Packet::RegionDeltaKeyframe { metadata: metadata.clone(), state_len: 33, control: bv(&[0, 1]), data: bv(&[1, 2, 3, 4]) },
+            Packet::CompressedBlob {
+                keyframes: vec![metadata.clone()],
+                bookmarks: vec![],
+                compressed_data: bv(&[1, 2, 3]),
+                uncompressed_size: 300,
+                timestamp_start: 1.into(),
+                timestamp_end: 2.into(),
+                elapsed_frames_start: 3,
+                elapsed_frames_end: 4,
+            },
+            Packet::IncrementCounter { name: "c".into(), delta: -1 },
+        ];
+        for packet in &packets {
+            assert_eq!(&round_trip(packet, REPLAY_VERSION), packet);
+        }
+    }
+
+    #[test]
+    fn unknown_discriminator_is_a_parse_failure() {
+        let mut slice: &[u8] = &[0xF8, 0, 0];
+        assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 }

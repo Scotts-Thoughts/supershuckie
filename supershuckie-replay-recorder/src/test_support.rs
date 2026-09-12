@@ -337,6 +337,7 @@ fn describe(p: &Packet) -> String {
     match p {
         Packet::Keyframe { metadata, state } => alloc::format!("Keyframe(frame {}, {} bytes)", metadata.elapsed_frames, state.len()),
         Packet::DeltaKeyframe { metadata, .. } => alloc::format!("DeltaKeyframe(frame {})", metadata.elapsed_frames),
+        Packet::RegionDeltaKeyframe { metadata, .. } => alloc::format!("RegionDeltaKeyframe(frame {})", metadata.elapsed_frames),
         Packet::CompressedBlob { .. } => "CompressedBlob".to_string(),
         other => alloc::format!("{other:?}"),
     }

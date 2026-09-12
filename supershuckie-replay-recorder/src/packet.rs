@@ -97,14 +97,29 @@ pub enum Packet {
         state: ByteVec
     },
 
-    /// Adds a diffed keyframe so the replay can be scanned faster.
+    /// Adds a diffed keyframe so the replay can be scanned faster (format v2/v3 encoding).
     ///
-    /// The player will automatically convert these into regular keyframes using
-    /// (`apply_diff`)[`crate::util::apply_diff`].
+    /// The player materialises these into regular keyframes on demand using
+    /// [`apply_diff`](crate::util::apply_diff); readers never see one. New files use
+    /// [`Packet::RegionDeltaKeyframe`] instead.
     #[allow(missing_docs)]
     DeltaKeyframe {
         metadata: KeyframeMetadata,
         diff: Vec<UnsignedInteger>
+    },
+
+    /// A keyframe stored as a [region diff](crate::util::region_diff) against the previous
+    /// keyframe in the same chain (top-level stream or blob); format v4.
+    ///
+    /// The player materialises it on demand (see `playback::ChainState`), so readers only ever
+    /// see [`Packet::Keyframe`]. `state_len` is the length of the materialised state and lets the
+    /// reader validate the delta before applying it.
+    #[allow(missing_docs)]
+    RegionDeltaKeyframe {
+        metadata: KeyframeMetadata,
+        state_len: UnsignedInteger,
+        control: ByteVec,
+        data: ByteVec
     },
 
     /// Describes a compressed blob of memory.

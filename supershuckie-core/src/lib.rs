@@ -296,7 +296,9 @@ impl SuperShuckieCore {
                                 let _ = self.core.load_save_state(state.as_slice());
                             }
                         }
-                        Packet::DeltaKeyframe { .. } => {},
+                        // The player materialises every delta variant into a Keyframe before
+                        // handing it out; these arms are unreachable in practice.
+                        Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } => {},
                         Packet::CompressedBlob { .. } => unreachable!("compressed blob"),
                         Packet::IncrementCounter { name, delta } => {
                             self.change_replay_counter_map(&name, *delta);

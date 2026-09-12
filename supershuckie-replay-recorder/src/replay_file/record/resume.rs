@@ -268,10 +268,12 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                     Action::IncrementCounter(name.clone(), *delta)
                 }
                 Packet::NoOp => Action::Skip,
-                Packet::DeltaKeyframe { .. } | Packet::CompressedBlob { .. } => {
+                Packet::DeltaKeyframe { .. }
+                | Packet::RegionDeltaKeyframe { .. }
+                | Packet::CompressedBlob { .. } => {
                     return Err(ReplayResumeError::BadSource {
                         explanation: Cow::Borrowed(
-                            "unexpected DeltaKeyframe/CompressedBlob from player",
+                            "unexpected delta keyframe/compressed blob from player (should have been materialised)",
                         ),
                     })
                 }
