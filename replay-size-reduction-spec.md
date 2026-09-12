@@ -421,3 +421,33 @@ Unit tests live next to the code (the crate has `// TODO: WRITE UNIT TESTS` mark
 | `ReplaySettings::{max_recording_blob_minutes, mask_transient_buffers, zstd_compression_level}` | `supershuckie-frontend/src/settings.rs` | JSON settings |
 | `build_resumed_recorder` / new `build_reencoded_recorder`, `prime_and_refeed` | `record/resume.rs` | re-feed engine reused by the converter |
 | `supershuckie-replay-convert` | `src/bin/` (new) | offline v3 → v4 |
+
+---
+
+## 13. Results (implemented 2026-09-11, branch `resume-from-replay`)
+
+Everything in §5-§7 landed (commits `38a3f86..3aa955a`); the optional items of §11 step 8
+(incremental zstd, mmap-backed blob slices) were not done. Measured with `supershuckie-replay-convert`
+on the §2 sample files, every run passing `--verify`:
+
+| Sample | v3 | Phase 1 (`--no-masks`, bit-exact) | Phase 1 + 2 (masks) | Acceptance (§10) |
+|---|---|---|---|---|
+| Emerald `e-geodude-1-20359` | 115.2 MiB | 52.4 MiB (2.20x) | 23.6 MiB (4.88x) | <= 62 / <= 28 MiB |
+| HeartGold `h-ampharos-line-1-21318` | 2.3 GiB | 353.7 MiB (6.57x) | 191.6 MiB (12.1x) | <= 620 / <= 420 MiB |
+| White 2 `w-butterfree-line-1-22109` | 3.1 GiB | (not run) | 278.2 MiB (11.4x) | <= 1.05 GiB / <= 620 MiB |
+
+NDS lands well below the §2 projections because `compress_data` now gives blobs above 8 MiB a
+128 MiB window plus long-distance matching, so the near-identical replacement bytes of consecutive
+keyframe deltas (the 3D banks especially) match across the whole chain.
+
+Conversion cost: ~20 ms per NDS keyframe, i.e. ~5 min + ~5.5 min verify for a 2h15 NDS replay
+(Emerald: 9 s + 9 s). Files convert independently, so batch the archive several processes at a time
+(each needs RAM ~= its input size).
+
+Seek latency (`examples/seek_bench.rs`, converted HeartGold): cold seek into another 15-minute
+chain 110-175 ms, forward hop within the chain 8-10 ms; masked file 54 ms average over mixed seeks.
+
+Not verified in the app (the production instance was running and owns the REST port, so no second
+instance was driven): §9.9's manual checks — scrub across blob boundaries, play through a keyframe
+with resync on, resume from the middle, export a short video, and step frame-by-frame after a seek
+on a masked NDS file looking for 3D artefacts.

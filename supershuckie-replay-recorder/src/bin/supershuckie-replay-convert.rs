@@ -253,11 +253,11 @@ fn check_states(console: ReplayConsoleType, masks: bool, frame: UnsignedInteger,
     let masked = if masks { transient_ranges(console, source) } else { Vec::new() };
     let mut offset = 0usize;
     for range in masked.iter().chain(core::iter::once(&(source.len()..source.len()))) {
-        let live = offset..range.start.min(source.len());
+        let live = offset..range.start.clamp(offset, source.len());
         if let Some(at) = source[live.clone()].iter().zip(&output[live.clone()]).position(|(a, b)| a != b) {
             return Err(format!("keyframe state differs at frame {frame}, byte 0x{:X}", live.start + at));
         }
-        offset = range.end.max(offset);
+        offset = range.end.clamp(offset, source.len());
     }
     Ok(())
 }
