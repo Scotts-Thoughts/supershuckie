@@ -109,6 +109,14 @@ second instance run in lockstep with it (SameBoy's joypad-bounce emulation would
 with the sample rate); `supershuckie-core/examples/gb_audio_check.rs` and `nds_bench --audio
 --verify` are the checks for this.
 
+## RAM tools
+
+The **Tools** menu has a live RAM viewer (with a tab per memory region), a RAM search, a RAM watch
+list with change logging and pause conditions, and memory editing and freezing, all in separate
+windows. They use the same addresses as Poke-A-Byte and cost next to nothing while the game runs;
+edits and freezes made while recording are part of the replay. See
+[docs/ram_tools.md](docs/ram_tools.md).
+
 ## Converting old replays
 
 Replays recorded before format v4 (September 2026) can be re-encoded offline into the current

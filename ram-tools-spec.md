@@ -11,6 +11,92 @@
 
 ---
 
+## 0. Status: implemented (2026-09-12)
+
+Implemented on branch `ram-tools` in five phase commits plus fixes (§9's phases 1-5; phase 6's docs are
+`docs/ram_tools.md` and a README section; REST exposure is still a follow-up, per §12.4). User guide:
+`docs/ram_tools.md`.
+
+### Where it differs from this plan
+
+* **§2.4 problem 1 was overstated.** Poke-A-Byte freezes did not record many writes per frame: paced
+  cores report zero-frame runs while waiting for the next frame, which sets `mid_frame`, and
+  `handle_pokeabyte_integration` returns early then. The real behaviour was one recorded `WriteMemory`
+  per frozen address **on every frame, whether or not anything had changed the value** (plus
+  occasional doubles). The fix (§4.3: once per frame, only when the bytes differ) stands; measured with
+  a Poke-A-Byte UDP client in `ram_tools_smoke`, a freeze on a byte the game leaves alone now records 1
+  write over 240 frames instead of 240. Problems 2 and 3 were as described.
+* **GBC WRAM regions.** `0xC000-0xDFFF` is `RAM[0x0000..0x2000]`, i.e. banks 0 and 1 (bank 1 always,
+  not "the switchable bank"), and `0x10000` continues with banks 2-7 (`0x10000-0x15FFF` on a Game Boy
+  Color, absent on a Game Boy). §2.3's "8 KiB each / switchable bank" wording was wrong; the address
+  mapping itself is unchanged for Poke-A-Byte.
+* **Also fixed on the write path:** `flush_writes` recorded a `WriteMemory` even when the core refused
+  the write, creating replays that older builds crash on; only successful writes are recorded now.
+* **Samples are also taken while values are frozen** (the restore counts come with samples); freeze
+  restores never force an extra sample.
+* **Sample generations continue across cores** (a new core's monitor half starts after the shared
+  generation), so the UI keeps receiving samples after a ROM switch.
+* **Watch files** store addresses and frozen values as hex strings; watches are exchanged over the C API
+  as JSON as planned.
+* **Undo** covers edits (using the exact old bytes the core reports) and freeze changes, capped at 1000
+  steps, shared by all tool windows (Ctrl+Z / Ctrl+Shift+Z).
+
+### Measurements (this Mac: Apple Silicon, melonDS without LTO/PGO, White 2 intro, no replay)
+
+`nds_bench --present-every 4`, monitor serviced after every frame:
+
+| Configuration | Monitor cost per frame | Share of emulation time |
+|---|---|---|
+| Attached, idle request | 0.2 µs | 0.004 % |
+| 16 KiB window + 128 probes at 30 Hz | 0.8 µs (p99 8.2 µs) | 0.02 % |
+| 64 traced watches | 1.8 µs | 0.045 % |
+| 256 freezes, restoring every frame | 1.6 µs | 0.06 % |
+| 4 KiB window + 128 probes + 64 traces + 16 freezes | 3.1 µs (464 samples in ~16 s: 30 Hz) | 0.11 % |
+| Full 4 MiB snapshot (per search step) | 0.13 ms mean, 0.43 ms max (first, before buffer reuse) | — |
+
+`ram_tools_pacing` (the real threaded core loop, every run from the same save state, two viewers,
+visible watch and search rows, 10 traced watches, 16 freezes):
+
+| Workload | Without tools | With tools |
+|---|---|---|
+| NDS at 4x (this Mac cannot hold 4x here) | 219.3 fps, 4.833 ms, 64.4 % over budget | 219.5 fps, 4.822 ms, 65.1 % over budget |
+| NDS at 2x | 120.0 fps, 4.297 ms, 0 % over budget | 120.0 fps, 4.274 ms, 0 % over budget |
+| GBA at 4x | 239.0 fps, 1.425 ms, 0.48 % over budget | 239.0 fps, 1.442 ms, 0.59 % over budget |
+
+Search engine: an unknown-value scan of 4 MiB takes 13 ms and a "changed" refinement 1 ms on the worker
+thread. A scan while paused completes about 3 ms after it is requested (the paused core thread is woken).
+
+### Tests
+
+* `supershuckie-memory-tools`: 21 unit tests (addresses, values and BCD, patterns, `.tbl` tables, the
+  search engine against a brute-force reference over random data and scan sequences, paging, undo,
+  watch files and pointer paths).
+* `supershuckie-core` `memory_monitor`: 10 unit tests on a fake core (samples, pointer paths, traces
+  and discontinuities, pause conditions, freezes, edits and failures, snapshots, limits).
+* `supershuckie-core/examples/ram_tools_smoke.rs` on Crystal (GBC), FireRed (GBA) and White 2 (NDS):
+  regions agree with `read_ram` and keep every Poke-A-Byte address; pause conditions fire on the exact
+  frame; a recording with a freeze and an edit plays back identically with one `WriteMemory` per restore;
+  seeks are discontinuities; writes during playback are refused and do not land on detach; unmappable
+  replay writes are skipped; the threaded core samples, pauses on a condition and answers a woken request
+  within about a millisecond; Poke-A-Byte freezes write at most once per frame and only when changed.
+* `supershuckie-frontend/examples/memory_tools_smoke.rs`: viewer samples, search scans and refinements
+  (running and paused), visible values, undo/redo, watches with traces, pause conditions and the trace
+  cap, edits with undo/redo, freezes holding a value and taking edits, and watch lists saved and reloaded
+  per game.
+* The Qt tool windows were checked on screen (viewer with region tabs, live highlighting and inspector;
+  search; watch with a pointer path resolving live).
+
+### Known limitations
+
+* Freezes and edits happen between frames; a game can see its own value within a frame (§8.1).
+* Games that copy their palette buffer into palette RAM every frame (Pokémon on the GBA among them)
+  overwrite palette edits and freezes immediately.
+* On macOS, `scripts/build-melonds.sh` passes `-ffat-lto-objects`, which Apple's clang rejects, and
+  Homebrew Qt's CMake asks for the AGL framework that the macOS 26 SDK no longer has. Neither is part of
+  this change; this build used melonDS without LTO and `-DWrapOpenGL_AGL=…/OpenGL.framework`.
+
+---
+
 ## 1. Goal
 
 Five capabilities. All of them work while the game runs, while it's paused, and (read-only) during replay playback:

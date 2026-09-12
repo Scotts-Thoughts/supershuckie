@@ -404,6 +404,116 @@ fn check_gba_palette(rom: &[u8]) {
     core.enqueue_write(0x0500_0000, ByteVec::from(&palette[..]));
 }
 
+/// Poke-A-Byte freezes write (and record) at most once per frame, and only when the game changed the
+/// value: one on a byte the game keeps changing writes about once per frame, one on a byte it
+/// leaves alone writes once. Talks to the integration server over its UDP protocol like the
+/// Poke-A-Byte client does.
+fn check_pokeabyte_freeze(console: Console, rom: &[u8]) {
+    use std::net::UdpSocket;
+
+    // The freeze below covers roughly frames 60-300 of the threaded core; find a byte the game keeps
+    // changing over that stretch.
+    let mut probe = make_core(console, rom);
+    for _ in 0..60 {
+        run_frame(&mut probe);
+    }
+    let before = all_memory(probe.get_core());
+    let (busy, changes) = busiest_byte(&mut probe, 240);
+    assert!(changes >= 200, "{console:?}: need a byte the game changes nearly every frame ({changes}/240)");
+    // A byte in the busy byte's region that stayed the same the whole time (and is not 0xA5).
+    let after = all_memory(probe.get_core());
+    let regions = probe.get_core().memory_regions().to_vec();
+    let mut offset = 0usize;
+    let mut quiet = None;
+    for (index, region) in regions.iter().enumerate() {
+        let len = probe.get_core().memory_region_data(index).map(|d| d.len()).unwrap_or(0);
+        if region.offset_of(busy, 1).is_some() {
+            let i = (busy - region.base_address) as usize / 2;
+            quiet = (i..len).chain(0..i).find(|i| before[offset + i] == after[offset + i] && after[offset + i] != 0xA5).map(|i| region.base_address + i as u32);
+        }
+        offset += len;
+    }
+    drop(probe);
+    let quiet = quiet.expect("a byte that does not change");
+
+    let core = ThreadedSuperShuckieCore::new(make_emulator(console, rom));
+    core.set_speed(supershuckie_core::Speed::from_multiplier_float(1.0));
+    while core.get_elapsed_time().frames < 55 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if let Err(e) = core.set_pokeabyte_enabled(true) {
+        println!("  skipping the Poke-A-Byte check: {e}");
+        return
+    }
+    let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let server = "127.0.0.1:55356";
+
+    let header = |instruction: u8| {
+        let mut h = vec![0u8; 32];
+        h[0] = 1;
+        h[4] = instruction;
+        h
+    };
+
+    // Setup: one 16-byte read block around the busy byte.
+    let mut setup = header(2);
+    setup.resize(0x20 + 0xC * 128, 0);
+    setup[8..12].copy_from_slice(&1u32.to_le_bytes());
+    setup[12..16].copy_from_slice(&(-1i32).to_le_bytes());
+    setup[32..36].copy_from_slice(&0u32.to_le_bytes());
+    setup[36..40].copy_from_slice(&busy.to_le_bytes());
+    setup[40..44].copy_from_slice(&16u32.to_le_bytes());
+    client.send_to(&setup, server).expect("send setup");
+    let mut response = [0u8; 64];
+    let (len, _) = client.recv_from(&mut response).expect("setup response");
+    assert!(len >= 32 && response[4] == 2 && response[5] == 1, "unexpected setup response");
+
+    let replay_path = std::env::temp_dir().join("supershuckie-ram-tools-smoke").join(format!("{console:?}-pokeabyte.replay"));
+    let temp_path = replay_path.with_extension("temp.replay");
+    std::fs::create_dir_all(replay_path.parent().unwrap()).unwrap();
+    core.start_recording_replay(PartialReplayRecordMetadata {
+        rom_name: "pokeabyte".into(),
+        rom_filename: "pokeabyte".into(),
+        settings: record_settings(),
+        patch_format: ReplayPatchFormat::Unpatched,
+        patch_target_checksum: Default::default(),
+        patch_data: ByteVec::new(),
+        frames_per_keyframe: NonZeroU64::new(120).unwrap(),
+        final_file: BufWriter::new(File::create(&replay_path).expect("create final")),
+        temp_file: BufWriter::new(File::create(&temp_path).expect("create temp")),
+    });
+
+    for (address, value) in [(busy, 0x5Au8), (quiet, 0xA5u8)] {
+        let mut freeze = header(4);
+        freeze.resize(0x21, 0);
+        freeze[8..16].copy_from_slice(&(address as u64).to_le_bytes());
+        freeze[16..20].copy_from_slice(&1u32.to_le_bytes());
+        freeze[0x20] = value;
+        client.send_to(&freeze, server).expect("send freeze");
+    }
+
+    std::thread::sleep(Duration::from_secs(4));
+    let mut close = header(0xFF);
+    close.resize(32, 0);
+    let _ = client.send_to(&close, server);
+    assert!(core.stop_recording_replay(), "{console:?}: recording closed");
+    let _ = core.set_pokeabyte_enabled(false);
+    drop(core);
+
+    let bytes = std::fs::read(&replay_path).expect("read replay");
+    let frames = ReplayFilePlayer::new(&bytes, false).expect("parse").get_total_frames();
+    let (writes, _) = count_writes(&bytes, busy);
+    let (quiet_writes, _) = count_writes(&bytes, quiet);
+    println!("  Poke-A-Byte freezes over {frames} frames: {writes} writes to a byte the game keeps changing, {quiet_writes} to one it leaves alone");
+    assert!(frames > 60, "{console:?}: the recording is too short to judge");
+    assert!(writes > frames / 2, "{console:?}: the game should have fought the freeze on most frames ({writes} writes)");
+    assert!(writes <= frames + 1, "{console:?}: Poke-A-Byte freezes wrote more than once per frame ({writes} over {frames} frames)");
+    // Before the fix Poke-A-Byte freezes wrote (and recorded) on every frame whether or not anything
+    // had changed the value.
+    assert!(quiet_writes <= frames / 10, "{console:?}: a freeze on a value the game rarely touches kept writing ({quiet_writes} writes)");
+}
+
 /// The threaded core services an attached monitor, pauses on a condition and wakes early.
 fn check_threaded(console: Console, rom: &[u8]) {
     let mut probe = make_core(console, rom);
@@ -505,6 +615,7 @@ fn main() {
             check_gba_palette(&rom);
         }
         check_threaded(console, &rom);
+        check_pokeabyte_freeze(console, &rom);
     }
     println!("all checks passed");
 }
