@@ -53,6 +53,8 @@ pub enum ReplayResumeError {
     Write(ReplayFileWriteError),
     /// Reading/seeking the source failed.
     Read(ReplaySeekError),
+    /// The progress callback asked to stop.
+    Cancelled,
 }
 
 /// Build a recorder primed to continue from `resume_at_frame` (`None` = end of replay).
@@ -114,7 +116,7 @@ pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
     };
 
     let end_mode = target == total;
-    let resume_info = prime_and_refeed(&mut recorder, source, start_frame, target, end_mode, &mut |_, _| {})?;
+    let resume_info = prime_and_refeed(&mut recorder, source, start_frame, target, end_mode, &mut |_, _| true)?;
 
     Ok((recorder, resume_info))
 }
@@ -130,7 +132,8 @@ const VERBATIM_COPY_MINIMUM_VERSION: u32 = 3;
 /// metadata, patch data and crop/timer markers ride through unchanged (this is
 /// [`ResumeCropPolicy::PreserveAll`]).
 ///
-/// `progress(frames_done, total_frames)` is called at every re-fed keyframe.
+/// `progress(frames_done, total_frames)` is called at every re-fed keyframe; returning `false`
+/// from it stops the re-encode with [`ReplayResumeError::Cancelled`].
 ///
 /// Read errors in the source abort the conversion unless `tolerate_read_errors` is set, in which
 /// case the output simply ends at the last readable packet (the frame total will be shorter than
@@ -143,7 +146,7 @@ pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
     tolerate_read_errors: bool,
     final_sink: FS,
     temp_sink: TS,
-    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger),
+    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
 ) -> Result<(ReplayFileRecorder<FS, TS>, ResumeInfo), ReplayResumeError> {
     let total = source.get_total_frames();
     let metadata = source.get_replay_metadata().clone();
@@ -236,14 +239,14 @@ fn copy_completed_blobs_before_boundary<FS: ReplayFileSink, TS: ReplayFileSink>(
 /// With `tolerate_read_errors`, a read error in the source ends the re-feed gracefully instead of
 /// failing (resume uses this when resuming from the very end, the converter only when asked).
 ///
-/// `progress(frames_done, target)` is called at every re-fed keyframe.
+/// `progress(frames_done, target)` is called at every re-fed keyframe; `false` cancels.
 fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     recorder: &mut ReplayFileRecorder<FS, TS>,
     source: &mut ReplayFilePlayer,
     start_frame: UnsignedInteger,
     target: UnsignedInteger,
     tolerate_read_errors: bool,
-    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger),
+    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
 ) -> Result<ResumeInfo, ReplayResumeError> {
     source.go_to_keyframe(start_frame).map_err(ReplayResumeError::Read)?;
 
@@ -278,7 +281,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     recorder
         .insert_keyframe(state0, kf0.elapsed_millis)
         .map_err(ReplayResumeError::Write)?;
-    progress(kf0.elapsed_frames, target);
+    if !progress(kf0.elapsed_frames, target) {
+        return Err(ReplayResumeError::Cancelled);
+    }
 
     let mut running_ms: u64 = kf0.elapsed_millis.0;
     let mut cur_frames: u64 = kf0.elapsed_frames;
@@ -389,7 +394,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 recorder
                     .insert_keyframe(state, elapsed_millis)
                     .map_err(ReplayResumeError::Write)?;
-                progress(cur_frames, target);
+                if !progress(cur_frames, target) {
+                    return Err(ReplayResumeError::Cancelled);
+                }
             }
             Action::IncrementCounter(name, delta) => {
                 recorder
@@ -783,6 +790,7 @@ mod tests {
                 &mut |done, total| {
                     assert!(done <= total);
                     progress_calls += 1;
+                    true
                 },
             )
             .unwrap();
@@ -827,7 +835,7 @@ mod tests {
         let (source, _) = recorder.close().unwrap();
 
         let mut player = ReplayFilePlayer::new(&source, false).unwrap();
-        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| {}).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
 
         let out = ReplayFilePlayer::new(&bytes, false).unwrap();
@@ -851,10 +859,31 @@ mod tests {
         let intact_total = player.get_total_frames();
         assert!(intact_total < TOTAL_FRAMES);
 
-        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| {}).unwrap();
+        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
         assert_eq!(info.elapsed_frames, intact_total);
         assert_eq!(ReplayFilePlayer::new(&bytes, false).unwrap().get_total_frames(), intact_total);
+    }
+
+    #[test]
+    fn reencode_can_be_cancelled_from_the_progress_callback() {
+        use crate::test_support::*;
+
+        let mut player = ReplayFilePlayer::new(V3_SMALL_CLOSED, false).unwrap();
+        let mut calls = 0;
+        let result = build_reencoded_recorder(
+            &mut player,
+            small_settings(),
+            false,
+            Vec::<u8>::new(),
+            NullReplayFileSink,
+            &mut |_, _| {
+                calls += 1;
+                calls < 5
+            },
+        );
+        assert!(matches!(result, Err(ReplayResumeError::Cancelled)));
+        assert_eq!(calls, 5);
     }
 
     #[test]

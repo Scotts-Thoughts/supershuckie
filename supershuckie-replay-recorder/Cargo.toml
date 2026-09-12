@@ -7,9 +7,9 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = []
-# The offline `supershuckie-replay-convert` binary (needs `std` and memory-mapped input files).
-convert = ["std", "dep:memmap2"]
+std = ["dep:memmap2"]
+# The offline `supershuckie-replay-convert` binary (kept as an alias of `std`).
+convert = ["std"]
 
 [dependencies]
 num_enum = { workspace = true }
@@ -21,4 +21,4 @@ memmap2 = { version = "0.9", optional = true }
 
 [[bin]]
 name = "supershuckie-replay-convert"
-required-features = ["convert"]
+required-features = ["std"]

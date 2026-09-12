@@ -16,23 +16,21 @@
 //! `supershuckie_replay_recorder::keyframe_masks`); `--no-masks` keeps every keyframe bit-exact.
 //! With masks on, `--verify` compares keyframe states outside the masked ranges.
 //!
+//! The engine lives in `supershuckie_replay_recorder::replay_file::convert` (shared with the app).
 //! Build with `cargo build --release -p supershuckie-replay-recorder --features convert`.
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use memmap2::Mmap;
-use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
-use supershuckie_replay_recorder::replay_file::record::{
-    build_reencoded_recorder, NullReplayFileSink, ReplayFileRecorderSettings, DEFAULT_MAX_FRAMES_PER_BLOB,
-    DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB, DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+use supershuckie_replay_recorder::replay_file::convert::{
+    convert_replay_file, human_duration, human_size, verify_replay_files, ConvertError, ConvertOptions, ConvertPhase,
 };
-use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
-use supershuckie_replay_recorder::replay_file::ReplayConsoleType;
-use supershuckie_replay_recorder::{Packet, UnsignedInteger};
+use supershuckie_replay_recorder::replay_file::record::{
+    ReplayFileRecorderSettings, DEFAULT_MAX_FRAMES_PER_BLOB, DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB,
+    DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+};
 
 const USAGE: &str = "\
 usage: supershuckie-replay-convert <in.replay> <out.replay> [options]
@@ -54,12 +52,8 @@ options:
 struct Args {
     input: PathBuf,
     output: PathBuf,
-    level: i32,
-    chain_frames: u64,
-    blob_bytes: usize,
-    masks: bool,
+    options: ConvertOptions,
     verify: bool,
-    allow_corruption: bool,
     force: bool,
 }
 
@@ -97,239 +91,94 @@ fn parse_args() -> Result<Args, String> {
 
     let [input, output] = <[PathBuf; 2]>::try_from(positional).map_err(|_| USAGE.to_owned())?;
 
-    Ok(Args { input, output, level, chain_frames, blob_bytes, masks, verify, allow_corruption, force })
-}
+    let options = ConvertOptions {
+        settings: ReplayFileRecorderSettings {
+            minimum_uncompressed_bytes_per_blob: blob_bytes,
+            max_frames_per_blob: chain_frames,
+            compression_level: level,
+            mask_transient_buffers: masks,
+        },
+        allow_corruption,
+    };
 
-fn map_file(path: &Path) -> Result<Mmap, String> {
-    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    // SAFETY: the file is only read, and nothing else is expected to modify a replay while it is
-    // being converted (an in-progress recording should never be converted).
-    unsafe { Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", path.display()))
-}
-
-fn open_player(path: &Path, bytes: &[u8], allow_corruption: bool) -> Result<ReplayFilePlayer, String> {
-    ReplayFilePlayer::new(bytes, allow_corruption).map_err(|e| format!("cannot parse {}: {e:?}", path.display()))
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
-}
-
-fn human_duration(millis: u64) -> String {
-    let seconds = millis / 1000;
-    format!("{}:{:02}:{:02}", seconds / 3600, (seconds / 60) % 60, seconds % 60)
-}
-
-fn describe_source(path: &Path, size: u64, player: &ReplayFilePlayer) {
-    let blobs = player.all_uncompressed_packets().iter().filter(|p| matches!(p, Packet::CompressedBlob { .. })).count();
-    let top_level = player.all_uncompressed_packets().len() - blobs;
-    let metadata = player.get_replay_metadata();
-    eprintln!(
-        "{}: format v{}, {}, {} ({}), {} frames ({}), {} keyframes, {} blobs{}",
-        path.display(),
-        player.get_replay_version(),
-        metadata.console_type,
-        metadata.rom_name,
-        human_size(size),
-        player.get_total_frames(),
-        human_duration(player.get_total_milliseconds().0),
-        player.all_keyframes().values().map(|k| k.len()).sum::<usize>(),
-        blobs,
-        if top_level > 0 { format!(" + {top_level} uncompressed top-level packets") } else { String::new() }
-    );
+    Ok(Args { input, output, options, verify, force })
 }
 
 /// Prints `<what>... N%` to stderr, at most twice a second and only when the percentage changed.
 struct ProgressReporter {
-    what: &'static str,
     started: Instant,
     last_print: Option<Instant>,
     last_percent: u64,
 }
 
 impl ProgressReporter {
-    fn new(what: &'static str, started: Instant) -> Self {
-        Self { what, started, last_print: None, last_percent: u64::MAX }
+    fn new() -> Self {
+        Self { started: Instant::now(), last_print: None, last_percent: u64::MAX }
     }
 
-    fn report(&mut self, done: u64, total: u64) {
+    fn report(&mut self, phase: ConvertPhase, done: u64, total: u64) -> bool {
         let percent = done * 100 / total.max(1);
         let due = self.last_print.is_none_or(|t| t.elapsed().as_millis() >= 500);
         if percent != self.last_percent && due {
             self.last_percent = percent;
             self.last_print = Some(Instant::now());
-            eprint!("\r{}... {percent:3}% ({done} / {total} frames, {:.0} s)", self.what, self.started.elapsed().as_secs_f64());
+            let what = match phase {
+                ConvertPhase::Converting => "converting",
+                ConvertPhase::Verifying => "verifying",
+            };
+            eprint!("\r{what}... {percent:3}% ({done} / {total} frames, {:.0} s)", self.started.elapsed().as_secs_f64());
         }
+        true
     }
 }
 
-fn convert(args: &Args) -> Result<(), String> {
-    if args.input == args.output {
-        return Err("input and output must be different files".to_owned());
-    }
-    if args.output.exists() && !args.force {
-        return Err(format!("{} already exists (use --force to overwrite)", args.output.display()));
-    }
-
-    let started = Instant::now();
-    let input_map = map_file(&args.input)?;
-    let input_size = input_map.len() as u64;
-    let mut player = open_player(&args.input, &input_map[..], args.allow_corruption)?;
-    describe_source(&args.input, input_size, &player);
-
-    let output_file = File::create(&args.output).map_err(|e| format!("cannot create {}: {e}", args.output.display()))?;
-    let output = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
-
-    let settings = ReplayFileRecorderSettings {
-        minimum_uncompressed_bytes_per_blob: args.blob_bytes,
-        max_frames_per_blob: args.chain_frames,
-        compression_level: args.level,
-        mask_transient_buffers: args.masks,
-    };
-
-    let total = player.get_total_frames().max(1);
-    let mut reporter = ProgressReporter::new("converting", started);
-    let mut progress = |frames: UnsignedInteger, _target: UnsignedInteger| reporter.report(frames, total);
-
-    let (mut recorder, info) = build_reencoded_recorder(&mut player, settings, args.allow_corruption, output, NullReplayFileSink, &mut progress)
-        .map_err(|e| format!("\nconversion failed: {e:?}"))?;
+fn run(args: &Args) -> Result<(), String> {
+    let mut reporter = ProgressReporter::new();
+    let report = convert_replay_file(&args.input, &args.output, &args.options, args.force, &mut |phase, done, total| reporter.report(phase, done, total))
+        .map_err(|e| match e {
+            ConvertError::Cancelled => "cancelled".to_owned(),
+            ConvertError::Failed(message) => message,
+        })?;
     eprintln!();
 
-    let (output, _) = recorder.close().map_err(|(_, _, e)| format!("closing the output failed: {e}"))?;
-    let output_file = output.into_inner().map_err(|e| format!("flushing the output failed: {e}"))?;
-    output_file.sync_all().map_err(|e| format!("syncing the output failed: {e}"))?;
-    let output_size = output_file.metadata().map_err(|e| format!("cannot stat the output: {e}"))?.len();
-    drop(output_file);
-    drop(player);
-    drop(input_map);
-
+    let source = &report.source;
+    eprintln!(
+        "{}: format v{}, {}, {} ({}), {} frames ({}), {} keyframes, {} blobs{}",
+        args.input.display(),
+        source.version,
+        source.console,
+        source.rom_name,
+        human_size(source.size),
+        source.frames,
+        human_duration(source.millis),
+        source.keyframes,
+        source.blobs,
+        if source.top_level_packets > 0 { format!(" + {} uncompressed top-level packets", source.top_level_packets) } else { String::new() }
+    );
     eprintln!(
         "wrote {}: {} ({:.2}x smaller, {} frames) in {:.1} s",
         args.output.display(),
-        human_size(output_size),
-        input_size as f64 / output_size.max(1) as f64,
-        info.elapsed_frames,
-        started.elapsed().as_secs_f64()
+        human_size(report.output_size),
+        source.size as f64 / report.output_size.max(1) as f64,
+        report.frames,
+        report.elapsed.as_secs_f64()
     );
 
-    Ok(())
-}
-
-fn describe_packet(packet: &Packet) -> String {
-    match packet {
-        Packet::Keyframe { metadata, state } => format!("Keyframe(frame {}, {} bytes)", metadata.elapsed_frames, state.len()),
-        Packet::LoadSaveState { state } => format!("LoadSaveState({} bytes)", state.len()),
-        Packet::DeltaKeyframe { metadata, .. } => format!("DeltaKeyframe(frame {})", metadata.elapsed_frames),
-        Packet::RegionDeltaKeyframe { metadata, .. } => format!("RegionDeltaKeyframe(frame {})", metadata.elapsed_frames),
-        Packet::CompressedBlob { .. } => "CompressedBlob".to_owned(),
-        other => format!("{other:?}"),
-    }
-}
-
-fn check_eq<T: PartialEq + std::fmt::Debug>(what: &str, source: T, output: T) -> Result<(), String> {
-    if source == output {
-        Ok(())
-    }
-    else {
-        Err(format!("{what} differs:\n  source: {source:?}\n  output: {output:?}"))
-    }
-}
-
-/// Compare two keyframe states, reporting the first differing byte. With `masks`, bytes inside
-/// the transient ranges of the source state are ignored (the output legitimately holds the chain
-/// restart's copy there).
-fn check_states(console: ReplayConsoleType, masks: bool, frame: UnsignedInteger, source: &[u8], output: &[u8]) -> Result<(), String> {
-    if source.len() != output.len() {
-        return Err(format!("keyframe state length differs at frame {frame}: {} vs {}", source.len(), output.len()));
+    if args.verify {
+        let mut reporter = ProgressReporter::new();
+        let verified = verify_replay_files(&args.input, &args.output, args.options.settings.mask_transient_buffers, args.options.allow_corruption, &mut |phase, done, total| reporter.report(phase, done, total))
+            .map_err(|e| format!("VERIFY FAILED: {e}"))?;
+        eprintln!();
+        eprintln!(
+            "verified: {} packets, {} keyframes and {} frames are identical{} ({:.1} s)",
+            verified.packets,
+            verified.keyframes,
+            verified.frames,
+            if verified.masked { " outside the masked buffers" } else { "" },
+            verified.elapsed.as_secs_f64()
+        );
     }
 
-    let masked = if masks { transient_ranges(console, source) } else { Vec::new() };
-    let mut offset = 0usize;
-    for range in masked.iter().chain(core::iter::once(&(source.len()..source.len()))) {
-        let live = offset..range.start.clamp(offset, source.len());
-        if let Some(at) = source[live.clone()].iter().zip(&output[live.clone()]).position(|(a, b)| a != b) {
-            return Err(format!("keyframe state differs at frame {frame}, byte 0x{:X}", live.start + at));
-        }
-        offset = range.end.clamp(offset, source.len());
-    }
-    Ok(())
-}
-
-fn verify(args: &Args) -> Result<(), String> {
-    let started = Instant::now();
-    let input_map = map_file(&args.input)?;
-    let output_map = map_file(&args.output)?;
-    let mut source = open_player(&args.input, &input_map[..], args.allow_corruption)?;
-    let mut output = open_player(&args.output, &output_map[..], false)?;
-
-    check_eq("total frames", source.get_total_frames(), output.get_total_frames())?;
-    check_eq("total milliseconds", source.get_total_milliseconds(), output.get_total_milliseconds())?;
-    check_eq("header metadata", source.get_replay_metadata(), output.get_replay_metadata())?;
-    check_eq("patch data", source.get_patch_data(), output.get_patch_data())?;
-    check_eq("keyframe frames", source.all_keyframes().keys().collect::<Vec<_>>(), output.all_keyframes().keys().collect::<Vec<_>>())?;
-    let bookmark_index = |player: &ReplayFilePlayer| {
-        player
-            .all_bookmarks()
-            .iter()
-            .map(|(name, list)| (name.clone(), list.iter().map(|b| (b.elapsed_frames, b.elapsed_millis)).collect::<Vec<_>>()))
-            .collect::<Vec<_>>()
-    };
-    check_eq("bookmarks", bookmark_index(&source), bookmark_index(&output))?;
-    let console = source.get_replay_metadata().console_type;
-
-    source.go_to_keyframe(0).map_err(|e| format!("source: cannot seek to frame 0: {e:?}"))?;
-    output.go_to_keyframe(0).map_err(|e| format!("output: cannot seek to frame 0: {e:?}"))?;
-
-    let total = source.get_total_frames().max(1);
-    let mut packets = 0u64;
-    let mut keyframes = 0u64;
-    let mut frames = 0u64;
-    let mut reporter = ProgressReporter::new("verifying", started);
-
-    loop {
-        let a = source.next_packet().map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?;
-        let b = output.next_packet().map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?;
-
-        let (a, b) = match (a, b) {
-            (None, None) => break,
-            (Some(a), None) => return Err(format!("output ends after packet {packets} (frame {frames}); source continues with {}", describe_packet(a))),
-            (None, Some(b)) => return Err(format!("output continues after the source ended at packet {packets} (frame {frames}) with {}", describe_packet(b))),
-            (Some(a), Some(b)) => (a, b),
-        };
-
-        match (a, b) {
-            (Packet::Keyframe { metadata: ma, state: sa }, Packet::Keyframe { metadata: mb, state: sb }) => {
-                check_eq(&format!("keyframe metadata at frame {}", ma.elapsed_frames), ma, mb)?;
-                check_states(console, args.masks, ma.elapsed_frames, sa.as_slice(), sb.as_slice())?;
-                keyframes += 1;
-                reporter.report(frames, total);
-            }
-            _ => {
-                if a != b {
-                    return Err(format!("packet {packets} (frame {frames}) differs: source {}, output {}", describe_packet(a), describe_packet(b)));
-                }
-            }
-        }
-
-        if matches!(a, Packet::NextFrame { .. }) {
-            frames += 1;
-        }
-        packets += 1;
-    }
-    eprintln!();
-
-    eprintln!(
-        "verified: {packets} packets, {keyframes} keyframes and {frames} frames are identical{} ({:.1} s)",
-        if args.masks { " outside the masked buffers" } else { "" },
-        started.elapsed().as_secs_f64()
-    );
     Ok(())
 }
 
@@ -342,17 +191,11 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Err(message) = convert(&args) {
+    if let Err(message) = run(&args) {
+        eprintln!();
         eprintln!("{message}");
+        let _ = std::io::stderr().flush();
         return ExitCode::FAILURE;
-    }
-
-    if args.verify {
-        if let Err(message) = verify(&args) {
-            eprintln!("VERIFY FAILED: {message}");
-            let _ = std::io::stderr().flush();
-            return ExitCode::FAILURE;
-        }
     }
 
     ExitCode::SUCCESS
