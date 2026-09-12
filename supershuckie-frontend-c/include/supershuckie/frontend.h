@@ -755,6 +755,19 @@ bool supershuckie_frontend_get_auto_resync_keyframes_in_replay(const struct Supe
 void supershuckie_frontend_set_auto_resync_keyframes_in_replay(struct SuperShuckieFrontendRaw *frontend, bool enabled);
 
 /**
+ * Get the zstd compression level used for new recordings and replay conversions (1..=22; 9 is the
+ * default, 3 was the default before format v4, 19 is about 10% smaller at roughly twice the
+ * conversion time).
+ */
+int32_t supershuckie_frontend_get_replay_compression_level(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set the zstd compression level used for new recordings and replay conversions. Values outside
+ * 1..=22 are clamped. Existing replay files are not touched.
+ */
+void supershuckie_frontend_set_replay_compression_level(struct SuperShuckieFrontendRaw *frontend, int32_t level);
+
+/**
  * Set if speed changes from the replay should be ignored when playing back replays.
  */
 void supershuckie_frontend_set_ignore_speed_changes_in_replay(struct SuperShuckieFrontendRaw *frontend, bool ignored);

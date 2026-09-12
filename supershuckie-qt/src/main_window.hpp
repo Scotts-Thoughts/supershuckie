@@ -117,6 +117,8 @@ private:
     QAction *continue_last_replay;
     QAction *disable_save_states_when_recording;
     QAction *disable_speed_changes_when_recording;
+    NumberedAction *replay_compression_levels[4];
+    QAction *replay_compression_custom;
 
     QAction *sgb_enabled;
     QMenu *game_boy_settings;
@@ -162,6 +164,7 @@ private:
     void quick_save(std::uint8_t index);
     void quick_load(std::uint8_t index);
     void set_gbc_mode(std::uint8_t mode);
+    void set_replay_compression_level(std::uint8_t level);
 
     void make_save_state(const char *state);
     void load_save_state(const char *state);

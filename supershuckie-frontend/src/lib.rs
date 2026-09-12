@@ -1957,6 +1957,18 @@ impl SuperShuckieFrontend {
         self.settings.replay.auto_resync_keyframes_in_replays
     }
 
+    /// Get the zstd compression level used for new recordings and replay conversions.
+    #[inline]
+    pub fn get_replay_compression_level(&self) -> i32 {
+        self.settings.replay.zstd_compression_level
+    }
+
+    /// Set the zstd compression level used for new recordings and replay conversions (clamped to
+    /// zstd's 1..=22; existing files are not touched).
+    pub fn set_replay_compression_level(&mut self, level: i32) {
+        self.settings.replay.zstd_compression_level = level.clamp(1, 22);
+    }
+
     /// Set whether or not save states can be created/loading when recording replays.
     #[inline]
     pub fn set_disable_save_states_when_recording(&mut self, disabled: bool) {

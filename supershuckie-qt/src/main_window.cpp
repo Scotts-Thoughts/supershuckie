@@ -524,6 +524,23 @@ void MainWindow::set_up_replays_menu() {
     connect(this->disable_speed_changes_when_recording, SIGNAL(triggered()), this, SLOT(do_toggle_disable_speed_changes_when_recording()));
     this->disable_speed_changes_when_recording->setCheckable(true);
 
+    // zstd level for new recordings and conversions. Only 19 buys anything over 9 (about 10% smaller
+    // files) and it costs roughly twice the conversion time; 3 is what pre-v4 versions used.
+    auto *compression_items = this->replays_menu->addMenu("Replay compression");
+    this->replay_compression_levels[0] = new NumberedAction(this, "Fastest (level 1)", 1, &MainWindow::set_replay_compression_level);
+    this->replay_compression_levels[1] = new NumberedAction(this, "Fast (level 3)", 3, &MainWindow::set_replay_compression_level);
+    this->replay_compression_levels[2] = new NumberedAction(this, "Balanced (level 9, default)", 9, &MainWindow::set_replay_compression_level);
+    this->replay_compression_levels[3] = new NumberedAction(this, "Smallest (level 19, slow to write)", 19, &MainWindow::set_replay_compression_level);
+    for(auto *level : this->replay_compression_levels) {
+        level->setCheckable(true);
+        compression_items->addAction(level);
+    }
+    // Shown (checked and disabled) only when settings.json holds a level that is not one of the above.
+    this->replay_compression_custom = compression_items->addAction("Custom");
+    this->replay_compression_custom->setCheckable(true);
+    this->replay_compression_custom->setEnabled(false);
+    this->replay_compression_custom->setVisible(false);
+
     this->replays_menu->addSeparator();
 
     this->play_replay = this->replays_menu->addAction("Play (unset)");
@@ -765,6 +782,17 @@ void MainWindow::refresh_action_states() {
     }
 
     this->continue_last_replay->setEnabled(this->frontend != nullptr && supershuckie_frontend_can_continue_last_replay(this->frontend));
+
+    auto compression_level = this->frontend != nullptr ? supershuckie_frontend_get_replay_compression_level(this->frontend) : 9;
+    bool compression_is_preset = false;
+    for(auto *level : this->replay_compression_levels) {
+        bool matches = level->number == compression_level;
+        level->setChecked(matches);
+        compression_is_preset = compression_is_preset || matches;
+    }
+    this->replay_compression_custom->setVisible(!compression_is_preset);
+    this->replay_compression_custom->setChecked(!compression_is_preset);
+    this->replay_compression_custom->setText(QString("Custom (level %1, from settings.json)").arg(compression_level));
 
     switch(replay_state) {
         case SuperShuckieReplayState::SuperShuckieReplayState__Recording:
@@ -1436,6 +1464,11 @@ void MainWindow::do_toggle_sgb() {
 
 void MainWindow::set_gbc_mode(std::uint8_t mode) {
     supershuckie_frontend_set_gbc_mode(this->frontend, mode);
+    this->refresh_action_states();
+}
+
+void MainWindow::set_replay_compression_level(std::uint8_t level) {
+    supershuckie_frontend_set_replay_compression_level(this->frontend, level);
     this->refresh_action_states();
 }
 

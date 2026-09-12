@@ -1206,6 +1206,18 @@ pub extern "C" fn supershuckie_frontend_set_auto_resync_keyframes_in_replay(
     frontend.set_auto_resync_keyframes_in_replay(ignored)
 }
 
+/// Get the zstd compression level used for new recordings and replay conversions.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_replay_compression_level(frontend: &SuperShuckieFrontend) -> i32 {
+    frontend.get_replay_compression_level()
+}
+
+/// Set the zstd compression level used for new recordings and replay conversions (clamped to 1..=22).
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_replay_compression_level(frontend: &mut SuperShuckieFrontend, level: i32) {
+    frontend.set_replay_compression_level(level)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_get_disable_save_states_when_recording(
     frontend: &SuperShuckieFrontend
