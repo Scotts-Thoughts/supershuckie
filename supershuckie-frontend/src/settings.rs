@@ -107,12 +107,29 @@ impl Default for RecentROMs {
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct ReplaySettings {
+    /// Hard cap on the uncompressed bytes buffered per compressed blob while recording.
+    ///
+    /// Since format v4 this counts the actual (delta-encoded) bytes, so it is rarely the limit
+    /// that closes a blob; `max_recording_blob_minutes` normally is.
     #[serde(default = "ReplaySettings::MAX_RECORDING_BLOB_SIZE_MB")]
     pub max_recording_blob_size_mb: NonZeroU32,
 
+    /// Close a compressed blob (= one delta-keyframe chain) after this many minutes of recording.
+    ///
+    /// Longer chains save a few MiB per hour on Nintendo DS replays but make a cold seek into the
+    /// chain proportionally slower (15 minutes is roughly 50-100 ms). Default 15.
+    #[serde(default = "ReplaySettings::MAX_RECORDING_BLOB_MINUTES")]
+    pub max_recording_blob_minutes: NonZeroU32,
+
+    /// Decompress every blob of a replay when it is opened instead of on demand.
+    ///
+    /// Decompressed blobs hold compact delta chains (about the compressed size of the file, not
+    /// the sum of the keyframe states), so this is affordable even for long Nintendo DS replays.
     #[serde(default = "ReplaySettings::AUTO_DECOMPRESS_REPLAYS_UPFRONT")]
     pub auto_decompress_replays_upfront: bool,
 
+    /// zstd compression level for recording. The default is 9 as of format v4 (it was 3); a value
+    /// persisted from an older settings file is kept as-is.
     #[serde(default = "ReplaySettings::DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL")]
     pub zstd_compression_level: i32,
 
@@ -145,6 +162,7 @@ impl Default for ReplaySettings {
     fn default() -> Self {
         Self {
             max_recording_blob_size_mb: Self::MAX_RECORDING_BLOB_SIZE_MB(),
+            max_recording_blob_minutes: Self::MAX_RECORDING_BLOB_MINUTES(),
             auto_decompress_replays_upfront: Self::AUTO_DECOMPRESS_REPLAYS_UPFRONT(),
             zstd_compression_level: Self::DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL(),
             frames_per_keyframe: Self::DEFAULT_FRAMES_PER_KEYFRAME(),
@@ -163,6 +181,9 @@ impl ReplaySettings {
     const MAX_RECORDING_BLOB_SIZE_MB: fn() -> NonZeroU32 = || unsafe { NonZeroU32::new_unchecked(
         (ReplayFileRecorderSettings::default().minimum_uncompressed_bytes_per_blob / 1024 / 1024) as u32
     ) };
+    const MAX_RECORDING_BLOB_MINUTES: fn() -> NonZeroU32 = || unsafe { NonZeroU32::new_unchecked(
+        (ReplayFileRecorderSettings::default().max_frames_per_blob / (60 * 60)).max(1) as u32
+    ) };
     const AUTO_DECOMPRESS_REPLAYS_UPFRONT: fn() -> bool = || false;
     const DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL: fn() -> i32 = || ReplayFileRecorderSettings::default().compression_level;
     const DEFAULT_FRAMES_PER_KEYFRAME: fn() -> NonZeroU64 = || unsafe { NonZeroU64::new_unchecked(120) };
@@ -173,6 +194,12 @@ impl ReplaySettings {
     const AUTO_RESYNC_KEYFRAMES_IN_REPLAYS: fn() -> bool = || false;
     const DISABLE_SAVE_STATES_WHEN_RECORDING: fn() -> bool = || false;
     const DISABLE_SPEED_CHANGES_WHEN_RECORDING: fn() -> bool = || false;
+
+    /// `max_recording_blob_minutes` as a frame count. The cap is coarse by design, so a nominal
+    /// 60 fps is used for every console.
+    pub fn max_frames_per_blob(&self) -> u64 {
+        u64::from(self.max_recording_blob_minutes.get()).saturating_mul(60 * 60)
+    }
 }
 
 /// Settings for the "export video from replay" feature.

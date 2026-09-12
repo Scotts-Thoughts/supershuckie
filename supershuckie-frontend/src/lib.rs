@@ -1411,7 +1411,7 @@ impl SuperShuckieFrontend {
                     .saturating_mul(1024)
                     .saturating_mul(1024),
                 compression_level: self.settings.replay.zstd_compression_level,
-                ..Default::default()
+                max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
             },
 
             // TODO: patches
@@ -1507,7 +1507,7 @@ impl SuperShuckieFrontend {
                     .saturating_mul(1024)
                     .saturating_mul(1024),
                 compression_level: self.settings.replay.zstd_compression_level,
-                ..Default::default()
+                max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
             },
 
             // TODO: patches
