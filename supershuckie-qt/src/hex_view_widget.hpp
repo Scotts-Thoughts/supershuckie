@@ -111,6 +111,12 @@ private:
 
     std::uint32_t cursor = 0;
     std::uint32_t anchor = 0;
+    /** Keep centring the cursor on resizes until the user scrolls (go_to() before the final layout). */
+    bool center_pending = false;
+    /** The view is scrolling itself (not the user). */
+    bool self_scrolling = false;
+    void center_cursor();
+    bool cursor_visible(int visible_rows) const noexcept;
     bool text_pane = false;
     bool dragging = false;
 

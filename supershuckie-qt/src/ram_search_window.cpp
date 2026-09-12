@@ -313,7 +313,9 @@ RamSearchWindow::RamSearchWindow(MemoryToolsController *controller): QWidget(con
     this->range_start = new QLineEdit(this);
     this->range_start->setPlaceholderText("start");
     this->range_end = new QLineEdit(this);
-    this->range_end->setPlaceholderText("end (exclusive)");
+    this->range_end->setPlaceholderText("end");
+    this->range_end->setToolTip("The first address after the range");
+    this->range_start->setToolTip("0x02024284 or EWRAM:24284");
     where_row->addWidget(this->range_check);
     where_row->addWidget(this->range_start);
     where_row->addWidget(new QLabel("to", this));

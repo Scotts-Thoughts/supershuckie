@@ -285,6 +285,27 @@ QSize HexViewWidget::sizeHint() const {
     return QSize(width, height);
 }
 
+void HexViewWidget::center_cursor() {
+    if(this->region_length == 0) {
+        return;
+    }
+    // A third of the way down rather than at the very edge.
+    int row = static_cast<int>((this->cursor - this->base) / this->row_bytes);
+    this->update_scroll_range();
+    this->self_scrolling = true;
+    this->verticalScrollBar()->setValue(std::max(0, row - this->visible_rows() / 3));
+    this->self_scrolling = false;
+}
+
+bool HexViewWidget::cursor_visible(int visible_rows) const noexcept {
+    if(this->region_length == 0) {
+        return false;
+    }
+    int row = static_cast<int>((this->cursor - this->base) / this->row_bytes);
+    int top = this->verticalScrollBar()->value();
+    return row >= top && row < top + visible_rows;
+}
+
 void HexViewWidget::paintEvent(QPaintEvent *) {
     QPainter painter(this->viewport());
     painter.setFont(this->font);
@@ -456,12 +477,28 @@ std::uint8_t HexViewWidget::typed_high_nibble_value(std::uint8_t current) const 
 }
 
 void HexViewWidget::resizeEvent(QResizeEvent *event) {
+    // Rows that fitted before this resize (the viewport shrinks or grows with the widget).
+    int chrome = this->height() - this->viewport()->height();
+    int old_rows = std::max(1, (event->oldSize().height() - chrome - this->header_height()) / this->line_height);
+    bool was_visible = event->oldSize().isValid() && this->cursor_visible(old_rows);
+
     QAbstractScrollArea::resizeEvent(event);
     this->update_scroll_range();
+    if(this->center_pending) {
+        this->center_cursor();
+    }
+    else if(was_visible && !this->cursor_visible(this->visible_rows())) {
+        this->self_scrolling = true;
+        this->ensure_cursor_visible();
+        this->self_scrolling = false;
+    }
     this->emit_window_if_changed();
 }
 
 void HexViewWidget::scrollContentsBy(int, int) {
+    if(!this->self_scrolling) {
+        this->center_pending = false;
+    }
     this->emit_window_if_changed();
     this->viewport()->update();
 }
@@ -526,12 +563,15 @@ void HexViewWidget::ensure_cursor_visible() {
     }
     int row = static_cast<int>((this->cursor - this->base) / this->row_bytes);
     auto *bar = this->verticalScrollBar();
+    bool was_self_scrolling = this->self_scrolling;
+    this->self_scrolling = true;
     if(row < bar->value()) {
         bar->setValue(row);
     }
     else if(row >= bar->value() + this->visible_rows()) {
         bar->setValue(row - this->visible_rows() + 1);
     }
+    this->self_scrolling = was_self_scrolling;
     this->emit_window_if_changed();
 }
 
@@ -545,18 +585,19 @@ void HexViewWidget::go_to(std::uint32_t address, std::uint32_t select_length) {
         this->anchor = address;
         this->cursor = static_cast<std::uint32_t>(last);
     }
-    // Put the address a third of the way down rather than at the very edge.
     int row = static_cast<int>((address - this->base) / this->row_bytes);
     auto *bar = this->verticalScrollBar();
     if(row < bar->value() || row >= bar->value() + this->visible_rows()) {
-        bar->setValue(std::max(0, row - this->visible_rows() / 3));
+        this->center_cursor();
     }
+    this->center_pending = true;
     this->emit_window_if_changed();
     this->viewport()->update();
     emit this->cursor_changed(this->cursor);
 }
 
 void HexViewWidget::mousePressEvent(QMouseEvent *event) {
+    this->center_pending = false;
     if(event->button() != Qt::LeftButton && event->button() != Qt::RightButton) {
         return;
     }
@@ -608,6 +649,7 @@ void HexViewWidget::focusOutEvent(QFocusEvent *event) {
 }
 
 void HexViewWidget::keyPressEvent(QKeyEvent *event) {
+    this->center_pending = false;
     if(this->region_length == 0) {
         QAbstractScrollArea::keyPressEvent(event);
         return;

@@ -146,8 +146,10 @@ HexViewerWindow::HexViewerWindow(MemoryToolsController *controller, std::uint8_t
         this->inspector->item(row, 0)->setToolTip("Double-click a value to change it");
     }
     splitter->addWidget(this->inspector);
-    splitter->setStretchFactor(0, 3);
-    splitter->setStretchFactor(1, 1);
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 0);
+    splitter->setCollapsible(0, false);
+    this->inspector->setMinimumWidth(this->inspector->fontMetrics().horizontalAdvance("BCD (8 digits)  Little-endian  Big-endian") + 40);
     layout->addWidget(splitter, 1);
 
     this->status = new QLabel(this);
@@ -216,7 +218,9 @@ HexViewerWindow::HexViewerWindow(MemoryToolsController *controller, std::uint8_t
     connect(forward_shortcut, &QShortcut::activated, this, &HexViewerWindow::on_forward);
 
     this->view->set_glyphs(this->controller->glyphs(0));
-    this->resize(900, 560);
+    int inspector_width = this->inspector->minimumWidth() + 40;
+    splitter->setSizes({ this->view->sizeHint().width(), inspector_width });
+    this->resize(this->view->sizeHint().width() + inspector_width + 40, 600);
     this->on_regions_changed();
 }
 
