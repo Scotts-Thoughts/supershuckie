@@ -302,6 +302,102 @@ void supershuckie_frontend_search_redo(const struct SuperShuckieFrontendRaw *fro
 void supershuckie_frontend_search_cancel(const struct SuperShuckieFrontendRaw *frontend);
 void supershuckie_frontend_search_reset(struct SuperShuckieFrontendRaw *frontend);
 
+
+/* ----------------------------------------------------------------------------------------------
+ * RAM watch
+ *
+ * Watches are exchanged as JSON objects:
+ *
+ *   {
+ *     "id": 3,                                   (0 when adding)
+ *     "label": "Money",
+ *     "address": {"base": "0x02024284", "offsets": [12]},   (offsets: pointer path, optional)
+ *     "format": {"type": "u16", "size": 2, "big_endian": false},
+ *     "display": "decimal" | "hex" | "binary",
+ *     "table": "",                               (character table name for text)
+ *     "group": "", "notes": "",
+ *     "trace": false,                            (log every change, frame-accurately)
+ *     "pause_when": {"when": "equals", "value": 5},   (optional; "changes" has no value)
+ *     "freeze": {"value": "63 00", "active": true}     (optional)
+ *   }
+ *
+ * The list is saved per ROM (ram-watch.json in the ROM's data directory); freezes always load inactive.
+ * ------------------------------------------------------------------------------------------- */
+
+enum SuperShuckieWatchLogKind {
+    SuperShuckieWatchLogKind__Changed = 0,
+    SuperShuckieWatchLogKind__Discontinuity = 1,
+    SuperShuckieWatchLogKind__Paused = 2,
+    SuperShuckieWatchLogKind__Edited = 3,
+    SuperShuckieWatchLogKind__EditFailed = 4
+};
+
+struct SuperShuckieWatchValue {
+    uint32_t id;
+    /** The value could be read. */
+    bool ok;
+    /** The address resolved (pointers included). */
+    bool resolved;
+    uint32_t resolved_address;
+    /** Frames since the value last changed (UINT64_MAX when not seen changing). */
+    uint64_t frames_since_change;
+    uint8_t length;
+    uint8_t value[64];
+    char text[128];
+    char previous_text[128];
+};
+
+struct SuperShuckieWatchLogEntry {
+    uint64_t frame;
+    uint32_t watch_id;
+    uint32_t kind;
+    char text[256];
+};
+
+/** Whether any watch logs changes or pauses (so the UI should keep polling while its windows are hidden). */
+bool supershuckie_frontend_memory_has_traces(const struct SuperShuckieFrontendRaw *frontend);
+
+/** Free a string that a function says must be freed with this. */
+void supershuckie_string_free(char *string);
+
+/** The watch list as a JSON array. Free with supershuckie_string_free(). */
+char *supershuckie_frontend_watch_list_json(const struct SuperShuckieFrontendRaw *frontend);
+
+/** Changes whenever the watch list changes. */
+uint64_t supershuckie_frontend_watch_generation(const struct SuperShuckieFrontendRaw *frontend);
+
+/** Add a watch (id 0) or replace the one with the same id. Returns its id, or 0 with a message in `error`. */
+uint32_t supershuckie_frontend_watch_upsert_json(struct SuperShuckieFrontendRaw *frontend, const char *json, char *error, size_t error_len);
+
+void supershuckie_frontend_watch_remove(struct SuperShuckieFrontendRaw *frontend, uint32_t id);
+
+/** The watches on screen (their values are sampled). */
+void supershuckie_frontend_watch_set_visible(struct SuperShuckieFrontendRaw *frontend, const uint32_t *ids, size_t count);
+
+/** The latest values of the visible watches. Returns how many were written. */
+size_t supershuckie_frontend_watch_read_values(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieWatchValue *out, size_t capacity);
+
+/** Take up to `capacity` change log lines (oldest first); `*dropped` counts lines lost meanwhile. */
+size_t supershuckie_frontend_watch_drain_log(struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieWatchLogEntry *out, size_t capacity, uint64_t *dropped);
+
+/** Problems found loading or importing watches (cleared when read). Returns false if there are none. */
+bool supershuckie_frontend_watch_problems(struct SuperShuckieFrontendRaw *frontend, char *out, size_t out_len);
+
+/** Import a watch list file (replacing the list or adding to it). */
+bool supershuckie_frontend_watch_import(struct SuperShuckieFrontendRaw *frontend, const char *path, bool replace, char *error, size_t error_len);
+
+/** Export the watch list to a file. */
+bool supershuckie_frontend_watch_export(const struct SuperShuckieFrontendRaw *frontend, const char *path, char *error, size_t error_len);
+
+/** Save the watch list now (it is also saved a second after each change and when the ROM closes). */
+void supershuckie_frontend_watch_save(struct SuperShuckieFrontendRaw *frontend);
+
+/** Parse "0x…", "EWRAM:…" or "[…]+off" into address JSON. Free with supershuckie_string_free(); null on error. */
+char *supershuckie_frontend_watch_parse_address(const struct SuperShuckieFrontendRaw *frontend, const char *text, char *error, size_t error_len);
+
+/** Format address JSON as text. Returns the bytes needed including the NUL. */
+size_t supershuckie_frontend_watch_format_address(const struct SuperShuckieFrontendRaw *frontend, const char *json, char *out, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

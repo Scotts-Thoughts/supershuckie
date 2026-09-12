@@ -269,6 +269,7 @@ private slots:
     void do_open_ram_viewer();
     void do_new_ram_viewer();
     void do_open_ram_search();
+    void do_open_ram_watch();
     void do_open_tables_folder();
     void do_reload_tables();
 };

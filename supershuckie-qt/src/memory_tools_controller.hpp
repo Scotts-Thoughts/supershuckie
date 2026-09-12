@@ -11,11 +11,14 @@
 
 #include <supershuckie/supershuckie.h>
 
+class QMenu;
+
 namespace SuperShuckie64 {
 
 class MainWindow;
 class HexViewerWindow;
 class RamSearchWindow;
+class RamWatchWindow;
 
 /** A memory region of the running game, as the tool windows see it. */
 struct MemoryRegionView {
@@ -58,6 +61,22 @@ public:
     /** Open the search window ready to search for `value`. */
     void search_for_value(std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &value);
 
+    /** Open (or raise) the RAM watch window. */
+    RamWatchWindow *open_watch();
+
+    /** Ask for a new watch at `address` (from the viewer or a search result). */
+    void add_watch(QWidget *parent, std::uint32_t address, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &label);
+
+    /** Add watches for search results straight away. */
+    void add_watches(const std::vector<std::uint32_t> &addresses, std::uint32_t value_type, std::uint8_t size, bool big_endian);
+
+    /** Add or replace a watch (JSON); returns its id or 0 with a message in `error`. */
+    std::uint32_t upsert_watch(const QByteArray &json, char *error, std::size_t error_len);
+
+    /** Editing hooks for the watch window (value editing and freezing). */
+    bool edit_watch_value_inline(QWidget *parent, std::uint32_t id, bool value_column);
+    void add_watch_actions(QMenu *menu, QWidget *parent, const std::vector<std::uint32_t> &ids);
+
     /** Re-open the windows that were open when the app last closed. */
     void restore_windows();
 
@@ -96,6 +115,7 @@ signals:
 
 private slots:
     void on_timer();
+    void on_idle_timer();
 
 private:
     MainWindow *main;
@@ -104,6 +124,8 @@ private:
     std::array<HexViewerWindow *, SUPERSHUCKIE_MEMORY_MAX_VIEWERS> viewers = {};
     HexViewerWindow *last_viewer = nullptr;
     RamSearchWindow *search = nullptr;
+    RamWatchWindow *watch = nullptr;
+    QTimer idle_timer;
 
     std::vector<MemoryRegionView> region_cache;
     std::uint64_t cached_regions_generation = 0;

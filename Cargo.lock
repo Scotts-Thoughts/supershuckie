@@ -983,6 +983,7 @@ dependencies = [
 name = "supershuckie-frontend-c"
 version = "0.4.12"
 dependencies = [
+ "serde_json",
  "supershuckie-core",
  "supershuckie-frontend",
  "supershuckie-memory-tools",

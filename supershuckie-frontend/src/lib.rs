@@ -852,7 +852,8 @@ impl SuperShuckieFrontend {
             new_core.pause();
         }
         self.core = new_core;
-        self.memory_tools.core_switched(&self.core);
+        let watch_file = self.rom_name.as_ref().map(|rom| self.get_userdir_for_rom(rom.as_str()).join("ram-watch.json"));
+        self.memory_tools.core_switched(&self.core, watch_file);
     }
 
     fn reset_save_state_history(&mut self) {

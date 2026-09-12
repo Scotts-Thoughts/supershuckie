@@ -10,9 +10,10 @@
 use std::time::{Duration, Instant};
 use supershuckie_core::emulator::{EmulatorCore, GameBoyAdvance, NintendoDS};
 use supershuckie_core::{std_timestamp_provider, ThreadedSuperShuckieCore};
-use supershuckie_frontend::memory_tools::MemoryTools;
+use supershuckie_frontend::memory_tools::{LogKind, MemoryTools};
 use supershuckie_memory_tools::search::{Comparison, SearchSettings};
-use supershuckie_memory_tools::{Number, ValueFormat, ValueType};
+use supershuckie_memory_tools::watch::{Watch, WatchAddress, WatchCondition};
+use supershuckie_memory_tools::{DisplayBase, Number, ValueFormat, ValueType};
 
 fn make_core(path: &str) -> ThreadedSuperShuckieCore {
     let rom = std::fs::read(path).expect("read rom");
@@ -24,7 +25,7 @@ fn make_core(path: &str) -> ThreadedSuperShuckieCore {
     ThreadedSuperShuckieCore::new(core)
 }
 
-fn wait_until(tools: &mut MemoryTools, core: &ThreadedSuperShuckieCore, what: &str, mut done: impl FnMut(&MemoryTools) -> bool) {
+fn wait_until(tools: &mut MemoryTools, core: &ThreadedSuperShuckieCore, what: &str, mut done: impl FnMut(&mut MemoryTools) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         tools.tick(core, false);
@@ -42,9 +43,13 @@ fn main() {
     let second = args.next().expect("usage: memory_tools_smoke <rom> <other rom>");
 
     let dir = std::env::temp_dir().join("supershuckie-memory-tools-smoke");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let first_watches = dir.join("first-ram-watch.json");
+    let second_watches = dir.join("second-ram-watch.json");
     let mut tools = MemoryTools::new(dir.join("tables"));
     let core = make_core(&first);
-    tools.core_switched(&core);
+    tools.core_switched(&core, Some(first_watches.clone()));
     assert!(!tools.regions().is_empty());
     println!("regions: {}", tools.regions().iter().map(|r| r.short_name.as_str()).collect::<Vec<_>>().join(", "));
 
@@ -102,12 +107,76 @@ fn main() {
     wait_until(&mut tools, &core, "a paused-for scan", |t| !t.search_status().busy);
     assert!(!core.is_paused(), "emulation resumes after a scan that paused it");
 
-    // A different game invalidates the search.
+    // Watches: a busy value found by the search, logged every frame, pausing when it changes.
+    let busy = tools.search_results(0, 1)[0].address;
+    let watch = Watch {
+        id: 0,
+        label: "busy byte".to_owned(),
+        address: WatchAddress::direct(busy),
+        format: ValueFormat::new(ValueType::U8, 1, false),
+        display: DisplayBase::Hex,
+        table: String::new(),
+        group: "Test".to_owned(),
+        notes: String::new(),
+        trace: true,
+        pause_when: None,
+        freeze: None
+    };
+    let id = tools.upsert_watch(&core, watch.clone()).expect("add watch");
+    tools.set_visible_watches(&core, &[id]);
+    wait_until(&mut tools, &core, "a watch value", |t| t.watch_values().first().is_some_and(|v| v.value.is_some()));
+    println!("watch value: {}", tools.watch_values()[0].text);
+    // The search found bytes that were changing, but not all keep changing; log what happens.
+    std::thread::sleep(Duration::from_millis(500));
+    wait_until(&mut tools, &core, "log lines", |_| true);
+    let (lines, _) = tools.drain_log(100);
+    println!("{} log lines, e.g. {:?}", lines.len(), lines.first().map(|l| (l.frame, &l.text)));
+
+    // Pause on change: find a byte that changes nearly every frame by logging several.
+    let frame_counter = {
+        let settings = SearchSettings { format: ValueFormat::new(ValueType::U8, 1, false), alignment: 1, regions: vec![1], range: None, epsilon: 0.01 };
+        tools.search_scan(&core, Some(settings), Comparison::Unknown, false).unwrap();
+        wait_until(&mut tools, &core, "iwram scan", |t| !t.search_status().busy);
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(50));
+            tools.search_scan(&core, None, Comparison::Changed, false).unwrap();
+            wait_until(&mut tools, &core, "changed scan", |t| !t.search_status().busy);
+        }
+        tools.search_results(0, 1).first().map(|r| r.address).expect("a byte that keeps changing")
+    };
+    let pausing = Watch { label: "pauser".to_owned(), address: WatchAddress::direct(frame_counter), trace: false, pause_when: Some(WatchCondition::Changes), group: String::new(), ..watch.clone() };
+    let pause_id = tools.upsert_watch(&core, pausing).expect("add pausing watch");
+    wait_until(&mut tools, &core, "the pause condition", |_| core.is_paused());
+    wait_until(&mut tools, &core, "the pause log line", |t| t.drain_log(1000).0.iter().any(|l| l.kind == LogKind::Paused && l.watch_id == pause_id));
+    println!("pause condition paused emulation");
+    tools.remove_watch(&core, pause_id);
+    core.start();
+
+    // Traced watch cap.
+    let mut too_many = 0;
+    for i in 0..70 {
+        let w = Watch { label: format!("t{i}"), address: WatchAddress::direct(busy), ..watch.clone() };
+        if tools.upsert_watch(&core, w).is_err() {
+            too_many += 1;
+        }
+    }
+    assert!(too_many > 0, "the traced watch cap is enforced");
+
+    // Persistence: switching games saves this list and loads the other game's (none yet).
+    let count = tools.watches().len();
     let other = make_core(&second);
-    tools.core_switched(&other);
+    tools.core_switched(&other, Some(second_watches.clone()));
     wait_until(&mut tools, &other, "the search reset", |t| !t.search_status().active);
     println!("after switching games: {:?}", tools.search_status().message);
+    assert!(tools.watches().is_empty(), "the other game has no watches");
+    assert!(first_watches.is_file(), "the first game's watches were saved");
     drop(core);
+
+    let back = make_core(&first);
+    tools.core_switched(&back, Some(first_watches.clone()));
+    assert_eq!(tools.watches().len(), count, "watches reload with their game");
+    println!("watches saved and reloaded ({count})");
+    drop(other);
 
     println!("all checks passed");
 }

@@ -5,6 +5,7 @@ pub mod region;
 pub mod search;
 pub mod table;
 pub mod value;
+pub mod watch;
 
 pub use region::*;
 pub use table::CharTable;

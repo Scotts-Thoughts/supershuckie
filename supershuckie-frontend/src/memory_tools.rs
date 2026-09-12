@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use supershuckie_core::memory_monitor::{AddressPath, FullSnapshot, MemoryMonitorShared, MonitorRequest, MonitorSample, Probe, ViewWindow, MAX_PROBES, MAX_VIEW_BYTES, MAX_VIEW_WINDOWS};
+use std::collections::{BTreeMap, VecDeque};
+use std::time::Instant;
+use supershuckie_core::memory_monitor::{AddressPath, FullSnapshot, MemoryMonitorShared, MonitorEvent, MonitorRequest, MonitorSample, Probe, TraceCondition, TraceSpec, ValueDecode, ViewWindow, MAX_PROBES, MAX_TRACES, MAX_VIEW_BYTES, MAX_VIEW_WINDOWS};
 use supershuckie_core::ThreadedSuperShuckieCore;
 use supershuckie_memory_tools::search::{Comparison, MemorySnapshot, ScanControl, Search, SearchError, SearchRow, SearchSettings, SnapshotRegion};
-use supershuckie_memory_tools::{CharTable, RegionInfo};
+use supershuckie_memory_tools::watch::{Watch, WatchCondition, WatchFile, WATCH_FILE_VERSION};
+use supershuckie_memory_tools::{format_value, CharTable, RegionInfo, ValueType};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 
 /// Viewer windows that can be open at once.
@@ -228,7 +231,79 @@ fn search_worker(jobs: Receiver<SearchJob>, snapshots: Receiver<FullSnapshot>, s
 /// Who a probe in the monitor request belongs to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ProbeOwner {
-    SearchRow(usize)
+    SearchRow(usize),
+    Watch(u32)
+}
+
+/// Change log lines kept.
+pub const CHANGE_LOG_CAPACITY: usize = 10_000;
+
+/// What a change log line is about.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LogKind {
+    /// A traced watch changed.
+    Changed,
+    /// Memory was replaced wholesale (state load, reset, seek).
+    Discontinuity,
+    /// A watch's condition paused emulation.
+    Paused,
+    /// Memory was edited by the user.
+    Edited,
+    /// An edit was refused.
+    EditFailed
+}
+
+/// A change log line.
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    pub frame: u64,
+    pub watch_id: u32,
+    pub kind: LogKind,
+    pub text: String
+}
+
+/// What the tools know about a watch between samples.
+#[derive(Clone, Debug, Default)]
+struct WatchRuntime {
+    value: Option<Vec<u8>>,
+    previous: Option<Vec<u8>>,
+    last_change_frame: Option<u64>,
+    resolved: Option<u32>
+}
+
+/// A watch's latest value, for display.
+#[derive(Clone, Debug)]
+pub struct WatchValue {
+    pub id: u32,
+    /// The value's bytes, if they could be read.
+    pub value: Option<Vec<u8>>,
+    pub text: String,
+    pub previous_text: String,
+    /// The address the value was read at (after pointers).
+    pub resolved_address: Option<u32>,
+    /// Frames since the value last changed, if it has been seen changing.
+    pub frames_since_change: Option<u64>
+}
+
+/// Value bytes of a traced watch packed into an event (see `MonitorEvent::Changed`).
+fn unpack_event_value(packed: u64, len: usize) -> Option<Vec<u8>> {
+    (len <= 8).then(|| packed.to_le_bytes()[..len].to_vec())
+}
+
+fn trace_condition(condition: WatchCondition) -> TraceCondition {
+    match condition {
+        WatchCondition::Changes => TraceCondition::Changes,
+        WatchCondition::Equals(v) => TraceCondition::Equals(v),
+        WatchCondition::NotEquals(v) => TraceCondition::NotEquals(v),
+        WatchCondition::GreaterThan(v) => TraceCondition::GreaterThan(v),
+        WatchCondition::LessThan(v) => TraceCondition::LessThan(v),
+        WatchCondition::IncreasedBy(v) => TraceCondition::IncreasedBy(v),
+        WatchCondition::DecreasedBy(v) => TraceCondition::DecreasedBy(v)
+    }
+}
+
+fn watch_path(watch: &Watch) -> AddressPath {
+    AddressPath::with_derefs(watch.address.base, &watch.address.offsets).unwrap_or(AddressPath::direct(watch.address.base))
 }
 
 pub struct MemoryTools {
@@ -267,7 +342,19 @@ pub struct MemoryTools {
 
     probe_owners: Vec<ProbeOwner>,
     /// Request generation from which the current probes' values are in samples.
-    probes_request_generation: u64
+    probes_request_generation: u64,
+
+    watches: Vec<Watch>,
+    watch_runtime: BTreeMap<u32, WatchRuntime>,
+    watch_file: Option<PathBuf>,
+    watches_dirty_at: Option<Instant>,
+    watch_generation: u64,
+    watch_problems: Vec<String>,
+    visible_watches: Vec<u32>,
+
+    events: Vec<MonitorEvent>,
+    log: VecDeque<LogEntry>,
+    log_dropped: u64
 }
 
 impl MemoryTools {
@@ -319,7 +406,17 @@ impl MemoryTools {
             search_visible_rows: Vec::new(),
             search_rows_generation: 0,
             probe_owners: Vec::new(),
-            probes_request_generation: 0
+            probes_request_generation: 0,
+            watches: Vec::new(),
+            watch_runtime: BTreeMap::new(),
+            watch_file: None,
+            watches_dirty_at: None,
+            watch_generation: 1,
+            watch_problems: Vec::new(),
+            visible_watches: Vec::new(),
+            events: Vec::new(),
+            log: VecDeque::new(),
+            log_dropped: 0
         };
         tools.reload_tables();
         tools
@@ -334,7 +431,7 @@ impl MemoryTools {
     ///
     /// Returns whether the game changed (a different ROM or console), in which case state that
     /// belongs to the old game must be dropped.
-    pub fn core_switched(&mut self, core: &ThreadedSuperShuckieCore) -> bool {
+    pub fn core_switched(&mut self, core: &ThreadedSuperShuckieCore, watch_file: Option<PathBuf>) -> bool {
         let regions: Vec<RegionInfo> = core.memory_regions().iter().map(|r| RegionInfo {
             name: r.name.to_owned(),
             short_name: r.short_name.to_owned(),
@@ -357,6 +454,10 @@ impl MemoryTools {
             let _ = self.search_jobs.send(SearchJob::Reset { message: Some("The game changed; start a new search".to_owned()) });
             self.search_visible_rows.clear();
         }
+        if game_changed {
+            self.save_watches();
+            self.load_watches(if self.game.is_some() { watch_file } else { None });
+        }
 
         // The old core took its half of the monitor with it.
         self.attached = false;
@@ -373,6 +474,13 @@ impl MemoryTools {
         }
         if self.attached && let Some(generation) = self.shared.take_sample(self.sample_generation, &mut self.sample) {
             self.sample_generation = generation;
+            self.absorb_sample();
+        }
+        if self.attached {
+            self.absorb_events();
+        }
+        if self.watches_dirty_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) {
+            self.save_watches();
         }
 
         // A scan finished: resume emulation if it was paused for it, re-read the rows on screen,
@@ -405,6 +513,15 @@ impl MemoryTools {
 
         let mut probes = Vec::new();
         self.probe_owners.clear();
+        for id in &self.visible_watches {
+            if probes.len() >= MAX_PROBES {
+                break
+            }
+            if let Some(watch) = self.watches.iter().find(|w| w.id == *id) {
+                probes.push(Probe { path: watch_path(watch), len: watch.format.size });
+                self.probe_owners.push(ProbeOwner::Watch(watch.id));
+            }
+        }
         for (index, row) in self.search_visible_rows.iter().enumerate() {
             if probes.len() >= MAX_PROBES {
                 break
@@ -413,11 +530,20 @@ impl MemoryTools {
             self.probe_owners.push(ProbeOwner::SearchRow(index));
         }
 
+        let traces: Vec<TraceSpec> = self.watches.iter().filter(|w| w.is_traced()).take(MAX_TRACES).map(|w| TraceSpec {
+            id: w.id,
+            path: watch_path(w),
+            len: w.format.size,
+            decode: ValueDecode { big_endian: w.format.big_endian, signed: w.format.ty.is_signed(), bcd: w.format.ty == ValueType::Bcd },
+            pause_when: w.pause_when.map(trace_condition)
+        }).collect();
+
         let request = self.shared.update_request(|request| {
             request.sampling = viewers.iter().any(Option::is_some) || !probes.is_empty();
             request.interval = interval;
             request.windows = viewers;
             request.probes = probes;
+            request.traces = traces;
             request.freezes_suspended = playback;
             request.clone()
         });
@@ -602,8 +728,7 @@ impl MemoryTools {
         let mut values = vec![None; self.search_visible_rows.len()];
         if self.sample.request_generation >= self.probes_request_generation {
             for (probe, owner) in self.probe_owners.iter().enumerate() {
-                let ProbeOwner::SearchRow(row) = owner;
-                if let Some(slot) = values.get_mut(*row) {
+                if let ProbeOwner::SearchRow(row) = owner && let Some(slot) = values.get_mut(*row) {
                     *slot = self.sample.probe(probe);
                 }
             }
@@ -615,6 +740,254 @@ impl MemoryTools {
     #[inline]
     pub fn sample_generation(&self) -> u64 {
         self.sample_generation
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Watches
+
+    fn table_for(&self, watch: &Watch) -> &CharTable {
+        self.tables.iter().find(|t| t.name() == watch.table).unwrap_or(&self.tables[0])
+    }
+
+    fn format_watch_value(&self, watch: &Watch, bytes: &[u8]) -> String {
+        format_value(&watch.format, watch.display, bytes, self.table_for(watch))
+    }
+
+    /// Update watch values from the latest sample.
+    fn absorb_sample(&mut self) {
+        if self.sample.request_generation < self.probes_request_generation {
+            return
+        }
+        for (probe, owner) in self.probe_owners.iter().enumerate() {
+            let ProbeOwner::Watch(id) = owner else { continue };
+            let traced = self.watches.iter().any(|w| w.id == *id && w.is_traced());
+            let value = self.sample.probe(probe).map(|b| b.to_vec());
+            let runtime = self.watch_runtime.entry(*id).or_default();
+            runtime.resolved = self.sample.probe_ok.get(probe).copied().unwrap_or(false).then(|| self.sample.probe_addresses[probe]);
+            if value.is_some() && runtime.value != value {
+                if runtime.value.is_some() {
+                    runtime.previous = runtime.value.take();
+                    if !traced {
+                        runtime.last_change_frame = Some(self.sample.frame);
+                    }
+                }
+                runtime.value = value;
+            }
+        }
+    }
+
+    fn push_log(&mut self, entry: LogEntry) {
+        if self.log.len() >= CHANGE_LOG_CAPACITY {
+            self.log.pop_front();
+            self.log_dropped += 1;
+        }
+        self.log.push_back(entry);
+    }
+
+    /// Turn the core thread's events into log lines.
+    fn absorb_events(&mut self) {
+        let dropped = self.shared.drain_events(&mut self.events);
+        if dropped > 0 {
+            self.log_dropped += dropped;
+        }
+        let events = core::mem::take(&mut self.events);
+        for event in &events {
+            match event {
+                MonitorEvent::Changed { frame, id, old, new } => {
+                    let Some(watch) = self.watches.iter().find(|w| w.id == *id) else { continue };
+                    let len = watch.format.len();
+                    let describe = |packed: u64| unpack_event_value(packed, len).map(|b| self.format_watch_value(watch, &b)).unwrap_or_else(|| "(changed)".to_owned());
+                    let text = format!("{}: {} → {}", watch.label, describe(*old), describe(*new));
+                    let runtime = self.watch_runtime.entry(*id).or_default();
+                    runtime.last_change_frame = Some(*frame);
+                    self.push_log(LogEntry { frame: *frame, watch_id: *id, kind: LogKind::Changed, text });
+                }
+                MonitorEvent::Discontinuity { frame } => {
+                    self.push_log(LogEntry { frame: *frame, watch_id: 0, kind: LogKind::Discontinuity, text: "memory replaced (state loaded, reset or seeked)".to_owned() });
+                }
+                MonitorEvent::PausedByCondition { frame, id } => {
+                    let label = self.watches.iter().find(|w| w.id == *id).map(|w| w.label.clone()).unwrap_or_default();
+                    self.push_log(LogEntry { frame: *frame, watch_id: *id, kind: LogKind::Paused, text: format!("paused: {label}") });
+                }
+                MonitorEvent::Written { .. } | MonitorEvent::WriteFailed { .. } => {
+                    self.absorb_write_event(event);
+                }
+            }
+        }
+        self.events = events;
+        self.events.clear();
+    }
+
+    /// Edits are handled with editing (see below); nothing to log for them otherwise.
+    fn absorb_write_event(&mut self, _event: &MonitorEvent) {}
+
+    /// Load the watch list at `path` (none: clear it).
+    fn load_watches(&mut self, path: Option<PathBuf>) {
+        self.watches.clear();
+        self.watch_runtime.clear();
+        self.watch_problems.clear();
+        self.watches_dirty_at = None;
+        self.watch_file = path;
+        self.watch_generation += 1;
+        let Some(path) = self.watch_file.as_ref() else {
+            return
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return
+        };
+        match WatchFile::parse(&text) {
+            Ok((file, problems)) => {
+                self.watch_problems = problems;
+                if let Some(game) = self.game && !file.rom_checksum.is_empty() && file.rom_checksum != blake3_hex(&game.rom_checksum) {
+                    self.watch_problems.push("these watches were made for a different version of the ROM".to_owned());
+                }
+                self.watches = file.watches;
+            }
+            Err(e) => self.watch_problems.push(format!("{}: {e}", path.display()))
+        }
+    }
+
+    /// Write the watch list now (if it has a file).
+    pub fn save_watches(&mut self) {
+        self.watches_dirty_at = None;
+        let Some(path) = self.watch_file.as_ref() else {
+            return
+        };
+        let file = self.watch_file_contents();
+        let temp = path.with_extension("json.tmp");
+        if std::fs::write(&temp, file.to_json()).is_ok() {
+            let _ = std::fs::rename(&temp, path);
+        }
+    }
+
+    fn watch_file_contents(&self) -> WatchFile {
+        WatchFile {
+            version: WATCH_FILE_VERSION,
+            console: self.game.map(|g| format!("{:?}", g.console_type)).unwrap_or_default(),
+            rom_checksum: self.game.map(|g| blake3_hex(&g.rom_checksum)).unwrap_or_default(),
+            watches: self.watches.clone()
+        }
+    }
+
+    fn watches_changed(&mut self, core: &ThreadedSuperShuckieCore) {
+        self.watch_generation += 1;
+        self.watches_dirty_at.get_or_insert_with(Instant::now);
+        self.push_request(core);
+    }
+
+    /// The watch list.
+    #[inline]
+    pub fn watches(&self) -> &[Watch] {
+        &self.watches
+    }
+
+    /// Changes whenever the watch list does.
+    #[inline]
+    pub fn watch_generation(&self) -> u64 {
+        self.watch_generation
+    }
+
+    /// Problems found loading or importing watches, cleared when taken.
+    pub fn take_watch_problems(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.watch_problems)
+    }
+
+    /// Add `watch` (id 0 or unknown) or replace the watch with its id. Returns its id.
+    pub fn upsert_watch(&mut self, core: &ThreadedSuperShuckieCore, mut watch: Watch) -> Result<u32, String> {
+        if self.game.is_none() {
+            return Err("No game is loaded".to_owned())
+        }
+        watch.validate()?;
+        let existing = self.watches.iter().position(|w| w.id == watch.id && watch.id != 0);
+        let traced = self.watches.iter().enumerate().filter(|(i, w)| Some(*i) != existing && w.is_traced()).count();
+        if watch.is_traced() && traced >= MAX_TRACES {
+            return Err(format!("At most {MAX_TRACES} watches can log changes or pause emulation at once"))
+        }
+        match existing {
+            Some(index) => {
+                let old = &self.watches[index];
+                if old.address != watch.address || old.format != watch.format {
+                    self.watch_runtime.remove(&watch.id);
+                }
+                self.watches[index] = watch.clone();
+            }
+            None => {
+                watch.id = self.watches.iter().map(|w| w.id).max().unwrap_or(0) + 1;
+                self.watches.push(watch.clone());
+            }
+        }
+        self.watches_changed(core);
+        Ok(watch.id)
+    }
+
+    pub fn remove_watch(&mut self, core: &ThreadedSuperShuckieCore, id: u32) {
+        let before = self.watches.len();
+        self.watches.retain(|w| w.id != id);
+        if self.watches.len() != before {
+            self.watch_runtime.remove(&id);
+            self.visible_watches.retain(|v| *v != id);
+            self.watches_changed(core);
+        }
+    }
+
+    /// Which watches are on screen, so their values are sampled.
+    pub fn set_visible_watches(&mut self, core: &ThreadedSuperShuckieCore, ids: &[u32]) {
+        if ids != self.visible_watches.as_slice() {
+            self.visible_watches = ids.to_vec();
+            self.push_request(core);
+        }
+    }
+
+    /// The latest values of the watches on screen.
+    pub fn watch_values(&self) -> Vec<WatchValue> {
+        self.visible_watches.iter().filter_map(|id| {
+            let watch = self.watches.iter().find(|w| w.id == *id)?;
+            let runtime = self.watch_runtime.get(id);
+            let value = runtime.and_then(|r| r.value.clone());
+            Some(WatchValue {
+                id: *id,
+                text: value.as_ref().map(|v| self.format_watch_value(watch, v)).unwrap_or_else(|| "—".to_owned()),
+                previous_text: runtime.and_then(|r| r.previous.as_ref()).map(|v| self.format_watch_value(watch, v)).unwrap_or_default(),
+                value,
+                resolved_address: runtime.and_then(|r| r.resolved),
+                frames_since_change: runtime.and_then(|r| r.last_change_frame).map(|f| self.sample.frame.saturating_sub(f))
+            })
+        }).collect()
+    }
+
+    /// Take up to `max` change log lines (oldest first) and how many were dropped meanwhile.
+    pub fn drain_log(&mut self, max: usize) -> (Vec<LogEntry>, u64) {
+        let count = max.min(self.log.len());
+        (self.log.drain(..count).collect(), core::mem::take(&mut self.log_dropped))
+    }
+
+    /// Replace the watch list with the one in `path` (freezes load inactive).
+    pub fn import_watches(&mut self, core: &ThreadedSuperShuckieCore, path: &std::path::Path, replace: bool) -> Result<usize, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("Can't read {}: {e}", path.display()))?;
+        let (file, problems) = WatchFile::parse(&text)?;
+        if replace {
+            self.watches.clear();
+            self.watch_runtime.clear();
+        }
+        let mut next_id = self.watches.iter().map(|w| w.id).max().unwrap_or(0) + 1;
+        let mut added = 0;
+        for mut watch in file.watches {
+            watch.id = next_id;
+            next_id += 1;
+            if watch.is_traced() && self.watches.iter().filter(|w| w.is_traced()).count() >= MAX_TRACES {
+                watch.trace = false;
+                watch.pause_when = None;
+            }
+            self.watches.push(watch);
+            added += 1;
+        }
+        self.watch_problems = problems;
+        self.watches_changed(core);
+        Ok(added)
+    }
+
+    pub fn export_watches(&self, path: &std::path::Path) -> Result<(), String> {
+        std::fs::write(path, self.watch_file_contents().to_json()).map_err(|e| format!("Can't write {}: {e}", path.display()))
     }
 
     /// Where `.tbl` character tables are loaded from.
@@ -669,4 +1042,8 @@ impl MemoryTools {
     pub fn table(&self, index: usize) -> &CharTable {
         self.tables.get(index).unwrap_or(&self.tables[0])
     }
+}
+
+fn blake3_hex(hash: &ReplayHeaderBlake3Hash) -> String {
+    hash.iter().map(|b| format!("{b:02x}")).collect()
 }

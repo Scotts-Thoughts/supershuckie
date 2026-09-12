@@ -776,6 +776,10 @@ void MainWindow::set_up_tools_menu() {
     ram_search->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_F));
     connect(ram_search, SIGNAL(triggered()), this, SLOT(do_open_ram_search()));
 
+    auto *ram_watch = this->tools_menu->addAction("RAM watch");
+    ram_watch->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_W));
+    connect(ram_watch, SIGNAL(triggered()), this, SLOT(do_open_ram_watch()));
+
     this->tools_menu->addSeparator();
 
     auto *open_tables = this->tools_menu->addAction("Open character tables folder");
@@ -794,6 +798,12 @@ void MainWindow::do_open_ram_viewer() {
 void MainWindow::do_open_ram_search() {
     if(this->memory_tools != nullptr) {
         this->memory_tools->open_search();
+    }
+}
+
+void MainWindow::do_open_ram_watch() {
+    if(this->memory_tools != nullptr) {
+        this->memory_tools->open_watch();
     }
 }
 
@@ -1156,6 +1166,7 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         if(this->memory_tools != nullptr) {
             this->memory_tools->save_windows();
         }
+        supershuckie_frontend_watch_save(this->frontend);
         supershuckie_frontend_stop_recording_replay(this->frontend);
         supershuckie_frontend_write_settings(this->frontend);
         supershuckie_frontend_save_sram(this->frontend, nullptr, 0);

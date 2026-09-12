@@ -6,6 +6,10 @@
 #include "memory_tools_controller.hpp"
 #include "hex_viewer_window.hpp"
 #include "ram_search_window.hpp"
+#include "ram_watch_window.hpp"
+#include "watch_edit_dialog.hpp"
+#include <QJsonDocument>
+#include <QMenu>
 #include "main_window.hpp"
 #include "error.hpp"
 
@@ -15,9 +19,15 @@ static const char *RAM_VIEWERS_OPEN = "qt__ram_viewers_open";
 static const char *RAM_VIEWER_STATE_PREFIX = "qt__ram_viewer_";
 static const char *RAM_REFRESH_RATE = "qt__ram_refresh_hz";
 static const char *RAM_SEARCH_STATE = "qt__ram_search_window";
+static const char *RAM_WATCH_STATE = "qt__ram_watch_window";
 
 MemoryToolsController::MemoryToolsController(MainWindow *main_window): QObject(main_window), main(main_window) {
     connect(&this->timer, SIGNAL(timeout()), this, SLOT(on_timer()));
+    // While every tool window is hidden, traced watches still pause emulation; this notices and
+    // shows the watch window.
+    connect(&this->idle_timer, SIGNAL(timeout()), this, SLOT(on_idle_timer()));
+    this->idle_timer.setInterval(250);
+    this->idle_timer.start();
 
     const char *rate = supershuckie_frontend_get_custom_setting(this->frontend(), RAM_REFRESH_RATE);
     if(rate != nullptr) {
@@ -40,8 +50,70 @@ bool MemoryToolsController::any_window_visible() const {
             return true;
         }
     }
-    return this->search != nullptr && this->search->isVisible();
+    return (this->search != nullptr && this->search->isVisible()) || (this->watch != nullptr && this->watch->isVisible());
 }
+
+void MemoryToolsController::on_idle_timer() {
+    if(this->timer.isActive()) {
+        return;
+    }
+    this->update_regions();
+    if(supershuckie_frontend_watch_generation(this->frontend()) == 0) {
+        return;
+    }
+    if(this->watch != nullptr || supershuckie_frontend_memory_has_traces(this->frontend())) {
+        if(this->watch == nullptr) {
+            this->watch = new RamWatchWindow(this);
+        }
+        emit this->refresh();
+    }
+}
+
+RamWatchWindow *MemoryToolsController::open_watch() {
+    if(this->watch == nullptr) {
+        this->watch = new RamWatchWindow(this);
+    }
+    this->watch->show();
+    this->watch->raise();
+    this->watch->activateWindow();
+    this->visibility_changed();
+    return this->watch;
+}
+
+std::uint32_t MemoryToolsController::upsert_watch(const QByteArray &json, char *error, std::size_t error_len) {
+    return supershuckie_frontend_watch_upsert_json(this->frontend(), json.constData(), error, error_len);
+}
+
+void MemoryToolsController::add_watch(QWidget *parent, std::uint32_t address, std::uint32_t value_type, std::uint8_t size, bool big_endian, const QString &label) {
+    auto watch = WatchEditDialog::new_watch(address, value_type, size, big_endian, label);
+    auto id = WatchEditDialog::edit(this, parent, watch);
+    if(id) {
+        this->open_watch()->select_watch(*id);
+    }
+}
+
+void MemoryToolsController::add_watches(const std::vector<std::uint32_t> &addresses, std::uint32_t value_type, std::uint8_t size, bool big_endian) {
+    std::uint32_t last = 0;
+    char error[512] = {};
+    for(auto address : addresses) {
+        auto watch = WatchEditDialog::new_watch(address, value_type, size, big_endian, this->format_address(address, true));
+        auto id = this->upsert_watch(QJsonDocument(watch).toJson(QJsonDocument::Compact), error, sizeof(error));
+        if(id == 0) {
+            DISPLAY_ERROR_DIALOG("Can't add watch", "%s", error);
+            break;
+        }
+        last = id;
+    }
+    if(last != 0) {
+        this->open_watch()->select_watch(last);
+    }
+}
+
+bool MemoryToolsController::edit_watch_value_inline(QWidget *, std::uint32_t, bool) {
+    return false;
+}
+
+void MemoryToolsController::add_watch_actions(QMenu *, QWidget *, const std::vector<std::uint32_t> &) {}
 
 RamSearchWindow *MemoryToolsController::open_search() {
     if(this->search == nullptr) {
@@ -278,6 +350,10 @@ void MemoryToolsController::save_windows() {
         QString state = QString("%1|%2").arg(this->search->isVisible() ? "1" : "0", this->search->save_state());
         supershuckie_frontend_set_custom_setting(this->frontend(), RAM_SEARCH_STATE, state.toUtf8().constData());
     }
+    if(this->watch != nullptr) {
+        QString state = QString("%1|%2").arg(this->watch->isVisible() ? "1" : "0", this->watch->save_state());
+        supershuckie_frontend_set_custom_setting(this->frontend(), RAM_WATCH_STATE, state.toUtf8().constData());
+    }
 }
 
 void MemoryToolsController::restore_windows() {
@@ -315,6 +391,19 @@ void MemoryToolsController::restore_windows() {
             this->search->restore_state(state.mid(split + 1));
             if(state.left(split) == "1") {
                 this->search->show();
+            }
+        }
+    }
+
+    const char *watch_state = supershuckie_frontend_get_custom_setting(this->frontend(), RAM_WATCH_STATE);
+    if(watch_state != nullptr) {
+        QString state = QString::fromUtf8(watch_state);
+        int split = state.indexOf('|');
+        if(split > 0) {
+            this->watch = new RamWatchWindow(this);
+            this->watch->restore_state(state.mid(split + 1));
+            if(state.left(split) == "1") {
+                this->watch->show();
             }
         }
     }

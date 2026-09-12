@@ -771,6 +771,25 @@ void RamSearchWindow::on_context_menu(const QPoint &position) {
     connect(copy, &QAction::triggered, this, [this, row]() {
         QApplication::clipboard()->setText(this->controller->format_address(row->address, false));
     });
+
+    std::vector<std::uint32_t> addresses;
+    for(auto &selected : this->table->selectionModel()->selectedRows()) {
+        auto selected_row = this->model->row(selected.row());
+        if(selected_row) {
+            addresses.push_back(selected_row->address);
+        }
+        if(addresses.size() >= 256) {
+            break;
+        }
+    }
+    if(addresses.empty()) {
+        addresses.push_back(row->address);
+    }
+    auto status = this->model->search_status();
+    auto *add_watch = menu.addAction(addresses.size() == 1 ? QString("Add to watch list") : QString("Add %1 results to watch list").arg(addresses.size()));
+    connect(add_watch, &QAction::triggered, this, [this, addresses, status]() {
+        this->controller->add_watches(addresses, status.value_type, status.size, status.big_endian);
+    });
     menu.exec(this->table->viewport()->mapToGlobal(position));
 }
 

@@ -34,6 +34,8 @@ add_library(supershuckie-cpp-static STATIC
     src/hex_view_widget.cpp
     src/hex_viewer_window.cpp
     src/ram_search_window.cpp
+    src/ram_watch_window.cpp
+    src/watch_edit_dialog.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

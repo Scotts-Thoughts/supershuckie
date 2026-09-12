@@ -597,3 +597,248 @@ pub extern "C" fn supershuckie_frontend_search_reset(frontend: &mut SuperShuckie
     let (tools, core) = frontend.memory_tools_mut();
     tools.search_reset(core);
 }
+
+// ---------------------------------------------------------------------------------------------
+// RAM watch
+
+use std::ffi::CString;
+use supershuckie_frontend::memory_tools::LogKind;
+use supershuckie_memory_tools::watch::{format_watch_address, parse_watch_address, Watch, WatchAddress};
+
+/// Free a string returned by a `supershuckie_*` function that says to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_string_free(string: *mut c_char) {
+    if !string.is_null() {
+        drop(unsafe { CString::from_raw(string) });
+    }
+}
+
+fn into_c_string(text: String) -> *mut c_char {
+    CString::new(text.replace('\0', "")).expect("no NUL").into_raw()
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SuperShuckieWatchValueC {
+    pub id: u32,
+    pub ok: bool,
+    pub resolved: bool,
+    pub resolved_address: u32,
+    /// u64::MAX when the value has not been seen changing.
+    pub frames_since_change: u64,
+    pub length: u8,
+    pub value: [u8; 64],
+    pub text: [u8; 128],
+    pub previous_text: [u8; 128]
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct SuperShuckieWatchLogEntryC {
+    pub frame: u64,
+    pub watch_id: u32,
+    pub kind: u32,
+    pub text: [u8; 256]
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_watch_list_json(frontend: &SuperShuckieFrontend) -> *mut c_char {
+    let watches = frontend.memory_tools().watches();
+    into_c_string(serde_json::to_string(watches).unwrap_or_else(|_| "[]".to_owned()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_watch_generation(frontend: &SuperShuckieFrontend) -> u64 {
+    frontend.memory_tools().watch_generation()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_upsert_json(
+    frontend: &mut SuperShuckieFrontend,
+    json: *const c_char,
+    error: *mut u8,
+    error_len: usize
+) -> u32 {
+    let (tools, core) = frontend.memory_tools_mut();
+    let result = serde_json::from_str::<Watch>(unsafe { c_str(json) })
+        .map_err(|e| format!("Bad watch: {e}"))
+        .and_then(|watch| tools.upsert_watch(core, watch));
+    match result {
+        Ok(id) => id,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_watch_remove(frontend: &mut SuperShuckieFrontend, id: u32) {
+    let (tools, core) = frontend.memory_tools_mut();
+    tools.remove_watch(core, id);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_set_visible(frontend: &mut SuperShuckieFrontend, ids: *const u32, count: usize) {
+    let ids = if ids.is_null() { &[][..] } else { unsafe { from_raw_parts(ids, count) } };
+    let (tools, core) = frontend.memory_tools_mut();
+    tools.set_visible_watches(core, ids);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_read_values(
+    frontend: &SuperShuckieFrontend,
+    out: *mut SuperShuckieWatchValueC,
+    capacity: usize
+) -> usize {
+    let values = frontend.memory_tools().watch_values();
+    if out.is_null() {
+        return values.len()
+    }
+    let out = unsafe { from_raw_parts_mut(out, capacity) };
+    for (value, slot) in values.iter().zip(out.iter_mut()) {
+        let mut entry = SuperShuckieWatchValueC {
+            id: value.id,
+            ok: value.value.is_some(),
+            resolved: value.resolved_address.is_some(),
+            resolved_address: value.resolved_address.unwrap_or(0),
+            frames_since_change: value.frames_since_change.unwrap_or(u64::MAX),
+            length: 0,
+            value: [0; 64],
+            text: [0; 128],
+            previous_text: [0; 128]
+        };
+        if let Some(bytes) = value.value.as_ref() {
+            let len = bytes.len().min(64);
+            entry.value[..len].copy_from_slice(&bytes[..len]);
+            entry.length = len as u8;
+        }
+        write_str_to_data(&value.text, &mut entry.text);
+        write_str_to_data(&value.previous_text, &mut entry.previous_text);
+        *slot = entry;
+    }
+    values.len().min(capacity)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_drain_log(
+    frontend: &mut SuperShuckieFrontend,
+    out: *mut SuperShuckieWatchLogEntryC,
+    capacity: usize,
+    dropped: *mut u64
+) -> usize {
+    let (tools, _) = frontend.memory_tools_mut();
+    let (entries, lost) = tools.drain_log(if out.is_null() { 0 } else { capacity });
+    if !dropped.is_null() {
+        unsafe { *dropped = lost };
+    }
+    if out.is_null() {
+        return 0
+    }
+    let out = unsafe { from_raw_parts_mut(out, capacity) };
+    for (entry, slot) in entries.iter().zip(out.iter_mut()) {
+        let mut c = SuperShuckieWatchLogEntryC {
+            frame: entry.frame,
+            watch_id: entry.watch_id,
+            kind: match entry.kind {
+                LogKind::Changed => 0,
+                LogKind::Discontinuity => 1,
+                LogKind::Paused => 2,
+                LogKind::Edited => 3,
+                LogKind::EditFailed => 4
+            },
+            text: [0; 256]
+        };
+        write_str_to_data(&entry.text, &mut c.text);
+        *slot = c;
+    }
+    entries.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_problems(frontend: &mut SuperShuckieFrontend, out: *mut u8, out_len: usize) -> bool {
+    let (tools, _) = frontend.memory_tools_mut();
+    let problems = tools.take_watch_problems();
+    if problems.is_empty() {
+        return false
+    }
+    unsafe { write_error(&problems.join("\n"), out, out_len) };
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_import(
+    frontend: &mut SuperShuckieFrontend,
+    path: *const c_char,
+    replace: bool,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    let (tools, core) = frontend.memory_tools_mut();
+    match tools.import_watches(core, std::path::Path::new(unsafe { c_str(path) }), replace) {
+        Ok(_) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_export(
+    frontend: &SuperShuckieFrontend,
+    path: *const c_char,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.memory_tools().export_watches(std::path::Path::new(unsafe { c_str(path) })) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_watch_save(frontend: &mut SuperShuckieFrontend) {
+    let (tools, _) = frontend.memory_tools_mut();
+    tools.save_watches();
+}
+
+/// Parse a watch address (`0x…`, `EWRAM:…`, `[…]+off`) into JSON `{"base": …, "offsets": […]}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_parse_address(
+    frontend: &SuperShuckieFrontend,
+    text: *const c_char,
+    error: *mut u8,
+    error_len: usize
+) -> *mut c_char {
+    match parse_watch_address(unsafe { c_str(text) }, frontend.memory_tools().regions()) {
+        Ok(address) => into_c_string(serde_json::to_string(&address).expect("serializes")),
+        Err(e) => {
+            unsafe { write_error(&e, error, error_len) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Format a watch address given as JSON `{"base": …, "offsets": […]}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_watch_format_address(
+    frontend: &SuperShuckieFrontend,
+    json: *const c_char,
+    out: *mut u8,
+    out_len: usize
+) -> usize {
+    let address: WatchAddress = serde_json::from_str(unsafe { c_str(json) }).unwrap_or_default();
+    let text = format_watch_address(&address, frontend.memory_tools().regions());
+    unsafe { write_string(&text, out, out_len) }
+}
+
+/// Whether any watch is compared every frame (logging changes or pausing), so the UI keeps
+/// polling while its windows are hidden.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_memory_has_traces(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.memory_tools().watches().iter().any(|w| w.is_traced())
+}

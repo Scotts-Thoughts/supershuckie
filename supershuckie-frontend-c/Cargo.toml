@@ -14,3 +14,4 @@ crate-type = ["staticlib"]
 supershuckie-frontend = { workspace = true }
 supershuckie-core = { workspace = true }
 supershuckie-memory-tools = { workspace = true }
+serde_json = { workspace = true }

@@ -549,6 +549,12 @@ void HexViewerWindow::on_context_menu(QPoint global_position) {
     int group = this->view->group_size();
     bool big_endian = this->view->is_big_endian();
     std::uint32_t type = group == 4 ? SuperShuckieMemoryValueType__U32 : group == 2 ? SuperShuckieMemoryValueType__U16 : SuperShuckieMemoryValueType__U8;
+    std::uint32_t cursor = this->view->cursor_address();
+    auto *add_watch = menu.addAction(QString("Add watch at %1…").arg(this->controller->format_address(cursor, true)));
+    connect(add_watch, &QAction::triggered, this, [this, cursor, type, group, big_endian]() {
+        this->controller->add_watch(this, cursor, type, static_cast<std::uint8_t>(group), big_endian, this->controller->format_address(cursor, true));
+    });
+
     auto value_bytes = this->view->bytes_at(this->view->cursor_address(), static_cast<std::size_t>(group));
     if(value_bytes) {
         QString value = this->controller->format_value(0, type, static_cast<std::uint8_t>(group), big_endian, SuperShuckieMemoryDisplay__Decimal, value_bytes->data(), value_bytes->size());
