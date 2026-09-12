@@ -38,6 +38,7 @@
 #include "controller_settings_window.hpp"
 #include "replay_playback_controls.hpp"
 #include "video_export_dialog.hpp"
+#include "memory_tools_controller.hpp"
 
 #include <QProgressDialog>
 #include <QThread>
@@ -263,6 +264,9 @@ MainWindow::MainWindow(): QMainWindow() {
     this->render_widget->setFocus(Qt::OtherFocusReason);
     this->rebuild_recent_roms_menu();
 
+    this->memory_tools = new MemoryToolsController(this);
+    this->memory_tools->restore_windows();
+
     this->ticker.start();
 }
 
@@ -445,6 +449,7 @@ void MainWindow::set_up_menu() {
     this->set_up_save_states_menu();
     this->set_up_replays_menu();
     this->set_up_audio_menu();
+    this->set_up_tools_menu();
     this->set_up_settings_menu();
 
     this->refresh_action_states();
@@ -754,6 +759,49 @@ void MainWindow::set_up_audio_menu() {
         action->setCheckable(true);
         buffer_menu->addAction(action);
         this->audio_buffers[i] = action;
+    }
+}
+
+void MainWindow::set_up_tools_menu() {
+    this->tools_menu = this->menu_bar->addMenu("Tools");
+
+    auto *ram_viewer = this->tools_menu->addAction("RAM viewer");
+    ram_viewer->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_V));
+    connect(ram_viewer, SIGNAL(triggered()), this, SLOT(do_open_ram_viewer()));
+
+    auto *new_ram_viewer = this->tools_menu->addAction("New RAM viewer window");
+    connect(new_ram_viewer, SIGNAL(triggered()), this, SLOT(do_new_ram_viewer()));
+
+    this->tools_menu->addSeparator();
+
+    auto *open_tables = this->tools_menu->addAction("Open character tables folder");
+    connect(open_tables, SIGNAL(triggered()), this, SLOT(do_open_tables_folder()));
+
+    auto *reload_tables = this->tools_menu->addAction("Reload character tables");
+    connect(reload_tables, SIGNAL(triggered()), this, SLOT(do_reload_tables()));
+}
+
+void MainWindow::do_open_ram_viewer() {
+    if(this->memory_tools != nullptr) {
+        this->memory_tools->open_viewer();
+    }
+}
+
+void MainWindow::do_new_ram_viewer() {
+    if(this->memory_tools != nullptr && this->memory_tools->new_viewer() == nullptr) {
+        this->set_title("All RAM viewer windows are already open");
+    }
+}
+
+void MainWindow::do_open_tables_folder() {
+    if(this->memory_tools != nullptr) {
+        this->memory_tools->open_tables_folder();
+    }
+}
+
+void MainWindow::do_reload_tables() {
+    if(this->memory_tools != nullptr) {
+        this->memory_tools->reload_tables();
     }
 }
 
@@ -1095,6 +1143,9 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         auto geometry = this->geometry();
         std::snprintf(xy, sizeof(xy), "%d|%d", geometry.x(), geometry.y());
         supershuckie_frontend_set_custom_setting(this->frontend, WINDOW_XY, xy);
+        if(this->memory_tools != nullptr) {
+            this->memory_tools->save_windows();
+        }
         supershuckie_frontend_stop_recording_replay(this->frontend);
         supershuckie_frontend_write_settings(this->frontend);
         supershuckie_frontend_save_sram(this->frontend, nullptr, 0);

@@ -203,7 +203,7 @@ pub extern "C" fn supershuckie_frontend_is_game_running(
     frontend.is_game_running()
 }
 
-fn write_str_to_data(string: &str, buffer: &mut [u8]) {
+pub(crate) fn write_str_to_data(string: &str, buffer: &mut [u8]) {
     if buffer.is_empty() {
         return
     }

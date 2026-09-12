@@ -756,6 +756,9 @@ pub struct MemoryMonitorLocal {
 impl MemoryMonitorLocal {
     /// The core thread's half of `shared`.
     pub fn new(shared: Arc<MemoryMonitorShared>) -> Self {
+        // A monitor outlives the cores it is attached to; keep sample generations increasing so the
+        // UI side, which remembers the last one it saw, takes this core's samples too.
+        let next_sample_generation = shared.sample_generation.load(Ordering::Relaxed) + 1;
         Self {
             shared,
             request: MonitorRequest::default(),
@@ -763,7 +766,7 @@ impl MemoryMonitorLocal {
             seen_edits_generation: 0,
             sample: MonitorSample::default(),
             sample_unpublished: false,
-            next_sample_generation: 1,
+            next_sample_generation,
             next_sample_at: None,
             initialized: false,
             last_frame: 0,

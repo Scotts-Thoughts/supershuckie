@@ -30,6 +30,9 @@ add_library(supershuckie-cpp-static STATIC
     src/nds_date_dialog.cpp
     src/video_export_dialog.cpp
     src/audio_output.cpp
+    src/memory_tools_controller.cpp
+    src/hex_view_widget.cpp
+    src/hex_viewer_window.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

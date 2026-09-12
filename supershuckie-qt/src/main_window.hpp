@@ -28,6 +28,7 @@ class NDSDateDialog;
 class StringAction;
 class VideoExportDialog;
 class AudioOutput;
+class MemoryToolsController;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -49,6 +50,7 @@ class MainWindow: public QMainWindow {
     friend NDSDateDialog;
     friend StringAction;
     friend VideoExportDialog;
+    friend MemoryToolsController;
     
 public:
     MainWindow();
@@ -76,6 +78,7 @@ private:
     QMenu *save_states_menu;
     QMenu *replays_menu;
     QMenu *audio_menu;
+    QMenu *tools_menu;
     QMenu *settings_menu;
     QMenu *recent_roms_menu;
 
@@ -169,7 +172,10 @@ private:
     void set_up_save_states_menu();
     void set_up_replays_menu();
     void set_up_audio_menu();
+    void set_up_tools_menu();
     void set_up_settings_menu();
+
+    MemoryToolsController *memory_tools = nullptr;
 
     void apply_audio_gain();
     void set_audio_volume(std::uint8_t percent);
@@ -260,6 +266,10 @@ private slots:
     void do_toggle_audio_enabled();
     void do_toggle_audio_muted();
     void do_toggle_audio_mute_when_sped_up();
+    void do_open_ram_viewer();
+    void do_new_ram_viewer();
+    void do_open_tables_folder();
+    void do_reload_tables();
 };
 
 class NumberedAction: public QAction {

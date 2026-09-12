@@ -13,3 +13,4 @@ crate-type = ["staticlib"]
 [dependencies]
 supershuckie-frontend = { workspace = true }
 supershuckie-core = { workspace = true }
+supershuckie-memory-tools = { workspace = true }

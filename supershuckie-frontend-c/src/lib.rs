@@ -8,3 +8,4 @@ macro_rules! nullable_reference {
 pub mod frontend;
 pub mod string_array;
 pub mod control_settings;
+pub mod memory;

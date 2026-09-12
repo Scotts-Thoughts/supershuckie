@@ -975,6 +975,7 @@ dependencies = [
  "serde_json",
  "supershuckie-core",
  "supershuckie-frontend-webserver",
+ "supershuckie-memory-tools",
  "supershuckie-replay-recorder",
 ]
 
@@ -984,6 +985,7 @@ version = "0.4.12"
 dependencies = [
  "supershuckie-core",
  "supershuckie-frontend",
+ "supershuckie-memory-tools",
 ]
 
 [[package]]
@@ -992,6 +994,14 @@ version = "0.4.12"
 dependencies = [
  "rouille",
  "serde",
+]
+
+[[package]]
+name = "supershuckie-memory-tools"
+version = "0.4.12"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

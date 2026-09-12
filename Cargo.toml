@@ -7,7 +7,8 @@ members = [
     "supershuckie-frontend-c",
     "melonds-rs",
     "mgba-rs",
-    "supershuckie-frontend-webserver"
+    "supershuckie-frontend-webserver",
+    "supershuckie-memory-tools"
 ]
 
 resolver = "3"
@@ -27,6 +28,7 @@ supershuckie-core = { version = "0.4.12", path = "supershuckie-core" }
 supershuckie-frontend = { version = "0.4.12", path = "supershuckie-frontend" }
 melonds-rs = { version = "0.4.12", path = "melonds-rs" }
 mgba-rs = { version = "0.4.12", path = "mgba-rs" }
+supershuckie-memory-tools = { version = "0.4.12", path = "supershuckie-memory-tools" }
 
 num_enum = "0.7.5"
 tinyvec = { version = "1.10.0", features = ["alloc"], default-features = false }

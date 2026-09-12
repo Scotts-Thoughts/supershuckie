@@ -1,6 +1,7 @@
 pub mod util;
 pub mod settings;
 pub mod replay_convert;
+pub mod memory_tools;
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -150,6 +151,9 @@ pub struct SuperShuckieFrontend {
     /// from this on its own thread for the life of the frontend.
     audio_output: Arc<AudioOutput>,
 
+    /// RAM viewer, search, watch, editing and freezing.
+    memory_tools: memory_tools::MemoryTools,
+
     settings: Settings
 }
 
@@ -164,6 +168,7 @@ impl SuperShuckieFrontend {
         ).expect("failed to init user_dir");
 
         let audio_output = Arc::new(AudioOutput::new(settings.audio.latency_ms as u32));
+        let memory_tools = memory_tools::MemoryTools::new(data_dir.join("tables"));
 
         let mut s = Self {
             core: ThreadedSuperShuckieCore::new(Box::new(NullEmulatorCore)),
@@ -195,7 +200,8 @@ impl SuperShuckieFrontend {
             current_export: None,
             pending_conversion_plan: None,
             current_conversion: None,
-            audio_output
+            audio_output,
+            memory_tools
         };
 
         // This is not tied to the core, so we want to immediately enable this.
@@ -846,6 +852,7 @@ impl SuperShuckieFrontend {
             new_core.pause();
         }
         self.core = new_core;
+        self.memory_tools.core_switched(&self.core);
     }
 
     fn reset_save_state_history(&mut self) {
@@ -1138,6 +1145,9 @@ impl SuperShuckieFrontend {
         let mut errors = String::new();
 
         self.refresh_screen(false);
+
+        let playing_back = self.core.is_playing_back();
+        self.memory_tools.tick(&self.core, playing_back);
 
         let replay_errors = self.core.get_replay_recording_errors();
         if !replay_errors.is_empty() {
@@ -2227,6 +2237,18 @@ impl SuperShuckieFrontend {
                 Err(self.external_commands_error.as_ref().expect("??? we just set it"))
             }
         }
+    }
+
+    /// The RAM tools' state.
+    #[inline]
+    pub fn memory_tools(&self) -> &memory_tools::MemoryTools {
+        &self.memory_tools
+    }
+
+    /// The RAM tools' state, with the running core for operations that reach it.
+    #[inline]
+    pub fn memory_tools_mut(&mut self) -> (&mut memory_tools::MemoryTools, &ThreadedSuperShuckieCore) {
+        (&mut self.memory_tools, &self.core)
     }
 
     #[inline]
