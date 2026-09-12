@@ -18,3 +18,7 @@ build_*.log
 
 # Runtime user data
 UserData/
+
+# Local packaging output (built exe / zips) - never commit binaries
+/dist
+/dist-static-test
