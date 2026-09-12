@@ -75,6 +75,13 @@ interpretation 12-18% faster with bit-identical emulation. The result is `build\
 (it needs the MSYS2 `bin` directory on `PATH` for the Qt/SDL DLLs; build with
 `-DSUPERSHUCKIE_STATIC=ON` against the static Qt package for a standalone exe).
 
+The Windows build also writes `libraries-and-attributions/` next to the executable: the
+license texts and copyright notices of everything compiled into it (the emulator cores, every
+Rust crate, Qt and the libraries it statically links, the MinGW runtime, the embedded boot
+ROMs). Those licenses require the folder to accompany the exe, so ship them together. It is
+produced by `scripts/make-attributions.py` (see `licenses/README.md`), which fails the build if
+a new dependency has no license text to ship.
+
 ## Performance notes
 
 * The Nintendo DS core always runs melonDS's interpreter: the JIT compiles blocks from what it

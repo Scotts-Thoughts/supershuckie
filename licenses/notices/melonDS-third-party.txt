@@ -1,0 +1,86 @@
+Third-party code compiled into the melonDS core (libcore + libteakra)
+=====================================================================
+
+melonDS itself is licensed under the GNU General Public License v3 or later
+(see LICENSE in this directory). SuperShuckie builds only the emulator core
+(BUILD_QT_SDL=OFF, ENABLE_OGLRENDERER=OFF, ENABLE_GDBSTUB=OFF, ENABLE_JIT=ON),
+so the components below are the ones that end up in the executable. The
+network stack (libslirp, pcap) and the Qt frontend are not built.
+
+Teakra (DSi DSP emulator)                     -> teakra-LICENSE
+  Copyright (c) 2018 Weiyi Wang
+  MIT License
+
+blip_buf (band-limited audio synthesis)      -> blip-buf-license.txt
+  Library Copyright (C) 2003-2009 Shay Green
+  GNU Lesser General Public License v2.1 or later
+
+Dolphin Emulator code (JIT emitter helpers)  -> dolphin-license.txt
+  Copyright Dolphin Emulator Project
+  GNU General Public License v2 or later
+  Only built when ENABLE_JIT=ON (it is).
+
+FatFs (generic FAT filesystem module)        -> fatfs-LICENSE.txt
+  Copyright (C) ChaN
+  FatFs license (BSD-style, one clause)
+
+tiny-AES-c                                   -> tiny-AES-c-unlicense.txt
+  Public domain (The Unlicense)
+
+xxHash
+  Copyright (C) 2012-2023 Yann Collet
+  BSD 2-Clause License (https://www.opensource.org/licenses/bsd-license.php)
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are
+  met:
+
+     * Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+     * Redistributions in binary form must reproduce the above
+       copyright notice, this list of conditions and the following disclaimer
+       in the documentation and/or other materials provided with the
+       distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+  OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+  https://www.xxhash.com  /  https://github.com/Cyan4973/xxHash
+
+SHA-1 in C
+  By Steve Reid <steve@edmweb.com>
+  100% Public Domain
+
+FreeBIOS (Custom NDS ARM7/ARM9 BIOS replacement)
+  SuperShuckie does not ship Nintendo's DS BIOS; melonDS's built-in
+  replacement is used instead.
+
+  Copyright (c) 2013, Gilead Kutnick
+  All rights reserved.
+  Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are met:
+  1) Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+  2) Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.

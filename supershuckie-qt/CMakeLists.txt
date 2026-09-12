@@ -133,6 +133,53 @@ endif()
 add_executable(supershuckie-debug)
 target_link_libraries(supershuckie-debug supershuckie-cpp-static)
 
+# Ship the license texts and copyright notices of everything linked into the executable
+# (the emulator cores, every Rust crate, Qt and its statically linked dependencies, the
+# MinGW runtime, the embedded boot ROMs) in a libraries-and-attributions/ folder next to it.
+# scripts/make-attributions.py gathers them from the repo, the cargo registry and the MSYS2
+# prefix, and fails the build if a dependency has no license text to ship.
+# Default on for the Windows standalone build, where every library is redistributed inside
+# the exe; on other platforms Qt/SDL/the runtime are the system's and the toolchain layout
+# the script expects (an MSYS2 or rustup sysroot) may not exist.
+if(${WIN32})
+    set(_ss_attr_default ON)
+else()
+    set(_ss_attr_default OFF)
+endif()
+option(SUPERSHUCKIE_ATTRIBUTIONS "Generate libraries-and-attributions/ next to the executable" ${_ss_attr_default})
+if(SUPERSHUCKIE_ATTRIBUTIONS)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    set(SUPERSHUCKIE_ATTRIBUTIONS_DIR "${CMAKE_BINARY_DIR}/libraries-and-attributions")
+    set(_ss_attr_script "${CMAKE_SOURCE_DIR}/../scripts/make-attributions.py")
+    set(_ss_attr_args --out "${SUPERSHUCKIE_ATTRIBUTIONS_DIR}"
+        --cargo "${Rust_CARGO_CACHED}" --target "${Rust_CARGO_TARGET_CACHED}")
+    if(${WIN32})
+        # The Qt/SDL/runtime libraries come from the MSYS2 environment whose cargo builds the
+        # crates (C:/msys64/ucrt64/bin/cargo.exe -> C:/msys64/ucrt64).
+        get_filename_component(_ss_msys_prefix "${Rust_CARGO_CACHED}" DIRECTORY)
+        get_filename_component(_ss_msys_prefix "${_ss_msys_prefix}" DIRECTORY)
+        list(APPEND _ss_attr_args --msys-prefix "${_ss_msys_prefix}")
+    else()
+        list(APPEND _ss_attr_args --msys-prefix "")
+    endif()
+    # Re-run when the inputs it reads from the repo change: the script, the lock file (crate
+    # set), the vendored notices, and the license files it copies verbatim.
+    file(GLOB_RECURSE _ss_attr_inputs CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/../licenses/*"
+        "${CMAKE_SOURCE_DIR}/../bootrom/*/LICENSE"
+        "${CMAKE_SOURCE_DIR}/../bootrom/*/*/LICENSE")
+    add_custom_command(
+        OUTPUT "${SUPERSHUCKIE_ATTRIBUTIONS_DIR}/README.txt"
+        COMMAND "${Python3_EXECUTABLE}" "${_ss_attr_script}" ${_ss_attr_args}
+        DEPENDS "${_ss_attr_script}" "${CMAKE_SOURCE_DIR}/../Cargo.lock"
+                "${CMAKE_SOURCE_DIR}/../COPYING" "${CMAKE_SOURCE_DIR}/icon-credits.txt"
+                ${_ss_attr_inputs}
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/.."
+        COMMENT "Collecting third-party licenses into libraries-and-attributions/"
+        VERBATIM)
+    add_custom_target(supershuckie-attributions DEPENDS "${SUPERSHUCKIE_ATTRIBUTIONS_DIR}/README.txt")
+endif()
+
 if(${APPLE})
     set(supershuckie_ICON "${CMAKE_SOURCE_DIR}/supershuckie.icns")
     set_source_files_properties(${supershuckie_ICON} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
@@ -161,6 +208,9 @@ else()
 endif()
 
 target_link_libraries(supershuckie supershuckie-cpp-static)
+if(SUPERSHUCKIE_ATTRIBUTIONS)
+    add_dependencies(supershuckie supershuckie-attributions)
+endif()
 
 if(SUPERSHUCKIE_STATIC)
     # A static Qt has no plugin DLLs to load at runtime, so the platform integration

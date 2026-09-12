@@ -1,0 +1,36 @@
+Game Boy Advance BIOS (bootrom/agb/gba_bios.bin)
+================================================
+
+SuperShuckie embeds an open-source replacement for the Game Boy Advance
+BIOS, not Nintendo's. The 16 KiB image is byte-for-byte identical
+(MD5 1876f71b0d8c65eef3454547896ffb11) to the one distributed with the
+ReGBA / TempGBA emulator, whose source is in the "bios" directory of
+https://github.com/Nebuleon/ReGBA. It is the "Custom GBA BIOS replacement"
+based on VisualBoyAdvance-M's high-level BIOS emulation, as compiled by
+Normmatt.
+
+Its source files carry the following notice:
+
+  Custom GBA BIOS replacement
+  Copyright (c) 2002-2006 VBA Development Team
+  Copyright (c) 2006-2013 VBA-M Development Team
+  Copyright (c) 2013 Normmatt
+
+  This program is free software; you can redistribute it and/or
+  modify it under the terms of the GNU General Public License
+  as published by the Free Software Foundation; either version 2
+  of the License, or (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+The text of the GNU General Public License version 2 is in GPL-2.0.txt next
+to this file. Because the BIOS is licensed as "version 2 or any later
+version", it is distributed here together with GPL-3-licensed SuperShuckie
+under the terms of version 3 (see ../../supershuckie/COPYING).

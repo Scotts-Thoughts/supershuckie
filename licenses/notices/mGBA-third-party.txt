@@ -1,0 +1,23 @@
+Third-party code compiled into the mGBA core (libmgba)
+======================================================
+
+mGBA is licensed under the Mozilla Public License 2.0 (see LICENSE in this
+directory). SuperShuckie builds libmgba only (LIBMGBA_ONLY=ON,
+DISABLE_FRONTENDS=ON); of the bundled third-party code in mGBA's
+src/third-party/, only inih is compiled in. libpng and zlib are taken from
+the system (see ../../libraries/), and lzma, sqlite3, minizip and
+discord-rpc are not built.
+
+inih (INI file parser)                       -> inih-LICENSE.txt
+  Copyright (c) 2009, Ben Hoyt
+  All rights reserved.
+  New BSD License (BSD 3-Clause)
+  https://github.com/benhoyt/inih
+
+mGBA's own MD5 and SHA-1 implementations (src/util/md5.c, src/util/sha1.c)
+are MPL-2.0 like the rest of mGBA; they are based on public-domain code from
+https://github.com/Zunawe/md5-c (the Unlicense) and https://github.com/clibs/sha1.
+
+mGBA's Game Boy Advance core contains its own high-level BIOS emulation
+(src/gba/hle-bios.c, MPL-2.0). SuperShuckie does not use it: it supplies the
+open-source replacement BIOS described in ../../boot-roms/gba-bios/.
