@@ -62,3 +62,8 @@ target/release/supershuckie-replay-convert <in.replay> <out.replay> --verify
 ```
 
 Run it with `--help` for the encoding options. Keep the original until `--verify` has passed.
+
+To convert a whole `UserData` folder, `convert-replays.ps1` (Windows PowerShell) walks every
+`<ROM>-dataeplays\*.replay`, converts and verifies each one in place with several processes at
+a time, and moves the verified originals to a backup folder (`-DeleteOriginals` to delete them
+instead). Start with `.\convert-replays.ps1 -DryRun`; see the script header for the options.
