@@ -238,6 +238,93 @@ pub fn run_script<R: ReplayFileRecorderFns + ?Sized>(recorder: &mut R) {
     }
 }
 
+/// Record the script with `settings`. Returns the crash-safe temp-file layout (snapshotted just
+/// before `close()`) and the closed final file.
+pub fn record_script(settings: crate::replay_file::record::ReplayFileRecorderSettings) -> (Vec<u8>, Vec<u8>) {
+    let temp = SharedSink::default();
+    let final_sink = SharedSink::default();
+    let mut recorder = crate::replay_file::record::ReplayFileRecorder::new_with_metadata(
+        make_metadata(),
+        ByteVec::new(),
+        settings,
+        0u64.into(),
+        ib(&[0]),
+        Speed::default(),
+        bv(&state_for(0)),
+        final_sink.clone(),
+        temp.clone(),
+    )
+    .unwrap();
+
+    run_script(&mut recorder);
+    let temp_bytes = temp.snapshot();
+    recorder.close().unwrap();
+    (temp_bytes, final_sink.snapshot())
+}
+
+/// How a keyframe is stored in a file.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum StoredKeyframeKind {
+    Full,
+    V3Delta,
+    RegionDelta,
+}
+
+/// Raw layout statistics of a replay file (walks the packets directly, decompressing blobs).
+#[derive(Clone, Default, Debug)]
+pub struct FileStats {
+    pub blobs: usize,
+    pub top_level_packets: usize,
+    /// `(frame, kind, in_blob)` for every keyframe-class packet in stream order.
+    pub keyframes: Vec<(u64, StoredKeyframeKind, bool)>,
+}
+
+impl FileStats {
+    pub fn count(&self, kind: StoredKeyframeKind) -> usize {
+        self.keyframes.iter().filter(|k| k.1 == kind).count()
+    }
+
+    pub fn kind_at(&self, frame: u64) -> StoredKeyframeKind {
+        self.keyframes.iter().find(|k| k.0 == frame).unwrap_or_else(|| panic!("no keyframe at {frame}")).1
+    }
+}
+
+pub fn file_stats(bytes: &[u8]) -> FileStats {
+    use crate::PacketIO;
+
+    let header = crate::replay_file::ReplayHeaderRaw::from_bytes(bytes[..2048].try_into().unwrap());
+    let version = header.replay_version;
+    let mut stats = FileStats::default();
+
+    fn note(stats: &mut FileStats, packet: &Packet, in_blob: bool) {
+        match packet {
+            Packet::Keyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::Full, in_blob)),
+            Packet::DeltaKeyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::V3Delta, in_blob)),
+            Packet::RegionDeltaKeyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::RegionDelta, in_blob)),
+            _ => {}
+        }
+    }
+
+    let mut data = &bytes[2048 + header.patch_data_length as usize..];
+    while !data.is_empty() {
+        let packet = Packet::read_all(&mut data, version).expect("packet");
+        stats.top_level_packets += 1;
+        if let Packet::CompressedBlob { compressed_data, uncompressed_size, .. } = &packet {
+            stats.blobs += 1;
+            let raw = crate::decompress_data(compressed_data.as_slice(), *uncompressed_size as usize).expect("decompress");
+            let mut inner = raw.as_slice();
+            while !inner.is_empty() {
+                note(&mut stats, &Packet::read_all(&mut inner, version).expect("inner packet"), true);
+            }
+        }
+        else {
+            note(&mut stats, &packet, false);
+        }
+    }
+
+    stats
+}
+
 /// Expected input bytes in effect at frame `frame` (as recorded in keyframe metadata).
 pub fn expected_input_at(frame: u64) -> Vec<u8> {
     let mut input = alloc::vec![0u8];

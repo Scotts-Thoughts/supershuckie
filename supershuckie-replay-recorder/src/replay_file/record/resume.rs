@@ -366,6 +366,7 @@ mod tests {
         ReplayFileRecorderSettings {
             // Small enough to force multiple blob splits during the source build & re-feed.
             minimum_uncompressed_bytes_per_blob: 256,
+            max_frames_per_blob: 0,
             compression_level: 1,
         }
     }

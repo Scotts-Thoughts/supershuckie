@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use core::mem::transmute;
 use core::ffi::CStr;
 use num_enum::TryFromPrimitive;
-use zstd_sys::{ZSTD_decompress, ZSTD_getErrorName, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel};
+use zstd_sys::{ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2, ZSTD_createCCtx, ZSTD_decompress, ZSTD_freeCCtx, ZSTD_getErrorName, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel};
 use crate::replay_file::ReplayHeaderBlake3Hash;
 
 /// Describes an enum that may or may not be valid.
@@ -54,6 +54,21 @@ pub(crate) const unsafe fn reinterpret_ref<F: Copy, T: Copy>(from: &F) -> &T {
     unsafe { transmute(from) }
 }
 
+/// Inputs above this size get a window large enough to cover the whole input (capped at 128 MiB)
+/// plus long-distance matching, so every keyframe delta in a blob can match against every earlier
+/// one.
+const LARGE_WINDOW_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// `ZSTD_WINDOWLOG_LIMIT_DEFAULT`: the largest window a decoder accepts without opting in.
+const MAX_WINDOW_LOG: u32 = 27;
+
+fn zstd_error(code: usize) -> Cow<'static, str> {
+    // SAFETY: ZSTD_getErrorName always returns a valid static C string.
+    let error_name = unsafe { CStr::from_ptr(ZSTD_getErrorName(code)).to_string_lossy() };
+    Cow::Owned(format!("zstd error: {code} - {error_name}"))
+}
+
+/// Compress `data` as a single zstd frame (readable by [`decompress_data`]).
 pub(crate) fn compress_data(data: &[u8], compression_level: i32) -> Result<Vec<u8>, Cow<'static, str>> {
     // SAFETY: This function is safe.
     let bound = unsafe { zstd_sys::ZSTD_compressBound(data.len()) };
@@ -67,22 +82,53 @@ pub(crate) fn compress_data(data: &[u8], compression_level: i32) -> Result<Vec<u
     // SAFETY: These are safe.
     let level = unsafe { compression_level.clamp(ZSTD_minCLevel() as i32, ZSTD_maxCLevel() as i32) };
 
-    // SAFETY: We've reserved everything and we've supplied the correct arguments
-    let compressed_data_len = unsafe {
-        zstd_sys::ZSTD_compress(
-            v.as_mut_ptr() as *mut c_void,
-            v.capacity(),
-            data.as_ptr() as *const c_void,
-            data.len(),
-            level
-        )
+    // SAFETY: Creating a context is safe; a null result means allocation failed.
+    let cctx = unsafe { ZSTD_createCCtx() };
+    if cctx.is_null() {
+        return Err(Cow::Borrowed("could not allocate a zstd compression context"));
+    }
+
+    let set_parameter = |parameter: ZSTD_cParameter, value: i32| -> Result<(), Cow<'static, str>> {
+        // SAFETY: cctx is a valid context and every parameter is validated by zstd.
+        let result = unsafe { ZSTD_CCtx_setParameter(cctx, parameter, value) };
+        if unsafe { ZSTD_isError(result) } != 0 {
+            return Err(zstd_error(result));
+        }
+        Ok(())
     };
 
-    // SAFETY: This function is safe.
-    if unsafe { ZSTD_isError(compressed_data_len) } != 0 {
-        let error_name = unsafe { CStr::from_ptr(ZSTD_getErrorName(compressed_data_len)).to_string_lossy() };
-        return Err(Cow::Owned(format!("zstd error: {compressed_data_len} - {error_name}")))
-    }
+    let compressed_data_len = (|| {
+        set_parameter(ZSTD_cParameter::ZSTD_c_compressionLevel, level)?;
+
+        if data.len() > LARGE_WINDOW_THRESHOLD {
+            let window_log = (usize::BITS - (data.len() - 1).leading_zeros()).min(MAX_WINDOW_LOG);
+            set_parameter(ZSTD_cParameter::ZSTD_c_windowLog, window_log as i32)?;
+            set_parameter(ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, 1)?;
+        }
+
+        // SAFETY: We've reserved everything and we've supplied the correct arguments
+        let compressed_data_len = unsafe {
+            ZSTD_compress2(
+                cctx,
+                v.as_mut_ptr() as *mut c_void,
+                v.capacity(),
+                data.as_ptr() as *const c_void,
+                data.len()
+            )
+        };
+
+        // SAFETY: This function is safe.
+        if unsafe { ZSTD_isError(compressed_data_len) } != 0 {
+            return Err(zstd_error(compressed_data_len));
+        }
+
+        Ok(compressed_data_len)
+    })();
+
+    // SAFETY: cctx was created above and is not used afterwards.
+    unsafe { ZSTD_freeCCtx(cctx) };
+
+    let compressed_data_len = compressed_data_len?;
 
     assert!(compressed_data_len <= bound, "compressed_data_len 0x{compressed_data_len:X} exceeds buffer len 0x{bound:X}");
 
@@ -470,6 +516,42 @@ mod tests {
         assert_eq!(in_place, cur);
         d
     }
+
+    #[test]
+    fn compress_round_trips_small_and_large_inputs() {
+        // Compressible but not trivial: repeated pseudo-random blocks with edits.
+        let block = pseudo_random_bytes(3, 64 * 1024);
+        let mut small = Vec::new();
+        for i in 0..4u8 {
+            small.extend_from_slice(&block);
+            small[i as usize * 1000] ^= i;
+        }
+        // Past LARGE_WINDOW_THRESHOLD, so the window/LDM parameters are exercised.
+        let mut large = Vec::new();
+        while large.len() <= LARGE_WINDOW_THRESHOLD {
+            large.extend_from_slice(&block);
+            let n = large.len();
+            large[n - 1] ^= (n % 7) as u8;
+        }
+
+        for (name, data) in [("empty", Vec::new()), ("small", small), ("large", large)] {
+            for level in [1, DEFAULT_LEVEL_FOR_TEST, 19] {
+                let compressed = compress_data(&data, level).unwrap_or_else(|e| panic!("{name} @ {level}: {e}"));
+                let back = decompress_data(&compressed, data.len()).unwrap_or_else(|e| panic!("{name} @ {level}: {e}"));
+                assert_eq!(back, data, "{name} @ {level}");
+                if data.len() > 1024 {
+                    assert!(compressed.len() < data.len() / 2, "{name} @ {level} did not compress: {} vs {}", compressed.len(), data.len());
+                }
+            }
+        }
+
+        // The wrong size is an error, not a panic.
+        let compressed = compress_data(&[1, 2, 3], 3).unwrap();
+        assert!(decompress_data(&compressed, 4).is_err());
+        assert!(decompress_data(&[0xFF; 8], 3).is_err());
+    }
+
+    const DEFAULT_LEVEL_FOR_TEST: i32 = crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4;
 
     #[test]
     fn leb128_round_trips() {

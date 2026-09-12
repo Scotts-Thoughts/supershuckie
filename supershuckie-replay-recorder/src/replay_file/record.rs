@@ -32,7 +32,7 @@ use std::{
     fs::File
 };
 use std::collections::BTreeMap;
-use crate::util::fast_diff;
+use crate::util::region_diff;
 
 /// Records a replay file
 ///
@@ -46,9 +46,6 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
     current_blob_keyframes: Vec<KeyframeMetadata>,
     current_blob_bookmarks: Vec<BookmarkMetadata>,
     current_blob_offset: u64,
-
-    // NOTE: Not exact. Used for determining when to make the next compressed blob.
-    current_blob_size_undiffed: usize,
 
     elapsed_frames: UnsignedInteger,
     elapsed_millis: TimestampMillis,
@@ -72,25 +69,46 @@ struct SinkTuple<Final: ReplayFileSink, Temp: ReplayFileSink> {
 }
 
 /// Settings for [`ReplayFileRecorder`]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ReplayFileRecorderSettings {
-    /// Minimum uncompressed bytes per blob before creating a new blob
+    /// Hard cap on *actual* buffered uncompressed packet bytes before a blob is closed.
+    ///
+    /// (Format v3 counted every delta keyframe as a full state here; that estimator is gone, so
+    /// this now only bounds the recorder's in-progress buffer and the player's per-chain memory.)
     ///
     /// Default is [`DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB`]
     pub minimum_uncompressed_bytes_per_blob: usize,
 
+    /// Close the blob at the first keyframe at or after this many frames since the blob's first
+    /// keyframe. `0` = unlimited.
+    ///
+    /// This bounds the length of a delta chain, i.e. how many deltas a cold seek may have to apply.
+    ///
+    /// Default is [`DEFAULT_MAX_FRAMES_PER_BLOB`] (15 minutes at 60 fps).
+    pub max_frames_per_blob: u64,
+
     /// zstd compression level
     ///
-    /// Default is [`DEFAULT_ZSTD_COMPRESSION_LEVEL`]
+    /// Default is [`DEFAULT_ZSTD_COMPRESSION_LEVEL_V4`]
     pub compression_level: i32
 }
 
 /// Default minimum uncompressed bytes per blob
 pub const DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB: usize = 1024 * 1024 * 1024;
 
-/// Default compression level
+/// Default maximum frames per blob (15 minutes at 60 fps).
+pub const DEFAULT_MAX_FRAMES_PER_BLOB: u64 = 54_000;
+
+/// Default compression level for format v4 files.
 ///
-/// This is generally going to be equal to `3`.
+/// Level 9 costs nothing measurable on region-diff data (132-177 MiB/s) and is 8-18% smaller than
+/// zstd's own default of 3.
+pub const DEFAULT_ZSTD_COMPRESSION_LEVEL_V4: i32 = 9;
+
+/// zstd's own default compression level
+///
+/// This is generally going to be equal to `3`. Format v3 files were written with it; v4 defaults
+/// to [`DEFAULT_ZSTD_COMPRESSION_LEVEL_V4`].
 pub static DEFAULT_ZSTD_COMPRESSION_LEVEL: LazyLock<i32> = LazyLock::new(|| unsafe { ZSTD_defaultCLevel() } as i32);
 
 impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp> {
@@ -173,7 +191,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             current_blob_bookmarks: Vec::new(),
             current_blob_offset: u64::try_from(current_blob_offset).expect("failed to read"),
             poisoned: false,
-            current_blob_size_undiffed: 0,
             header: metadata,
             last_state_to_diff: None,
             counters: BTreeMap::new(),
@@ -231,7 +248,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.current_speed = kf.speed;
         self.counters = kf.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
         self.last_state_to_diff = None;
-        self.current_blob_size_undiffed = 0;
         self.current_blob.clear();
         self.current_blob_keyframes.clear();
         self.current_blob_bookmarks.clear();
@@ -304,6 +320,11 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
     /// Add a new keyframe.
     ///
+    /// The keyframe is written as a [`Packet::RegionDeltaKeyframe`] against the previous keyframe
+    /// of the current blob whenever that is smaller than the state itself (it practically always
+    /// is), and as a full [`Packet::Keyframe`] otherwise: at the start of every blob, when the
+    /// state length changed, or when the state was rewritten wholesale.
+    ///
     /// Returns the frame index the keyframe is on.
     pub fn insert_keyframe(&mut self, state: ByteVec, elapsed_millis: TimestampMillis) -> Result<u64, ReplayFileWriteError> {
         assert!(self.elapsed_millis <= elapsed_millis, "Bad timestamp given (time went backwards!!!); expected {} (current) <= {elapsed_millis} (last)", self.elapsed_millis);
@@ -312,7 +333,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.elapsed_millis = elapsed_millis;
         self.last_keyframe_frames = self.elapsed_frames;
 
-        if self.current_blob_size_undiffed >= self.settings.minimum_uncompressed_bytes_per_blob {
+        if self.blob_limit_reached() {
             self.next_blob()?;
             self.last_state_to_diff = None;
         }
@@ -330,33 +351,48 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         self.current_blob_keyframes.push(metadata.clone());
 
-        let diff;
-        if let Some(s) = self.last_state_to_diff.take() {
-            diff = fast_diff(s.as_slice(), state.as_slice());
-        }
-        else {
-            diff = None;
-        }
+        let delta = match self.last_state_to_diff.as_ref() {
+            Some(previous) if previous.len() == state.len() => {
+                let diff = region_diff(previous.as_slice(), state.as_slice()).expect("lengths were checked");
+                (diff.encoded_len() < state.len()).then_some(diff)
+            },
+            _ => None
+        };
 
-        self.last_state_to_diff = Some(state.clone());
-
-        if let Some(diff) = diff {
-            let size_before = self.current_blob_size_undiffed;
-            let estimated_size = state.len() + metadata.input.len() + 24;
-            self.write_packet_data(&Packet::DeltaKeyframe {
+        if let Some(diff) = delta {
+            self.write_packet_data(&Packet::RegionDeltaKeyframe {
                 metadata,
-                diff
+                state_len: u64::try_from(state.len()).expect("state length exceeds u64"),
+                control: ByteVec::Heap(diff.control),
+                data: ByteVec::Heap(diff.data)
             })?;
-            self.current_blob_size_undiffed = size_before + estimated_size;
         }
         else {
             self.write_packet_data(&Packet::Keyframe {
                 metadata,
-                state
+                state: state.clone()
             })?;
         }
 
+        // The next delta is taken against the state exactly as the player will reconstruct it.
+        self.last_state_to_diff = Some(state);
+
         Ok(self.elapsed_frames)
+    }
+
+    /// Whether the in-progress blob should be closed before the next keyframe: it has run for
+    /// `max_frames_per_blob` frames since its first keyframe, or buffers at least
+    /// `minimum_uncompressed_bytes_per_blob` bytes.
+    fn blob_limit_reached(&self) -> bool {
+        let Some(first_keyframe) = self.current_blob_keyframes.first() else {
+            return false
+        };
+
+        let frame_limit = self.settings.max_frames_per_blob;
+        let frames_in_blob = self.elapsed_frames.saturating_sub(first_keyframe.elapsed_frames);
+
+        (frame_limit > 0 && frames_in_blob >= frame_limit)
+            || self.current_blob.len() >= self.settings.minimum_uncompressed_bytes_per_blob
     }
 
     fn next_blob(&mut self) -> Result<(), ReplayFileWriteError> {
@@ -403,7 +439,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             temporary_sink.write_packet_data(&write_instructions)?;
 
             this.current_blob_offset = current_blob_offset_old.checked_add(written).expect("overflowed adding current_blob_offset");
-            this.current_blob_size_undiffed = 0;
 
             Ok(())
         })
@@ -449,10 +484,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
     fn write_packet_unchecked<'a, P: PacketIO<'a>>(&mut self, what: &'a P) -> Result<(), ReplayFileWriteError> {
         let instructions = what.write_packet_instructions();
-        let start = self.current_blob.len();
         self.current_blob.write_packet_data(&instructions)?;
-        let bytes_written = self.current_blob.len() - start;
-        self.current_blob_size_undiffed += bytes_written;
         self.sink.as_mut().expect("write_packet_data on None sink").temp_sink.write_packet_data(&instructions)?;
         Ok(())
     }
@@ -530,7 +562,8 @@ impl Default for ReplayFileRecorderSettings {
     fn default() -> Self {
         Self {
             minimum_uncompressed_bytes_per_blob: DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB,
-            compression_level: *DEFAULT_ZSTD_COMPRESSION_LEVEL,
+            max_frames_per_blob: DEFAULT_MAX_FRAMES_PER_BLOB,
+            compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
         }
     }
 }
@@ -799,4 +832,114 @@ impl<Final: ReplayFileSink + 'static + Send, Temp: ReplayFileSink + 'static + Se
 
 fn _ensure_replay_file_recorder_fns_is_dyn_compatible(_fns: &dyn ReplayFileRecorderFns) {}
 
-// TODO: WRITE UNIT TESTS
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    fn settings(max_frames_per_blob: u64, minimum_uncompressed_bytes_per_blob: usize) -> ReplayFileRecorderSettings {
+        ReplayFileRecorderSettings {
+            minimum_uncompressed_bytes_per_blob,
+            max_frames_per_blob,
+            compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+        }
+    }
+
+    /// Every layout the recorder can produce must play back exactly (sequentially and with
+    /// forward/backward/cross-blob seeks), from the temp file as well as the closed file.
+    #[test]
+    fn recorded_files_play_back_exactly() {
+        let cases = [
+            ("frame cap 45", settings(45, usize::MAX)),
+            ("frame cap 50 (splits at the rewritten keyframe)", settings(50, usize::MAX)),
+            ("byte cap 12 KiB", settings(0, 12 * 1024)),
+            ("both caps", settings(60, 9 * 1024)),
+            ("no cap (single blob / all top-level)", settings(0, usize::MAX)),
+            ("one keyframe per blob", settings(1, usize::MAX)),
+        ];
+
+        for (name, settings) in cases {
+            let (temp, closed) = record_script(settings);
+            check_script_replay(&temp, &format!("{name}: temp layout"));
+            check_script_replay(&closed, &format!("{name}: closed layout"));
+        }
+    }
+
+    #[test]
+    fn keyframes_are_region_deltas_except_restarts_and_fallbacks() {
+        let (temp, closed) = record_script(settings(45, usize::MAX));
+
+        // 200 frames / 45 per blob: restarts at 0, 45, 90, 135, 180.
+        let stats = file_stats(&closed);
+        assert_eq!(stats.blobs, 5);
+        assert_eq!(stats.top_level_packets, 5);
+        assert_eq!(stats.keyframes.len(), keyframe_frames().len());
+        assert_eq!(stats.count(StoredKeyframeKind::V3Delta), 0);
+
+        for frame in [0, 45, 90, 135, 180] {
+            assert_eq!(stats.kind_at(frame), StoredKeyframeKind::Full, "restart at {frame}");
+        }
+        // Fallbacks: the rewritten state (and the keyframe after it, which shares nothing with it
+        // either), and the length changes at both ends of LONGER_RANGE.
+        assert_eq!(stats.kind_at(REWRITTEN_FRAME), StoredKeyframeKind::Full);
+        assert_eq!(stats.kind_at(REWRITTEN_FRAME + KEYFRAME_INTERVAL), StoredKeyframeKind::Full);
+        assert_eq!(stats.kind_at(LONGER_RANGE.start), StoredKeyframeKind::Full);
+        assert_eq!(stats.kind_at(LONGER_RANGE.end), StoredKeyframeKind::Full);
+        // ...and the chain continues with deltas right after each fallback.
+        for frame in [REWRITTEN_FRAME + 2 * KEYFRAME_INTERVAL, LONGER_RANGE.start + 5, LONGER_RANGE.end + 5, 5, 50, 195, 200] {
+            assert_eq!(stats.kind_at(frame), StoredKeyframeKind::RegionDelta, "delta at {frame}");
+        }
+        assert_eq!(stats.count(StoredKeyframeKind::Full), 5 + 4);
+
+        // The temp layout holds the same keyframes, with the last chain uncompressed at top level.
+        let temp_stats = file_stats(&temp);
+        assert_eq!(temp_stats.blobs, 4);
+        assert_eq!(temp_stats.keyframes, stats.keyframes.iter().map(|&(f, k, _)| (f, k, f < 180)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn byte_cap_counts_actual_buffered_bytes() {
+        // Each keyframe delta is a few hundred bytes; with 4 KiB states the v3 estimator would have
+        // rolled an 8 KiB cap over every second keyframe (41 keyframes -> ~20 blobs). Only full
+        // keyframes (restarts and the 4 fallbacks) weigh anything now.
+        let (_, closed) = record_script(settings(0, 8 * 1024));
+        let stats = file_stats(&closed);
+        assert!(stats.blobs >= 2 && stats.blobs <= 8, "blobs = {}", stats.blobs);
+        assert!(stats.count(StoredKeyframeKind::RegionDelta) > 30);
+    }
+
+    #[test]
+    fn v4_output_is_smaller_than_the_v3_fixture() {
+        // Same script, same number of blobs (4: restarts at 0, 55, 110, 165) as the v3 fixture.
+        let (_, closed) = record_script(settings(55, usize::MAX));
+        assert_eq!(file_stats(&closed).blobs, 4);
+        assert!(closed.len() < V3_SMALL_CLOSED.len(), "{} >= {}", closed.len(), V3_SMALL_CLOSED.len());
+        let version = crate::replay_file::ReplayHeaderRaw::from_bytes(closed[..2048].try_into().unwrap()).replay_version;
+        assert_eq!(version, crate::replay_file::REPLAY_VERSION);
+    }
+
+    #[test]
+    fn identical_consecutive_states_produce_empty_deltas() {
+        let state = bv(&pseudo_random_bytes(4, 1000));
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), state.clone(), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        recorder.next_frame(16.into()).unwrap();
+        recorder.insert_keyframe(state.clone(), 16.into()).unwrap();
+        recorder.next_frame(32.into()).unwrap();
+        recorder.insert_keyframe(state.clone(), 32.into()).unwrap();
+        let (closed, _) = recorder.close().unwrap();
+
+        let stats = file_stats(&closed);
+        assert_eq!(stats.keyframes.iter().map(|k| k.1).collect::<Vec<_>>(), [StoredKeyframeKind::Full, StoredKeyframeKind::RegionDelta, StoredKeyframeKind::RegionDelta]);
+
+        let mut player = crate::replay_file::playback::ReplayFilePlayer::new(&closed, false).unwrap();
+        for frame in [2u64, 0, 1] {
+            player.go_to_keyframe(frame).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { state: s, .. }) => assert_eq!(s, &state),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}

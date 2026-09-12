@@ -1410,7 +1410,8 @@ impl SuperShuckieFrontend {
                 minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
                     .saturating_mul(1024)
                     .saturating_mul(1024),
-                compression_level: self.settings.replay.zstd_compression_level
+                compression_level: self.settings.replay.zstd_compression_level,
+                ..Default::default()
             },
 
             // TODO: patches
@@ -1505,7 +1506,8 @@ impl SuperShuckieFrontend {
                 minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
                     .saturating_mul(1024)
                     .saturating_mul(1024),
-                compression_level: self.settings.replay.zstd_compression_level
+                compression_level: self.settings.replay.zstd_compression_level,
+                ..Default::default()
             },
 
             // TODO: patches

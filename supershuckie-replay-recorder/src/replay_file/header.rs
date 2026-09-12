@@ -17,10 +17,18 @@ pub const SIGNATURE_END: [u8; 4] = 0x52494E41u32.to_be_bytes();
 pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 
 /// Replay format version (written version)
-pub const REPLAY_VERSION: u32 = 3;
+///
+/// * v2: original format.
+/// * v3: `KeyframeMetadata` gained `counters`.
+/// * v4: keyframe deltas are `RegionDeltaKeyframe` packets (run-length region diffs) and delta
+///   chains run for minutes rather than ~2 minutes; no new header fields (packets self-describe),
+///   but the delta chains are only affordable with a player that materialises deltas lazily, so
+///   older builds refuse v4 files.
+pub const REPLAY_VERSION: u32 = 4;
 
 // Resume support: see replay_file::record::resume (build_resumed_recorder). A resumed file is an
-// ordinary v3 file; no format change.
+// ordinary v4 file; no format change. Blobs copied verbatim from the source keep the source's
+// packet encoding (v3 DeltaKeyframes stay v3), which every v4 reader accepts.
 
 /// Blake3 checksum
 pub type ReplayHeaderBlake3Hash = [u8; 32];
