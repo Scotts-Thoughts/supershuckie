@@ -61,6 +61,10 @@ pub struct ReplayFilePlayer {
     /// [`Packet::Keyframe`]. Overwritten by the next delta the cursor passes.
     materialized: Option<Packet>,
 
+    /// Whether [`Packet::Keyframe`]s handed out for delta keyframes carry a copy of the state
+    /// (see [`Self::set_keyframe_states_wanted`]).
+    keyframe_states_wanted: bool,
+
     #[cfg(feature = "std")]
     threading: bool
 }
@@ -355,6 +359,7 @@ impl ReplayFilePlayer {
             header_raw: *header_raw,
             chain: ChainState::new(),
             materialized: None,
+            keyframe_states_wanted: true,
 
             #[cfg(feature = "std")]
             threading: false
@@ -388,6 +393,24 @@ impl ReplayFilePlayer {
     #[cfg(feature = "std")]
     pub fn enable_threading(&mut self) {
         self.threading = true;
+    }
+
+    /// Choose whether the [`Packet::Keyframe`] returned for a delta keyframe carries a copy of
+    /// the reconstructed state (`true`, the default) or an empty `state` (`false`).
+    ///
+    /// Reconstructing the chain is cheap and always happens, but copying a multi-megabyte state
+    /// for every keyframe the cursor passes is not; a consumer that only needs the state now and
+    /// then (or never, when it does not resync) should turn this off and read
+    /// [`Self::current_keyframe_state`] instead when it does.
+    pub fn set_keyframe_states_wanted(&mut self, wanted: bool) {
+        self.keyframe_states_wanted = wanted;
+    }
+
+    /// The full state of the keyframe-class packet most recently returned by
+    /// [`Self::next_packet`], regardless of [`Self::set_keyframe_states_wanted`]. Empty before
+    /// the first keyframe.
+    pub fn current_keyframe_state(&self) -> &[u8] {
+        &self.chain.state
     }
 
     /// Get a reference to a map of keyframes.
@@ -624,9 +647,15 @@ impl ReplayFilePlayer {
                     self.chain.fold(list, packets.as_slice(), index)?;
                 }
 
+                let state = if self.keyframe_states_wanted {
+                    ByteVec::Heap(self.chain.state.clone())
+                }
+                else {
+                    ByteVec::new()
+                };
                 self.materialized = Some(Packet::Keyframe {
                     metadata: metadata.clone(),
-                    state: ByteVec::Heap(self.chain.state.clone())
+                    state
                 });
 
                 return Ok(self.materialized.as_ref().expect("just set"));

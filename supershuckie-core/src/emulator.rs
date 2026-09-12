@@ -18,6 +18,9 @@ use supershuckie_replay_recorder::ByteVec;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettings, ReplayFileSink};
 
+/// Sample rate, in Hz, at which every core delivers audio through [`EmulatorCore::take_audio`].
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+
 /// Emulator core functionality.
 pub trait EmulatorCore: Send + 'static {
     /// Run the smallest amount of time.
@@ -44,6 +47,47 @@ pub trait EmulatorCore: Send + 'static {
 
     /// Create a save state.
     fn create_save_state(&self) -> Vec<u8>;
+
+    /// Write a save state into `into`, reusing its allocation where the core supports it.
+    ///
+    /// Cores with large states (melonDS, mGBA) fill a previously used buffer an order of
+    /// magnitude faster than a fresh one, so periodic callers should recycle buffers.
+    fn create_save_state_into(&self, into: &mut Vec<u8>) {
+        let state = self.create_save_state();
+        into.clear();
+        into.extend_from_slice(&state);
+    }
+
+    /// Presentation hint: when `skip` is set, frames run from now on need not be drawn because
+    /// nobody will look at them. Cores that support it stop updating their screens (and report
+    /// `presented: false` in [`RunTime`]); emulation itself is unaffected. Default: ignored.
+    fn set_skip_drawing(&mut self, _skip: bool) {}
+
+    /// Turn audio generation on or off. Off by default.
+    ///
+    /// When off, [`take_audio`](Self::take_audio) yields nothing and the core may skip rendering
+    /// samples entirely. Like [`set_skip_drawing`](Self::set_skip_drawing), this is a
+    /// presentation setting: it must never affect emulation, timing or save states.
+    fn set_audio_enabled(&mut self, _enabled: bool) {}
+
+    /// Append every interleaved stereo `i16` sample (left, right, …) at [`AUDIO_SAMPLE_RATE`]
+    /// produced since the previous call, then forget them.
+    ///
+    /// Must not affect emulation state: the caller drains after every run, heard or not, so a
+    /// core's internal audio buffers are in the same state whether or not anyone is listening.
+    fn take_audio(&mut self, _into: &mut Vec<i16>) {}
+
+    /// Microseconds until the core is due to run its next frame under its own pacing, if it
+    /// paces itself (`run` returns zero frames until then). `None` when unknown or not pacing.
+    fn microseconds_until_next_frame(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// The paced frame period in microseconds (the budget one frame has at the current speed),
+    /// if the core paces itself.
+    fn frame_period_microseconds(&self) -> Option<u64> {
+        None
+    }
 
     /// Load a save state.
     fn load_save_state(&mut self, state: &[u8]) -> Result<(), String>;
@@ -101,7 +145,19 @@ pub trait EmulatorCore: Send + 'static {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct RunTime {
     /// Frames passed.
-    pub frames: u64
+    pub frames: u64,
+
+    /// Whether the screens now hold a newly drawn frame. `false` when the frame was skipped via
+    /// [`EmulatorCore::set_skip_drawing`] (or when no frame passed).
+    pub presented: bool
+}
+
+impl RunTime {
+    /// No frame passed.
+    pub const NONE: Self = Self { frames: 0, presented: false };
+
+    /// One drawn frame.
+    pub const ONE_FRAME: Self = Self { frames: 1, presented: true };
 }
 
 /// Describes a current input state.

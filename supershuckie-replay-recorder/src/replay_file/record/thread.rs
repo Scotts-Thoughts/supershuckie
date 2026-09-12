@@ -18,6 +18,7 @@ pub struct NonBlockingReplayFileRecorder<Final: ReplayFileSink + Send + 'static,
 
     sender: Sender<ThreadedReplayFileRecorderCommand>,
     errors: Receiver<ReplayFileWriteError>,
+    free_buffers: Receiver<Vec<u8>>,
     closed: Receiver<()>
 }
 
@@ -29,11 +30,13 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let (sender_main, receiver_helper) = channel();
         let (sender_helper, receiver_main) = channel();
         let (closed_helper, closed_main) = channel();
+        let (free_sender, free_receiver) = channel();
 
         let helper = ThreadedReplayFileRecorderThread {
             recorder: Arc::downgrade(&recorder),
             error_sender: sender_helper,
             receiver: receiver_helper,
+            free_buffers: free_sender,
             closed: closed_helper
         };
 
@@ -47,9 +50,15 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         Self {
             sender: sender_main,
             errors: receiver_main,
+            free_buffers: free_receiver,
             recorder: Some(recorder),
             closed: closed_main
         }
+    }
+
+    /// A keyframe state buffer the recorder thread has finished with, if one is waiting.
+    pub fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
+        self.free_buffers.try_recv().ok()
     }
 
     /// Return `true` if the recorder was already closed.
@@ -161,6 +170,8 @@ struct ThreadedReplayFileRecorderThread<Final: ReplayFileSink, Temp: ReplayFileS
     // eventually be closed if it fails
     error_sender: Sender<ReplayFileWriteError>,
     receiver: Receiver<ThreadedReplayFileRecorderCommand>,
+    /// Displaced keyframe state buffers go back to the producer through here.
+    free_buffers: Sender<Vec<u8>>,
     closed: Sender<()>
 }
 
@@ -196,8 +207,11 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
                 recorder.write_memory(address, data)
             },
             ThreadedReplayFileRecorderCommand::NewKeyframe { timestamp, state } => {
-                let _ = recorder.insert_keyframe(state, timestamp)?;
-                Ok(())
+                let result = recorder.insert_keyframe(state, timestamp);
+                if let Some(buffer) = recorder.take_recycled_state() {
+                    let _ = self.free_buffers.send(buffer);
+                }
+                result.map(|_| ())
             }
             ThreadedReplayFileRecorderCommand::SetInput { input } => {
                 recorder.set_input(input)
@@ -326,6 +340,11 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
     fn change_counter(&mut self, counter: String, delta: SignedInteger) -> Result<(), ReplayFileWriteError> {
         self.change_counter(counter, delta);
         Ok(())
+    }
+
+    #[inline]
+    fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
+        self.take_free_state_buffer()
     }
 }
 

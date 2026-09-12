@@ -25,6 +25,8 @@ unsafe extern "C" {
     fn mgba_rs_core_load_save_state(core: *mut MGBACoreRaw, data: *const u8, data_size: usize) -> bool;
     fn mgba_rs_core_get_ewram(core: *mut MGBACoreRaw) -> *mut [u8; 0x40000];
     fn mgba_rs_core_get_iwram(core: *mut MGBACoreRaw) -> *mut [u8; 0x8000];
+    fn mgba_rs_core_set_audio_enabled(core: *mut MGBACoreRaw, enabled: bool);
+    fn mgba_rs_core_read_audio(core: *mut MGBACoreRaw, out: *mut i16, max_frames: usize) -> usize;
 }
 
 pub struct Core {
@@ -73,14 +75,22 @@ impl Core {
 
     #[inline]
     pub fn create_save_state(&self) -> Option<Vec<u8>> {
-        let mut v = Vec::with_capacity(32 * 1024 * 1024);
+        let mut v = Vec::new();
+        self.create_save_state_into(&mut v).then_some(v)
+    }
 
-        match unsafe { mgba_rs_core_create_save_state(self.inner, v.as_mut_ptr(), v.capacity()) } {
-            0 => None,
-            n => Some({
-                unsafe { v.set_len(n); }
-                v
-            })
+    /// Write a save state into `into`, reusing its allocation (see the melonDS binding for why
+    /// callers taking periodic states should recycle buffers).
+    pub fn create_save_state_into(&self, into: &mut Vec<u8>) -> bool {
+        into.clear();
+        into.reserve(32 * 1024 * 1024);
+
+        match unsafe { mgba_rs_core_create_save_state(self.inner, into.as_mut_ptr(), into.capacity()) } {
+            0 => false,
+            n => {
+                unsafe { into.set_len(n); }
+                true
+            }
         }
     }
 
@@ -107,6 +117,19 @@ impl Core {
     #[inline]
     pub fn get_iwram_mut(&mut self) -> &mut [u8] {
         unsafe { &mut *mgba_rs_core_get_iwram(self.inner) }.as_mut_slice()
+    }
+
+    /// Whether the core's mix is resampled for `read_audio`. Never affects emulation.
+    #[inline]
+    pub fn set_audio_enabled(&mut self, enabled: bool) {
+        unsafe { mgba_rs_core_set_audio_enabled(self.inner, enabled) }
+    }
+
+    /// Pop the stereo frames (interleaved `i16` pairs at 48 kHz) mixed since the last call into
+    /// `out`, returning how many frames were written. Nothing while audio is disabled.
+    #[inline]
+    pub fn read_audio(&mut self, out: &mut [i16]) -> usize {
+        unsafe { mgba_rs_core_read_audio(self.inner, out.as_mut_ptr(), out.len() / 2) }
     }
 }
 

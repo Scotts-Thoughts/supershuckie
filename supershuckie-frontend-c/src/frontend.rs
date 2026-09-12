@@ -3,7 +3,9 @@ use std::mem::MaybeUninit;
 use std::num::NonZeroU8;
 use std::ptr::null;
 use std::slice::from_raw_parts_mut;
-use supershuckie_core::emulator::{ScreenData, ScreenDataEncoding};
+use std::sync::Arc;
+use supershuckie_core::emulator::{ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
+use supershuckie_core::AudioOutput;
 use supershuckie_frontend::{ConnectedControllerIndex, SuperShuckieEmulatorType, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState, UserInput};
 use supershuckie_frontend::settings::{GameBoyMode, NintendoDSDate};
 use supershuckie_frontend::util::UTF8CString;
@@ -859,6 +861,34 @@ pub unsafe extern "C" fn supershuckie_frontend_get_all_save_states_for_rom(
     Box::into_raw(Box::new(array))
 }
 
+/// Emulated frames per second over roughly the last second, drawn or not (the true emulation
+/// rate). Call it once per UI tick; it updates its window itself.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_emulation_fps(frontend: &mut SuperShuckieFrontend) -> f64 {
+    frontend.get_emulation_fps()
+}
+
+/// Frame-time diagnostics from the core thread, in microseconds. Null pointers are skipped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_get_frame_time_stats(
+    frontend: &SuperShuckieFrontend,
+    average_micros: *mut u32,
+    last_micros: *mut u32,
+    max_micros: *mut u32,
+    budget_micros: *mut u32,
+    frames_over_budget: *mut u64
+) {
+    let stats = frontend.get_frame_time_stats();
+    // SAFETY: the caller passes either null or valid, writable pointers.
+    unsafe {
+        if !average_micros.is_null() { *average_micros = stats.average_frame_micros; }
+        if !last_micros.is_null() { *last_micros = stats.last_frame_micros; }
+        if !max_micros.is_null() { *max_micros = stats.max_frame_micros; }
+        if !budget_micros.is_null() { *budget_micros = stats.budget_micros; }
+        if !frames_over_budget.is_null() { *frames_over_budget = stats.frames_over_budget; }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_get_elapsed_time(
     frontend: &SuperShuckieFrontend,
@@ -1080,6 +1110,103 @@ pub extern "C" fn supershuckie_frontend_get_nds_jit(frontend: &SuperShuckieFront
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_set_nds_jit(frontend: &mut SuperShuckieFrontend, enabled: bool) {
     frontend.set_jit_enabled(enabled)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_audio_enabled(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_audio_enabled()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_audio_enabled(frontend: &mut SuperShuckieFrontend, enabled: bool) {
+    frontend.set_audio_enabled(enabled)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_audio_muted(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_audio_muted()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_audio_muted(frontend: &mut SuperShuckieFrontend, muted: bool) {
+    frontend.set_audio_muted(muted)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_audio_volume(frontend: &SuperShuckieFrontend) -> u8 {
+    frontend.get_audio_volume()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_audio_volume(frontend: &mut SuperShuckieFrontend, percent: u8) {
+    frontend.set_audio_volume(percent)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_audio_mute_when_sped_up(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_audio_mute_when_sped_up()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_audio_mute_when_sped_up(frontend: &mut SuperShuckieFrontend, mute: bool) {
+    frontend.set_audio_mute_when_sped_up(mute)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_audio_latency_ms(frontend: &SuperShuckieFrontend) -> u16 {
+    frontend.get_audio_latency_ms()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_audio_latency_ms(frontend: &mut SuperShuckieFrontend, latency_ms: u16) {
+    frontend.set_audio_latency_ms(latency_ms)
+}
+
+/// Hand out a retained reference to the frontend's audio ring; the C side owns one strong count
+/// per call and gives it back with `supershuckie_audio_output_release`.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_retain_audio_output(frontend: &SuperShuckieFrontend) -> *const AudioOutput {
+    Arc::into_raw(frontend.audio_output().clone())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_audio_output_release(audio: *const AudioOutput) {
+    if !audio.is_null() {
+        drop(unsafe { Arc::from_raw(audio) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_audio_output_read(audio: &AudioOutput, out: *mut i16, frames: usize) -> usize {
+    if out.is_null() || frames == 0 {
+        return 0
+    }
+    audio.read(unsafe { from_raw_parts_mut(out, frames * 2) })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_audio_output_clear(audio: &AudioOutput) {
+    audio.clear()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_audio_output_sample_rate() -> u32 {
+    AUDIO_SAMPLE_RATE
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_audio_output_queued_frames(audio: &AudioOutput) -> usize {
+    audio.queued_frames()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_audio_output_speed(audio: &AudioOutput) -> f32 {
+    audio.speed()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_audio_output_fast_forward_scales_pitch(audio: &AudioOutput) -> bool {
+    audio.fast_forward_scales_pitch()
 }
 
 #[unsafe(no_mangle)]

@@ -8,6 +8,15 @@ extern "C" {
 struct SuperShuckieStringArrayRaw;
 struct SuperShuckieControlSettingsRaw;
 
+/**
+ * The ring of audio samples the running core produces, retained with
+ * supershuckie_frontend_retain_audio_output() and released with supershuckie_audio_output_release().
+ *
+ * Unlike the frontend, this may be used from any thread (an audio device callback, typically).
+ * It stays valid across ROM loads for as long as it is retained.
+ */
+struct SuperShuckieAudioOutputRaw;
+
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -492,6 +501,32 @@ bool supershuckie_frontend_get_replay_playback_time(
 );
 
 /**
+ * Get the emulation rate: emulated frames per second over roughly the last second, whether or
+ * not they were drawn. Call once per UI tick; the window is maintained internally.
+ *
+ * This is the number to compare against speed * native refresh (e.g. 4x = ~240). The on-screen
+ * refresh rate never exceeds the number of frames actually drawn (60/s at 4x).
+ */
+double supershuckie_frontend_get_emulation_fps(struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Get frame-time diagnostics from the core thread, in microseconds. Any pointer may be null.
+ *
+ * average_micros: moving average of the core's time per frame (emulation + drawing).
+ * last_micros / max_micros: the most recent frame and the longest since the last speed change.
+ * budget_micros: how long one frame may take at the current speed (0 if not paced).
+ * frames_over_budget: frames that exceeded the budget since the last speed change.
+ */
+void supershuckie_frontend_get_frame_time_stats(
+    const struct SuperShuckieFrontendRaw *frontend,
+    uint32_t *average_micros,
+    uint32_t *last_micros,
+    uint32_t *max_micros,
+    uint32_t *budget_micros,
+    uint64_t *frames_over_budget
+);
+
+/**
  * Get the number of milliseconds and frames elapsed.
  *
  * elapsed_frames and elapsed_milliseconds, if non-null, will be written their respective values.
@@ -728,6 +763,104 @@ bool supershuckie_frontend_get_nds_jit(const struct SuperShuckieFrontendRaw *fro
  * Set if JIT is enabled for the DS.
  */
 void supershuckie_frontend_set_nds_jit(struct SuperShuckieFrontendRaw *frontend, bool enabled);
+
+/**
+ * Get whether audio is rendered and handed to the audio output. Off by default.
+ */
+bool supershuckie_frontend_get_audio_enabled(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set whether audio is rendered and handed to the audio output.
+ */
+void supershuckie_frontend_set_audio_enabled(struct SuperShuckieFrontendRaw *frontend, bool enabled);
+
+/**
+ * Get whether playback is muted. This is only a stored setting; the frontend applies it as the device gain.
+ */
+bool supershuckie_frontend_get_audio_muted(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set whether playback is muted.
+ */
+void supershuckie_frontend_set_audio_muted(struct SuperShuckieFrontendRaw *frontend, bool muted);
+
+/**
+ * Get the volume in percent (0-100). This is only a stored setting; the frontend applies it as the device gain.
+ */
+uint8_t supershuckie_frontend_get_audio_volume(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set the volume in percent (clamped to 100).
+ */
+void supershuckie_frontend_set_audio_volume(struct SuperShuckieFrontendRaw *frontend, uint8_t percent);
+
+/**
+ * Get whether audio stays silent while the game runs at any speed other than 1x (turbo or a non-1x base speed).
+ * Default true.
+ */
+bool supershuckie_frontend_get_audio_mute_when_sped_up(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set whether audio stays silent while the game runs at any speed other than 1x.
+ */
+void supershuckie_frontend_set_audio_mute_when_sped_up(struct SuperShuckieFrontendRaw *frontend, bool mute);
+
+/**
+ * Get how much audio may queue ahead of the device, in milliseconds.
+ */
+uint16_t supershuckie_frontend_get_audio_latency_ms(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set how much audio may queue ahead of the device, in milliseconds (clamped to 16-500).
+ */
+void supershuckie_frontend_set_audio_latency_ms(struct SuperShuckieFrontendRaw *frontend, uint16_t latency_ms);
+
+/**
+ * Retain a handle to the frontend's audio ring. Each call must be balanced by supershuckie_audio_output_release().
+ */
+struct SuperShuckieAudioOutputRaw *supershuckie_frontend_retain_audio_output(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Release a handle from supershuckie_frontend_retain_audio_output(). Accepts null.
+ */
+void supershuckie_audio_output_release(struct SuperShuckieAudioOutputRaw *audio);
+
+/**
+ * Pop up to `frames` stereo frames (2 * frames int16 values, interleaved left/right) into `out`.
+ *
+ * Returns the number of frames written; the caller pads the rest with silence. Safe to call from
+ * an audio device callback: it takes a short lock and never blocks on the emulator.
+ */
+size_t supershuckie_audio_output_read(struct SuperShuckieAudioOutputRaw *audio, int16_t *out, size_t frames);
+
+/**
+ * Drop everything queued in the ring.
+ */
+void supershuckie_audio_output_clear(struct SuperShuckieAudioOutputRaw *audio);
+
+/**
+ * Sample rate of the audio ring (48000).
+ */
+uint32_t supershuckie_audio_output_sample_rate(void);
+
+/**
+ * Stereo frames currently queued in the ring.
+ */
+size_t supershuckie_audio_output_queued_frames(const struct SuperShuckieAudioOutputRaw *audio);
+
+/**
+ * Current emulation speed multiplier (1.0 = normal).
+ */
+float supershuckie_audio_output_speed(const struct SuperShuckieAudioOutputRaw *audio);
+
+/**
+ * Whether sped-up playback needs pitch scaling on the device side (frequency ratio = speed) to keep up.
+ *
+ * True for the GBA and DS cores, which emit `speed` times more samples per real second when sped up;
+ * false for the Game Boy core, which already renders sped-up audio at the host rate (pitched).
+ * Only relevant while "mute when sped up" is off.
+ */
+bool supershuckie_audio_output_fast_forward_scales_pitch(const struct SuperShuckieAudioOutputRaw *audio);
 
 /**
  * Get whether the DS top/bottom screens are swapped on-screen.

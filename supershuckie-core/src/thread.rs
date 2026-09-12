@@ -1,6 +1,6 @@
 use crate::emulator::{EmulatorCore, Input, PartialReplayRecordMetadata, ScreenData};
 use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
-use crate::{std_timestamp_provider, ReplayPlayerAttachError, Speed};
+use crate::{std_timestamp_provider, AudioOutput, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
 use spin::RwLock;
 use std::borrow::ToOwned;
@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::format;
 use std::fs::File;
 use std::string::String;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::vec::Vec;
 use supershuckie_pokeabyte_integration::PokeAByteEmulatorCommand;
 #[cfg(feature = "pokeabyte")]
@@ -31,6 +31,8 @@ pub struct ThreadedSuperShuckieCore {
     desired_replay_frame: Arc<AtomicU32>,
     delta_replay_frames: Arc<AtomicI32>,
     elapsed_time: Arc<RwLock<ElapsedTimeStats>>,
+    frame_times: Arc<RwLock<FrameTimeStats>>,
+    emulated_frames: Arc<AtomicU64>,
     playback_paused: Arc<AtomicBool>,
     replay_stalled: Arc<AtomicBool>,
 
@@ -47,7 +49,53 @@ pub struct ThreadedSuperShuckieCore {
 pub struct ElapsedTimeStats {
     pub milliseconds: u32,
     pub frames: u32,
-    pub speed: Speed
+    pub speed: Speed,
+
+    /// Incremented every time a newly drawn frame is published to `read_screens`. Frames that
+    /// were emulated but not drawn (fast-forward) do not change it, so compare this rather than
+    /// `frames` to decide whether the screens need re-reading.
+    pub screen_generation: u32
+}
+
+/// How long emulated frames are taking on the core thread, for diagnostics.
+///
+/// Times cover the core's own work for one frame (emulation plus compositing), not the pacing
+/// wait. A frame is "over budget" when it took longer than the period the current speed allows.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct FrameTimeStats {
+    /// Duration of the most recent frame, in microseconds.
+    pub last_frame_micros: u32,
+    /// Exponential moving average over roughly the last 64 frames, in microseconds.
+    pub average_frame_micros: u32,
+    /// Longest frame seen since the stats were last reset (speed change, ROM load).
+    pub max_frame_micros: u32,
+    /// Time one frame may take at the current speed, in microseconds (0 when the core does not
+    /// pace itself).
+    pub budget_micros: u32,
+    /// Frames that took longer than `budget_micros` since the stats were last reset.
+    pub frames_over_budget: u64,
+    /// Frames measured since the stats were last reset.
+    pub frames_measured: u64
+}
+
+impl FrameTimeStats {
+    fn record(&mut self, elapsed: Duration, budget: Option<u64>) {
+        let micros = elapsed.as_micros().min(u32::MAX as u128) as u32;
+        self.last_frame_micros = micros;
+        self.average_frame_micros = if self.frames_measured == 0 {
+            micros
+        }
+        else {
+            // EMA with alpha = 1/64
+            (self.average_frame_micros as u64 * 63 + micros as u64).div_ceil(64) as u32
+        };
+        self.max_frame_micros = self.max_frame_micros.max(micros);
+        self.budget_micros = budget.unwrap_or(0).min(u32::MAX as u64) as u32;
+        if budget.is_some_and(|b| micros as u64 > b) {
+            self.frames_over_budget += 1;
+        }
+        self.frames_measured += 1;
+    }
 }
 
 impl ThreadedSuperShuckieCore {
@@ -67,9 +115,13 @@ impl ThreadedSuperShuckieCore {
         let replay_stalled = Arc::new(AtomicBool::new(false));
 
         let elapsed_time = Arc::new(RwLock::new(ElapsedTimeStats::default()));
+        let frame_times = Arc::new(RwLock::new(FrameTimeStats::default()));
+        let emulated_frames = Arc::new(AtomicU64::new(0));
 
         {
             let elapsed_time = elapsed_time.clone();
+            let frame_times = frame_times.clone();
+            let emulated_frames = emulated_frames.clone();
             let screens = Arc::downgrade(&screens);
             let desired_replay_frame = desired_replay_frame.clone();
             let delta_replay_frames = delta_replay_frames.clone();
@@ -78,17 +130,22 @@ impl ThreadedSuperShuckieCore {
             let playback_paused = playback_paused.clone();
             let replay_stalled = replay_stalled.clone();
             let _ = std::thread::Builder::new().name("ThreadedSuperShuckieCore".to_owned()).spawn(move || {
+                mark_thread_latency_sensitive();
                 ThreadedSuperShuckieCoreThread {
                     screens,
                     is_null: emulator_core.is_null(),
                     screens_queued: emulator_core.get_screens().to_vec(),
                     screen_ready_for_copy: false,
+                    screen_generation: 0,
+                    published_run_serial: 0,
                     core: SuperShuckieCore::new(emulator_core, std_timestamp_provider()),
                     pokeabyte_integration: None,
                     receiver,
                     sender_close,
                     desired_replay_frame,
                     elapsed_time,
+                    frame_times,
+                    emulated_frames,
                     delta_replay_frames,
                     replay_errors,
                     replay_counters,
@@ -108,6 +165,8 @@ impl ThreadedSuperShuckieCore {
             playback_total_milliseconds,
             replay_errors,
             elapsed_time,
+            frame_times,
+            emulated_frames,
             replay_counters,
             playback: false,
             desired_replay_frame,
@@ -120,6 +179,17 @@ impl ThreadedSuperShuckieCore {
     /// Get the elapsed time.
     pub fn get_elapsed_time(&self) -> ElapsedTimeStats {
         self.elapsed_time.read().to_owned()
+    }
+
+    /// Frame-time diagnostics for the core thread.
+    pub fn get_frame_time_stats(&self) -> FrameTimeStats {
+        self.frame_times.read().to_owned()
+    }
+
+    /// Total frames emulated by this core since it was created (drawn or not, any replay state).
+    /// Compare successive readings to get the true emulation rate.
+    pub fn get_emulated_frame_count(&self) -> u64 {
+        self.emulated_frames.load(Ordering::Relaxed)
     }
 
     /// Read the screens.
@@ -263,6 +333,11 @@ impl ThreadedSuperShuckieCore {
     pub fn set_speed(&self, speed: Speed) {
         self.sender.send(ThreadCommand::SetSpeed(speed))
             .expect("SetSpeed - the core thread has crashed");
+    }
+
+    /// Reset the frame-time diagnostics (max, over-budget and measured counts).
+    pub fn reset_frame_time_stats(&self) {
+        *self.frame_times.write() = FrameTimeStats::default();
     }
 
     /// Set the speed.
@@ -425,6 +500,24 @@ impl ThreadedSuperShuckieCore {
         let _ = self.sender.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
+    /// Route the audio of audible frames to `output` (`None` to stop).
+    #[inline]
+    pub fn set_audio_output(&self, output: Option<Arc<AudioOutput>>) {
+        let _ = self.sender.send(ThreadCommand::SetAudioOutput(output));
+    }
+
+    /// Turn audio rendering in the core on or off.
+    #[inline]
+    pub fn set_audio_enabled(&self, enabled: bool) {
+        let _ = self.sender.send(ThreadCommand::SetAudioEnabled(enabled));
+    }
+
+    /// Discard audio while the game runs at any speed other than 1x.
+    #[inline]
+    pub fn set_audio_mute_when_sped_up(&self, mute: bool) {
+        let _ = self.sender.send(ThreadCommand::SetAudioMuteWhenSpedUp(mute));
+    }
+
     /// Transfer the given Poke-A-Byte integration if it is compatible.
     ///
     /// NOTE: This is blocking.
@@ -528,6 +621,9 @@ enum ThreadCommand {
     ChangeReplayCounter { name: String, delta: SignedInteger },
     IgnoreSpeedChangesInReplay(bool),
     AutoResyncKeyframesInReplay(bool),
+    SetAudioOutput(Option<Arc<AudioOutput>>),
+    SetAudioEnabled(bool),
+    SetAudioMuteWhenSpedUp(bool),
     TransferPokeAByteIntegrationExternal(Sender<bool>, Sender<ThreadCommand>),
     TransferPokeAByteIntegrationInternal(Sender<bool>, PokeAByteIntegrationServer, ReplayConsoleType, ReplayHeaderBlake3Hash),
     Rendezvous(Sender<()>),
@@ -551,6 +647,11 @@ struct ThreadedSuperShuckieCoreThread {
 
     screens_queued: Vec<ScreenData>,
     screen_ready_for_copy: bool,
+    /// See [`ElapsedTimeStats::screen_generation`].
+    screen_generation: u32,
+    /// `SuperShuckieCore::run_serial` of the last run whose frame was handed to `screens` (or
+    /// deliberately not, because it was not drawn).
+    published_run_serial: u64,
     desired_replay_frame: Arc<AtomicU32>,
     delta_replay_frames: Arc<AtomicI32>,
     replay_errors: Arc<Mutex<Vec<ReplayFileWriteError>>>,
@@ -565,6 +666,8 @@ struct ThreadedSuperShuckieCoreThread {
     is_null: bool,
 
     elapsed_time: Arc<RwLock<ElapsedTimeStats>>,
+    frame_times: Arc<RwLock<FrameTimeStats>>,
+    emulated_frames: Arc<AtomicU64>,
 
     freezes: BTreeMap<u64, ByteVec>,
     replay_stalled: Arc<AtomicBool>,
@@ -579,6 +682,8 @@ impl ThreadedSuperShuckieCoreThread {
                 }
 
                 self.handle_command(cmd);
+                // counters can change without a frame running (REST while paused, seeks)
+                self.update_counters();
                 continue
             }
 
@@ -591,7 +696,7 @@ impl ThreadedSuperShuckieCoreThread {
 
             if self.is_running() {
                 if !self.playback_frozen {
-                    self.core.run();
+                    self.run_one();
                 }
             }
             else if self.core.replay_player.is_none() {
@@ -603,14 +708,46 @@ impl ThreadedSuperShuckieCoreThread {
                 // sleep for a reduced time so seeking can still be responsive
                 std::thread::sleep(Duration::from_millis(10));
             }
-
-            self.update_counters();
         }
 
         self.core.stop_recording_replay();
         self.pokeabyte_integration = None;
 
         let _ = self.sender_close.send(());
+    }
+
+    /// Longest single wait before the next frame; keeps commands and Poke-A-Byte reads responsive.
+    const MAX_FRAME_WAIT: Duration = Duration::from_millis(8);
+
+    /// `thread::sleep` overshoots by a fraction of a millisecond, so stop sleeping this far
+    /// before the deadline and let the core's own timestamp check take the last stretch.
+    const WAKE_EARLY: Duration = Duration::from_micros(1000);
+
+    /// Run the core once and, if it was not yet time for a frame, wait for most of the remaining
+    /// interval instead of spinning through the loop (which burned a core at any speed).
+    fn run_one(&mut self) {
+        let started = Instant::now();
+        self.core.run();
+        let ran = self.core.last_run_time();
+
+        if ran.frames > 0 {
+            self.emulated_frames.fetch_add(ran.frames, Ordering::Relaxed);
+            self.frame_times.write().record(started.elapsed(), self.core.core.frame_period_microseconds());
+            self.update_counters();
+            return;
+        }
+
+        if self.core.replay_stalled || self.core.mid_frame && self.core.core.frame_period_microseconds().is_none() {
+            // Not a pacing wait (Game Boy mid-frame stepping, or nothing to run): keep going.
+            return;
+        }
+
+        if let Some(until) = self.core.core.microseconds_until_next_frame() {
+            let until = Duration::from_micros(until);
+            if until > Self::WAKE_EARLY {
+                std::thread::sleep((until - Self::WAKE_EARLY).min(Self::MAX_FRAME_WAIT));
+            }
+        }
     }
 
     fn check_if_replay_stalled(&mut self) {
@@ -635,6 +772,7 @@ impl ThreadedSuperShuckieCoreThread {
 
         // We aren't really too focused on smooth playback as opposed to updating the buffer now!
         self.force_refresh_screen_data();
+        self.update_counters();
     }
 
     fn update_counters(&mut self) {
@@ -666,6 +804,7 @@ impl ThreadedSuperShuckieCoreThread {
         let in_screens = &mut self.screens_queued;
         core::mem::swap(in_screens, &mut *out_screens);
 
+        self.screen_generation = self.screen_generation.wrapping_add(1);
         self.update_elapsed_time();
     }
 
@@ -673,7 +812,8 @@ impl ThreadedSuperShuckieCoreThread {
         *self.elapsed_time.write() = ElapsedTimeStats {
             milliseconds: self.core.get_recording_milliseconds().0 as u32,
             frames: self.core.total_frames as u32,
-            speed: self.core.game_speed
+            speed: self.core.game_speed,
+            screen_generation: self.screen_generation
         };
     }
 
@@ -681,9 +821,24 @@ impl ThreadedSuperShuckieCoreThread {
         !self.is_null && !self.playback_paused.load(Ordering::Relaxed)
     }
 
-    /// Attempt to copy the screen data, or store it for later.
+    /// Publish the most recently drawn frame to the screen buffer (or queue it if the reader
+    /// holds the buffer right now). Frames that were emulated but not drawn only update the
+    /// elapsed-time stats.
     fn refresh_screen_data(&mut self) {
         if self.is_running() && self.core.mid_frame {
+            return
+        }
+
+        // Only a run that drew something has anything to publish; runs made inside commands
+        // (loading a state, a seek's last frame) count too, hence the serial rather than a flag.
+        let run_serial = self.core.run_serial();
+        if run_serial == self.published_run_serial {
+            self.update_elapsed_time();
+            return
+        }
+        self.published_run_serial = run_serial;
+        if !self.core.last_frame_presented() {
+            self.update_elapsed_time();
             return
         }
 
@@ -696,11 +851,13 @@ impl ThreadedSuperShuckieCoreThread {
         let out_screens_result = match out_screens_maybe.as_mut() {
             Ok(n) => {
                 self.screen_ready_for_copy = false;
+                self.screen_generation = self.screen_generation.wrapping_add(1);
                 self.update_elapsed_time();
                 &mut *n
             },
             Err(TryLockError::WouldBlock) => {
                 self.screen_ready_for_copy = true;
+                self.update_elapsed_time();
                 &mut self.screens_queued
             },
             Err(e) => panic!("refresh_screen_data Can't get screens mutex: {e}")
@@ -728,6 +885,8 @@ impl ThreadedSuperShuckieCoreThread {
             .lock()
             .expect("can't get screens mutex force_get_screen_data");
 
+        self.screen_generation = self.screen_generation.wrapping_add(1);
+        self.published_run_serial = self.core.run_serial();
         self.update_elapsed_time();
         self.screen_ready_for_copy = false;
 
@@ -863,6 +1022,7 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::SetSpeed(speed) => {
                 self.core.set_speed(speed);
+                *self.frame_times.write() = FrameTimeStats::default();
             }
             ThreadCommand::SetRapidFireInput(input) => {
                 self.core.set_rapid_fire_input(input);
@@ -919,6 +1079,15 @@ impl ThreadedSuperShuckieCoreThread {
             ThreadCommand::AutoResyncKeyframesInReplay(resync) => {
                 self.core.set_auto_resync_keyframes_in_replays(resync)
             },
+            ThreadCommand::SetAudioOutput(output) => {
+                self.core.set_audio_output(output)
+            },
+            ThreadCommand::SetAudioEnabled(enabled) => {
+                self.core.set_audio_enabled(enabled)
+            },
+            ThreadCommand::SetAudioMuteWhenSpedUp(mute) => {
+                self.core.set_audio_mute_when_sped_up(mute)
+            },
             ThreadCommand::TransferPokeAByteIntegrationExternal(sender, core_sender) => {
                 let Some(server) = self.pokeabyte_integration.take() else {
                     let _ = sender.send(false);
@@ -945,3 +1114,52 @@ impl ThreadedSuperShuckieCoreThread {
         }
     }
 }
+
+/// Tell the OS this thread is the one the user is waiting on.
+///
+/// On Windows 11 with a hybrid CPU, a busy thread in a process that is not the foreground window
+/// is fair game for the efficiency cores and for EcoQoS clock limits, which is a 30-40 % loss
+/// that shows up as lost speed. Opting the thread out of power throttling and raising its
+/// priority slightly keeps it on a performance core at full clock. No-op elsewhere.
+#[cfg(windows)]
+fn mark_thread_latency_sensitive() {
+    #[repr(C)]
+    struct ThreadPowerThrottlingState {
+        version: u32,
+        control_mask: u32,
+        state_mask: u32,
+    }
+
+    const THREAD_POWER_THROTTLING_CURRENT_VERSION: u32 = 1;
+    const THREAD_POWER_THROTTLING_EXECUTION_SPEED: u32 = 0x1;
+    const THREAD_INFORMATION_CLASS_POWER_THROTTLING: i32 = 6; // ThreadPowerThrottling
+    const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadInformation(thread: *mut core::ffi::c_void, class: i32, info: *const core::ffi::c_void, size: u32) -> i32;
+        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+
+    let state = ThreadPowerThrottlingState {
+        version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        control_mask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        state_mask: 0,
+    };
+
+    // SAFETY: plain Win32 calls on the current thread with a correctly sized, initialised struct.
+    unsafe {
+        let thread = GetCurrentThread();
+        let _ = SetThreadInformation(
+            thread,
+            THREAD_INFORMATION_CLASS_POWER_THROTTLING,
+            (&state as *const ThreadPowerThrottlingState).cast(),
+            core::mem::size_of::<ThreadPowerThrottlingState>() as u32,
+        );
+        let _ = SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_thread_latency_sensitive() {}

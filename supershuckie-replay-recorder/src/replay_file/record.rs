@@ -53,6 +53,10 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
     last_keyframe_frames: UnsignedInteger,
     last_state_to_diff: Option<ByteVec>,
 
+    /// The state buffer most recently displaced from `last_state_to_diff`, kept so the producer of
+    /// keyframe states can take it back and reuse the allocation (see [`Self::take_recycled_state`]).
+    recycled_state: Option<Vec<u8>>,
+
     current_speed: Speed,
     current_input: InputBuffer,
 
@@ -202,6 +206,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             poisoned: false,
             header: metadata,
             last_state_to_diff: None,
+            recycled_state: None,
             counters: BTreeMap::new(),
             sink: Some(SinkTuple {
                 final_sink, temp_sink
@@ -344,7 +349,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         if self.blob_limit_reached() {
             self.next_blob()?;
-            self.last_state_to_diff = None;
+            let displaced = self.last_state_to_diff.take();
+            self.recycle_state(displaced);
         }
 
         let metadata = KeyframeMetadata {
@@ -389,9 +395,23 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         // The next delta is taken against the state exactly as the player will reconstruct it
         // (masked, if it was masked).
-        self.last_state_to_diff = Some(state);
+        let displaced = self.last_state_to_diff.replace(state);
+        self.recycle_state(displaced);
 
         Ok(self.elapsed_frames)
+    }
+
+    fn recycle_state(&mut self, displaced: Option<ByteVec>) {
+        if let Some(ByteVec::Heap(buffer)) = displaced {
+            self.recycled_state = Some(buffer);
+        }
+    }
+
+    /// Take back a state buffer that the recorder no longer needs, so the next keyframe can be
+    /// written into an allocation that is already mapped. Only heap-allocated states are ever
+    /// recycled; returns `None` when there is nothing to hand back.
+    pub fn take_recycled_state(&mut self) -> Option<Vec<u8>> {
+        self.recycled_state.take()
     }
 
     /// Whether the in-progress blob should be closed before the next keyframe: it has run for
@@ -768,12 +788,23 @@ pub trait ReplayFileRecorderFns: core::any::Any + 'static + Send {
     fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(), ReplayFileWriteError>;
     fn mark_end(&mut self) -> Result<(), ReplayFileWriteError>;
     fn change_counter(&mut self, counter: String, delta: SignedInteger) -> Result<(), ReplayFileWriteError>;
+
+    /// A state buffer the recorder has finished with, if any, for reuse by the next
+    /// `insert_keyframe` (see `ReplayFileRecorder::take_recycled_state`).
+    fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 impl<Final: ReplayFileSink + 'static + Send, Temp: ReplayFileSink + 'static + Send> ReplayFileRecorderFns for ReplayFileRecorder<Final, Temp> {
     #[inline]
     fn is_closed(&self) -> bool {
         self.is_closed()
+    }
+
+    #[inline]
+    fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
+        self.take_recycled_state()
     }
 
     #[inline]
@@ -879,6 +910,43 @@ mod tests {
             check_script_replay(&temp, &format!("{name}: temp layout"));
             check_script_replay(&closed, &format!("{name}: closed layout"));
         }
+    }
+
+    /// The buffer a keyframe state arrives in is handed back once the recorder has diffed the
+    /// next keyframe against it, so the producer can fill it again instead of allocating.
+    #[test]
+    fn displaced_keyframe_buffers_are_recycled() {
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(),
+            ByteVec::new(),
+            settings(0, usize::MAX),
+            0u64.into(),
+            ib(&[0]),
+            Speed::default(),
+            bv(&state_for(0)),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        // The initial state is the first diff base; nothing has been displaced yet.
+        assert!(recorder.take_recycled_state().is_none());
+
+        let first: Vec<u8> = state_for(1);
+        let first_ptr = first.as_ptr();
+        recorder.next_frame(16u64.into()).unwrap();
+        recorder.insert_keyframe(ByteVec::Heap(first), 16u64.into()).unwrap();
+        // The initial state was an inline/heap ByteVec made by the test helper; whatever came
+        // back, `first` itself is now the diff base and must not be offered yet.
+        let _ = recorder.take_recycled_state();
+
+        recorder.next_frame(32u64.into()).unwrap();
+        recorder.insert_keyframe(ByteVec::Heap(state_for(2)), 32u64.into()).unwrap();
+        let recycled = recorder.take_recycled_state().expect("the displaced buffer is offered back");
+        assert_eq!(recycled.as_ptr(), first_ptr, "the very allocation that was displaced comes back");
+        assert!(recorder.take_recycled_state().is_none(), "offered once only");
+
+        recorder.close().unwrap();
     }
 
     #[test]

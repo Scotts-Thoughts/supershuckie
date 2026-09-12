@@ -36,6 +36,15 @@ In many cases, you can also use Rustup to get Rust.
 
 Run `build.sh` and locate the executables in the `build` directory.
 
+`build.sh` builds melonDS through `scripts/build-melonds.sh`, which applies Super Shuckie's
+local melonDS patches (`melonds-rs/patches/`) and builds the core with LTO. For the fastest
+Nintendo DS emulation also give it a training workload, which enables profile-guided
+optimisation (12-18% faster interpretation, bit-identical emulation):
+
+```
+PGO_ROM=/path/to/game.nds PGO_REPLAY="/path/to/one.replay /path/to/another.replay" ./build.sh
+```
+
 ### macOS
 
 On macOS, you can satisfy these requirements by installing the following:
@@ -47,7 +56,51 @@ Run `build.sh` and locate the executables in the `build` directory.
 
 ### Windows
 
-TODO
+Install [MSYS2](https://www.msys2.org/) and, from its UCRT64 environment, the toolchain:
+`pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,qt6-base,sdl3,rust} git`. Then, from
+PowerShell with `C:\msys64\ucrt64\bin` on `PATH`:
+
+```
+git submodule update --init --recursive
+cmake -G Ninja ./mgba-rs/mgba -B build/mgba -DLIBMGBA_ONLY=ON -DDISABLE_FRONTENDS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build/mgba -j
+.\scripts\build-melonds.ps1 -Rom game.nds -Replay one.replay, another.replay   # or no arguments for a plain LTO build
+cmake -G Ninja ./supershuckie-qt -B build -DCMAKE_BUILD_TYPE=Release -DSCRIPT_BUILD=ON
+cmake --build build -j
+```
+
+`scripts/build-melonds.ps1` applies the local melonDS patches and builds the core with LTO;
+given a ROM and one or more replays it also trains a profile (PGO), which makes DS
+interpretation 12-18% faster with bit-identical emulation. The result is `build\supershuckie.exe`
+(it needs the MSYS2 `bin` directory on `PATH` for the Qt/SDL DLLs; build with
+`-DSUPERSHUCKIE_STATIC=ON` against the static Qt package for a standalone exe).
+
+## Performance notes
+
+* The Nintendo DS core always runs melonDS's interpreter: the JIT compiles blocks from what it
+  observes on their first execution, so it is not reproducible across a save-state load and
+  cannot be used with replays. `nds-performance-report.md` has the measurements.
+* From 2x speed up only one frame in `floor(speed)` is composited (the display cannot show more
+  than 60 a second anyway); the rest are emulated but not drawn, which is about a quarter
+  cheaper per frame. Emulation and save states are unaffected. Seeks, video export and speeds
+  below 2x always draw every frame.
+* The status bar shows the emulation rate (emulated frames per second, drawn or not); hover it
+  for the frame-time average, worst case and budget. The REST `stats` endpoint reports the same
+  as `emulation_fps`, `frame_time_ms`, `frame_budget_ms` and `frames_over_budget`.
+* `supershuckie-core/examples/nds_bench.rs` is a headless benchmark and determinism checker
+  for the DS core (throughput per replay segment, keyframe cost, `--verify` against a replay's
+  recorded keyframes, JIT/interpreter reproducibility). Its header says how to link it.
+
+## Audio
+
+Audio is off by default. The **Audio** menu turns it on and holds every audio setting: mute,
+volume, "Mute when sped up" (on by default, so turbo and any base speed other than 1x stay silent
+and sound returns the moment the game is back at 1x) and the buffer size. Playback never touches
+emulation: what a replay records and plays back is the same with audio on or off. For Game Boy
+games the emulated SameBoy instance stays exactly as it always was and the sound comes from a
+second instance run in lockstep with it (SameBoy's joypad-bounce emulation would otherwise change
+with the sample rate); `supershuckie-core/examples/gb_audio_check.rs` and `nds_bench --audio
+--verify` are the checks for this.
 
 ## Converting old replays
 

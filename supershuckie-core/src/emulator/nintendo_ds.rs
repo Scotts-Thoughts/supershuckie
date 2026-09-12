@@ -17,7 +17,9 @@ pub struct NintendoDS {
     core: Core,
     last_frame_microseconds: TimestampMicros,
     microseconds_per_frames: TimestampMicros,
-    clock: Box<dyn MonotonicTimestampProvider>
+    clock: Box<dyn MonotonicTimestampProvider>,
+    skip_drawing: bool,
+    audio_enabled: bool
 }
 
 impl NintendoDS {
@@ -34,7 +36,9 @@ impl NintendoDS {
             core: Core::new(rom, sram.unwrap_or(&[]), jit).expect("failed to make a core (TODO: HANDLE THIS ERROR)"),
             last_frame_microseconds: 0,
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
-            clock
+            clock,
+            skip_drawing: false,
+            audio_enabled: false
         }
     }
 
@@ -61,9 +65,7 @@ impl EmulatorCore for NintendoDS {
         let expected_next = self.last_frame_microseconds + self.microseconds_per_frames;
         let now = self.clock.get_timestamp_microseconds();
         if now < expected_next {
-            return RunTime {
-                frames: 0
-            }
+            return RunTime::NONE
         }
 
         let rval = self.run_unlocked();
@@ -82,15 +84,61 @@ impl EmulatorCore for NintendoDS {
     fn run_unlocked(&mut self) -> RunTime {
         self.core.run_frame();
 
+        // A skipped frame was not composited, so the core's framebuffer still holds the last
+        // drawn frame; leave our screens alone rather than re-copying it.
+        if self.skip_drawing {
+            return RunTime { frames: 1, presented: false }
+        }
+
         let pixels_a = self.core.get_pixels(0).expect("no pixels????");
         let pixels_b = self.core.get_pixels(1).expect("no pixels????");
 
         self.screens[0].pixels.copy_from_slice(pixels_a.as_slice());
         self.screens[1].pixels.copy_from_slice(pixels_b.as_slice());
 
-        RunTime {
-            frames: 1
+        RunTime::ONE_FRAME
+    }
+
+    fn set_skip_drawing(&mut self, skip: bool) {
+        if self.skip_drawing != skip {
+            self.skip_drawing = skip;
+            self.core.set_skip_drawing(skip);
         }
+    }
+
+    fn set_audio_enabled(&mut self, enabled: bool) {
+        if self.audio_enabled == enabled {
+            return
+        }
+        self.audio_enabled = enabled;
+        // The SPU mixes regardless (it is part of emulation); what was mixed while nobody
+        // listened must not play now.
+        self.core.drain_audio();
+    }
+
+    fn take_audio(&mut self, into: &mut Vec<i16>) {
+        if !self.audio_enabled {
+            return
+        }
+        // One frame is ~802 frames at 48 kHz; the ring holds 2048, so this is one iteration
+        // unless several frames were run before a drain.
+        let mut chunk = [0i16; 2048 * 2];
+        loop {
+            let frames = self.core.read_audio(&mut chunk);
+            if frames == 0 {
+                break
+            }
+            into.extend_from_slice(&chunk[..frames * 2]);
+        }
+    }
+
+    fn microseconds_until_next_frame(&mut self) -> Option<u64> {
+        let expected_next = self.last_frame_microseconds + self.microseconds_per_frames;
+        Some(expected_next.saturating_sub(self.clock.get_timestamp_microseconds()))
+    }
+
+    fn frame_period_microseconds(&self) -> Option<u64> {
+        Some(self.microseconds_per_frames)
     }
 
     fn read_ram(&self, address: u32, into: &mut [u8]) -> Result<(), &'static str> {
@@ -123,6 +171,10 @@ impl EmulatorCore for NintendoDS {
 
     fn create_save_state(&self) -> Vec<u8> {
         self.core.create_save_state().expect("failed to make NDS save state???")
+    }
+
+    fn create_save_state_into(&self, into: &mut Vec<u8>) {
+        assert!(self.core.create_save_state_into(into), "failed to make NDS save state???");
     }
 
     fn load_save_state(&mut self, state: &[u8]) -> Result<(), String> {

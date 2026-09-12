@@ -1,0 +1,140 @@
+diff --git a/src/GPU.h b/src/GPU.h
+index fd5ad820..437a6f77 100644
+--- a/src/GPU.h
++++ b/src/GPU.h
+@@ -698,6 +698,13 @@ private:
+ 
+     bool RunFIFO = false;
+ 
++public:
++    // Super Shuckie: when set, the 2D renderer does not composite the current frame (the
++    // frontend will not present it). The unit registers the renderer normally advances while
++    // drawing are still advanced, so emulation and save states are unaffected. Not serialised.
++    bool SkipDrawing = false;
++private:
++
+     u16 VMatch[2] {};
+ 
+     std::unique_ptr<GPU2D::Renderer2D> GPU2D_Renderer = nullptr;
+diff --git a/src/GPU2D_Soft.cpp b/src/GPU2D_Soft.cpp
+index 2f8afcba..a1f660f7 100644
+--- a/src/GPU2D_Soft.cpp
++++ b/src/GPU2D_Soft.cpp
+@@ -170,6 +170,15 @@ void SoftRenderer::DrawScanline(u32 line, Unit* unit)
+     u32 dispmode = CurUnit->DispCnt >> 16;
+     dispmode &= (CurUnit->Num ? 0x1 : 0x3);
+ 
++    // Super Shuckie: frames the frontend will not present are not composited. Display capture
++    // reads the composited line back into VRAM, so a frame with capture latched is always drawn.
++    if (GPU.SkipDrawing && !CurUnit->CaptureLatch)
++    {
++        SkipScanline_BGOBJ(line);
++        CurUnit->UpdateMosaicCounters(line);
++        return;
++    }
++
+     // always render regular graphics
+     DrawScanline_BGOBJ(line);
+     CurUnit->UpdateMosaicCounters(line);
+@@ -689,6 +698,67 @@ void SoftRenderer::DrawScanlineBGMode7(u32 line)
+     }
+ }
+ 
++// Applies exactly the unit-state side effects of DrawScanline_BGOBJ without producing pixels:
++// the horizontal window activity bits toggled by CalculateWindowMask, the affine reference
++// registers advanced by every affine-class BG drawer, and the BG mosaic line counter. Keep this
++// in sync with DrawScanline_BGOBJ / DrawScanlineBGMode* / DrawBG_Affine / DrawBG_Extended /
++// DrawBG_Large and Unit::CalculateWindowMask.
++void SoftRenderer::SkipScanline_BGOBJ(u32 line)
++{
++    // forced blank disables BG/OBJ compositing (and none of the side effects happen)
++    if (CurUnit->DispCnt & (1<<7))
++        return;
++
++    u32 dispCnt = CurUnit->DispCnt;
++
++    if (dispCnt & 0xE000)
++    {
++        // CalculateWindowMask scans x = 0..255 doing "if (x == x2) clear; else if (x == x1) set"
++        // on bit 1 of WinNActive; both coordinates are u8, so the last event decides.
++        if (dispCnt & (1<<14))
++        {
++            if (CurUnit->Win1Coords[0] > CurUnit->Win1Coords[1]) CurUnit->Win1Active |=  0x2;
++            else                                                 CurUnit->Win1Active &= ~0x2;
++        }
++        if (dispCnt & (1<<13))
++        {
++            if (CurUnit->Win0Coords[0] > CurUnit->Win0Coords[1]) CurUnit->Win0Active |=  0x2;
++            else                                                 CurUnit->Win0Active &= ~0x2;
++        }
++    }
++
++    // every affine-class BG drawer ends with BGXRefInternal += rotB, BGYRefInternal += rotD
++    u32 bgmode = dispCnt & 0x7;
++    bool bg3Affine = false, bg2Affine = false;
++    if (bgmode <= 5)
++    {
++        bg3Affine = (dispCnt & 0x0800) && bgmode >= 1;                                   // Affine (1,2) / Extended (3..5)
++        bg2Affine = (dispCnt & 0x0400) && (bgmode == 2 || bgmode == 4 || bgmode == 5);   // Affine (2,4) / Extended (5)
++    }
++    else if (bgmode == 6)
++    {
++        bg2Affine = (dispCnt & 0x0400);                                                  // Large
++    }
++    if (bg3Affine)
++    {
++        CurUnit->BGXRefInternal[1] += CurUnit->BGRotB[1];
++        CurUnit->BGYRefInternal[1] += CurUnit->BGRotD[1];
++    }
++    if (bg2Affine)
++    {
++        CurUnit->BGXRefInternal[0] += CurUnit->BGRotB[0];
++        CurUnit->BGYRefInternal[0] += CurUnit->BGRotD[0];
++    }
++
++    if (CurUnit->BGMosaicY >= CurUnit->BGMosaicYMax)
++    {
++        CurUnit->BGMosaicY = 0;
++        CurUnit->BGMosaicYMax = CurUnit->BGMosaicSize[1];
++    }
++    else
++        CurUnit->BGMosaicY++;
++}
++
+ void SoftRenderer::DrawScanline_BGOBJ(u32 line)
+ {
+     // forced blank disables BG/OBJ compositing
+diff --git a/src/GPU2D_Soft.h b/src/GPU2D_Soft.h
+index 4beaf8f9..f676b8f5 100644
+--- a/src/GPU2D_Soft.h
++++ b/src/GPU2D_Soft.h
+@@ -123,6 +123,7 @@ private:
+     void DrawScanlineBGMode6(u32 line);
+     void DrawScanlineBGMode7(u32 line);
+     void DrawScanline_BGOBJ(u32 line);
++    void SkipScanline_BGOBJ(u32 line);
+ 
+     static void DrawPixel_Normal(u32* dst, u16 color, u32 flag);
+     static void DrawPixel_Accel(u32* dst, u16 color, u32 flag);
+diff --git a/src/GPU3D.cpp b/src/GPU3D.cpp
+index 1204741d..d4dcc331 100644
+--- a/src/GPU3D.cpp
++++ b/src/GPU3D.cpp
+@@ -2604,7 +2604,7 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
+     {
+         if ((CurCommand & 0xFF) || (NumCommands == 4 && CurCommand == 0))
+         {
+-            CmdFIFOEntry entry;
++            CmdFIFOEntry entry{}; // zero the padding: DoSavestate copies the raw entries
+             entry.Command = CurCommand & 0xFF;
+             entry.Param = val;
+             CmdFIFOWrite(entry);
+@@ -2959,7 +2959,7 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
+ 
+     if (addr >= 0x04000440 && addr < 0x040005CC)
+     {
+-        CmdFIFOEntry entry;
++        CmdFIFOEntry entry{}; // zero the padding: DoSavestate copies the raw entries
+         entry.Command = (addr & 0x1FC) >> 2;
+         entry.Param = val;
+         CmdFIFOWrite(entry);

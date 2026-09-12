@@ -2,9 +2,23 @@
 
 #include "melonDS/src/NDS.h"
 #include "melonDS/src/Platform.h"
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <semaphore>
+#include <thread>
+#ifdef _WIN32
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace melonDS;
 
@@ -32,6 +46,9 @@ extern "C" MelonDSCoreHolder *melonds_rs_core_new(
     if(!jit) {
         nds_args.JIT = std::nullopt;
     }
+    // Every core hands the frontend 48 kHz stereo (supershuckie_core::emulator::AUDIO_SAMPLE_RATE);
+    // melonDS resamples the SPU's 32.7 kHz mix to this with blip_buf.
+    nds_args.OutputSampleRate = 48000.0;
 
     holder->nds = std::make_unique<NDS>(std::move(nds_args));
 
@@ -63,6 +80,25 @@ extern "C" void melonds_rs_core_free(MelonDSCoreHolder *core) {
 
 extern "C" void melonds_rs_core_run_frame(MelonDSCoreHolder *core) {
     core->nds->RunFrame();
+}
+
+// Presentation hint: when set, the 2D renderer does not composite frames (see GPU::SkipDrawing).
+// Emulation, timing and save states are unaffected; the framebuffer simply is not updated.
+extern "C" void melonds_rs_core_set_skip_drawing(MelonDSCoreHolder *core, bool skip) {
+    core->nds->GPU.SkipDrawing = skip;
+}
+
+// Pop up to `max_frames` stereo frames the SPU has mixed since the last read. The output ring is
+// not part of the save state and overwrites itself when nobody reads it, so this never affects
+// emulation.
+extern "C" std::size_t melonds_rs_core_read_audio(MelonDSCoreHolder *core, std::int16_t *out, std::size_t max_frames) {
+    int read = core->nds->SPU.ReadOutput(reinterpret_cast<s16 *>(out), static_cast<int>(max_frames));
+    return read < 0 ? 0 : static_cast<std::size_t>(read);
+}
+
+// Forget whatever the SPU has mixed so far.
+extern "C" void melonds_rs_core_drain_audio(MelonDSCoreHolder *core) {
+    core->nds->SPU.DrainOutput();
 }
 
 extern "C" u8 *melonds_rs_core_get_sram(const MelonDSCoreHolder *core, size_t &size) {
@@ -166,9 +202,26 @@ namespace melonDS::Platform {
         bool done = false;
     };
 
+    // melonDS creates exactly one thread through this: the software 3D rasteriser, which the
+    // main emulation thread waits on every scanline. Ask the OS to schedule it like the thread
+    // it serves (no efficiency-core / EcoQoS placement, slightly elevated priority).
+    static void mark_thread_latency_sensitive() {
+#ifdef _WIN32
+        THREAD_POWER_THROTTLING_STATE state{};
+        state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+        state.StateMask = 0;
+        SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+    }
+
     Thread* Thread_Create(std::function<void()> func) {
         Thread *thread = new Thread();
-        thread->thread = std::thread(func);
+        thread->thread = std::thread([func = std::move(func)]() {
+            mark_thread_latency_sensitive();
+            func();
+        });
         return thread;
     }
     void Thread_Free(Thread* thread) { delete thread; }

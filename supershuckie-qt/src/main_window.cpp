@@ -1,5 +1,5 @@
 // FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.4.11stp"
+#define SUPERSHUCKIE_VERSION "0.4.12stp"
 
 #include <cstdio>
 #include <cstdint>
@@ -27,6 +27,7 @@
 #include <supershuckie/supershuckie.h>
 
 #include "ask_for_text_dialog.hpp"
+#include "audio_output.hpp"
 #include "nds_date_dialog.hpp"
 #include "select_item_dialog.hpp"
 #include "error.hpp"
@@ -148,6 +149,7 @@ MainWindow::MainWindow(): QMainWindow() {
     this->current_state->hide();
 
     this->status_bar_fps = new QLabel("999+ FPS ", this->status_bar);
+    this->status_bar_fps->setToolTip("Emulated frames per second (hover for frame-time details)");
     this->status_bar_fps->setFixedSize(this->status_bar_fps->sizeHint());
     this->status_bar_fps->setAlignment(Qt::AlignRight);
     this->status_bar_fps->setText("0 FPS ");
@@ -244,6 +246,19 @@ MainWindow::MainWindow(): QMainWindow() {
     this->disable_save_states_when_recording->setChecked(supershuckie_frontend_get_disable_save_states_when_recording(this->frontend));
     this->disable_speed_changes_when_recording->setChecked(supershuckie_frontend_get_disable_speed_changes_when_recording(this->frontend));
 
+    // The ring outlives every core, so one handle and (when enabled) one device for the life of
+    // the window. Audio is off unless the user turned it on; then it starts with the app.
+    this->audio = std::make_unique<AudioOutput>(supershuckie_frontend_retain_audio_output(this->frontend));
+    this->audio_enabled->setChecked(supershuckie_frontend_get_audio_enabled(this->frontend));
+    this->audio_muted->setChecked(supershuckie_frontend_get_audio_muted(this->frontend));
+    this->audio_mute_when_sped_up->setChecked(supershuckie_frontend_get_audio_mute_when_sped_up(this->frontend));
+    this->apply_audio_gain();
+    if(supershuckie_frontend_get_audio_enabled(this->frontend) && !this->audio->open()) {
+        supershuckie_frontend_set_audio_enabled(this->frontend, false);
+        this->audio_enabled->setChecked(false);
+        DISPLAY_ERROR_DIALOG("Failed to open the audio device", "Audio has been turned off. Enable it again from the Audio menu to retry.\n\n%s", this->audio->last_error().c_str());
+    }
+
     this->sdl.frontend = this->frontend;
     this->render_widget->setFocus(Qt::OtherFocusReason);
     this->rebuild_recent_roms_menu();
@@ -310,22 +325,47 @@ void MainWindow::tick() {
 
     auto now = clock::now();
     auto time_since_last_second_us = std::chrono::duration_cast<std::chrono::microseconds>(now - this->second_start).count();
+
+    // The emulation rate counts every emulated frame, drawn or not; the display rate counts the
+    // frames that reached the screen (at most ~60/s when fast-forwarding).
+    double emulation_fps = supershuckie_frontend_get_emulation_fps(this->frontend);
+
     if(time_since_last_second_us > 1000000) {
-        this->current_fps = 1000000.0 * static_cast<double>(this->frames_in_last_second) / static_cast<double>(time_since_last_second_us);
+        this->current_display_fps = 1000000.0 * static_cast<double>(this->frames_in_last_second) / static_cast<double>(time_since_last_second_us);
+        this->current_fps = emulation_fps;
         this->frames_in_last_second = 0;
         this->second_start = now;
 
-        char fps_text[16];
+        std::uint32_t average_us = 0, max_us = 0, budget_us = 0;
+        std::uint64_t over_budget = 0;
+        supershuckie_frontend_get_frame_time_stats(this->frontend, &average_us, nullptr, &max_us, &budget_us, &over_budget);
+
+        char fps_text[64];
         if(this->current_fps > 999) {
             std::snprintf(fps_text, sizeof(fps_text), "999+ FPS ");
         }
-        if(this->current_fps > 0.0 && this->current_fps < 1.0) {
+        else if(this->current_fps > 0.0 && this->current_fps < 1.0) {
             std::snprintf(fps_text, sizeof(fps_text), "<1 FPS ");
         }
         else {
-            std::snprintf(fps_text, sizeof(fps_text), "%d FPS ", static_cast<int>(this->current_fps));
+            std::snprintf(fps_text, sizeof(fps_text), "%d FPS ", static_cast<int>(this->current_fps + 0.5));
         }
         this->status_bar_fps->setText(fps_text);
+
+        char detail[256];
+        if(budget_us > 0) {
+            std::snprintf(
+                detail, sizeof(detail),
+                "Emulation: %.1f frames/s (display %.0f/s)\nFrame time: %.2f ms average, %.2f ms worst, budget %.2f ms\nFrames over budget since last speed change: %llu",
+                this->current_fps, this->current_display_fps,
+                average_us / 1000.0, max_us / 1000.0, budget_us / 1000.0,
+                static_cast<unsigned long long>(over_budget)
+            );
+        }
+        else {
+            std::snprintf(detail, sizeof(detail), "Emulation: %.1f frames/s (display %.0f/s)\nFrame time: %.2f ms average, %.2f ms worst", this->current_fps, this->current_display_fps, average_us / 1000.0, max_us / 1000.0);
+        }
+        this->status_bar_fps->setToolTip(detail);
 
         this->refresh_title();
     }
@@ -367,6 +407,20 @@ void MainWindow::tick() {
     // Keep the menu checkbox in sync with the setting, which may be toggled via a bound hotkey.
     this->swap_nds_screens->setChecked(supershuckie_frontend_get_swap_nds_screens(this->frontend));
 
+    // The GBA and DS cores emit `speed` times more samples per second when sped up; the Game Boy
+    // core already pitches its own. Only matters while sped-up audio is not muted (then the
+    // emulator drops those samples and the device never sees them).
+    if(this->audio->is_open()) {
+        float ratio = 1.0f;
+        if(!this->audio_mute_when_sped_up->isChecked() && this->audio->fast_forward_scales_pitch()) {
+            ratio = this->audio->emulation_speed();
+        }
+        if(ratio != this->audio_frequency_ratio) {
+            this->audio_frequency_ratio = ratio;
+            this->audio->set_frequency_ratio(ratio);
+        }
+    }
+
     if(supershuckie_frontend_is_paused(this->frontend)) {
         this->paused_state->show();
     }
@@ -390,6 +444,7 @@ void MainWindow::set_up_menu() {
     this->set_up_gameplay_menu();
     this->set_up_save_states_menu();
     this->set_up_replays_menu();
+    this->set_up_audio_menu();
     this->set_up_settings_menu();
 
     this->refresh_action_states();
@@ -658,6 +713,50 @@ void MainWindow::quick_load(std::uint8_t index) {
     this->load_save_state(fmt);
 }
 
+const std::uint16_t MainWindow::audio_buffer_ms[MainWindow::AUDIO_BUFFER_PRESETS] = { 32, 64, 128 };
+
+void MainWindow::set_up_audio_menu() {
+    this->audio_menu = this->menu_bar->addMenu("Audio");
+
+    this->audio_enabled = this->audio_menu->addAction("Enable audio");
+    this->audio_enabled->setCheckable(true);
+    connect(this->audio_enabled, SIGNAL(triggered()), this, SLOT(do_toggle_audio_enabled()));
+
+    this->audio_muted = this->audio_menu->addAction("Mute");
+    this->audio_muted->setCheckable(true);
+    connect(this->audio_muted, SIGNAL(triggered()), this, SLOT(do_toggle_audio_muted()));
+
+    // Someone who turbos through one stretch and plays the next at 1x should not get a barrage of
+    // sped-up audio in between; the emulator drops the samples while the speed is not 1x.
+    this->audio_mute_when_sped_up = this->audio_menu->addAction("Mute when sped up");
+    this->audio_mute_when_sped_up->setCheckable(true);
+    connect(this->audio_mute_when_sped_up, SIGNAL(triggered()), this, SLOT(do_toggle_audio_mute_when_sped_up()));
+
+    this->audio_volume_menu = this->audio_menu->addMenu("Volume");
+    for(std::size_t i = 0; i < MainWindow::AUDIO_VOLUME_STEPS; i++) {
+        auto percent = static_cast<std::uint8_t>((i + 1) * 100 / MainWindow::AUDIO_VOLUME_STEPS);
+        char fmt[32];
+        std::snprintf(fmt, sizeof(fmt), "%u%%", static_cast<unsigned>(percent));
+        auto *action = new NumberedAction(this, fmt, percent, &MainWindow::set_audio_volume);
+        action->setCheckable(true);
+        this->audio_volume_menu->addAction(action);
+        this->audio_volumes[i] = action;
+    }
+
+    this->audio_menu->addSeparator();
+
+    // How much audio may queue between the emulator and the device. Smaller is snappier but
+    // has less slack for a busy frame.
+    auto *buffer_menu = this->audio_menu->addMenu("Buffer");
+    const char *buffer_names[MainWindow::AUDIO_BUFFER_PRESETS] = { "Low (32 ms)", "Normal (64 ms)", "High (128 ms)" };
+    for(std::size_t i = 0; i < MainWindow::AUDIO_BUFFER_PRESETS; i++) {
+        auto *action = new NumberedAction(this, buffer_names[i], static_cast<std::uint8_t>(i), &MainWindow::set_audio_buffer);
+        action->setCheckable(true);
+        buffer_menu->addAction(action);
+        this->audio_buffers[i] = action;
+    }
+}
+
 void MainWindow::set_up_settings_menu() {
     this->settings_menu = this->menu_bar->addMenu("Settings");
 
@@ -782,6 +881,18 @@ void MainWindow::refresh_action_states() {
     }
 
     this->continue_last_replay->setEnabled(this->frontend != nullptr && supershuckie_frontend_can_continue_last_replay(this->frontend));
+
+    auto volume = this->frontend != nullptr ? supershuckie_frontend_get_audio_volume(this->frontend) : 100;
+    for(auto *v : this->audio_volumes) {
+        v->setChecked(v->number == volume);
+    }
+    auto latency = this->frontend != nullptr ? supershuckie_frontend_get_audio_latency_ms(this->frontend) : 64;
+    for(std::size_t i = 0; i < MainWindow::AUDIO_BUFFER_PRESETS; i++) {
+        this->audio_buffers[i]->setChecked(MainWindow::audio_buffer_ms[i] == latency);
+    }
+    bool audio_on = this->frontend != nullptr && supershuckie_frontend_get_audio_enabled(this->frontend);
+    this->audio_muted->setEnabled(audio_on);
+    this->audio_volume_menu->setEnabled(audio_on);
 
     auto compression_level = this->frontend != nullptr ? supershuckie_frontend_get_replay_compression_level(this->frontend) : 9;
     bool compression_is_preset = false;
@@ -995,6 +1106,9 @@ void MainWindow::closeEvent(QCloseEvent *event) {
 }
 
 MainWindow::~MainWindow() {
+    // The device callback reads the ring, never the frontend, but stop it before the frontend
+    // goes anyway.
+    this->audio.reset();
     if(this->frontend) {
         supershuckie_frontend_free(this->frontend);
         this->frontend = nullptr;
@@ -1469,6 +1583,53 @@ void MainWindow::set_gbc_mode(std::uint8_t mode) {
 
 void MainWindow::set_replay_compression_level(std::uint8_t level) {
     supershuckie_frontend_set_replay_compression_level(this->frontend, level);
+    this->refresh_action_states();
+}
+
+void MainWindow::apply_audio_gain() {
+    bool muted = supershuckie_frontend_get_audio_muted(this->frontend);
+    auto volume = supershuckie_frontend_get_audio_volume(this->frontend);
+    this->audio->set_gain(muted ? 0.0f : static_cast<float>(volume) / 100.0f);
+}
+
+void MainWindow::do_toggle_audio_enabled() {
+    bool enable = this->audio_enabled->isChecked();
+    if(enable && !this->audio->open()) {
+        this->audio_enabled->setChecked(false);
+        DISPLAY_ERROR_DIALOG("Failed to open the audio device", "%s", this->audio->last_error().c_str());
+        this->refresh_action_states();
+        return;
+    }
+    supershuckie_frontend_set_audio_enabled(this->frontend, enable);
+    if(!enable) {
+        this->audio->close();
+    }
+    this->refresh_action_states();
+}
+
+void MainWindow::do_toggle_audio_muted() {
+    supershuckie_frontend_set_audio_muted(this->frontend, this->audio_muted->isChecked());
+    this->apply_audio_gain();
+}
+
+void MainWindow::do_toggle_audio_mute_when_sped_up() {
+    supershuckie_frontend_set_audio_mute_when_sped_up(this->frontend, this->audio_mute_when_sped_up->isChecked());
+    // Silence right away if the game is sped up at this moment, rather than after the queue plays out.
+    if(this->audio_mute_when_sped_up->isChecked()) {
+        this->audio->clear();
+    }
+}
+
+void MainWindow::set_audio_volume(std::uint8_t percent) {
+    supershuckie_frontend_set_audio_volume(this->frontend, percent);
+    this->apply_audio_gain();
+    this->refresh_action_states();
+}
+
+void MainWindow::set_audio_buffer(std::uint8_t preset) {
+    if(preset < MainWindow::AUDIO_BUFFER_PRESETS) {
+        supershuckie_frontend_set_audio_latency_ms(this->frontend, MainWindow::audio_buffer_ms[preset]);
+    }
     this->refresh_action_states();
 }
 

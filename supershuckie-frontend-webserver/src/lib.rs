@@ -342,6 +342,20 @@ pub struct Stats {
     pub is_playback_finished: bool,
 
     pub counters: BTreeMap<String, i64>,
-    
-    pub current_speed: f64
+
+    pub current_speed: f64,
+
+    /// Emulated frames per second over the last second (drawn or not), i.e. the real emulation
+    /// rate; the on-screen refresh rate is at most 60.
+    pub emulation_fps: f64,
+
+    /// Average time the core spent on one frame recently, in milliseconds.
+    pub frame_time_ms: f64,
+
+    /// Time one frame may take at the current speed, in milliseconds (0 if the core does not
+    /// pace itself).
+    pub frame_budget_ms: f64,
+
+    /// Frames that took longer than the budget since the last speed change or ROM load.
+    pub frames_over_budget: u64
 }

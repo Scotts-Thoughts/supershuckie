@@ -15,13 +15,14 @@ use std::io::Write;
 use std::num::{NonZeroU64, NonZeroU8};
 use std::path::{absolute, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use std::io::BufWriter;
 use std::time::Duration;
 use std::borrow::Cow;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use num_enum::TryFromPrimitive;
 use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, PartialReplayRecordMetadata, ScreenData, NullEmulatorCore, NintendoDS, GameBoyAdvance};
-use supershuckie_core::{std_timestamp_provider, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
+use supershuckie_core::{std_timestamp_provider, AudioOutput, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
 use supershuckie_core::{ExportRange, ScreenLayout, VideoExportError, VideoExportHandle, VideoFrameSink};
 use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShuckieWebserver};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat};
@@ -127,6 +128,10 @@ pub struct SuperShuckieFrontend {
     bios_override: Option<Vec<u8>>,
 
     last_read_elapsed_time_stats: ElapsedTimeStats,
+
+    /// `(when, emulated frame count then)` for [`Self::get_emulation_fps`].
+    fps_window: Option<(Instant, u64)>,
+    last_emulation_fps: f64,
     last_read_replay_stats: Option<LastReadReplayCropData>,
 
     last_replay_and_frame: Option<(UTF8CString, u32)>,
@@ -141,6 +146,10 @@ pub struct SuperShuckieFrontend {
     /// The replay conversion in progress, if any.
     current_conversion: Option<replay_convert::ConversionJob>,
 
+    /// Samples from the running core, whichever core that currently is; the audio device reads
+    /// from this on its own thread for the life of the frontend.
+    audio_output: Arc<AudioOutput>,
+
     settings: Settings
 }
 
@@ -153,6 +162,8 @@ impl SuperShuckieFrontend {
             data_dir.as_ref(),
             config_dir.as_ref(),
         ).expect("failed to init user_dir");
+
+        let audio_output = Arc::new(AudioOutput::new(settings.audio.latency_ms as u32));
 
         let mut s = Self {
             core: ThreadedSuperShuckieCore::new(Box::new(NullEmulatorCore)),
@@ -168,6 +179,8 @@ impl SuperShuckieFrontend {
             current_input: Input::default(),
             current_save_state_history: Vec::new(),
             last_read_elapsed_time_stats: ElapsedTimeStats::default(),
+            fps_window: None,
+            last_emulation_fps: 0.0,
             current_save_state_history_position: 0,
             recording_replay_file: None,
             pokeabyte_error: None,
@@ -181,7 +194,8 @@ impl SuperShuckieFrontend {
             current_replay: None,
             current_export: None,
             pending_conversion_plan: None,
-            current_conversion: None
+            current_conversion: None,
+            audio_output
         };
 
         // This is not tied to the core, so we want to immediately enable this.
@@ -1187,6 +1201,8 @@ impl SuperShuckieFrontend {
                         *c = c.wrapping_add(offset)
                     };
 
+                    let frame_times = what.get_frame_time_stats();
+
                     Arc::new(Stats {
                         time_start: timer_start,
                         time_end: timer_end,
@@ -1200,6 +1216,10 @@ impl SuperShuckieFrontend {
                         current_speed: stats.speed.into_multiplier_float(),
                         counters,
                         is_paused: what.is_paused(),
+                        emulation_fps: what.last_emulation_fps,
+                        frame_time_ms: frame_times.average_frame_micros as f64 / 1000.0,
+                        frame_budget_ms: frame_times.budget_micros as f64 / 1000.0,
+                        frames_over_budget: frame_times.frames_over_budget,
                     })
                 }).clone()
             };
@@ -1281,14 +1301,44 @@ impl SuperShuckieFrontend {
 
     fn refresh_screen(&mut self, force: bool) {
         let current_stats = self.core.get_elapsed_time();
-        if !force && current_stats.frames == self.last_read_elapsed_time_stats.frames {
+        let new_frame_drawn = current_stats.screen_generation != self.last_read_elapsed_time_stats.screen_generation;
+        self.last_read_elapsed_time_stats = current_stats;
+
+        // Frames that were emulated but not drawn (fast-forward) leave the screens untouched, so
+        // there is nothing to upload for them.
+        if !force && !new_frame_drawn {
             return
         }
 
-        self.last_read_elapsed_time_stats = current_stats;
         self.core.read_screens(|screens| {
             self.callbacks.refresh_screens(screens);
         })
+    }
+
+    /// Emulated frames per second, averaged over the last second or so (drawn or not). This is
+    /// the real emulation rate, unlike the on-screen refresh rate which never exceeds the number
+    /// of frames actually drawn.
+    pub fn get_emulation_fps(&mut self) -> f64 {
+        let now = Instant::now();
+        let frames = self.core.get_emulated_frame_count();
+        if let Some((at, count)) = self.fps_window {
+            let elapsed = now.duration_since(at).as_secs_f64();
+            if elapsed >= 1.0 {
+                self.last_emulation_fps = frames.saturating_sub(count) as f64 / elapsed;
+                self.fps_window = Some((now, frames));
+            }
+        }
+        else {
+            self.fps_window = Some((now, frames));
+            self.last_emulation_fps = 0.0;
+        }
+        self.last_emulation_fps
+    }
+
+    /// Frame-time diagnostics from the core thread.
+    #[inline]
+    pub fn get_frame_time_stats(&self) -> supershuckie_core::FrameTimeStats {
+        self.core.get_frame_time_stats()
     }
 
     fn get_current_rom_name_arc(&self) -> Option<Arc<UTF8CString>> {
@@ -1477,6 +1527,7 @@ impl SuperShuckieFrontend {
         self.stop_recording_replay();
         self.stop_replay_playback();
         self.pokeabyte_error = None;
+        self.audio_output.clear();
     }
 
     /// Start recording a replay.
@@ -2001,7 +2052,90 @@ impl SuperShuckieFrontend {
         if self.settings.replay.auto_resync_keyframes_in_replays {
             self.core.set_auto_resync_keyframes_in_replay(true);
         }
+
+        // A new core is a new timeline; nothing the old one queued should be heard.
+        self.audio_output.clear();
+        self.core.set_audio_output(Some(self.audio_output.clone()));
+        self.core.set_audio_mute_when_sped_up(self.settings.audio.mute_when_sped_up);
+        self.core.set_audio_enabled(self.settings.audio.enabled);
+
         self.update_video_mode();
+    }
+
+    /// The ring the audio device reads from. Stable for the life of the frontend.
+    #[inline]
+    pub fn audio_output(&self) -> &Arc<AudioOutput> {
+        &self.audio_output
+    }
+
+    /// Whether audio is rendered and handed to the device.
+    #[inline]
+    pub fn get_audio_enabled(&self) -> bool {
+        self.settings.audio.enabled
+    }
+
+    /// Turn audio on or off (off by default).
+    pub fn set_audio_enabled(&mut self, enabled: bool) {
+        if self.settings.audio.enabled == enabled {
+            return
+        }
+        self.settings.audio.enabled = enabled;
+        self.core.set_audio_enabled(enabled);
+        if !enabled {
+            self.audio_output.clear();
+        }
+    }
+
+    /// Whether playback is muted (audio keeps being rendered; the device plays it at zero gain).
+    #[inline]
+    pub fn get_audio_muted(&self) -> bool {
+        self.settings.audio.muted
+    }
+
+    /// Mute or unmute playback.
+    #[inline]
+    pub fn set_audio_muted(&mut self, muted: bool) {
+        self.settings.audio.muted = muted;
+    }
+
+    /// Volume in percent, 0..=100.
+    #[inline]
+    pub fn get_audio_volume(&self) -> u8 {
+        self.settings.audio.volume
+    }
+
+    /// Set the volume in percent (clamped to 100).
+    #[inline]
+    pub fn set_audio_volume(&mut self, volume: u8) {
+        self.settings.audio.volume = volume.min(AudioSettings::MAX_VOLUME);
+    }
+
+    /// Whether audio stays silent while the game runs at a speed other than 1x.
+    #[inline]
+    pub fn get_audio_mute_when_sped_up(&self) -> bool {
+        self.settings.audio.mute_when_sped_up
+    }
+
+    /// Set whether audio stays silent while the game runs at a speed other than 1x.
+    pub fn set_audio_mute_when_sped_up(&mut self, mute: bool) {
+        if self.settings.audio.mute_when_sped_up == mute {
+            return
+        }
+        self.settings.audio.mute_when_sped_up = mute;
+        self.core.set_audio_mute_when_sped_up(mute);
+    }
+
+    /// Most audio queued ahead of the device, in milliseconds.
+    #[inline]
+    pub fn get_audio_latency_ms(&self) -> u16 {
+        self.settings.audio.latency_ms
+    }
+
+    /// Set how much audio may queue ahead of the device (clamped to a sane range).
+    pub fn set_audio_latency_ms(&mut self, latency_ms: u16) {
+        let latency_ms = latency_ms.clamp(AudioSettings::MIN_LATENCY_MS, AudioSettings::MAX_LATENCY_MS);
+        self.settings.audio.latency_ms = latency_ms;
+        self.audio_output.set_max_latency_ms(latency_ms as u32);
     }
 
     fn update_video_mode(&mut self) {

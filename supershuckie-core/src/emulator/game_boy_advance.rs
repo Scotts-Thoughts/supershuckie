@@ -45,9 +45,7 @@ impl EmulatorCore for GameBoyAdvance {
         let expected_next = self.last_frame_microseconds + self.microseconds_per_frames;
         let now = self.clock.get_timestamp_microseconds();
         if now < expected_next {
-            return RunTime {
-                frames: 0
-            }
+            return RunTime::NONE
         }
 
         let rval = self.run_unlocked();
@@ -75,9 +73,16 @@ impl EmulatorCore for GameBoyAdvance {
             *a = 0xFF000000 | r | g | b;
         }
 
-        RunTime {
-            frames: 1
-        }
+        RunTime::ONE_FRAME
+    }
+
+    fn microseconds_until_next_frame(&mut self) -> Option<u64> {
+        let expected_next = self.last_frame_microseconds + self.microseconds_per_frames;
+        Some(expected_next.saturating_sub(self.clock.get_timestamp_microseconds()))
+    }
+
+    fn frame_period_microseconds(&self) -> Option<u64> {
+        Some(self.microseconds_per_frames)
     }
 
     fn read_ram(&self, address: u32, into: &mut [u8]) -> Result<(), &'static str> {
@@ -111,6 +116,22 @@ impl EmulatorCore for GameBoyAdvance {
     }
 
     #[inline]
+    fn set_audio_enabled(&mut self, enabled: bool) {
+        self.core.set_audio_enabled(enabled);
+    }
+
+    fn take_audio(&mut self, into: &mut Vec<i16>) {
+        // One frame is ~804 frames at 48 kHz; normally a single iteration.
+        let mut chunk = [0i16; 2048 * 2];
+        loop {
+            let frames = self.core.read_audio(&mut chunk);
+            if frames == 0 {
+                break
+            }
+            into.extend_from_slice(&chunk[..frames * 2]);
+        }
+    }
+
     fn set_speed(&mut self, speed: f64) {
         self.microseconds_per_frames = (DEFAULT_MICROSECONDS_PER_FRAME as f64 / speed).clamp(0.0, u32::MAX as f64) as u64;
     }
@@ -123,6 +144,10 @@ impl EmulatorCore for GameBoyAdvance {
     #[inline]
     fn create_save_state(&self) -> Vec<u8> {
         self.core.create_save_state().expect("failed to create GBA save state")
+    }
+
+    fn create_save_state_into(&self, into: &mut Vec<u8>) {
+        assert!(self.core.create_save_state_into(into), "failed to create GBA save state");
     }
 
     #[inline]

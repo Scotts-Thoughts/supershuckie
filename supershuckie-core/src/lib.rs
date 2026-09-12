@@ -18,7 +18,7 @@ use alloc::collections::BTreeMap;
 use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
 use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
-use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
+use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{ByteVec, Packet, SignedInteger, TimestampMillis, UnsignedInteger};
 
 pub mod emulator;
@@ -33,6 +33,12 @@ mod thread;
 
 #[cfg(feature = "std")]
 pub use thread::*;
+
+#[cfg(feature = "std")]
+pub mod audio;
+
+#[cfg(feature = "std")]
+pub use audio::AudioOutput;
 
 /// Wrapper for [`EmulatorCore`] that provides useful desktop emulator functionality.
 pub struct SuperShuckieCore {
@@ -80,7 +86,32 @@ pub struct SuperShuckieCore {
     frames_per_keyframe: u64,
     total_frames: u64,
     ignore_speed_changes_in_replays: bool,
-    auto_resync_keyframes_in_replays: bool
+    auto_resync_keyframes_in_replays: bool,
+
+    /// What the last `run`/`run_unlocked` reported.
+    last_run: RunTime,
+
+    /// Incremented every time the core actually ran (see [`Self::run_serial`]).
+    run_serial: u64,
+
+    /// Present (draw) one frame in this many while running paced; see [`Self::present_every`].
+    present_every: u64,
+
+    /// Save-state buffers handed back by the recorder, reused for the next keyframe.
+    state_buffers: Vec<Vec<u8>>,
+
+    /// Where audible frames' samples go, if anyone is listening.
+    #[cfg(feature = "std")]
+    audio_output: Option<alloc::sync::Arc<AudioOutput>>,
+
+    /// Samples taken from the core after each run (kept to reuse the allocation).
+    audio_scratch: Vec<i16>,
+
+    /// Whether the core is rendering audio at all (see [`EmulatorCore::set_audio_enabled`]).
+    audio_enabled: bool,
+
+    /// Discard audio while the game runs at any speed other than 1x.
+    audio_mute_when_sped_up: bool
 }
 
 #[derive(Clone, Debug)]
@@ -150,18 +181,70 @@ impl SuperShuckieCore {
             core: emulator_core,
             timestamp_provider,
             ignore_speed_changes_in_replays: false,
-            auto_resync_keyframes_in_replays: false
+            auto_resync_keyframes_in_replays: false,
+            last_run: RunTime::NONE,
+            run_serial: 0,
+            present_every: 1,
+            state_buffers: Vec::new(),
+            #[cfg(feature = "std")]
+            audio_output: None,
+            audio_scratch: Vec::new(),
+            audio_enabled: false,
+            audio_mute_when_sped_up: true
         }
+    }
+
+    /// Most keyframe state buffers kept around for reuse (one being filled, one held by the
+    /// recorder as the diff base, one in flight).
+    const STATE_BUFFER_POOL: usize = 3;
+
+    /// Frames over which one frame is drawn while running paced at the current speed.
+    ///
+    /// From 2x up nobody can see every frame (the display shows 60 a second), so only one frame
+    /// in `floor(speed)` is composited; the rest are emulated but not drawn, which is markedly
+    /// cheaper. Unpaced runs (seeks, export) always draw what they need to.
+    pub fn present_every(&self) -> u64 {
+        self.present_every
+    }
+
+    /// Whether the screens hold a newly drawn frame from the last run.
+    pub fn last_frame_presented(&self) -> bool {
+        self.last_run.presented
+    }
+
+    /// What the last run reported.
+    pub fn last_run_time(&self) -> RunTime {
+        self.last_run
+    }
+
+    /// A counter that changes whenever the core ran (including runs made on behalf of commands
+    /// such as loading a save state), so a consumer can tell a fresh [`Self::last_run_time`] from
+    /// one it has already acted on.
+    pub fn run_serial(&self) -> u64 {
+        self.run_serial
     }
 
     /// Run the emulator core for the shortest amount of time.
     pub fn run(&mut self) {
-        self.do_run_fn(EmulatorCore::run);
+        let skip = self.present_every > 1 && !self.mid_frame && self.total_frames % self.present_every != 0;
+        self.core.set_skip_drawing(skip);
+        self.do_run_fn(EmulatorCore::run, true);
     }
 
     /// Run the emulator core for the shortest amount of time without any timekeeping.
+    ///
+    /// Nobody is listening to unpaced runs (exports, finishing a frame), so their audio is
+    /// dropped.
     pub fn run_unlocked(&mut self) {
-        self.do_run_fn(EmulatorCore::run_unlocked);
+        self.core.set_skip_drawing(false);
+        self.do_run_fn(EmulatorCore::run_unlocked, false);
+    }
+
+    /// Like [`Self::run_unlocked`], but the frame need not be drawn (used while catching up to a
+    /// target frame nobody will look at).
+    fn run_unlocked_hidden(&mut self) {
+        self.core.set_skip_drawing(true);
+        self.do_run_fn(EmulatorCore::run_unlocked, false);
     }
 
     /// Get the current replay counters.
@@ -169,7 +252,12 @@ impl SuperShuckieCore {
         self.replay_counters.as_ref()
     }
 
-    fn do_run_fn(&mut self, run_fn: fn(&mut dyn EmulatorCore) -> RunTime) {
+    /// Run the core with `run_fn`. `audible` says whether the samples it produces should reach
+    /// the audio output; they are always taken from the core either way so its buffers do not
+    /// depend on who is listening.
+    fn do_run_fn(&mut self, run_fn: fn(&mut dyn EmulatorCore) -> RunTime, audible: bool) {
+        self.last_run = RunTime::NONE;
+
         if !self.replay_stalled {
             self.before_run();
         }
@@ -177,6 +265,78 @@ impl SuperShuckieCore {
         if !self.replay_stalled {
             let time = run_fn(Box::as_mut(&mut self.core));
             self.after_run(&time);
+            self.drain_audio(audible);
+        }
+    }
+
+    /// Move the samples the core produced to the audio output, or throw them away.
+    fn drain_audio(&mut self, audible: bool) {
+        self.audio_scratch.clear();
+        if !self.audio_enabled {
+            return
+        }
+        self.core.take_audio(&mut self.audio_scratch);
+
+        #[cfg(feature = "std")]
+        if let Some(output) = self.audio_output.as_ref() {
+            if audible && (!self.audio_mute_when_sped_up || self.is_normal_speed()) {
+                output.push(&self.audio_scratch);
+            }
+        }
+        let _ = audible;
+        self.audio_scratch.clear();
+    }
+
+    #[inline]
+    fn is_normal_speed(&self) -> bool {
+        self.game_speed == Speed::from_multiplier_float(1.0)
+    }
+
+    /// Route audible frames' samples to `output` (`None` to stop). The output also learns
+    /// whether this console's sped-up audio needs pitch scaling on the consumer side.
+    #[cfg(feature = "std")]
+    pub fn set_audio_output(&mut self, output: Option<alloc::sync::Arc<AudioOutput>>) {
+        if let Some(o) = output.as_ref() {
+            let scales_pitch = !matches!(
+                self.core.replay_console_type(),
+                Some(ReplayConsoleType::GameBoy | ReplayConsoleType::GameBoyColor | ReplayConsoleType::SuperGameBoy2)
+            );
+            o.set_fast_forward_scales_pitch(scales_pitch);
+            o.set_speed(self.game_speed.into_multiplier_float() as f32);
+        }
+        self.audio_output = output;
+    }
+
+    /// Turn audio rendering in the core on or off.
+    pub fn set_audio_enabled(&mut self, enabled: bool) {
+        if self.audio_enabled == enabled {
+            return
+        }
+        self.audio_enabled = enabled;
+        self.core.set_audio_enabled(enabled);
+        self.clear_audio();
+    }
+
+    /// Whether the core is rendering audio.
+    #[inline]
+    pub fn audio_enabled(&self) -> bool {
+        self.audio_enabled
+    }
+
+    /// Discard audio while the game runs at any speed other than 1x (default: on).
+    pub fn set_audio_mute_when_sped_up(&mut self, mute: bool) {
+        if self.audio_mute_when_sped_up == mute {
+            return
+        }
+        self.audio_mute_when_sped_up = mute;
+        self.clear_audio();
+    }
+
+    /// Drop queued audio so nothing stale plays after a discontinuity.
+    fn clear_audio(&mut self) {
+        #[cfg(feature = "std")]
+        if let Some(o) = self.audio_output.as_ref() {
+            o.clear();
         }
     }
 
@@ -222,9 +382,20 @@ impl SuperShuckieCore {
 
     /// Set the speed multiplier of the game.
     pub fn set_speed(&mut self, speed: Speed) {
-        self.game_speed = Speed::from_multiplier_float(speed.into_multiplier_float());
-        self.core.set_speed(speed.into_multiplier_float());
+        let multiplier = speed.into_multiplier_float();
+        self.game_speed = Speed::from_multiplier_float(multiplier);
+        self.core.set_speed(multiplier);
+        self.present_every = if multiplier >= 2.0 { (multiplier.floor() as u64).clamp(1, 16) } else { 1 };
         self.with_recorder(|r| r.set_speed(speed));
+
+        #[cfg(feature = "std")]
+        if let Some(o) = self.audio_output.as_ref() {
+            o.set_speed(multiplier as f32);
+        }
+        // Sped-up stretches start silent right away rather than after the queued tail plays.
+        if self.audio_mute_when_sped_up && !self.is_normal_speed() {
+            self.clear_audio();
+        }
     }
 
     /// Mark the start of the replay, returning the timestamp.
@@ -292,9 +463,11 @@ impl SuperShuckieCore {
                             let _ = self.core.load_save_state(state.as_slice());
                         },
                         Packet::Bookmark { .. } => {}
-                        Packet::Keyframe { state, .. } => {
+                        Packet::Keyframe { .. } => {
                             if self.auto_resync_keyframes_in_replays {
-                                let state = self.splice_live_transient_buffers(state.as_slice());
+                                // The player is told not to copy states into packets (see
+                                // `attach_replay_player`); read the reconstructed state directly.
+                                let state = self.splice_live_transient_buffers(player.current_keyframe_state());
                                 let _ = self.core.load_save_state(&state);
                             }
                         }
@@ -354,6 +527,8 @@ impl SuperShuckieCore {
     }
 
     fn after_run(&mut self, time: &RunTime) {
+        self.last_run = *time;
+        self.run_serial = self.run_serial.wrapping_add(1);
         self.do_frame_timekeeping(&time);
         self.push_keyframe_if_needed();
     }
@@ -390,6 +565,7 @@ impl SuperShuckieCore {
         }
         self.finish_current_frame();
         self.core.hard_reset();
+        self.clear_audio();
         self.with_recorder(|r| r.reset_console());
     }
 
@@ -437,6 +613,7 @@ impl SuperShuckieCore {
 
         self.mid_frame = false;
         let _ = self.core.load_save_state(state);
+        self.clear_audio();
 
         if self.replay_file_recorder.is_some() {
             self.with_recorder(|r| r.load_save_state(state.into()));
@@ -569,6 +746,8 @@ impl SuperShuckieCore {
         let mut source_player = self.replay_player.take().ok_or(ReplayResumeError::BadSource {
             explanation: alloc::borrow::Cow::Borrowed("no replay player attached to resume from"),
         })?;
+        // The resume builder reads keyframe states out of the packets it is handed.
+        source_player.set_keyframe_states_wanted(true);
         let (recorder, info) = build_resumed_recorder(
             &mut source_player,
             resume_at_frame,
@@ -615,6 +794,16 @@ impl SuperShuckieCore {
     /// This will reset to 0 whenever a replay is started.
     pub fn get_recording_milliseconds(&self) -> TimestampMillis {
         self.total_milliseconds
+    }
+
+    /// Frames emulated since the recording or playback started (or since the core was created).
+    pub fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+
+    /// Whether an attached replay has run out of packets (or failed to read).
+    pub fn is_replay_stalled(&self) -> bool {
+        self.replay_stalled
     }
 
     /// Stop recording the current replay.
@@ -705,8 +894,17 @@ impl SuperShuckieCore {
 
         self.frames_since_last_keyframe = 0;
         let ms = self.total_milliseconds;
-        let save_state = ByteVec::Heap(self.core.create_save_state());
-        self.with_recorder(|f| f.insert_keyframe(save_state, ms));
+
+        // Fill a recycled buffer: a fresh multi-megabyte allocation costs milliseconds of page
+        // faults, a reused one is a plain copy.
+        while self.state_buffers.len() < Self::STATE_BUFFER_POOL
+            && let Some(buffer) = self.replay_file_recorder.as_mut().and_then(|r| r.take_free_state_buffer())
+        {
+            self.state_buffers.push(buffer);
+        }
+        let mut buffer = self.state_buffers.pop().unwrap_or_default();
+        self.core.create_save_state_into(&mut buffer);
+        self.with_recorder(|f| f.insert_keyframe(ByteVec::Heap(buffer), ms));
     }
 
     /// Attach a replay file player to the core.
@@ -751,6 +949,10 @@ impl SuperShuckieCore {
             todo!("can't go to 0th keyframe (and can't handle this error TODO): {e:?}")
         }
 
+        // Every keyframe the cursor passes is reconstructed anyway; do not also copy it into the
+        // packet (20 MB per keyframe on NDS). Seeks and resyncs read `current_keyframe_state`.
+        player.set_keyframe_states_wanted(false);
+
         self.current_input = Input::new();
         self.next_input = None;
         self.replay_player = Some(player);
@@ -773,6 +975,7 @@ impl SuperShuckieCore {
         self.replay_player = None;
         self.replay_counters = None;
         self.reset_input();
+        self.clear_audio();
     }
 
     fn resume_timer(&mut self, resume_millis: TimestampMillis, resume_frames: UnsignedInteger) {
@@ -827,26 +1030,41 @@ impl SuperShuckieCore {
             }
         }
 
-        let Ok(Some(Packet::Keyframe { metadata, state })) = p.next_packet() else {
+        let Ok(Some(Packet::Keyframe { metadata, .. })) = p.next_packet() else {
             todo!("replay file is broken (no keyframe found at frame {frame}!! and error handling not yet implemented)")
         };
 
         let speed = metadata.speed;
+        let elapsed_frames = metadata.elapsed_frames;
+        let elapsed_millis = metadata.elapsed_millis;
+        let counters = metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
+        let input = metadata.input.clone();
 
-        self.core.load_save_state(state.as_slice()).expect("replay file is broken (can't load save state) and error handling not yet implemented!");
+        self.core.load_save_state(p.current_keyframe_state()).expect("replay file is broken (can't load save state) and error handling not yet implemented!");
+        // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
+        // next ChangeInput packet may be far away, so restore the input recorded with the
+        // keyframe; otherwise the frames after a seek depend on what was held before it.
+        self.core.set_input_encoded(input.as_slice());
 
         self.mid_frame = false;
-        self.total_frames = metadata.elapsed_frames;
-        self.total_milliseconds = metadata.elapsed_millis;
+        self.total_frames = elapsed_frames;
+        self.total_milliseconds = elapsed_millis;
         self.replay_stalled = false;
         self.frames_since_last_keyframe = 0;
-        self.replay_counters = Some(metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect());
+        self.replay_counters = Some(counters);
         self.replay_playback_speed = speed;
+        self.clear_audio();
 
         self.match_replay_playback_speed();
 
+        // Only the target frame is looked at; the ones on the way there need not be drawn.
         while self.total_frames <= desired && !self.replay_stalled {
-            self.run_unlocked();
+            if self.total_frames < desired {
+                self.run_unlocked_hidden();
+            }
+            else {
+                self.run_unlocked();
+            }
         }
     }
 

@@ -29,6 +29,7 @@ add_library(supershuckie-cpp-static STATIC
     src/replay_playback_controls.cpp
     src/nds_date_dialog.cpp
     src/video_export_dialog.cpp
+    src/audio_output.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)
@@ -103,6 +104,11 @@ if(SCRIPT_BUILD)
         PUBLIC ${MELONDS_TEAKRA}
         PUBLIC ${MGBA_CORE}
     )
+    # scripts/build-melonds.* produce libcore.a with LTO (and PGO) objects; make sure the final
+    # link actually runs the link-time optimiser over them rather than taking the fallback code.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(supershuckie-cpp-static PUBLIC -flto=auto)
+    endif()
 endif()
 
 

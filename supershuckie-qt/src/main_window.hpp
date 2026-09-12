@@ -27,6 +27,7 @@ class ReplayPlaybackControls;
 class NDSDateDialog;
 class StringAction;
 class VideoExportDialog;
+class AudioOutput;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -74,6 +75,7 @@ private:
     QMenu *gameplay_menu;
     QMenu *save_states_menu;
     QMenu *replays_menu;
+    QMenu *audio_menu;
     QMenu *settings_menu;
     QMenu *recent_roms_menu;
 
@@ -124,6 +126,18 @@ private:
     QMenu *game_boy_settings;
     NumberedAction *gbc_mode[3];
 
+    std::unique_ptr<AudioOutput> audio;
+    QAction *audio_enabled;
+    QAction *audio_muted;
+    QAction *audio_mute_when_sped_up;
+    QMenu *audio_volume_menu;
+    static const std::size_t AUDIO_VOLUME_STEPS = 10;
+    NumberedAction *audio_volumes[AUDIO_VOLUME_STEPS];
+    static const std::size_t AUDIO_BUFFER_PRESETS = 3;
+    static const std::uint16_t audio_buffer_ms[AUDIO_BUFFER_PRESETS];
+    NumberedAction *audio_buffers[AUDIO_BUFFER_PRESETS];
+    float audio_frequency_ratio = 1.0f;
+
     QLabel *current_state;
     QLabel *paused_state;
 
@@ -154,7 +168,12 @@ private:
     void set_up_gameplay_menu();
     void set_up_save_states_menu();
     void set_up_replays_menu();
+    void set_up_audio_menu();
     void set_up_settings_menu();
+
+    void apply_audio_gain();
+    void set_audio_volume(std::uint8_t percent);
+    void set_audio_buffer(std::uint8_t preset);
 
     void rebuild_recent_roms_menu() noexcept;
 
@@ -182,7 +201,8 @@ private:
     static void on_change_video_mode(void *user_data, std::size_t screen_count, const SuperShuckieScreenData *screen_data, std::uint8_t scaling);
 
     std::uint32_t frames_in_last_second = 0;
-    double current_fps = 0.0;
+    double current_fps = 0.0;         // emulated frames per second
+    double current_display_fps = 0.0; // frames that reached the screen per second
     clock::time_point second_start;
     void refresh_title();
 
@@ -237,6 +257,9 @@ private slots:
     void do_continue_last_replay();
     void do_toggle_disable_save_states_when_recording();
     void do_toggle_disable_speed_changes_when_recording();
+    void do_toggle_audio_enabled();
+    void do_toggle_audio_muted();
+    void do_toggle_audio_mute_when_sped_up();
 };
 
 class NumberedAction: public QAction {
