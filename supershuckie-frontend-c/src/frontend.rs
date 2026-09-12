@@ -311,6 +311,141 @@ pub unsafe extern "C" fn supershuckie_frontend_stop_recording_replay(
     frontend.stop_recording_replay();
 }
 
+/// Get the replays directory of the current ROM (a starting point for file dialogs).
+///
+/// Returns false (writing nothing) if no game is loaded.
+///
+/// Safety: `path` must be at least `path_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_get_replays_dir_for_current_rom(
+    frontend: &SuperShuckieFrontend,
+    path: *mut u8,
+    path_len: usize
+) -> bool {
+    match frontend.get_replays_dir_for_current_rom() {
+        Some(dir) => {
+            write_str_to_data(&dir.to_string_lossy(), unsafe { from_raw_parts_mut(path, path_len) });
+            true
+        }
+        None => false
+    }
+}
+
+/// Plan the conversion of `path` (a .replay file, or a folder searched recursively) to the current
+/// replay format, and remember it for `supershuckie_frontend_start_replay_conversion`.
+///
+/// Returns true and writes a one-line description of the plan to `description`, or returns false
+/// and writes the reason nothing can be converted (already the current format, being recorded,
+/// unreadable, or a conversion already running).
+///
+/// Safety: `path` must be a valid UTF-8 C string; `description` must be at least
+/// `description_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_plan_replay_conversion(
+    frontend: &mut SuperShuckieFrontend,
+    path: *const c_char,
+    description: *mut u8,
+    description_len: usize
+) -> bool {
+    let path = unsafe { CStr::from_ptr(path) }.to_str().expect("path not UTF-8");
+    let (ok, message) = match frontend.plan_replay_conversion(std::path::Path::new(path)) {
+        Ok(description) => (true, UTF8CString::from(description)),
+        Err(e) => (false, e)
+    };
+    write_str_to_data(message.as_str(), unsafe { from_raw_parts_mut(description, description_len) });
+    ok
+}
+
+/// Start the planned replay conversion on a background thread. Each replay is converted into a
+/// temporary file next to it and verified before the original is replaced; with `keep_backups` the
+/// original is kept as `<name>.replay.bak`.
+///
+/// On failure, writes an error to `error` and returns false. Poll with
+/// `supershuckie_frontend_replay_conversion_poll`, cancel with
+/// `supershuckie_frontend_replay_conversion_cancel`, and collect the summary with
+/// `supershuckie_frontend_replay_conversion_poll_finished`.
+///
+/// Safety: `error` must be at least `error_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_start_replay_conversion(
+    frontend: &mut SuperShuckieFrontend,
+    keep_backups: bool,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.start_replay_conversion(keep_backups) {
+        Ok(()) => true,
+        Err(e) => {
+            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            false
+        }
+    }
+}
+
+/// Poll the replay conversion in progress. Writes the 0-based index of the replay being worked on
+/// and the number of replays, the phase (0 = converting, 1 = verifying), the frames done / total in
+/// that phase, and the file name of the current replay (each when non-null).
+///
+/// Returns true if a conversion is currently active.
+///
+/// Safety: `current_name` must be at least `current_name_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_replay_conversion_poll(
+    frontend: &SuperShuckieFrontend,
+    file_index: *mut u32,
+    file_count: *mut u32,
+    phase: *mut u32,
+    frames_done: *mut u64,
+    frames_total: *mut u64,
+    current_name: *mut u8,
+    current_name_len: usize
+) -> bool {
+    use supershuckie_frontend::replay_convert::ConvertPhase;
+
+    let Some(status) = frontend.poll_replay_conversion() else {
+        return false
+    };
+
+    if !file_index.is_null() { unsafe { *file_index = status.file_index as u32; } }
+    if !file_count.is_null() { unsafe { *file_count = status.file_count as u32; } }
+    if !phase.is_null() { unsafe { *phase = if status.phase == ConvertPhase::Verifying { 1 } else { 0 }; } }
+    if !frames_done.is_null() { unsafe { *frames_done = status.done; } }
+    if !frames_total.is_null() { unsafe { *frames_total = status.total; } }
+    if !current_name.is_null() {
+        write_str_to_data(status.current_name.as_str(), unsafe { from_raw_parts_mut(current_name, current_name_len) });
+    }
+    true
+}
+
+/// Request cancellation of the replay conversion in progress, if any. The replay being worked on
+/// is left untouched.
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_replay_conversion_cancel(frontend: &SuperShuckieFrontend) {
+    frontend.cancel_replay_conversion();
+}
+
+/// Non-blocking check for the end of the replay conversion.
+///
+/// Returns 0 while it is still running (or none is active); 1 when it has finished, in which case
+/// a multi-line summary (converted files, sizes, failures) is written to `summary` and the job is
+/// cleared.
+///
+/// Safety: `summary` must be at least `summary_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_replay_conversion_poll_finished(
+    frontend: &mut SuperShuckieFrontend,
+    summary: *mut u8,
+    summary_len: usize
+) -> u32 {
+    match frontend.poll_replay_conversion_finished() {
+        None => 0,
+        Some(result) => {
+            write_str_to_data(result.describe().as_str(), unsafe { from_raw_parts_mut(summary, summary_len) });
+            1
+        }
+    }
+}
+
 /// Start a video export of a replay.
 ///
 /// `preset`: 0 = MP4/H.264, 1 = lossless FFV1/MKV, 2 = custom (uses `custom_args`).

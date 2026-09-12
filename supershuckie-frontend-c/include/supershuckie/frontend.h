@@ -259,6 +259,76 @@ uint32_t supershuckie_frontend_export_poll_finished(struct SuperShuckieFrontendR
 void supershuckie_frontend_stop_recording_replay(struct SuperShuckieFrontendRaw *frontend);
 
 /**
+ * Get the replays directory of the current ROM (a starting point for file dialogs).
+ *
+ * Returns false (writing nothing) if no game is loaded.
+ *
+ * Safety:
+ * - path must not be null and must be at least path_len bytes long.
+ */
+bool supershuckie_frontend_get_replays_dir_for_current_rom(const struct SuperShuckieFrontendRaw *frontend, char *path, size_t path_len);
+
+/**
+ * Plan the conversion of a .replay file, or of every replay under a folder (searched recursively),
+ * to the current replay format. The plan is remembered for
+ * supershuckie_frontend_start_replay_conversion().
+ *
+ * Returns true and writes a one-line description of the plan to description, or returns false and
+ * writes the reason nothing can be converted (already the current format, being recorded,
+ * unreadable, or a conversion already running).
+ *
+ * Safety:
+ * - path must not be null and must be valid UTF-8.
+ * - description must not be null and must be at least description_len bytes long.
+ */
+bool supershuckie_frontend_plan_replay_conversion(struct SuperShuckieFrontendRaw *frontend, const char *path, char *description, size_t description_len);
+
+/**
+ * Start the planned replay conversion on a background thread. Each replay is converted into a
+ * temporary file next to it and verified before the original is replaced; with keep_backups the
+ * original is kept as <name>.replay.bak.
+ *
+ * On failure, writes an error to error and returns false. Poll with
+ * supershuckie_frontend_replay_conversion_poll(), cancel with
+ * supershuckie_frontend_replay_conversion_cancel(), and collect the summary with
+ * supershuckie_frontend_replay_conversion_poll_finished().
+ *
+ * Safety:
+ * - error must not be null and must be at least error_len bytes long.
+ */
+bool supershuckie_frontend_start_replay_conversion(struct SuperShuckieFrontendRaw *frontend, bool keep_backups, char *error, size_t error_len);
+
+/**
+ * Poll the replay conversion in progress. Writes the 0-based index of the replay being worked on
+ * and the number of replays, the phase (0 = converting, 1 = verifying), the frames done / total in
+ * that phase, and the file name of the current replay (each when non-null).
+ *
+ * Returns true if a conversion is currently active, false otherwise.
+ *
+ * Safety:
+ * - current_name must be at least current_name_len bytes long when non-null.
+ */
+bool supershuckie_frontend_replay_conversion_poll(const struct SuperShuckieFrontendRaw *frontend, uint32_t *file_index, uint32_t *file_count, uint32_t *phase, uint64_t *frames_done, uint64_t *frames_total, char *current_name, size_t current_name_len);
+
+/**
+ * Request cancellation of the replay conversion in progress, if any. The replay being worked on is
+ * left untouched.
+ */
+void supershuckie_frontend_replay_conversion_cancel(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Non-blocking check for the end of the replay conversion.
+ *
+ * Returns 0 while it is still running (or none is active); 1 when it has finished, in which case a
+ * multi-line summary (converted files, sizes, failures) is written to summary and the job is
+ * cleared.
+ *
+ * Safety:
+ * - summary must not be null and must be at least summary_len bytes long.
+ */
+uint32_t supershuckie_frontend_replay_conversion_poll_finished(struct SuperShuckieFrontendRaw *frontend, char *summary, size_t summary_len);
+
+/**
  * Get whether or not Poke-A-Byte is enabled.
  *
  * If false, error may be filled with error data if there is any error data (or it will be empty if it is simply not

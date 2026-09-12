@@ -103,6 +103,8 @@ private:
     QAction *resume_replay;
     QAction *play_replay;
     QAction *export_video;
+    QAction *convert_replay;
+    QAction *convert_replay_folder;
     QAction *auto_stop_replay_on_input;
     QAction *auto_unpause_on_input;
     QAction *auto_pause_on_record;
@@ -169,6 +171,7 @@ private:
     void closeEvent(QCloseEvent *event) override;
 
     bool is_game_running();
+    void convert_replays_at(const QString &path);
 
     char title_text[128] = {};
 
@@ -204,6 +207,8 @@ private slots:
     void do_resume_replay();
     void do_play_replay();
     void do_export_video();
+    void do_convert_replay();
+    void do_convert_replay_folder();
     void do_open_game_speed_dialog() noexcept;
     void do_undo_load_save_state();
     void do_redo_load_save_state();

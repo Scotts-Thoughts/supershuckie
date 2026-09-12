@@ -1,5 +1,6 @@
 pub mod util;
 pub mod settings;
+pub mod replay_convert;
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -133,6 +134,13 @@ pub struct SuperShuckieFrontend {
     /// In-progress video export, if any (owned here so the C/Qt layer just polls/cancels).
     current_export: Option<VideoExportHandle>,
 
+    /// A replay conversion built by [`plan_replay_conversion`](Self::plan_replay_conversion) and
+    /// not started yet.
+    pending_conversion_plan: Option<replay_convert::ConversionPlan>,
+
+    /// The replay conversion in progress, if any.
+    current_conversion: Option<replay_convert::ConversionJob>,
+
     settings: Settings
 }
 
@@ -171,7 +179,9 @@ impl SuperShuckieFrontend {
             bios_override: None,
             last_replay_and_frame: None,
             current_replay: None,
-            current_export: None
+            current_export: None,
+            pending_conversion_plan: None,
+            current_conversion: None
         };
 
         // This is not tied to the core, so we want to immediately enable this.
@@ -1285,6 +1295,94 @@ impl SuperShuckieFrontend {
         self.rom_name.clone()
     }
 
+    /// The recorder settings derived from the replay settings (used for recording, resuming and
+    /// converting replays alike).
+    fn recorder_settings(&self) -> ReplayFileRecorderSettings {
+        ReplayFileRecorderSettings {
+            minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
+                .saturating_mul(1024)
+                .saturating_mul(1024),
+            compression_level: self.settings.replay.zstd_compression_level,
+            max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
+            mask_transient_buffers: self.settings.replay.mask_transient_buffers,
+        }
+    }
+
+    /// The replays directory of the current ROM, if a game is loaded (a sensible starting point
+    /// for file dialogs).
+    pub fn get_replays_dir_for_current_rom(&self) -> Option<PathBuf> {
+        self.rom_name.as_ref().map(|rom| self.get_replays_dir_for_rom(rom.as_str()))
+    }
+
+    /// Work out what converting `path` (a replay file or a folder of them) to the current format
+    /// would do, and remember it for [`start_replay_conversion`](Self::start_replay_conversion).
+    ///
+    /// Returns a one-line description of the plan, or an error if there is nothing to convert
+    /// (already the current format, being recorded, unreadable) or a conversion is running.
+    pub fn plan_replay_conversion(&mut self, path: &Path) -> Result<String, UTF8CString> {
+        if self.current_conversion.is_some() {
+            return Err("A replay conversion is already in progress".into());
+        }
+
+        // Never touch the recording in progress.
+        let exclude: Vec<PathBuf> = self
+            .recording_replay_file
+            .as_ref()
+            .map(|r| vec![r.final_replay_path.clone(), r.temp_replay_path.clone()])
+            .unwrap_or_default();
+
+        let plan = replay_convert::plan_conversion(path, &exclude).map_err(UTF8CString::from)?;
+        if plan.files.is_empty() {
+            return Err(format!("Nothing to convert. {}", plan.describe()).into());
+        }
+
+        let description = plan.describe();
+        self.pending_conversion_plan = Some(plan);
+        Ok(description)
+    }
+
+    /// Start converting the replays of the last [`plan_replay_conversion`](Self::plan_replay_conversion)
+    /// on a background thread, with the app's replay settings.
+    ///
+    /// Each replay is converted into a temporary file next to it and verified; only then is the
+    /// original replaced (kept as `<name>.replay.bak` when `keep_backups`). Poll with
+    /// [`poll_replay_conversion`](Self::poll_replay_conversion), cancel with
+    /// [`cancel_replay_conversion`](Self::cancel_replay_conversion), and collect the summary with
+    /// [`poll_replay_conversion_finished`](Self::poll_replay_conversion_finished).
+    pub fn start_replay_conversion(&mut self, keep_backups: bool) -> Result<(), UTF8CString> {
+        if self.current_conversion.is_some() {
+            return Err("A replay conversion is already in progress".into());
+        }
+        let Some(plan) = self.pending_conversion_plan.take() else {
+            return Err("No replay conversion was planned".into());
+        };
+        self.current_conversion = Some(replay_convert::ConversionJob::start(plan, self.recorder_settings(), keep_backups));
+        Ok(())
+    }
+
+    /// Progress of the replay conversion in progress, if any.
+    pub fn poll_replay_conversion(&self) -> Option<replay_convert::ConversionStatus> {
+        self.current_conversion.as_ref().map(|job| job.status())
+    }
+
+    /// Ask the replay conversion in progress to stop (after cleaning up the file it is on).
+    pub fn cancel_replay_conversion(&self) {
+        if let Some(job) = self.current_conversion.as_ref() {
+            job.cancel();
+        }
+    }
+
+    /// Non-blocking check for the end of the replay conversion.
+    ///
+    /// Returns `None` while it is still running (or none is active); otherwise the summary, and
+    /// the job is cleared.
+    pub fn poll_replay_conversion_finished(&mut self) -> Option<replay_convert::ConversionSummary> {
+        if !self.current_conversion.as_ref()?.is_finished() {
+            return None;
+        }
+        self.current_conversion.take().map(|job| job.finish())
+    }
+
     pub fn get_current_rom_name(&self) -> Option<&str> {
         self.rom_name.as_ref().map(|i| i.as_str())
     }
@@ -1406,14 +1504,7 @@ impl SuperShuckieFrontend {
             rom_name: current_rom_name.to_string(),
             rom_filename: current_rom_name.to_string(),
 
-            settings: ReplayFileRecorderSettings {
-                minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
-                    .saturating_mul(1024)
-                    .saturating_mul(1024),
-                compression_level: self.settings.replay.zstd_compression_level,
-                max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
-                mask_transient_buffers: self.settings.replay.mask_transient_buffers,
-            },
+            settings: self.recorder_settings(),
 
             // TODO: patches
             patch_format: ReplayPatchFormat::Unpatched,
@@ -1503,14 +1594,7 @@ impl SuperShuckieFrontend {
             rom_name: current_rom_name.to_string(),
             rom_filename: current_rom_name.to_string(),
 
-            settings: ReplayFileRecorderSettings {
-                minimum_uncompressed_bytes_per_blob: (self.settings.replay.max_recording_blob_size_mb.get() as usize)
-                    .saturating_mul(1024)
-                    .saturating_mul(1024),
-                compression_level: self.settings.replay.zstd_compression_level,
-                max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
-                mask_transient_buffers: self.settings.replay.mask_transient_buffers,
-            },
+            settings: self.recorder_settings(),
 
             // TODO: patches
             patch_format: ReplayPatchFormat::Unpatched,

@@ -39,6 +39,8 @@
 #include "video_export_dialog.hpp"
 
 #include <QProgressDialog>
+#include <QThread>
+#include <QPushButton>
 #include <QCoreApplication>
 
 using namespace SuperShuckie64;
@@ -531,11 +533,18 @@ void MainWindow::set_up_replays_menu() {
 
     this->export_video = this->replays_menu->addAction("Export video…");
 
+    this->replays_menu->addSeparator();
+
+    this->convert_replay = this->replays_menu->addAction("Convert replay to current format…");
+    this->convert_replay_folder = this->replays_menu->addAction("Convert folder of replays to current format…");
+
     connect(this->record_replay, SIGNAL(triggered()), this, SLOT(do_record_replay()));
     connect(this->resume_replay, SIGNAL(triggered()), this, SLOT(do_resume_replay()));
     connect(this->play_replay, SIGNAL(triggered()), this, SLOT(do_play_replay()));
     connect(this->continue_last_replay, SIGNAL(triggered()), this, SLOT(do_continue_last_replay()));
     connect(this->export_video, SIGNAL(triggered()), this, SLOT(do_export_video()));
+    connect(this->convert_replay, SIGNAL(triggered()), this, SLOT(do_convert_replay()));
+    connect(this->convert_replay_folder, SIGNAL(triggered()), this, SLOT(do_convert_replay_folder()));
 
     this->record_replay->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_R));
     this->resume_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_R));
@@ -711,7 +720,7 @@ void MainWindow::refresh_action_states() {
         supershuckie_frontend_get_replay_state(this->frontend) : SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
 
     this->gameplay_menu->setEnabled(game_loaded);
-    this->replays_menu->setEnabled(game_loaded);
+    this->replays_menu->setEnabled(true);
     this->close_rom->setEnabled(game_loaded);
     this->unload_rom->setEnabled(game_loaded);
     this->screenshot->setEnabled(game_loaded);
@@ -739,6 +748,8 @@ void MainWindow::refresh_action_states() {
     this->record_replay->setEnabled(game_loaded);
     this->resume_replay->setEnabled(game_loaded);
     this->export_video->setEnabled(game_loaded);
+    this->convert_replay->setEnabled(true);
+    this->convert_replay_folder->setEnabled(true);
     this->game_boy_settings->setEnabled(true);
 
     this->reload_core->setEnabled(game_loaded);
@@ -761,6 +772,9 @@ void MainWindow::refresh_action_states() {
             this->resume_replay->setEnabled(false);
             this->reload_core->setEnabled(false);
             this->export_video->setEnabled(false);
+            // The recording in progress must not be converted underneath the recorder.
+            this->convert_replay->setEnabled(false);
+            this->convert_replay_folder->setEnabled(false);
             this->current_state->setText("RECORDING");
             this->current_state->show();
             this->record_replay->setText("Stop recording replay");
@@ -1148,6 +1162,127 @@ void MainWindow::do_export_video() {
     if(success) {
         this->set_title("Exported video");
     }
+
+    this->refresh_action_states();
+}
+
+static QString default_replay_dialog_dir(MainWindow *window, SuperShuckieFrontendRaw *frontend, const QString &app_dir) {
+    char dir[4096];
+    if(supershuckie_frontend_get_replays_dir_for_current_rom(frontend, dir, sizeof(dir)) && QDir(QString::fromUtf8(dir)).exists()) {
+        return QString::fromUtf8(dir);
+    }
+    (void)window;
+    return app_dir;
+}
+
+void MainWindow::do_convert_replay() {
+    QString start = default_replay_dialog_dir(this, this->frontend, this->app_dir);
+    QString path = QFileDialog::getOpenFileName(this, "Convert replay to current format", start, "Replays (*.replay)");
+    if(path.isEmpty()) {
+        return;
+    }
+    this->convert_replays_at(path);
+}
+
+void MainWindow::do_convert_replay_folder() {
+    QString start = default_replay_dialog_dir(this, this->frontend, this->app_dir);
+    QString path = QFileDialog::getExistingDirectory(this, "Convert every replay in a folder to current format", start);
+    if(path.isEmpty()) {
+        return;
+    }
+    this->convert_replays_at(path);
+}
+
+void MainWindow::convert_replays_at(const QString &path) {
+    std::string path_utf8 = path.toStdString();
+
+    char description[2048];
+    if(!supershuckie_frontend_plan_replay_conversion(this->frontend, path_utf8.c_str(), description, sizeof(description))) {
+        QMessageBox info(this);
+        info.setWindowTitle("Convert replays");
+        info.setIcon(QMessageBox::Icon::Information);
+        info.setText(QString::fromUtf8(description));
+        info.exec();
+        return;
+    }
+
+    // Confirm, and ask whether to keep the originals.
+    QMessageBox confirm(this);
+    confirm.setWindowTitle("Convert replays");
+    confirm.setIcon(QMessageBox::Icon::Question);
+    confirm.setText(QString::fromUtf8(description));
+    confirm.setInformativeText(
+        "Replays are re-encoded with your current replay settings and verified; an original is only replaced "
+        "after its conversion has been checked packet by packet. Older versions of Super Shuckie cannot open "
+        "converted replays.\n\nKeep the originals as .replay.bak files?"
+    );
+    QPushButton *keep = confirm.addButton("Keep originals", QMessageBox::YesRole);
+    QPushButton *replace = confirm.addButton("Replace originals", QMessageBox::NoRole);
+    QPushButton *cancel = confirm.addButton(QMessageBox::Cancel);
+    confirm.setDefaultButton(keep);
+    confirm.exec();
+    if(confirm.clickedButton() == cancel || confirm.clickedButton() == nullptr) {
+        return;
+    }
+    bool keep_backups = confirm.clickedButton() != replace;
+
+    char err[1024];
+    if(!supershuckie_frontend_start_replay_conversion(this->frontend, keep_backups, err, sizeof(err))) {
+        DISPLAY_ERROR_DIALOG("Convert replays", "%s", err);
+        return;
+    }
+
+    // Stop the main ticker while the modal progress dialog drives the event loop.
+    this->stop_timer();
+
+    QProgressDialog progress("Converting…", "Cancel", 0, 100, this);
+    progress.setWindowTitle("Convert replays");
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setMinimumWidth(480);
+    progress.setValue(0);
+
+    char summary[8192];
+    summary[0] = 0;
+    while(true) {
+        std::uint32_t fin = supershuckie_frontend_replay_conversion_poll_finished(this->frontend, summary, sizeof(summary));
+        if(fin == 1) {
+            break;
+        }
+
+        std::uint32_t file_index = 0, file_count = 0, phase = 0;
+        std::uint64_t done = 0, total = 0;
+        char name[512];
+        name[0] = 0;
+        if(supershuckie_frontend_replay_conversion_poll(this->frontend, &file_index, &file_count, &phase, &done, &total, name, sizeof(name))) {
+            std::uint64_t percent = total > 0 ? done * 100 / total : 0;
+            progress.setLabelText(QString("%1 %2 (%3 of %4)")
+                .arg(phase == 1 ? "Verifying" : "Converting")
+                .arg(QString::fromUtf8(name))
+                .arg(file_index + 1)
+                .arg(file_count));
+            // Overall progress: each replay is 200 units (100 converting + 100 verifying).
+            progress.setMaximum(static_cast<int>(file_count * 200));
+            progress.setValue(static_cast<int>(file_index * 200 + phase * 100 + percent));
+        }
+
+        if(progress.wasCanceled()) {
+            supershuckie_frontend_replay_conversion_cancel(this->frontend);
+            progress.setLabelText("Cancelling after the current replay…");
+        }
+
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 16);
+        QThread::msleep(30);
+    }
+
+    progress.close();
+    this->start_timer();
+
+    QMessageBox result(this);
+    result.setWindowTitle("Convert replays");
+    result.setIcon(std::strstr(summary, "FAILED") != nullptr ? QMessageBox::Icon::Warning : QMessageBox::Icon::Information);
+    result.setText(QString::fromUtf8(summary));
+    result.exec();
 
     this->refresh_action_states();
 }
