@@ -13,5 +13,8 @@ pub mod replay_file;
 mod packet;
 mod util;
 
+#[cfg(test)]
+mod test_support;
+
 pub use packet::*;
 pub use util::*;

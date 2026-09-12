@@ -686,4 +686,16 @@ enum PacketDecompressionStatus {
     Decompressed { packets: Arc<Vec<Packet>> }
 }
 
-// TODO: WRITE UNIT TESTS
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+
+    /// A v3 file (both the crash-safe temp layout with a top-level delta tail and the closed
+    /// all-blobs layout) must keep playing back exactly: identical materialised keyframe states,
+    /// packet stream, totals and indexes.
+    #[test]
+    fn v3_fixture_plays_back_exactly() {
+        check_script_replay(V3_SMALL, "v3-small (temp layout)");
+        check_script_replay(V3_SMALL_CLOSED, "v3-small-closed");
+    }
+}
