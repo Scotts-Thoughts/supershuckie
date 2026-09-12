@@ -24,6 +24,9 @@ unsafe extern "C" {
     fn melonds_rs_core_create_save_state(core: *const MelonDSCoreHolderRaw, data: *mut u8, data_size: usize) -> usize;
     fn melonds_rs_core_load_save_state(core: *mut MelonDSCoreHolderRaw, data: *const u8, data_size: usize) -> bool;
     fn melonds_rs_core_get_ram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x400000];
+    fn melonds_rs_core_get_shared_wram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x8000];
+    fn melonds_rs_core_get_arm7_wram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x10000];
+    fn melonds_rs_core_invalidate_jit(core: *mut MelonDSCoreHolderRaw, region: u32, offset: u32, length: usize);
     fn melonds_rs_core_read_audio(core: *mut MelonDSCoreHolderRaw, out: *mut i16, max_frames: usize) -> usize;
     fn melonds_rs_core_drain_audio(core: *mut MelonDSCoreHolderRaw);
     fn melonds_rs_core_set_date(
@@ -39,6 +42,15 @@ unsafe extern "C" {
 
 pub struct Core {
     inner: *mut MelonDSCoreHolderRaw
+}
+
+/// Memory whose compiled JIT blocks [`Core::invalidate_jit`] can drop.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum JitRegion {
+    MainRAM = 0,
+    SharedWRAM = 1,
+    ARM7WRAM = 2
 }
 
 unsafe impl Send for Core {}
@@ -125,6 +137,35 @@ impl Core {
     #[inline]
     pub fn get_main_ram_mut(&mut self) -> &mut [u8] {
         unsafe { &mut *melonds_rs_core_get_ram(self.inner) }.as_mut_slice()
+    }
+
+    /// The 32 KiB of work RAM shared by both CPUs (which CPU sees which part depends on WRAMCNT).
+    #[inline]
+    pub fn get_shared_wram(&self) -> &[u8] {
+        unsafe { &*melonds_rs_core_get_shared_wram(self.inner) }.as_slice()
+    }
+
+    #[inline]
+    pub fn get_shared_wram_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut *melonds_rs_core_get_shared_wram(self.inner) }.as_mut_slice()
+    }
+
+    /// The ARM7's private 64 KiB of work RAM.
+    #[inline]
+    pub fn get_arm7_wram(&self) -> &[u8] {
+        unsafe { &*melonds_rs_core_get_arm7_wram(self.inner) }.as_slice()
+    }
+
+    #[inline]
+    pub fn get_arm7_wram_mut(&mut self) -> &mut [u8] {
+        unsafe { &mut *melonds_rs_core_get_arm7_wram(self.inner) }.as_mut_slice()
+    }
+
+    /// After writing `length` bytes at `offset` of `region` directly, drop any JIT blocks compiled
+    /// from them (a no-op with the JIT off).
+    #[inline]
+    pub fn invalidate_jit(&mut self, region: JitRegion, offset: u32, length: usize) {
+        unsafe { melonds_rs_core_invalidate_jit(self.inner, region as u32, offset, length) }
     }
 
     /// Pop the stereo frames (interleaved `i16` pairs at 48 kHz) mixed since the last call into

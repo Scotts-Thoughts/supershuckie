@@ -32,6 +32,9 @@ pub use supershuckie_replay_recorder::Speed;
 mod thread;
 
 #[cfg(feature = "std")]
+pub mod memory_monitor;
+
+#[cfg(feature = "std")]
 pub use thread::*;
 
 #[cfg(feature = "std")]
@@ -93,6 +96,12 @@ pub struct SuperShuckieCore {
 
     /// Incremented every time the core actually ran (see [`Self::run_serial`]).
     run_serial: u64,
+
+    /// Incremented whenever memory is replaced wholesale (see [`Self::state_epoch`]).
+    state_epoch: u64,
+
+    /// `WriteMemory` packets in played-back replays that could not be applied.
+    replay_write_failures: u64,
 
     /// Present (draw) one frame in this many while running paced; see [`Self::present_every`].
     present_every: u64,
@@ -184,6 +193,8 @@ impl SuperShuckieCore {
             auto_resync_keyframes_in_replays: false,
             last_run: RunTime::NONE,
             run_serial: 0,
+            state_epoch: 0,
+            replay_write_failures: 0,
             present_every: 1,
             state_buffers: Vec::new(),
             #[cfg(feature = "std")]
@@ -222,6 +233,39 @@ impl SuperShuckieCore {
     /// one it has already acted on.
     pub fn run_serial(&self) -> u64 {
         self.run_serial
+    }
+
+    /// A counter that changes whenever the emulated memory is replaced wholesale rather than by
+    /// the game running: a save state load, a reset, a replay seek, attaching or detaching a
+    /// replay. Memory watchers use it to tell such a jump from the game changing a value.
+    #[inline]
+    pub fn state_epoch(&self) -> u64 {
+        self.state_epoch
+    }
+
+    #[inline]
+    fn bump_state_epoch(&mut self) {
+        self.state_epoch = self.state_epoch.wrapping_add(1);
+    }
+
+    /// Whether the core is in the middle of a frame (only the Game Boy core steps in sub-frame
+    /// slices).
+    #[inline]
+    pub fn is_mid_frame(&self) -> bool {
+        self.mid_frame
+    }
+
+    /// Whether a replay is attached for playback.
+    #[inline]
+    pub fn is_playing_back(&self) -> bool {
+        self.replay_player.is_some()
+    }
+
+    /// How many `WriteMemory` packets of played-back replays could not be applied (for example a
+    /// replay made by a newer version writing to memory this version does not map).
+    #[inline]
+    pub fn replay_write_failures(&self) -> u64 {
+        self.replay_write_failures
     }
 
     /// Run the emulator core for the shortest amount of time.
@@ -347,10 +391,39 @@ impl SuperShuckieCore {
         }
     }
 
-    /// Enqueue a write for the next frame.
-    pub fn enqueue_write(&mut self, address: u32, data: ByteVec) {
+    /// Write `data` at `address` (recorded into the replay being recorded, if any): right away
+    /// between frames, or once the current frame finishes.
+    ///
+    /// Dropped, returning `false`, while a replay is being played back: the replay owns the
+    /// memory then, and a write held back until playback ends would land at an arbitrary moment.
+    pub fn enqueue_write(&mut self, address: u32, data: ByteVec) -> bool {
+        if self.replay_player.is_some() {
+            return false
+        }
         self.writes.push(QueuedWrite { address, data });
         self.flush_writes();
+        true
+    }
+
+    /// [`enqueue_write`](Self::enqueue_write) `data` at `address` only if the bytes there differ,
+    /// so holding a value in place (a freeze) writes (and records) only on frames where something
+    /// actually changed it. Returns whether a write was enqueued; unmapped memory is never written.
+    pub fn write_if_changed(&mut self, address: u32, data: &[u8]) -> bool {
+        if self.replay_player.is_some() || data.is_empty() {
+            return false
+        }
+        let unchanged = match crate::emulator::memory_slice(self.core.as_ref(), address, data.len()) {
+            Some(current) => current == data,
+            None => {
+                // Not in a listed region; fall back to the core's own address decoding.
+                let mut current = alloc::vec![0u8; data.len()];
+                match self.core.read_ram(address, &mut current) {
+                    Ok(()) => current == data,
+                    Err(_) => return false
+                }
+            }
+        };
+        !unchanged && self.enqueue_write(address, ByteVec::from(data))
     }
 
     /// Pause the current timer.
@@ -447,7 +520,11 @@ impl SuperShuckieCore {
                             break;
                         }
                         Packet::WriteMemory { address, data } => {
-                            self.core.write_ram(*address as u32, data.as_slice()).expect("failed to write RAM (and this was not handled)");
+                            // Skipped rather than fatal: a replay may write to memory this version
+                            // does not map.
+                            if self.core.write_ram(*address as u32, data.as_slice()).is_err() {
+                                self.replay_write_failures += 1;
+                            }
                         }
                         Packet::ChangeInput { data } => {
                             self.core.set_input_encoded(data.as_slice());
@@ -458,9 +535,11 @@ impl SuperShuckieCore {
                         }
                         Packet::ResetConsole => {
                             self.core.hard_reset();
+                            self.bump_state_epoch();
                         }
                         Packet::LoadSaveState { state } => {
                             let _ = self.core.load_save_state(state.as_slice());
+                            self.bump_state_epoch();
                         },
                         Packet::Bookmark { .. } => {}
                         Packet::Keyframe { .. } => {
@@ -545,8 +624,11 @@ impl SuperShuckieCore {
         let mut writes = core::mem::take(&mut self.writes);
 
         for write in writes.drain(..) {
-            let _ = self.core.write_ram(write.address, write.data.as_slice());
-            self.with_recorder(|recorder| recorder.write_memory(write.address as UnsignedInteger, write.data));
+            // Only record what was actually written: a replay must not carry a write it cannot
+            // apply on playback.
+            if self.core.write_ram(write.address, write.data.as_slice()).is_ok() {
+                self.with_recorder(|recorder| recorder.write_memory(write.address as UnsignedInteger, write.data));
+            }
         }
 
         // reuse the allocation
@@ -565,6 +647,7 @@ impl SuperShuckieCore {
         }
         self.finish_current_frame();
         self.core.hard_reset();
+        self.bump_state_epoch();
         self.clear_audio();
         self.with_recorder(|r| r.reset_console());
     }
@@ -613,6 +696,7 @@ impl SuperShuckieCore {
 
         self.mid_frame = false;
         let _ = self.core.load_save_state(state);
+        self.bump_state_epoch();
         self.clear_audio();
 
         if self.replay_file_recorder.is_some() {
@@ -955,6 +1039,8 @@ impl SuperShuckieCore {
 
         self.current_input = Input::new();
         self.next_input = None;
+        // Writes still queued for the end of a frame belong to the live session, not the replay.
+        self.writes.clear();
         self.replay_player = Some(player);
         self.replay_counters = Some(BTreeMap::new());
         self.replay_stalled = false;
@@ -976,6 +1062,7 @@ impl SuperShuckieCore {
         self.replay_counters = None;
         self.reset_input();
         self.clear_audio();
+        self.bump_state_epoch();
     }
 
     fn resume_timer(&mut self, resume_millis: TimestampMillis, resume_frames: UnsignedInteger) {
@@ -1041,6 +1128,7 @@ impl SuperShuckieCore {
         let input = metadata.input.clone();
 
         self.core.load_save_state(p.current_keyframe_state()).expect("replay file is broken (can't load save state) and error handling not yet implemented!");
+        self.state_epoch = self.state_epoch.wrapping_add(1);
         // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
         // next ChangeInput packet may be far away, so restore the input recorded with the
         // keyframe; otherwise the frames after a seek depend on what was held before it.

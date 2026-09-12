@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
-use crate::emulator::{EmulatorCore, Input, RunTime, ScreenData, ScreenDataEncoding};
+use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding};
 use alloc::string::String;
 use alloc::borrow::ToOwned;
-use melonds_rs::Core;
+use melonds_rs::{Core, JitRegion};
 use supershuckie_replay_recorder::blake3_hash;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 use alloc::boxed::Box;
@@ -19,7 +19,8 @@ pub struct NintendoDS {
     microseconds_per_frames: TimestampMicros,
     clock: Box<dyn MonotonicTimestampProvider>,
     skip_drawing: bool,
-    audio_enabled: bool
+    audio_enabled: bool,
+    jit: bool
 }
 
 impl NintendoDS {
@@ -38,7 +39,8 @@ impl NintendoDS {
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
             clock,
             skip_drawing: false,
-            audio_enabled: false
+            audio_enabled: false,
+            jit
         }
     }
 
@@ -58,6 +60,19 @@ impl NintendoDS {
 }
 
 const DEFAULT_MICROSECONDS_PER_FRAME: u64 = 1000000 / 60;
+
+const NDS_REGION_MAIN_RAM: usize = 0;
+const NDS_REGION_SHARED_WRAM: usize = 1;
+const NDS_REGION_ARM7_WRAM: usize = 2;
+
+/// The Nintendo DS address space as seen by `read_ram`/`write_ram`, in ARM9 bus addresses. Main
+/// RAM is the region Poke-A-Byte has always used; the work RAM regions start past its 4 MiB, where
+/// no address was valid before.
+const NDS_MEMORY_REGIONS: [MemoryRegionInfo; 3] = [
+    MemoryRegionInfo { name: "Main RAM", short_name: "MAIN", base_address: 0x0200_0000, len: 0x40_0000, default_big_endian: false, writable: true },
+    MemoryRegionInfo { name: "Shared WRAM", short_name: "SWRAM", base_address: 0x0300_0000, len: 0x8000, default_big_endian: false, writable: true },
+    MemoryRegionInfo { name: "ARM7 WRAM", short_name: "WRAM7", base_address: 0x0380_0000, len: 0x1_0000, default_big_endian: false, writable: true },
+];
 
 #[allow(unused_variables)]
 impl EmulatorCore for NintendoDS {
@@ -142,23 +157,35 @@ impl EmulatorCore for NintendoDS {
     }
 
     fn read_ram(&self, address: u32, into: &mut [u8]) -> Result<(), &'static str> {
-        let offset = address.checked_sub(0x2000000)
-            .ok_or("no such ram address")? as usize;
-        let range = offset..(offset + into.len());
-        let range_data = self.core.get_main_ram().get(range).ok_or("out of range read")?;
-        into.copy_from_slice(range_data);
-
-        Ok(())
+        read_ram_from_regions(self, address, into)
     }
 
     fn write_ram(&mut self, address: u32, from: &[u8]) -> Result<(), &'static str> {
-        let offset = address.checked_sub(0x2000000)
-            .ok_or("no such ram address")? as usize;
-        let range = offset..(offset + from.len());
-        let range_data = self.core.get_main_ram_mut().get_mut(range).ok_or("out of range write")?;
-        range_data.copy_from_slice(from);
-
+        let (index, offset) = locate_memory(&NDS_MEMORY_REGIONS, address, from.len()).ok_or("unknown address or range")?;
+        let (memory, jit_region) = match index {
+            NDS_REGION_MAIN_RAM => (self.core.get_main_ram_mut(), JitRegion::MainRAM),
+            NDS_REGION_SHARED_WRAM => (self.core.get_shared_wram_mut(), JitRegion::SharedWRAM),
+            NDS_REGION_ARM7_WRAM => (self.core.get_arm7_wram_mut(), JitRegion::ARM7WRAM),
+            _ => unreachable!("NDS_MEMORY_REGIONS index {index}")
+        };
+        memory.get_mut(offset..offset + from.len()).ok_or("out of range write")?.copy_from_slice(from);
+        if self.jit {
+            self.core.invalidate_jit(jit_region, offset as u32, from.len());
+        }
         Ok(())
+    }
+
+    fn memory_regions(&self) -> &[MemoryRegionInfo] {
+        &NDS_MEMORY_REGIONS
+    }
+
+    fn memory_region_data(&self, index: usize) -> Option<&[u8]> {
+        Some(match index {
+            NDS_REGION_MAIN_RAM => self.core.get_main_ram(),
+            NDS_REGION_SHARED_WRAM => self.core.get_shared_wram(),
+            NDS_REGION_ARM7_WRAM => self.core.get_arm7_wram(),
+            _ => return None
+        })
     }
 
     fn set_speed(&mut self, speed: f64) {

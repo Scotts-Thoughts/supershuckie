@@ -1,4 +1,5 @@
-use crate::emulator::{EmulatorCore, Input, PartialReplayRecordMetadata, ScreenData};
+use crate::emulator::{EmulatorCore, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
+use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
 use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 use crate::{std_timestamp_provider, AudioOutput, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
@@ -40,7 +41,15 @@ pub struct ThreadedSuperShuckieCore {
     playback_total_frames: UnsignedInteger,
     playback_total_milliseconds: TimestampMillis,
     replay_errors: Arc<Mutex<Vec<ReplayFileWriteError>>>,
-    replay_counters: Arc<Mutex<BTreeMap<String, SignedInteger>>>
+    replay_counters: Arc<Mutex<BTreeMap<String, SignedInteger>>>,
+
+    /// The core thread, to wake it early from a paused wait.
+    thread: Option<std::thread::Thread>,
+
+    /// Facts about the wrapped core that never change for its life.
+    memory_regions: Vec<MemoryRegionInfo>,
+    console_type: Option<ReplayConsoleType>,
+    rom_checksum: ReplayHeaderBlake3Hash
 }
 
 /// Current elapsed time, retrieved atomically (the frame count corresponds to milliseconds and vice versa).
@@ -102,6 +111,9 @@ impl ThreadedSuperShuckieCore {
     /// Wrap the given `core`.
     pub fn new(emulator_core: Box<dyn EmulatorCore>) -> Self {
         let screens = Arc::new(Mutex::new(emulator_core.get_screens().to_vec()));
+        let memory_regions = emulator_core.memory_regions().to_vec();
+        let console_type = emulator_core.replay_console_type();
+        let rom_checksum = *emulator_core.rom_checksum();
         let (sender, receiver) = channel();
         let (sender_close, receiver_close) = channel();
 
@@ -118,7 +130,7 @@ impl ThreadedSuperShuckieCore {
         let frame_times = Arc::new(RwLock::new(FrameTimeStats::default()));
         let emulated_frames = Arc::new(AtomicU64::new(0));
 
-        {
+        let thread = {
             let elapsed_time = elapsed_time.clone();
             let frame_times = frame_times.clone();
             let emulated_frames = emulated_frames.clone();
@@ -129,7 +141,7 @@ impl ThreadedSuperShuckieCore {
             let replay_counters = replay_counters.clone();
             let playback_paused = playback_paused.clone();
             let replay_stalled = replay_stalled.clone();
-            let _ = std::thread::Builder::new().name("ThreadedSuperShuckieCore".to_owned()).spawn(move || {
+            std::thread::Builder::new().name("ThreadedSuperShuckieCore".to_owned()).spawn(move || {
                 mark_thread_latency_sensitive();
                 ThreadedSuperShuckieCoreThread {
                     screens,
@@ -152,10 +164,12 @@ impl ThreadedSuperShuckieCore {
                     replay_stalled,
                     playback_frozen: false,
                     freezes: BTreeMap::new(),
+                    last_pokeabyte_freeze: None,
+                    memory_monitor: None,
                     playback_paused
                 }.run_thread();
-            });
-        }
+            }).ok().map(|handle| handle.thread().clone())
+        };
 
         Self {
             sender,
@@ -172,7 +186,45 @@ impl ThreadedSuperShuckieCore {
             desired_replay_frame,
             delta_replay_frames,
             playback_paused,
-            replay_stalled
+            replay_stalled,
+            thread,
+            memory_regions,
+            console_type,
+            rom_checksum
+        }
+    }
+
+    /// The wrapped core's memory regions (see [`EmulatorCore::memory_regions`]).
+    #[inline]
+    pub fn memory_regions(&self) -> &[MemoryRegionInfo] {
+        &self.memory_regions
+    }
+
+    /// The wrapped core's console type.
+    #[inline]
+    pub fn console_type(&self) -> Option<ReplayConsoleType> {
+        self.console_type
+    }
+
+    /// The wrapped core's ROM checksum.
+    #[inline]
+    pub fn rom_checksum(&self) -> &ReplayHeaderBlake3Hash {
+        &self.rom_checksum
+    }
+
+    /// Attach (or with `None`, detach) the RAM tools' memory monitor. The core thread services it
+    /// between frames (see [`crate::memory_monitor`]).
+    pub fn set_memory_monitor(&self, monitor: Option<Arc<MemoryMonitorShared>>) {
+        let _ = self.sender.send(ThreadCommand::SetMemoryMonitor(monitor));
+        self.wake();
+    }
+
+    /// Wake the core thread if it is waiting while paused, so that a change made through shared
+    /// state (such as the memory monitor's request) is picked up right away.
+    #[inline]
+    pub fn wake(&self) {
+        if let Some(thread) = self.thread.as_ref() {
+            thread.unpark();
         }
     }
 
@@ -627,6 +679,7 @@ enum ThreadCommand {
     TransferPokeAByteIntegrationExternal(Sender<bool>, Sender<ThreadCommand>),
     TransferPokeAByteIntegrationInternal(Sender<bool>, PokeAByteIntegrationServer, ReplayConsoleType, ReplayHeaderBlake3Hash),
     Rendezvous(Sender<()>),
+    SetMemoryMonitor(Option<Arc<MemoryMonitorShared>>),
 }
 
 fn extend_counter_map(from: &BTreeMap<String, SignedInteger>, into: &mut BTreeMap<String, SignedInteger>) {
@@ -670,7 +723,11 @@ struct ThreadedSuperShuckieCoreThread {
     emulated_frames: Arc<AtomicU64>,
 
     freezes: BTreeMap<u64, ByteVec>,
+    /// `(frame, state epoch)` the Poke-A-Byte freezes were last applied at.
+    last_pokeabyte_freeze: Option<(u64, u64)>,
     replay_stalled: Arc<AtomicBool>,
+
+    memory_monitor: Option<MemoryMonitorLocal>,
 }
 
 impl ThreadedSuperShuckieCoreThread {
@@ -692,6 +749,7 @@ impl ThreadedSuperShuckieCoreThread {
             self.refresh_screen_data();
             self.update_queued_screens();
             self.handle_pokeabyte_integration();
+            self.handle_memory_monitor();
             self.check_if_replay_stalled();
 
             if self.is_running() {
@@ -701,17 +759,18 @@ impl ThreadedSuperShuckieCoreThread {
             }
             else if self.core.replay_player.is_none() {
                 // unfortunately we can't just block until we're running again because we still need
-                // to handle pokeabyte writes
-                std::thread::sleep(Duration::from_millis(100));
+                // to handle pokeabyte writes (parked rather than slept so the RAM tools can wake us)
+                std::thread::park_timeout(Duration::from_millis(100));
             }
             else {
-                // sleep for a reduced time so seeking can still be responsive
-                std::thread::sleep(Duration::from_millis(10));
+                // wait for a reduced time so seeking can still be responsive
+                std::thread::park_timeout(Duration::from_millis(10));
             }
         }
 
         self.core.stop_recording_replay();
         self.pokeabyte_integration = None;
+        self.memory_monitor = None;
 
         let _ = self.sender_close.send(());
     }
@@ -930,10 +989,13 @@ impl ThreadedSuperShuckieCoreThread {
             return;
         }
 
-        // apply freezes immediately regardless of frame skipping setting
-        if is_running {
+        // apply freezes once per emulated frame regardless of frame skipping setting, and only when
+        // the game changed the value (every write is recorded into a replay being recorded)
+        let freeze_key = (self.core.total_frames(), self.core.state_epoch());
+        if is_running && self.last_pokeabyte_freeze != Some(freeze_key) {
+            self.last_pokeabyte_freeze = Some(freeze_key);
             for (address, data) in &self.freezes {
-                self.core.enqueue_write(*address as u32, data.clone());
+                self.core.write_if_changed(*address as u32, data.as_slice());
             }
         }
 
@@ -950,6 +1012,18 @@ impl ThreadedSuperShuckieCoreThread {
         }
 
         session.finish_frame();
+    }
+
+    /// Service the RAM tools' memory monitor, if attached.
+    fn handle_memory_monitor(&mut self) {
+        let running = self.is_running();
+        let Some(monitor) = self.memory_monitor.as_mut() else {
+            return
+        };
+        let outcome = monitor.service(&mut self.core, running);
+        if outcome.pause && !self.playback_paused.swap(true, Ordering::Relaxed) {
+            self.core.pause_timer();
+        }
     }
 
     fn handle_command(&mut self, command: ThreadCommand) {
@@ -1110,6 +1184,9 @@ impl ThreadedSuperShuckieCoreThread {
             },
             ThreadCommand::Rendezvous(sender) => {
                 let _ = sender.send(());
+            }
+            ThreadCommand::SetMemoryMonitor(monitor) => {
+                self.memory_monitor = monitor.map(MemoryMonitorLocal::new);
             }
         }
     }

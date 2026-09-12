@@ -21,6 +21,82 @@ use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettin
 /// Sample rate, in Hz, at which every core delivers audio through [`EmulatorCore::take_audio`].
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
+/// A contiguous block of console memory the RAM tools can inspect.
+///
+/// Addresses are the ones [`EmulatorCore::read_ram`] and [`EmulatorCore::write_ram`] accept (the
+/// address space Poke-A-Byte, the REST API and replay `WriteMemory` packets use), so an address
+/// shown by the tools means the same thing everywhere.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryRegionInfo {
+    /// Human-readable name ("EWRAM", "Main RAM", …).
+    pub name: &'static str,
+
+    /// Short name used in `SHORT:offset` address syntax. Unique per core, no spaces or colons.
+    pub short_name: &'static str,
+
+    /// First address of the region.
+    pub base_address: u32,
+
+    /// Size of the region in bytes.
+    ///
+    /// [`EmulatorCore::memory_region_data`] may hand out fewer bytes than this when the backing
+    /// store is smaller right now (a Game Boy Advance cartridge whose save type has not been
+    /// detected yet); the bytes past its end are unmapped.
+    pub len: u32,
+
+    /// Whether games on this console conventionally store multi-byte values big-endian.
+    pub default_big_endian: bool,
+
+    /// Whether the tools may write to this region. Raw writes to some regions (I/O registers)
+    /// would bypass hardware side effects, so those are read-only.
+    pub writable: bool
+}
+
+impl MemoryRegionInfo {
+    /// One past the last address of the region.
+    #[inline]
+    pub const fn end_address(&self) -> u64 {
+        self.base_address as u64 + self.len as u64
+    }
+
+    /// Offset of `address` into this region if `[address, address + len)` lies entirely inside it.
+    #[inline]
+    pub const fn offset_of(&self, address: u32, len: usize) -> Option<usize> {
+        if address < self.base_address {
+            return None
+        }
+        let offset = (address - self.base_address) as u64;
+        if offset + len as u64 > self.len as u64 {
+            return None
+        }
+        Some(offset as usize)
+    }
+}
+
+/// Find the region containing all of `[address, address + len)`, returning its index and the
+/// offset of `address` into it.
+#[inline]
+pub fn locate_memory(regions: &[MemoryRegionInfo], address: u32, len: usize) -> Option<(usize, usize)> {
+    regions.iter().enumerate().find_map(|(index, region)| region.offset_of(address, len).map(|offset| (index, offset)))
+}
+
+/// The bytes at `[address, address + len)` if they are mapped, read straight out of the core's
+/// region data (no copy).
+#[inline]
+pub fn memory_slice(core: &(impl EmulatorCore + ?Sized), address: u32, len: usize) -> Option<&[u8]> {
+    let (index, offset) = locate_memory(core.memory_regions(), address, len)?;
+    core.memory_region_data(index)?.get(offset..offset + len)
+}
+
+/// [`EmulatorCore::read_ram`] for cores whose address space is exactly their memory regions.
+pub fn read_ram_from_regions(core: &(impl EmulatorCore + ?Sized), address: u32, into: &mut [u8]) -> Result<(), &'static str> {
+    let (index, offset) = locate_memory(core.memory_regions(), address, into.len()).ok_or("unknown address or range")?;
+    let data = core.memory_region_data(index).ok_or("region unavailable")?;
+    let bytes = data.get(offset..offset + into.len()).ok_or("invalid range (went outside of the region)")?;
+    into.copy_from_slice(bytes);
+    Ok(())
+}
+
 /// Emulator core functionality.
 pub trait EmulatorCore: Send + 'static {
     /// Run the smallest amount of time.
@@ -38,6 +114,19 @@ pub trait EmulatorCore: Send + 'static {
     ///
     /// Note: The way `address` is interpreted is core-specific.
     fn write_ram(&mut self, address: u32, from: &[u8]) -> Result<(), &'static str>;
+
+    /// Memory regions the RAM tools may inspect, in the order they are listed. Addressed like
+    /// [`read_ram`](Self::read_ram). The list does not change for the life of the core.
+    fn memory_regions(&self) -> &[MemoryRegionInfo] {
+        &[]
+    }
+
+    /// Direct, read-only view of region `index` (same order as
+    /// [`memory_regions`](Self::memory_regions)). Must not copy. May be shorter than the region's
+    /// `len` (see [`MemoryRegionInfo::len`]).
+    fn memory_region_data(&self, _index: usize) -> Option<&[u8]> {
+        None
+    }
 
     /// Set the game speed multiplier.
     fn set_speed(&mut self, speed: f64);

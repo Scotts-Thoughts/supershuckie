@@ -231,3 +231,39 @@ extern "C" void *mgba_rs_core_get_iwram(MGBACoreRaw *core) {
     std::printf("Failed to get iwram\n");
     std::terminate();
 }
+
+// mGBA's region ids (enum GBAMemoryRegion); spelled out so the internal headers, whose struct
+// layouts depend on mGBA's build configuration, stay out of this file.
+static constexpr std::size_t GBA_REGION_ID_PALETTE_RAM = 0x5;
+static constexpr std::size_t GBA_REGION_ID_VRAM = 0x6;
+static constexpr std::size_t GBA_REGION_ID_OAM = 0x7;
+static constexpr std::size_t GBA_REGION_ID_SRAM_MIRROR = 0xF;
+
+// Direct access to a memory region by mGBA region id. The save data is asked for through the
+// SRAM mirror id, which always yields the whole buffer (the SRAM id hands out only the current
+// bank for 1 MiB flash, sized as if it were the whole chip). Null with size 0 when absent.
+extern "C" std::uint8_t *mgba_rs_core_get_region(MGBACoreRaw *core, std::uint32_t region, std::size_t &size) {
+    size = 0;
+    std::size_t id;
+    switch(region) {
+        case 0: id = GBA_REGION_ID_PALETTE_RAM; break;
+        case 1: id = GBA_REGION_ID_VRAM; break;
+        case 2: id = GBA_REGION_ID_OAM; break;
+        case 3: id = GBA_REGION_ID_SRAM_MIRROR; break;
+        default: return nullptr;
+    }
+    std::size_t block_size = 0;
+    auto *ptr = static_cast<std::uint8_t *>(core->core->getMemoryBlock(core->core, id, &block_size));
+    if(ptr == nullptr) {
+        return nullptr;
+    }
+    size = block_size;
+    return ptr;
+}
+
+// Write through mGBA's patch path so the renderer's palette/VRAM/OAM caches see the change.
+extern "C" void mgba_rs_core_patch_write(MGBACoreRaw *core, std::uint32_t address, const std::uint8_t *data, std::size_t length) {
+    for(std::size_t i = 0; i < length; i++) {
+        core->core->rawWrite8(core->core, address + static_cast<std::uint32_t>(i), -1, data[i]);
+    }
+}

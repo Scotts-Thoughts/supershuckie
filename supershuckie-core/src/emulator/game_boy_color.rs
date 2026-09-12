@@ -1,4 +1,4 @@
-use crate::emulator::{EmulatorCore, Input, RunTime, ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
+use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -51,7 +51,19 @@ pub struct GameBoyColor {
     /// Cycles the emulated instance has run since the shadow was last aligned with it.
     cycles: u64,
 
-    shadow: Option<ShadowAudio>
+    shadow: Option<ShadowAudio>,
+
+    /// Memory regions (see [`GameBoyColor::memory_regions`]) and where each one's bytes live.
+    regions: Vec<MemoryRegionInfo>,
+    region_sources: Vec<RegionSource>
+}
+
+/// Where a [`MemoryRegionInfo`] of a [`GameBoyColor`] is backed: `len` bytes of a SameBoy direct
+/// access region, starting at `offset`.
+#[derive(Copy, Clone)]
+struct RegionSource {
+    region: DirectAccessRegion,
+    offset: usize
 }
 
 struct GameBoyCallbackData {
@@ -187,9 +199,12 @@ impl GameBoyColor {
             input_mask: 0,
             speed: 1.0,
             cycles: 0,
-            shadow: None
+            shadow: None,
+            regions: Vec::new(),
+            region_sources: Vec::new()
         };
         r.hard_reset();
+        (r.regions, r.region_sources) = build_memory_regions(&r.core);
         r
     }
 
@@ -283,23 +298,37 @@ impl GameboyCallbacks for CallbackHandler {
     }
 }
 
-/// Returns the region and offset.
-fn pokeabyte_protocol_region_from_address(address: u32) -> Option<(DirectAccessRegion, usize)> {
-    match address {
-        // VRAM
-        0x8000..=0x9FFF => Some((DirectAccessRegion::VRAM, address as usize - 0x8000)),
+/// The Game Boy address space as seen by `read_ram`/`write_ram`.
+///
+/// VRAM, WRAM and HRAM keep the addresses Poke-A-Byte has always used: `0xC000-0xDFFF` is the
+/// first 8 KiB of WRAM (banks 0 and 1, whatever bank the game has switched in) and `0x10000` onwards
+/// continues through the rest of it (banks 2-7 on a Game Boy Color). OAM and the I/O registers are
+/// at their real addresses. Cartridge RAM gets a synthetic address past everything else, because
+/// its real `0xA000-0xBFFF` window only shows whichever bank is switched in.
+fn build_memory_regions(core: &Gameboy) -> (Vec<MemoryRegionInfo>, Vec<RegionSource>) {
+    let mut regions = Vec::new();
+    let mut sources = Vec::new();
 
-        // WRAM bank #0
-        0xC000..=0xDFFF => Some((DirectAccessRegion::RAM, address as usize - 0xC000)),
+    let mut add = |name, short_name, base_address: u32, region: DirectAccessRegion, offset: usize, max_len: usize, writable| {
+        let available = core.direct_access(region).data.len().saturating_sub(offset);
+        let len = available.min(max_len);
+        if len == 0 {
+            return
+        }
+        regions.push(MemoryRegionInfo { name, short_name, base_address, len: len as u32, default_big_endian: true, writable });
+        sources.push(RegionSource { region, offset });
+    };
 
-        // WRAM bank #1 (not the actual address)
-        0x10000..=0x11FFF => Some((DirectAccessRegion::RAM, address as usize - 0x10000 + 0x2000)),
+    add("VRAM", "VRAM", 0x8000, DirectAccessRegion::VRAM, 0, 0x2000, true);
+    add("WRAM (banks 0-1)", "WRAM", 0xC000, DirectAccessRegion::RAM, 0, 0x2000, true);
+    add("WRAM (banks 2-7)", "WRAMX", 0x10000, DirectAccessRegion::RAM, 0x2000, 0x10000 - 0x2000, true);
+    add("OAM", "OAM", 0xFE00, DirectAccessRegion::OAM, 0, 0xA0, true);
+    // Raw register writes would bypass the hardware side effects of writing them.
+    add("I/O registers", "IO", 0xFF00, DirectAccessRegion::IO, 0, 0x80, false);
+    add("HRAM", "HRAM", 0xFF80, DirectAccessRegion::HRAM, 0, 0x7F, true);
+    add("Cartridge RAM", "CART", 0x20000, DirectAccessRegion::CartRAM, 0, 0x100000, true);
 
-        // HRAM
-        0xFF80..=0xFFFE => Some((DirectAccessRegion::HRAM, address as usize - 0xFF80)),
-
-        _ => None
-    }
+    (regions, sources)
 }
 
 impl EmulatorCore for GameBoyColor {
@@ -315,34 +344,43 @@ impl EmulatorCore for GameBoyColor {
     }
 
     fn read_ram(&self, address: u32, into: &mut [u8]) -> Result<(), &'static str> {
-        let Some((region, offset)) = pokeabyte_protocol_region_from_address(address) else {
-            return Err("invalid or unknown address");
-        };
-        let Some(offset_end) = offset.checked_add(into.len()) else {
-            return Err("invalid length");
-        };
-
-        let region = self.core.direct_access(region);
-        let Some(data) = region.data.get(offset..offset_end) else {
-            return Err("address+length overflows");
-        };
-        into.copy_from_slice(data);
-        Ok(())
+        read_ram_from_regions(self, address, into)
     }
 
     fn write_ram(&mut self, address: u32, from: &[u8]) -> Result<(), &'static str> {
-        let Some((region, offset)) = pokeabyte_protocol_region_from_address(address) else {
+        let Some((index, offset)) = locate_memory(&self.regions, address, from.len()) else {
             return Err("invalid or unknown address");
         };
-        let Some(offset_end) = offset.checked_add(from.len()) else {
-            return Err("invalid length");
-        };
-        let region = self.core.direct_access_mut(region);
-        let Some(data) = region.data.get_mut(offset..offset_end) else {
+        if !self.regions[index].writable {
+            return Err("region is read-only");
+        }
+        let source = self.region_sources[index];
+        let start = source.offset + offset;
+
+        let region = self.core.direct_access_mut(source.region);
+        let Some(data) = region.data.get_mut(start..start + from.len()) else {
             return Err("address+length overflows");
         };
         data.copy_from_slice(from);
+
+        // Keep the audio shadow in lockstep (see the type's audio notes); otherwise it would drift
+        // and need a full resync.
+        if let Some(shadow) = self.shadow.as_mut()
+            && let Some(data) = shadow.gb.direct_access_mut(source.region).data.get_mut(start..start + from.len())
+        {
+            data.copy_from_slice(from);
+        }
         Ok(())
+    }
+
+    fn memory_regions(&self) -> &[MemoryRegionInfo] {
+        &self.regions
+    }
+
+    fn memory_region_data(&self, index: usize) -> Option<&[u8]> {
+        let info = self.regions.get(index)?;
+        let source = self.region_sources[index];
+        self.core.direct_access(source.region).data.get(source.offset..source.offset + info.len as usize)
     }
 
     #[inline]

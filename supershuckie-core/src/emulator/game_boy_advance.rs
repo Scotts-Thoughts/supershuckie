@@ -1,7 +1,7 @@
-use crate::emulator::{EmulatorCore, Input, RunTime, ScreenData, ScreenDataEncoding};
+use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use std::prelude::rust_2015::Box;
-use mgba_rs::Core;
+use mgba_rs::{Core, Region};
 use supershuckie_replay_recorder::blake3_hash;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 use crate::{MonotonicTimestampProvider, TimestampMicros};
@@ -19,6 +19,29 @@ pub struct GameBoyAdvance {
 
 // ~59.7 Hz
 const DEFAULT_MICROSECONDS_PER_FRAME: TimestampMicros = 16742;
+
+const GBA_REGION_EWRAM: usize = 0;
+const GBA_REGION_IWRAM: usize = 1;
+const GBA_REGION_PALETTE: usize = 2;
+const GBA_REGION_VRAM: usize = 3;
+const GBA_REGION_OAM: usize = 4;
+const GBA_REGION_SAVE: usize = 5;
+
+/// The Game Boy Advance's address space as seen by `read_ram`/`write_ram`: the real bus addresses.
+/// EWRAM and IWRAM are the regions Poke-A-Byte has always used.
+const GBA_MEMORY_REGIONS: [MemoryRegionInfo; 6] = [
+    gba_region("EWRAM", "EWRAM", 0x0200_0000, 0x40000),
+    gba_region("IWRAM", "IWRAM", 0x0300_0000, 0x8000),
+    gba_region("Palette RAM", "PAL", 0x0500_0000, 0x400),
+    gba_region("VRAM", "VRAM", 0x0600_0000, 0x18000),
+    gba_region("OAM", "OAM", 0x0700_0000, 0x400),
+    // Sized for the largest save chip (1 MiB flash); smaller or not-yet-detected saves are shorter.
+    gba_region("Save data", "SAVE", 0x0E00_0000, 0x20000),
+];
+
+const fn gba_region(name: &'static str, short_name: &'static str, base_address: u32, len: u32) -> MemoryRegionInfo {
+    MemoryRegionInfo { name, short_name, base_address, len, default_big_endian: false, writable: true }
+}
 
 impl GameBoyAdvance {
     /// Instantiate from a ROM.
@@ -86,33 +109,42 @@ impl EmulatorCore for GameBoyAdvance {
     }
 
     fn read_ram(&self, address: u32, into: &mut [u8]) -> Result<(), &'static str> {
-        let ram_requested = match address {
-            0x2000000..0x2040000 => self.core.get_ewram().get((address - 0x2000000) as usize..).expect("failed to get EWRAM"),
-            0x3000000..0x3008000 => self.core.get_iwram().get((address - 0x3000000) as usize..).expect("failed to get IWRAM"),
-            _ => return Err("unknown address")
-        };
-
-        let Some(ram_slice) = ram_requested.get(..into.len()) else {
-            return Err("invalid range (went outside of the region)")
-        };
-
-        into.copy_from_slice(ram_slice);
-        Ok(())
+        read_ram_from_regions(self, address, into)
     }
 
     fn write_ram(&mut self, address: u32, from: &[u8]) -> Result<(), &'static str> {
-        let ram_requested = match address {
-            0x2000000..0x2040000 => self.core.get_ewram_mut().get_mut((address - 0x2000000) as usize..).expect("failed to get EWRAM mutably"),
-            0x3000000..0x3008000 => self.core.get_iwram_mut().get_mut((address - 0x3000000) as usize..).expect("failed to get IWRAM mutably"),
-            _ => return Err("unknown address")
-        };
-
-        let Some(ram_slice) = ram_requested.get_mut(..from.len()) else {
-            return Err("invalid range (went outside of the region)")
-        };
-
-        ram_slice.copy_from_slice(from);
+        let (index, offset) = locate_memory(&GBA_MEMORY_REGIONS, address, from.len()).ok_or("unknown address or range")?;
+        match index {
+            GBA_REGION_EWRAM => self.core.get_ewram_mut()[offset..offset + from.len()].copy_from_slice(from),
+            GBA_REGION_IWRAM => self.core.get_iwram_mut()[offset..offset + from.len()].copy_from_slice(from),
+            // The renderer caches these; only mGBA's patch path keeps the caches in sync.
+            GBA_REGION_PALETTE | GBA_REGION_VRAM | GBA_REGION_OAM => self.core.patch_write(address, from),
+            GBA_REGION_SAVE => {
+                let save = self.core.get_region_mut(Region::SaveData);
+                let Some(bytes) = save.get_mut(offset..offset + from.len()) else {
+                    return Err("invalid range (went outside of the save data)")
+                };
+                bytes.copy_from_slice(from);
+            }
+            _ => unreachable!("GBA_MEMORY_REGIONS index {index}")
+        }
         Ok(())
+    }
+
+    fn memory_regions(&self) -> &[MemoryRegionInfo] {
+        &GBA_MEMORY_REGIONS
+    }
+
+    fn memory_region_data(&self, index: usize) -> Option<&[u8]> {
+        Some(match index {
+            GBA_REGION_EWRAM => self.core.get_ewram(),
+            GBA_REGION_IWRAM => self.core.get_iwram(),
+            GBA_REGION_PALETTE => self.core.get_region(Region::PaletteRAM),
+            GBA_REGION_VRAM => self.core.get_region(Region::VRAM),
+            GBA_REGION_OAM => self.core.get_region(Region::OAM),
+            GBA_REGION_SAVE => self.core.get_region(Region::SaveData),
+            _ => return None
+        })
     }
 
     #[inline]

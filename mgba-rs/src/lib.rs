@@ -26,11 +26,25 @@ unsafe extern "C" {
     fn mgba_rs_core_get_ewram(core: *mut MGBACoreRaw) -> *mut [u8; 0x40000];
     fn mgba_rs_core_get_iwram(core: *mut MGBACoreRaw) -> *mut [u8; 0x8000];
     fn mgba_rs_core_set_audio_enabled(core: *mut MGBACoreRaw, enabled: bool);
+    fn mgba_rs_core_get_region(core: *mut MGBACoreRaw, region: u32, size: &mut usize) -> *mut u8;
+    fn mgba_rs_core_patch_write(core: *mut MGBACoreRaw, address: u32, data: *const u8, length: usize);
     fn mgba_rs_core_read_audio(core: *mut MGBACoreRaw, out: *mut i16, max_frames: usize) -> usize;
 }
 
 pub struct Core {
     inner: *mut MGBACoreRaw
+}
+
+/// Memory regions reachable through [`Core::get_region`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum Region {
+    PaletteRAM = 0,
+    VRAM = 1,
+    OAM = 2,
+    /// The cartridge's save memory (SRAM, flash or EEPROM), all of it; empty until mGBA knows
+    /// the save type.
+    SaveData = 3
 }
 
 unsafe impl Sync for Core {}
@@ -117,6 +131,35 @@ impl Core {
     #[inline]
     pub fn get_iwram_mut(&mut self) -> &mut [u8] {
         unsafe { &mut *mgba_rs_core_get_iwram(self.inner) }.as_mut_slice()
+    }
+
+    /// A memory region other than EWRAM/IWRAM, or an empty slice if the core has none right now.
+    #[inline]
+    pub fn get_region(&self, region: Region) -> &[u8] {
+        let mut size = 0;
+        let ptr = unsafe { mgba_rs_core_get_region(self.inner, region as u32, &mut size) };
+        if ptr.is_null() || size == 0 {
+            return &[]
+        }
+        unsafe { core::slice::from_raw_parts(ptr, size) }
+    }
+
+    /// Mutable [`get_region`](Self::get_region).
+    #[inline]
+    pub fn get_region_mut(&mut self, region: Region) -> &mut [u8] {
+        let mut size = 0;
+        let ptr = unsafe { mgba_rs_core_get_region(self.inner, region as u32, &mut size) };
+        if ptr.is_null() || size == 0 {
+            return &mut []
+        }
+        unsafe { core::slice::from_raw_parts_mut(ptr, size) }
+    }
+
+    /// Write `data` at the bus `address` through mGBA's patch path, which keeps the renderer's
+    /// palette, VRAM and OAM caches up to date (a plain memory write would not).
+    #[inline]
+    pub fn patch_write(&mut self, address: u32, data: &[u8]) {
+        unsafe { mgba_rs_core_patch_write(self.inner, address, data.as_ptr(), data.len()) }
     }
 
     /// Whether the core's mix is resampled for `read_audio`. Never affects emulation.

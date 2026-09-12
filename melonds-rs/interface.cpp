@@ -157,6 +157,52 @@ extern "C" u8 *melonds_rs_core_get_ram(MelonDSCoreHolder *core) {
     return core->nds->MainRAM;
 }
 
+extern "C" u8 *melonds_rs_core_get_shared_wram(MelonDSCoreHolder *core) {
+    return core->nds->SharedWRAM;
+}
+
+extern "C" u8 *melonds_rs_core_get_arm7_wram(MelonDSCoreHolder *core) {
+    return core->nds->ARM7WRAM;
+}
+
+// Throw away JIT blocks compiled from memory that was just written behind the emulated CPUs'
+// backs, the way melonDS's own bus writes do. `region`: 0 main RAM, 1 shared WRAM (raw offset,
+// checked against both CPUs' current mappings), 2 ARM7 WRAM. The JIT tracks code in 16-byte
+// cells, so one check per cell covers the range.
+extern "C" void melonds_rs_core_invalidate_jit(MelonDSCoreHolder *core, std::uint32_t region, std::uint32_t offset, std::size_t length) {
+    auto &nds = *core->nds;
+    if(!nds.IsJITEnabled() || length == 0) {
+        return;
+    }
+
+    const std::uint64_t end = static_cast<std::uint64_t>(offset) + length;
+    for(std::uint64_t cell = offset & ~static_cast<std::uint64_t>(15); cell < end; cell += 16) {
+        const auto o = static_cast<std::uint32_t>(cell);
+        switch(region) {
+            case 0:
+                nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(0x02000000 + o);
+                break;
+            case 1:
+                if(nds.SWRAM_ARM9.Mem != nullptr) {
+                    const auto base = static_cast<std::uint32_t>(nds.SWRAM_ARM9.Mem - nds.SharedWRAM);
+                    if(o >= base && o - base <= nds.SWRAM_ARM9.Mask) {
+                        nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(0x03000000 + (o - base));
+                    }
+                }
+                if(nds.SWRAM_ARM7.Mem != nullptr) {
+                    const auto base = static_cast<std::uint32_t>(nds.SWRAM_ARM7.Mem - nds.SharedWRAM);
+                    if(o >= base && o - base <= nds.SWRAM_ARM7.Mask) {
+                        nds.JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(0x03000000 + (o - base));
+                    }
+                }
+                break;
+            case 2:
+                nds.JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(0x03800000 + o);
+                break;
+        }
+    }
+}
+
 extern "C" void melonds_rs_core_set_date(
     MelonDSCoreHolder *core,
     u16 year,
