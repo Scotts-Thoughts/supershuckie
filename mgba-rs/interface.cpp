@@ -11,6 +11,8 @@
 #include <mgba/core/log.h>
 #include <mgba/core/serialize.h>
 #include <mgba-util/vfs.h>
+#include <mgba-util/audio-buffer.h>
+#include <mgba-util/audio-resampler.h>
 #include <mgba/gba/core.h>
 
 static void nope_log(struct mLogger*, int category, enum mLogLevel level, const char* format, va_list args) {
@@ -37,7 +39,17 @@ struct MGBACoreRaw {
 
     std::size_t iwram = ~0;
     std::size_t ewram = ~0;
+
+    // The core mixes at 32.768 kHz (or more, depending on SOUNDBIAS) into its own buffer; this
+    // resamples that to the 48 kHz every core hands the frontend. Only run while enabled.
+    bool audio_enabled = false;
+    mAudioResampler resampler;
+    mAudioBuffer resampled;
 };
+
+// ~170 ms at 48 kHz: plenty for the frames run between two drains.
+static constexpr std::size_t RESAMPLED_CAPACITY_FRAMES = 8192;
+static constexpr double OUTPUT_SAMPLE_RATE = 48000.0;
 
 extern "C" MGBACoreRaw *mgba_rs_core_new(
     const std::byte *rom,
@@ -101,6 +113,10 @@ extern "C" MGBACoreRaw *mgba_rs_core_new(
     core->pixels.resize(240 * 160);
     core->core->setVideoBuffer(core->core, core->pixels.data(), 240);
 
+    mAudioBufferInit(&core->resampled, RESAMPLED_CAPACITY_FRAMES, 2);
+    mAudioResamplerInit(&core->resampler, mINTERPOLATOR_SINC);
+    mAudioResamplerSetDestination(&core->resampler, &core->resampled, OUTPUT_SAMPLE_RATE);
+
     if(bios_size > 0) {
         core->bios = std::vector(bios, bios + bios_size);
         core->bios_vf = VFileFromMemory(core->bios.data(), core->bios.size());
@@ -124,8 +140,33 @@ extern "C" void mgba_rs_core_free(MGBACoreRaw *core) {
     }
 
     core->core->deinit(core->core);
+    mAudioResamplerDeinit(&core->resampler);
+    mAudioBufferDeinit(&core->resampled);
 
     delete core;
+}
+
+// Whether to resample the core's mix for the frontend. The core mixes either way (it is part of
+// emulation; a full buffer just drops samples), so nothing here affects emulation or save states.
+// Both buffers are cleared on a change so a re-enable does not play what was mixed meanwhile.
+extern "C" void mgba_rs_core_set_audio_enabled(MGBACoreRaw *core, bool enabled) {
+    if(core->audio_enabled == enabled) {
+        return;
+    }
+    core->audio_enabled = enabled;
+    mAudioBufferClear(core->core->getAudioBuffer(core->core));
+    mAudioBufferClear(&core->resampled);
+}
+
+// Pop up to `max_frames` stereo frames at 48 kHz mixed since the last read.
+extern "C" std::size_t mgba_rs_core_read_audio(MGBACoreRaw *core, std::int16_t *out, std::size_t max_frames) {
+    if(!core->audio_enabled) {
+        return 0;
+    }
+    // The source rate follows the SOUNDBIAS resolution bits, so re-read it every time.
+    mAudioResamplerSetSource(&core->resampler, core->core->getAudioBuffer(core->core), core->core->audioSampleRate(core->core), true);
+    mAudioResamplerProcess(&core->resampler);
+    return mAudioBufferRead(&core->resampled, out, max_frames);
 }
 
 extern "C" void mgba_rs_core_run_frame(MGBACoreRaw *core) {

@@ -39,7 +39,8 @@ pub(crate) fn try_to_init_data_dir_and_get_settings(data_dir: &Path, config_dir:
         settings_str = "{}".to_owned();
     }
 
-    let settings: Settings = serde_json::from_str::<Settings>(&settings_str).map_err(|e| format!("Failed to parse the config file: {e}"))?;
+    let mut settings: Settings = serde_json::from_str::<Settings>(&settings_str).map_err(|e| format!("Failed to parse the config file: {e}"))?;
+    settings.audio.clamp();
     Ok(settings)
 }
 
@@ -76,9 +77,65 @@ pub struct Settings {
     #[serde(default = "ExportSettings::default")]
     pub export: ExportSettings,
 
+    #[serde(default = "AudioSettings::default")]
+    pub audio: AudioSettings,
+
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub custom: BTreeMap<String, UTF8CString>
+}
+
+/// Audio playback. Off by default: a fresh install plays nothing until the user turns it on.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioSettings {
+    #[serde(default = "AudioSettings::DEFAULT_ENABLED")]
+    pub enabled: bool,
+
+    #[serde(default = "AudioSettings::DEFAULT_MUTED")]
+    pub muted: bool,
+
+    /// Percent, 0..=100.
+    #[serde(default = "AudioSettings::DEFAULT_VOLUME")]
+    pub volume: u8,
+
+    /// Stay silent while the game runs at any speed other than 1x (turbo or a non-1x base
+    /// speed), so alternating between sped-up and normal play is not a barrage of fast audio.
+    #[serde(default = "AudioSettings::DEFAULT_MUTE_WHEN_SPED_UP")]
+    pub mute_when_sped_up: bool,
+
+    /// Most audio queued between the emulator and the device, in milliseconds.
+    #[serde(default = "AudioSettings::DEFAULT_LATENCY_MS")]
+    pub latency_ms: u16
+}
+
+impl AudioSettings {
+    const DEFAULT_ENABLED: fn() -> bool = || false;
+    const DEFAULT_MUTED: fn() -> bool = || false;
+    const DEFAULT_VOLUME: fn() -> u8 = || 100;
+    const DEFAULT_MUTE_WHEN_SPED_UP: fn() -> bool = || true;
+    const DEFAULT_LATENCY_MS: fn() -> u16 = || 64;
+
+    pub const MAX_VOLUME: u8 = 100;
+    pub const MIN_LATENCY_MS: u16 = 16;
+    pub const MAX_LATENCY_MS: u16 = 500;
+
+    /// Bring out-of-range values from the config file back into range.
+    pub(crate) fn clamp(&mut self) {
+        self.volume = self.volume.min(Self::MAX_VOLUME);
+        self.latency_ms = self.latency_ms.clamp(Self::MIN_LATENCY_MS, Self::MAX_LATENCY_MS);
+    }
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::DEFAULT_ENABLED(),
+            muted: Self::DEFAULT_MUTED(),
+            volume: Self::DEFAULT_VOLUME(),
+            mute_when_sped_up: Self::DEFAULT_MUTE_WHEN_SPED_UP(),
+            latency_ms: Self::DEFAULT_LATENCY_MS()
+        }
+    }
 }
 
 impl Settings {
