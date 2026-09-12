@@ -28,7 +28,7 @@ use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use crate::replay_file::{ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw};
-use crate::{apply_diff, apply_region_diff_in_place, BookmarkMetadata, ByteVec, KeyframeMetadata, Packet, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
+use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, ByteVec, KeyframeMetadata, Packet, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
 use crate::util::{decompress_data, launder_reference};
 
 type KeyframeMap<'a> = BTreeMap<UnsignedInteger, Vec<&'a KeyframeMetadata>>;
@@ -145,10 +145,9 @@ impl ChainState {
 
             Packet::DeltaKeyframe { diff, .. } => {
                 self.check_predecessor(list, packets, index)?;
-                let Some(applied) = apply_diff(self.state.as_slice(), diff.as_slice()) else {
+                if !apply_diff_in_place(&mut self.state, diff.as_slice()) {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe failed to apply") });
-                };
-                self.state = applied;
+                }
                 self.last_applied = Some(index);
             },
 

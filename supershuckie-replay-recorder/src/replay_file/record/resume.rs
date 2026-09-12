@@ -1,8 +1,8 @@
-//! Resume-from-replay support.
+//! Resume-from-replay support (and the whole-file re-encode used by the offline converter).
 //!
-//! See [`build_resumed_recorder`]. A resumed file is an ordinary v3 file; no format change is
-//! required. Timing is preserved by carrying the absolute `elapsed_millis` forward and re-emitting
-//! identical `NextFrame` deltas.
+//! See [`build_resumed_recorder`] and [`build_reencoded_recorder`]. A resumed file is an ordinary
+//! v4 file; no format change is required. Timing is preserved by carrying the absolute
+//! `elapsed_millis` forward and re-emitting identical `NextFrame` deltas.
 
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
@@ -71,8 +71,12 @@ pub enum ReplayResumeError {
 /// replay tractable: NDS save states (hence blobs) are megabytes each, so decompressing and
 /// recompressing the entire prefix — as a naive re-feed would — costs gigabytes of work and RAM.
 ///
-/// If the source is not laid out as all-blobs (e.g. it has a trailing uncompressed region), this
-/// falls back to re-feeding the whole prefix from frame 0, which is always correct.
+/// If the source is not laid out as all-blobs (e.g. it has a trailing uncompressed region), or it
+/// predates format v3 (whose keyframe metadata a current reader could not parse if copied
+/// verbatim), this falls back to re-feeding the whole prefix from frame 0, which is always correct.
+///
+/// Blobs copied verbatim keep the source's keyframe encoding (a v3 source's `DeltaKeyframe`s stay
+/// v3); run the converter ([`build_reencoded_recorder`]) to shrink such a file.
 ///
 /// `source` should be a player instance dedicated to this call (its cursor is consumed).
 pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
@@ -92,30 +96,13 @@ pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
         .clone()
         .with_resume_crop(target, crop_policy);
 
-    let mut patch = ByteVec::new();
-    if let Some(patch_bytes) = source.get_patch_data() {
-        patch.extend_from_slice(patch_bytes);
-    }
+    let mut recorder = blank_recorder_from_source(source, metadata, settings, final_sink, temp_sink)?;
 
-    // Build a blank recorder: header + patch written to both sinks, but NO frame-0 keyframe. The
-    // leading data is filled in below — either copied verbatim from the source's blobs, or re-fed.
-    // The starting input/speed are placeholders; they are overwritten by `prime_for_resume` from the
-    // keyframe we actually resume the re-feed from.
-    let mut recorder = ReplayFileRecorder::new_blank(
-        metadata,
-        patch,
-        settings,
-        InputBuffer::new(),
-        Speed::default(),
-        final_sink,
-        temp_sink,
-    )
-    .map_err(ReplayResumeError::Write)?;
-
-    let all_blobs = source
-        .all_uncompressed_packets()
-        .iter()
-        .all(|p| matches!(p, Packet::CompressedBlob { .. }));
+    let all_blobs = source.get_replay_version() >= VERBATIM_COPY_MINIMUM_VERSION
+        && source
+            .all_uncompressed_packets()
+            .iter()
+            .all(|p| matches!(p, Packet::CompressedBlob { .. }));
 
     // Determine where the re-fed (decompressed) portion begins. On the fast path we first copy every
     // completed blob that ends before the boundary; the re-feed then starts at the first keyframe of
@@ -126,9 +113,74 @@ pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
         0
     };
 
-    let resume_info = prime_and_refeed(&mut recorder, source, total, start_frame, target)?;
+    let end_mode = target == total;
+    let resume_info = prime_and_refeed(&mut recorder, source, start_frame, target, end_mode, &mut |_, _| {})?;
 
     Ok((recorder, resume_info))
+}
+
+/// Oldest format whose blobs can be copied verbatim into a file written by the current recorder.
+/// v2 keyframe metadata has no `counters` field, which a v3+ reader expects.
+const VERBATIM_COPY_MINIMUM_VERSION: u32 = 3;
+
+/// Re-encode the whole of `source` through the recorder: the engine of the offline converter.
+///
+/// Unlike [`build_resumed_recorder`], every blob is decompressed and re-fed — nothing is copied
+/// verbatim — so the output uses the current writer's encoding and `settings` throughout. Header
+/// metadata, patch data and crop/timer markers ride through unchanged (this is
+/// [`ResumeCropPolicy::PreserveAll`]).
+///
+/// `progress(frames_done, total_frames)` is called at every re-fed keyframe.
+///
+/// Read errors in the source abort the conversion unless `tolerate_read_errors` is set, in which
+/// case the output simply ends at the last readable packet (the frame total will be shorter than
+/// the source claimed).
+///
+/// The returned recorder is OPEN and positioned at the end of the source; the caller closes it.
+pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
+    source: &mut ReplayFilePlayer,
+    settings: ReplayFileRecorderSettings,
+    tolerate_read_errors: bool,
+    final_sink: FS,
+    temp_sink: TS,
+    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger),
+) -> Result<(ReplayFileRecorder<FS, TS>, ResumeInfo), ReplayResumeError> {
+    let total = source.get_total_frames();
+    let metadata = source.get_replay_metadata().clone();
+
+    let mut recorder = blank_recorder_from_source(source, metadata, settings, final_sink, temp_sink)?;
+    let info = prime_and_refeed(&mut recorder, source, 0, total, tolerate_read_errors, progress)?;
+
+    Ok((recorder, info))
+}
+
+/// Build a blank recorder (header + `source`'s patch written to both sinks, no frame-0 keyframe)
+/// whose leading data the caller fills in.
+///
+/// The starting input/speed are placeholders; they are overwritten by `prime_for_resume` from the
+/// keyframe the re-feed actually starts from.
+fn blank_recorder_from_source<FS: ReplayFileSink, TS: ReplayFileSink>(
+    source: &ReplayFilePlayer,
+    metadata: crate::replay_file::ReplayFileMetadata,
+    settings: ReplayFileRecorderSettings,
+    final_sink: FS,
+    temp_sink: TS,
+) -> Result<ReplayFileRecorder<FS, TS>, ReplayResumeError> {
+    let mut patch = ByteVec::new();
+    if let Some(patch_bytes) = source.get_patch_data() {
+        patch.extend_from_slice(patch_bytes);
+    }
+
+    ReplayFileRecorder::new_blank(
+        metadata,
+        patch,
+        settings,
+        InputBuffer::new(),
+        Speed::default(),
+        final_sink,
+        temp_sink,
+    )
+    .map_err(ReplayResumeError::Write)
 }
 
 /// Copy every completed compressed blob that ends *before* the resume boundary into `recorder`
@@ -180,15 +232,19 @@ fn copy_completed_blobs_before_boundary<FS: ReplayFileSink, TS: ReplayFileSink>(
 /// first packet of the in-progress blob — and its metadata seeds the running input/speed/counter
 /// state, so continuity holds whether `start_frame` is 0 (fallback) or the start of a boundary blob
 /// (fast path).
+///
+/// With `tolerate_read_errors`, a read error in the source ends the re-feed gracefully instead of
+/// failing (resume uses this when resuming from the very end, the converter only when asked).
+///
+/// `progress(frames_done, target)` is called at every re-fed keyframe.
 fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     recorder: &mut ReplayFileRecorder<FS, TS>,
     source: &mut ReplayFilePlayer,
-    total: UnsignedInteger,
     start_frame: UnsignedInteger,
     target: UnsignedInteger,
+    tolerate_read_errors: bool,
+    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger),
 ) -> Result<ResumeInfo, ReplayResumeError> {
-    let end_mode = target == total;
-
     source.go_to_keyframe(start_frame).map_err(ReplayResumeError::Read)?;
 
     // The first packet must be the keyframe at `start_frame`. Clone everything out before any
@@ -212,10 +268,17 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
 
     // Prime the recorder's running state to this keyframe, then write it as the first full keyframe
     // of the in-progress blob.
+    //
+    // Note that this boundary keyframe is a *restart* written from a reconstructed state: if the
+    // source chain masked transient buffers (see `keyframe_masks`), its masked ranges hold the
+    // source restart's stale copy rather than exact bytes. That is invisible in practice (a restart
+    // is loaded exactly like any other keyframe, and the game overwrites those buffers on its next
+    // frame); frame 0 is always exact.
     recorder.prime_for_resume(&kf0);
     recorder
         .insert_keyframe(state0, kf0.elapsed_millis)
         .map_err(ReplayResumeError::Write)?;
+    progress(kf0.elapsed_frames, target);
 
     let mut running_ms: u64 = kf0.elapsed_millis.0;
     let mut cur_frames: u64 = kf0.elapsed_frames;
@@ -279,8 +342,8 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 }
             },
             Err(error) => {
-                if end_mode {
-                    // Graceful end (corruption tolerance in end mode).
+                if tolerate_read_errors {
+                    // Graceful end (corruption tolerance).
                     break;
                 }
                 return Err(ReplayResumeError::Read(ReplaySeekError::ReadError { error }));
@@ -326,6 +389,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 recorder
                     .insert_keyframe(state, elapsed_millis)
                     .map_err(ReplayResumeError::Write)?;
+                progress(cur_frames, target);
             }
             Action::IncrementCounter(name, delta) => {
                 recorder
@@ -356,7 +420,8 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
 mod tests {
     use super::*;
     use crate::replay_file::playback::ReplayFilePlayer;
-    use crate::replay_file::record::{ReplayFileRecorder, ReplayFileRecorderSettings};
+    use crate::replay_file::record::{NullReplayFileSink, ReplayFileRecorder, ReplayFileRecorderSettings};
+    use alloc::format;
     use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata};
     use crate::{ByteVec, InputBuffer, Packet, Speed};
     use alloc::string::ToString;
@@ -368,6 +433,7 @@ mod tests {
             minimum_uncompressed_bytes_per_blob: 256,
             max_frames_per_blob: 0,
             compression_level: 1,
+            mask_transient_buffers: true,
         }
     }
 
@@ -698,6 +764,97 @@ mod tests {
 
         let player = ReplayFilePlayer::new(&bytes, false).unwrap();
         assert_eq!(player.get_total_frames(), info.elapsed_frames);
+    }
+
+    #[test]
+    fn reencode_v3_fixtures_to_v4() {
+        use crate::replay_file::REPLAY_VERSION;
+        use crate::test_support::*;
+
+        for (name, source) in [("v3-small", V3_SMALL), ("v3-small-closed", V3_SMALL_CLOSED)] {
+            let mut player = ReplayFilePlayer::new(source, false).unwrap();
+            let mut progress_calls = 0;
+            let (mut recorder, info) = build_reencoded_recorder(
+                &mut player,
+                ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() },
+                false,
+                Vec::<u8>::new(),
+                NullReplayFileSink,
+                &mut |done, total| {
+                    assert!(done <= total);
+                    progress_calls += 1;
+                },
+            )
+            .unwrap();
+            let (bytes, _) = recorder.close().unwrap();
+
+            assert_eq!(info.elapsed_frames, TOTAL_FRAMES, "{name}");
+            assert_eq!(info.elapsed_millis.0, millis_at(TOTAL_FRAMES), "{name}");
+            assert_eq!(progress_calls, keyframe_frames().len(), "{name}");
+
+            // Output is a v4 all-blobs file with only region deltas, and plays back exactly.
+            let stats = file_stats(&bytes);
+            assert_eq!(stats.blobs, 3, "{name}");
+            assert_eq!(stats.top_level_packets, 3, "{name}");
+            assert_eq!(stats.count(StoredKeyframeKind::V3Delta), 0, "{name}");
+            assert!(stats.count(StoredKeyframeKind::RegionDelta) >= 30, "{name}");
+            let version = crate::replay_file::ReplayHeaderRaw::from_bytes(bytes[..2048].try_into().unwrap()).replay_version;
+            assert_eq!(version, REPLAY_VERSION);
+            check_script_replay(&bytes, &format!("re-encoded {name}"));
+
+            // Header metadata rides through untouched.
+            let out = ReplayFilePlayer::new(&bytes, false).unwrap();
+            assert_eq!(out.get_replay_metadata(), ReplayFilePlayer::new(source, false).unwrap().get_replay_metadata());
+            assert!(bytes.len() < source.len(), "{name}: {} >= {}", bytes.len(), source.len());
+        }
+    }
+
+    #[test]
+    fn reencode_preserves_crop_markers_and_patch() {
+        use crate::test_support::*;
+
+        // Record the script with crop markers and a patch, then re-encode.
+        let mut metadata = make_metadata();
+        metadata.crop_start = Some((10, millis_at(10).into()));
+        metadata.crop_end = Some((190, millis_at(190).into()));
+        metadata.timer_offset = Some(1234.into());
+        let patch = bv(&pseudo_random_bytes(9, 777));
+
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            metadata.clone(), patch.clone(), small_settings(), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        run_script(&mut recorder);
+        let (source, _) = recorder.close().unwrap();
+
+        let mut player = ReplayFilePlayer::new(&source, false).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| {}).unwrap();
+        let (bytes, _) = recorder.close().unwrap();
+
+        let out = ReplayFilePlayer::new(&bytes, false).unwrap();
+        assert_eq!(*out.get_replay_metadata(), metadata);
+        assert_eq!(out.get_patch_data(), Some(patch.as_slice()));
+        check_script_replay(&bytes, "re-encoded with crop + patch");
+    }
+
+    #[test]
+    fn reencode_of_a_truncated_source_fails_unless_tolerated() {
+        use crate::test_support::*;
+
+        // Cut the closed fixture inside its last blob: strict parsing of the source fails outright,
+        // and with allow_some_corruption the player drops the broken blob, so the re-encode of what
+        // is left succeeds either way — the tolerance flag matters for errors surfacing mid-stream.
+        let header_len = core::mem::size_of::<crate::replay_file::ReplayHeaderBytes>();
+        let truncated = &V3_SMALL_CLOSED[..header_len + (V3_SMALL_CLOSED.len() - header_len) * 3 / 4];
+        assert!(ReplayFilePlayer::new(truncated, false).is_err());
+
+        let mut player = ReplayFilePlayer::new(truncated, true).unwrap();
+        let intact_total = player.get_total_frames();
+        assert!(intact_total < TOTAL_FRAMES);
+
+        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| {}).unwrap();
+        let (bytes, _) = recorder.close().unwrap();
+        assert_eq!(info.elapsed_frames, intact_total);
+        assert_eq!(ReplayFilePlayer::new(&bytes, false).unwrap().get_total_frames(), intact_total);
     }
 
     #[test]

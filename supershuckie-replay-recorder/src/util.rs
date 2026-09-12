@@ -450,20 +450,31 @@ pub fn fast_diff(a_buf: &[u8], b_buf: &[u8]) -> Option<Vec<u64>> {
 /// Return `None` if the diff is wrong.
 #[must_use]
 pub fn apply_diff(buff: &[u8], diff: &[u64]) -> Option<Vec<u8>> {
-    let max_size = (buff.len() + 3) / 4 * 4;
-    let mut output = Vec::with_capacity(max_size);
-    output.extend_from_slice(buff);
-    output.resize(max_size, 0);
+    let mut output = buff.to_vec();
+    apply_diff_in_place(&mut output, diff).then_some(output)
+}
 
-    for &d in diff {
-        let offset = (d >> 32) as usize;
-        let data = (d as u32).to_le_bytes();
+/// Apply a diff to `state` in place.
+///
+/// Returns `false`, leaving `state` untouched, if the diff is wrong (a word past the end).
+#[must_use]
+pub fn apply_diff_in_place(state: &mut Vec<u8>, diff: &[u64]) -> bool {
+    let len = state.len();
+    let padded_len = len.div_ceil(4) * 4;
 
-        output.get_mut(offset..offset+4)?.copy_from_slice(data.as_slice());
+    if diff.iter().any(|&d| ((d >> 32) as usize) + 4 > padded_len) {
+        return false;
     }
 
-    output.truncate(buff.len());
-    Some(output)
+    // The last partial word is zero-padded for the duration of the update (see `fast_diff`).
+    state.resize(padded_len, 0);
+    for &d in diff {
+        let offset = (d >> 32) as usize;
+        state[offset..offset + 4].copy_from_slice(&(d as u32).to_le_bytes());
+    }
+    state.truncate(len);
+
+    true
 }
 
 #[cfg(test)]
@@ -552,6 +563,35 @@ mod tests {
     }
 
     const DEFAULT_LEVEL_FOR_TEST: i32 = crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4;
+
+    #[test]
+    fn v3_diff_round_trips_and_rejects_out_of_range_words() {
+        // fast_diff bails out above 1/8 changed words, so the lengths must be large enough for
+        // every-64th-byte edits to stay under that.
+        for len in [4096usize, 4097, 4098, 4099, 8192 + 3] {
+            let prev = pseudo_random_bytes(11, len);
+            let mut cur = prev.clone();
+            for (i, b) in cur.iter_mut().enumerate() {
+                if i % 64 == 0 {
+                    *b ^= 0x3C;
+                }
+            }
+            let diff = fast_diff(&prev, &cur).expect("sparse enough");
+            assert_eq!(apply_diff(&prev, &diff).unwrap(), cur, "len {len}");
+            let mut in_place = prev.clone();
+            assert!(apply_diff_in_place(&mut in_place, &diff));
+            assert_eq!(in_place, cur, "len {len}");
+        }
+
+        // A word starting past the padded end is rejected and leaves the state untouched.
+        let state = pseudo_random_bytes(12, 10);
+        let mut copy = state.clone();
+        assert!(!apply_diff_in_place(&mut copy, &[(8u64 << 32) | 1, (12u64 << 32) | 2]));
+        assert_eq!(copy, state);
+        assert!(apply_diff(&state, &[(12u64 << 32) | 2]).is_none());
+        // ...while the last (partial) word is fine.
+        assert!(apply_diff(&state, &[(8u64 << 32) | 0x0201]).is_some());
+    }
 
     #[test]
     fn leb128_round_trips() {

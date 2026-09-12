@@ -1412,6 +1412,7 @@ impl SuperShuckieFrontend {
                     .saturating_mul(1024),
                 compression_level: self.settings.replay.zstd_compression_level,
                 max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
+                mask_transient_buffers: self.settings.replay.mask_transient_buffers,
             },
 
             // TODO: patches
@@ -1508,6 +1509,7 @@ impl SuperShuckieFrontend {
                     .saturating_mul(1024),
                 compression_level: self.settings.replay.zstd_compression_level,
                 max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
+                mask_transient_buffers: self.settings.replay.mask_transient_buffers,
             },
 
             // TODO: patches

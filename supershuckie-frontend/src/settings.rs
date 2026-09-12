@@ -133,6 +133,14 @@ pub struct ReplaySettings {
     #[serde(default = "ReplaySettings::DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL")]
     pub zstd_compression_level: i32,
 
+    /// Leave regenerated output buffers (melonDS 3D vertex/polygon banks, mGBA m4a mixed PCM) out
+    /// of delta keyframes. Cuts Nintendo DS replays by roughly another third and Game Boy Advance
+    /// ones by half; the only effect is that a keyframe loaded from the middle of a chain holds the
+    /// chain start's copy of those buffers until the game's next frame overwrites them, which the
+    /// player never shows.
+    #[serde(default = "ReplaySettings::MASK_TRANSIENT_BUFFERS")]
+    pub mask_transient_buffers: bool,
+
     #[serde(default = "ReplaySettings::DEFAULT_FRAMES_PER_KEYFRAME")]
     pub frames_per_keyframe: NonZeroU64,
 
@@ -165,6 +173,7 @@ impl Default for ReplaySettings {
             max_recording_blob_minutes: Self::MAX_RECORDING_BLOB_MINUTES(),
             auto_decompress_replays_upfront: Self::AUTO_DECOMPRESS_REPLAYS_UPFRONT(),
             zstd_compression_level: Self::DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL(),
+            mask_transient_buffers: Self::MASK_TRANSIENT_BUFFERS(),
             frames_per_keyframe: Self::DEFAULT_FRAMES_PER_KEYFRAME(),
             auto_stop_playback_on_input: Self::AUTO_STOP_PLAYBACK_ON_INPUT(),
             auto_unpause_on_input: Self::AUTO_UNPAUSE_ON_INPUT(),
@@ -186,6 +195,7 @@ impl ReplaySettings {
     ) };
     const AUTO_DECOMPRESS_REPLAYS_UPFRONT: fn() -> bool = || false;
     const DEFAULT_MAX_ZSTD_COMPRESSION_LEVEL: fn() -> i32 = || ReplayFileRecorderSettings::default().compression_level;
+    const MASK_TRANSIENT_BUFFERS: fn() -> bool = || ReplayFileRecorderSettings::default().mask_transient_buffers;
     const DEFAULT_FRAMES_PER_KEYFRAME: fn() -> NonZeroU64 = || unsafe { NonZeroU64::new_unchecked(120) };
     const AUTO_STOP_PLAYBACK_ON_INPUT: fn() -> bool = || false;
     const AUTO_UNPAUSE_ON_INPUT: fn() -> bool = || false;

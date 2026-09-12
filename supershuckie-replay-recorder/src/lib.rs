@@ -9,6 +9,7 @@ extern crate std;
 extern crate alloc;
 
 pub mod replay_file;
+pub mod keyframe_masks;
 
 mod packet;
 mod util;

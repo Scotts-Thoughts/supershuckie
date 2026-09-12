@@ -32,6 +32,7 @@ use std::{
     fs::File
 };
 use std::collections::BTreeMap;
+use crate::keyframe_masks::apply_masks;
 use crate::util::region_diff;
 
 /// Records a replay file
@@ -90,7 +91,15 @@ pub struct ReplayFileRecorderSettings {
     /// zstd compression level
     ///
     /// Default is [`DEFAULT_ZSTD_COMPRESSION_LEVEL_V4`]
-    pub compression_level: i32
+    pub compression_level: i32,
+
+    /// Copy regenerated output buffers (see [`crate::keyframe_masks`]) from the previous keyframe
+    /// before diffing, so delta keyframes do not carry them.
+    ///
+    /// Restart keyframes stay exact; a delta keyframe then reconstructs with the restart's copy of
+    /// those buffers, which the game overwrites on its next frame. Purely a size/cosmetic trade;
+    /// determinism is unaffected. Default `true`.
+    pub mask_transient_buffers: bool
 }
 
 /// Default minimum uncompressed bytes per blob
@@ -351,8 +360,12 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         self.current_blob_keyframes.push(metadata.clone());
 
+        let mut state = state;
         let delta = match self.last_state_to_diff.as_ref() {
             Some(previous) if previous.len() == state.len() => {
+                if self.settings.mask_transient_buffers {
+                    apply_masks(self.header.console_type.get_or_default(), previous.as_slice(), state.as_mut_slice());
+                }
                 let diff = region_diff(previous.as_slice(), state.as_slice()).expect("lengths were checked");
                 (diff.encoded_len() < state.len()).then_some(diff)
             },
@@ -374,7 +387,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             })?;
         }
 
-        // The next delta is taken against the state exactly as the player will reconstruct it.
+        // The next delta is taken against the state exactly as the player will reconstruct it
+        // (masked, if it was masked).
         self.last_state_to_diff = Some(state);
 
         Ok(self.elapsed_frames)
@@ -564,6 +578,7 @@ impl Default for ReplayFileRecorderSettings {
             minimum_uncompressed_bytes_per_blob: DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB,
             max_frames_per_blob: DEFAULT_MAX_FRAMES_PER_BLOB,
             compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+            mask_transient_buffers: true,
         }
     }
 }
@@ -842,6 +857,7 @@ mod tests {
             minimum_uncompressed_bytes_per_blob,
             max_frames_per_blob,
             compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+            mask_transient_buffers: true,
         }
     }
 
@@ -916,6 +932,79 @@ mod tests {
         assert!(closed.len() < V3_SMALL_CLOSED.len(), "{} >= {}", closed.len(), V3_SMALL_CLOSED.len());
         let version = crate::replay_file::ReplayHeaderRaw::from_bytes(closed[..2048].try_into().unwrap()).replay_version;
         assert_eq!(version, crate::replay_file::REPLAY_VERSION);
+    }
+
+    /// With masks on, a GBA chain must reconstruct every keyframe exactly outside the m4a PCM
+    /// buffer and with the chain restart's bytes inside it; with masks off, exactly everywhere.
+    #[test]
+    fn transient_buffer_masks_are_applied_per_chain() {
+        use crate::keyframe_masks::transient_ranges;
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::ReplayConsoleType;
+
+        const KEYFRAMES: u64 = 9;
+        const CHAIN: u64 = 4; // restarts at frames 0, 4, 8
+
+        // Synthetic mGBA states with an m4a SoundInfo at 0x03006380; every keyframe rewrites the
+        // whole PCM buffer and a few other bytes.
+        let base = pseudo_random_bytes(0x6BA, 0x61000 + 1024);
+        let sound_info = 0x19000 + 0x6380;
+        let state_at = |frame: u64| -> Vec<u8> {
+            let mut s = base.clone();
+            s[0..4].copy_from_slice(&0x0100_000Au32.to_le_bytes());
+            s[0x19000 + 0x7FF0..0x19000 + 0x7FF4].copy_from_slice(&0x0300_6380u32.to_le_bytes());
+            s[sound_info..sound_info + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
+            let pcm = pseudo_random_bytes(1000 + frame, 0xC60);
+            s[sound_info + 0x350..sound_info + 0x350 + 0xC60].copy_from_slice(&pcm);
+            s[100 + frame as usize * 8] = frame as u8;
+            s[0x40000 + frame as usize] = !(frame as u8);
+            s
+        };
+        let metadata = ReplayFileMetadata { console_type: ReplayConsoleType::GameBoyAdvance, ..make_metadata() };
+        let range = transient_ranges(ReplayConsoleType::GameBoyAdvance, &state_at(0));
+        assert_eq!(range.len(), 1);
+        let range = range[0].clone();
+
+        for masks in [true, false] {
+            let chain_settings = ReplayFileRecorderSettings { mask_transient_buffers: masks, ..settings(CHAIN, usize::MAX) };
+            let mut recorder = ReplayFileRecorder::new_with_metadata(
+                metadata.clone(), ByteVec::new(), chain_settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)), Vec::<u8>::new(), Vec::<u8>::new()
+            ).unwrap();
+            for frame in 1..=KEYFRAMES {
+                recorder.next_frame((frame * 16).into()).unwrap();
+                recorder.insert_keyframe(bv(&state_at(frame)), (frame * 16).into()).unwrap();
+            }
+            let (bytes, _) = recorder.close().unwrap();
+
+            let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+            for frame in (0..=KEYFRAMES).rev() {
+                player.go_to_keyframe(frame).unwrap();
+                let Some(Packet::Keyframe { state, .. }) = player.next_packet().unwrap() else { panic!("no keyframe at {frame}") };
+                let recorded = state_at(frame);
+                let restart = state_at(frame / CHAIN * CHAIN);
+
+                assert_eq!(&state[..range.start], &recorded[..range.start], "masks={masks} frame {frame}: before the range");
+                assert_eq!(&state[range.end..], &recorded[range.end..], "masks={masks} frame {frame}: after the range");
+                let expected_inside = if masks { &restart[range.clone()] } else { &recorded[range.clone()] };
+                assert_eq!(&state[range.clone()], expected_inside, "masks={masks} frame {frame}: inside the range");
+            }
+
+            // Masking removes the PCM buffer from every delta, so the file is much smaller.
+            if masks {
+                let unmasked = {
+                    let unmasked_settings = ReplayFileRecorderSettings { mask_transient_buffers: false, ..settings(CHAIN, usize::MAX) };
+                    let mut r = ReplayFileRecorder::new_with_metadata(
+                        metadata.clone(), ByteVec::new(), unmasked_settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)), Vec::<u8>::new(), Vec::<u8>::new()
+                    ).unwrap();
+                    for frame in 1..=KEYFRAMES {
+                        r.next_frame((frame * 16).into()).unwrap();
+                        r.insert_keyframe(bv(&state_at(frame)), (frame * 16).into()).unwrap();
+                    }
+                    r.close().unwrap().0.len()
+                };
+                assert!(bytes.len() < unmasked - 5 * 0xC60, "masked {} vs unmasked {unmasked}", bytes.len());
+            }
+        }
     }
 
     #[test]

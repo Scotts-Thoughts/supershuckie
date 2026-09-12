@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::fmt::{Display, Formatter};
 use core::num::NonZeroU64;
 use alloc::collections::BTreeMap;
+use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
 use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
@@ -293,7 +294,8 @@ impl SuperShuckieCore {
                         Packet::Bookmark { .. } => {}
                         Packet::Keyframe { state, .. } => {
                             if self.auto_resync_keyframes_in_replays {
-                                let _ = self.core.load_save_state(state.as_slice());
+                                let state = self.splice_live_transient_buffers(state.as_slice());
+                                let _ = self.core.load_save_state(&state);
                             }
                         }
                         // The player materialises every delta variant into a Keyframe before
@@ -313,6 +315,36 @@ impl SuperShuckieCore {
         }
 
         self.replay_player = Some(player);
+    }
+
+    /// Copy the emulator's own regenerated output buffers (melonDS 3D vertex/polygon banks, mGBA
+    /// mixed PCM; see [`transient_ranges`]) over the corresponding bytes of a keyframe `state` that
+    /// is about to be loaded while the emulator is already at that frame.
+    ///
+    /// Delta keyframes may carry their chain restart's stale copy of those buffers
+    /// (`ReplayFileRecorderSettings::mask_transient_buffers`); splicing the live ones in means a
+    /// resync never presents a frame built from stale geometry or audio. Returns `state` unchanged
+    /// when the console has no such buffers or the layouts differ.
+    fn splice_live_transient_buffers<'a>(&self, state: &'a [u8]) -> alloc::borrow::Cow<'a, [u8]> {
+        let Some(console) = self.core.replay_console_type() else {
+            return alloc::borrow::Cow::Borrowed(state)
+        };
+
+        let ranges = transient_ranges(console, state);
+        if ranges.is_empty() {
+            return alloc::borrow::Cow::Borrowed(state)
+        }
+
+        let live = self.core.create_save_state();
+        if live.len() != state.len() || transient_ranges(console, &live) != ranges {
+            return alloc::borrow::Cow::Borrowed(state)
+        }
+
+        let mut spliced = state.to_vec();
+        for range in ranges {
+            spliced[range.clone()].copy_from_slice(&live[range]);
+        }
+        alloc::borrow::Cow::Owned(spliced)
     }
 
     fn before_run(&mut self) {
@@ -756,11 +788,24 @@ impl SuperShuckieCore {
         self.enqueue_input(Input::new());
     }
 
+    /// Minimum number of frames emulated after loading a keyframe when seeking.
+    ///
+    /// A keyframe loaded from the middle of a delta chain may hold its chain restart's stale copy
+    /// of regenerated output buffers (see [`transient_ranges`]); the game rebuilds them on its next
+    /// frame (or the one after, for games that only resubmit 3D geometry every other frame), so a
+    /// seek always emulates at least this many frames past the keyframe before a frame is shown.
+    const POST_LOAD_FRAMES: u64 = 3;
+
     /// Seek to the given frame (if playing back).
+    ///
+    /// Afterwards the emulator has run `max(frame, 1)` frames (clamped to the replay's length) and
+    /// the framebuffer holds the last of them.
     pub fn go_to_replay_frame(&mut self, frame: UnsignedInteger) {
-        // go one frame before so that we play the actually desired frame (so it is rendered)
-        let before_frame = frame.saturating_sub(1);
-        self.go_to_replay_frame_inner(before_frame, before_frame);
+        // Load a keyframe at least POST_LOAD_FRAMES before the target, then run until the frame
+        // before the target has been emulated so that the target itself is the one rendered.
+        let keyframe_hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
+        let desired = frame.saturating_sub(1);
+        self.go_to_replay_frame_inner(keyframe_hint, desired);
     }
 
     fn go_to_replay_frame_inner(&mut self, frame: UnsignedInteger, desired: UnsignedInteger) {
