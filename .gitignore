@@ -1,6 +1,7 @@
 # This is the build folder
 /target
 build
+build-static
 
 # Don't want to accidentally commit someone's personal config
 .idea
