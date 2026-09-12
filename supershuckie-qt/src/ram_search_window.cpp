@@ -796,18 +796,27 @@ void RamSearchWindow::on_context_menu(const QPoint &position) {
         QApplication::clipboard()->setText(this->controller->format_address(row->address, false));
     });
 
+    // The selected rows (at most 256), each with the value to freeze it at: the value on screen if
+    // it is sampled, else its value at the last scan.
     std::vector<std::uint32_t> addresses;
-    for(auto &selected : this->table->selectionModel()->selectedRows()) {
-        auto selected_row = this->model->row(selected.row());
-        if(selected_row) {
-            addresses.push_back(selected_row->address);
+    std::vector<QByteArray> values;
+    auto add_row = [this, &addresses, &values](int index) {
+        auto selected_row = this->model->row(index);
+        if(!selected_row) {
+            return;
         }
+        auto current = this->model->current_value(index);
+        addresses.push_back(selected_row->address);
+        values.push_back(current ? QByteArray(reinterpret_cast<const char *>(current->data()), static_cast<qsizetype>(current->size())) : QByteArray(reinterpret_cast<const char *>(selected_row->previous), selected_row->length));
+    };
+    for(auto &selected : this->table->selectionModel()->selectedRows()) {
         if(addresses.size() >= 256) {
             break;
         }
+        add_row(selected.row());
     }
     if(addresses.empty()) {
-        addresses.push_back(row->address);
+        add_row(index.row());
     }
     auto status = this->model->search_status();
     auto *add_watch = menu.addAction(addresses.size() == 1 ? QString("Add to watch list") : QString("Add %1 results to watch list").arg(addresses.size()));
@@ -837,22 +846,9 @@ void RamSearchWindow::on_context_menu(const QPoint &position) {
         }
     });
     auto *freeze = menu.addAction(addresses.size() == 1 ? QString("Freeze at current value") : QString("Freeze %1 at their current values").arg(addresses.size()));
-    connect(freeze, &QAction::triggered, this, [this, addresses, status]() {
-        for(auto address : addresses) {
-            // The value on screen if it is sampled, else the value at the last scan.
-            QByteArray value;
-            for(int r = 0; r < this->model->rowCount(); r++) {
-                auto candidate = this->model->row(r);
-                if(candidate && candidate->address == address) {
-                    auto current = this->model->current_value(r);
-                    value = current ? QByteArray(reinterpret_cast<const char *>(current->data()), static_cast<qsizetype>(current->size())) : QByteArray(reinterpret_cast<const char *>(candidate->previous), candidate->length);
-                    break;
-                }
-                if(r > 100000) {
-                    break;
-                }
-            }
-            if(value.isEmpty() || this->controller->freeze(this, address, status.value_type, status.size, status.big_endian, value, "Frozen from search") == 0) {
+    connect(freeze, &QAction::triggered, this, [this, addresses, values, status]() {
+        for(std::size_t i = 0; i < addresses.size(); i++) {
+            if(values[i].isEmpty() || this->controller->freeze(this, addresses[i], status.value_type, status.size, status.big_endian, values[i], "Frozen from search") == 0) {
                 break;
             }
         }

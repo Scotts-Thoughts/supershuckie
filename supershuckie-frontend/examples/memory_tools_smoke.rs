@@ -9,10 +9,11 @@
 
 use std::time::{Duration, Instant};
 use supershuckie_core::emulator::{EmulatorCore, GameBoyAdvance, NintendoDS};
+use supershuckie_core::memory_monitor::MAX_FREEZE_BYTES;
 use supershuckie_core::{std_timestamp_provider, ThreadedSuperShuckieCore};
 use supershuckie_frontend::memory_tools::{LogKind, MemoryTools};
 use supershuckie_memory_tools::search::{Comparison, SearchSettings};
-use supershuckie_memory_tools::watch::{Watch, WatchAddress, WatchCondition};
+use supershuckie_memory_tools::watch::{FreezeState, Watch, WatchAddress, WatchCondition};
 use supershuckie_memory_tools::{DisplayBase, Number, ValueFormat, ValueType};
 
 fn make_core(path: &str) -> ThreadedSuperShuckieCore {
@@ -209,6 +210,39 @@ fn main() {
     tools.unfreeze_all(&core);
     assert_eq!(tools.frozen_count(), 0);
     println!("freeze held the value, took an edit, undid it and unfroze");
+
+    // A watch saved with its freeze on follows the same rules as freezing it directly: no new
+    // freezes during playback, and no more frozen bytes than the core takes. Paused, and frozen at
+    // the bytes already there, so the game is left alone.
+    core.pause();
+    const CHUNK: usize = 64;
+    let fill = MAX_FREEZE_BYTES / CHUNK;
+    let start = tools.regions()[0].base + 0x1000;
+    tools.set_viewer_window(&core, 0, Some((start, ((fill + 1) * CHUNK) as u32)));
+    wait_until(&mut tools, &core, "a sample of the bytes to freeze", |t| t.read_viewer(0, 0).is_some_and(|s| s.address == start && s.valid_len as usize == (fill + 1) * CHUNK));
+    let current = tools.read_viewer(0, 0).unwrap().bytes.to_vec();
+    let frozen_bytes = |index: usize| Watch {
+        label: format!("frozen bytes {index}"),
+        address: WatchAddress::direct(start + (index * CHUNK) as u32),
+        format: ValueFormat::new(ValueType::Bytes, CHUNK as u8, false),
+        trace: false,
+        pause_when: None,
+        group: String::new(),
+        freeze: Some(FreezeState { value: current[index * CHUNK..(index + 1) * CHUNK].to_vec(), active: true }),
+        ..watch.clone()
+    };
+    tools.tick(&core, true, false, false);
+    assert!(tools.upsert_watch(&core, frozen_bytes(0)).is_err(), "no new freezes during playback");
+    tools.tick(&core, false, false, false);
+    let limit_ids: Vec<u32> = (0..fill).map(|i| tools.upsert_watch(&core, frozen_bytes(i)).expect("a freeze within the limit")).collect();
+    let error = tools.upsert_watch(&core, frozen_bytes(fill)).expect_err("a freeze past the byte limit");
+    assert_eq!(tools.frozen_count(), fill);
+    tools.unfreeze_all(&core);
+    for id in limit_ids {
+        tools.remove_watch(&core, id);
+    }
+    core.start();
+    println!("saved freezes refused during playback and past the limit ({error})");
 
     // Persistence: switching games saves this list and loads the other game's (none yet).
     let count = tools.watches().len();

@@ -585,6 +585,12 @@ impl MemoryMonitorShared {
         self.edits_generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Drop every queued write no core has taken yet (call while no core is attached, such as when
+    /// the core they were meant for was replaced).
+    pub fn discard_edits(&self) {
+        lock(&self.edits).clear();
+    }
+
     /// Ask for a [`FullSnapshot`] at the next frame boundary, delivered to the sender set with
     /// [`set_snapshot_sender`](Self::set_snapshot_sender). `job_id` must not be zero; a newer
     /// request replaces one not taken yet.

@@ -81,8 +81,8 @@ thread. A scan while paused completes about 3 ms after it is requested (the paus
   within about a millisecond; Poke-A-Byte freezes write at most once per frame and only when changed.
 * `supershuckie-frontend/examples/memory_tools_smoke.rs`: viewer samples, search scans and refinements
   (running and paused), visible values, undo/redo, watches with traces, pause conditions and the trace
-  cap, edits with undo/redo, freezes holding a value and taking edits, and watch lists saved and reloaded
-  per game.
+  cap, edits with undo/redo, freezes holding a value and taking edits, freezes saved with a watch refused
+  during playback and past the 4 KiB limit, and watch lists saved and reloaded per game.
 * The Qt tool windows were checked on screen (viewer with region tabs, live highlighting and inspector;
   search; watch with a pointer path resolving live).
 

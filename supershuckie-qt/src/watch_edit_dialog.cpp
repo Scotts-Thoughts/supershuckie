@@ -330,6 +330,17 @@ void WatchEditDialog::accept() {
             this->error_label->setText(QString("Freeze: %1").arg(QString::fromUtf8(error)));
             return;
         }
+        // Starting a freeze writes to memory like an edit does.
+        if(!this->watch["freeze"].toObject()["active"].toBool()) {
+            char reason[512] = {};
+            if(!supershuckie_frontend_memory_can_write(frontend, reason, sizeof(reason))) {
+                this->error_label->setText(QString("Freeze: %1").arg(QString::fromUtf8(reason)));
+                return;
+            }
+            if(!this->controller->confirm_write(this)) {
+                return;
+            }
+        }
         // Text shorter than the watch is padded with zeros.
         std::size_t size = static_cast<std::size_t>(this->size_spin->value());
         QString hex;

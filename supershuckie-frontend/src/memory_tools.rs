@@ -479,9 +479,10 @@ impl MemoryTools {
         tools
     }
 
-    /// Whether the monitor needs to be attached to the core at all.
+    /// Whether the monitor needs to be attached to the core at all: something is requested, a scan
+    /// waits for its snapshot, or an edit has not been answered yet.
     fn needed(&self, request: &MonitorRequest) -> bool {
-        !request.is_idle() || self.search_busy
+        !request.is_idle() || self.search_busy || !self.pending_edits.is_empty()
     }
 
     /// A new core took over: learn its memory layout and hand it the monitor.
@@ -516,11 +517,13 @@ impl MemoryTools {
             self.load_watches(if self.game.is_some() { watch_file } else { None });
             self.undo_stack.clear();
             self.redo_stack.clear();
-            self.pending_edits.clear();
         }
 
-        // The old core took its half of the monitor with it.
+        // The old core took its half of the monitor with it. Edits it had not applied are dropped
+        // rather than applied to the new one.
         self.attached = false;
+        self.pending_edits.clear();
+        self.shared.discard_edits();
         self.push_request(core);
         game_changed
     }
@@ -544,7 +547,9 @@ impl MemoryTools {
             self.absorb_sample();
         }
         if self.attached {
+            let waiting = !self.pending_edits.is_empty();
             self.absorb_events();
+            push |= waiting && self.pending_edits.is_empty();
         }
         if self.watches_dirty_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) {
             self.save_watches();
@@ -908,7 +913,9 @@ impl MemoryTools {
     fn absorb_write_event(&mut self, event: &MonitorEvent) {
         match event {
             MonitorEvent::Written { frame, edit_id, address, old, new } => {
-                let origin = self.pending_edits.remove(edit_id).unwrap_or(EditOrigin::User);
+                let Some(origin) = self.take_pending_edit(*edit_id) else {
+                    return
+                };
                 if self.recording && old != new {
                     self.writes_this_recording += 1;
                 }
@@ -928,7 +935,7 @@ impl MemoryTools {
                 self.push_log(LogEntry { frame: *frame, watch_id: 0, kind: LogKind::Edited, text });
             }
             MonitorEvent::WriteFailed { edit_id, reason } => {
-                self.pending_edits.remove(edit_id);
+                self.take_pending_edit(*edit_id);
                 let text = match reason {
                     WriteFailure::Unmapped => "that address is not mapped",
                     WriteFailure::ReadOnly => "that region is read-only",
@@ -941,6 +948,15 @@ impl MemoryTools {
             }
             _ => {}
         }
+    }
+
+    /// Stop waiting for `edit_id` and return where it came from. Cores apply edits in the order they
+    /// were sent, so an older edit still waiting has lost its answer (the event ring overflowed)
+    /// and is forgotten too.
+    fn take_pending_edit(&mut self, edit_id: u64) -> Option<EditOrigin> {
+        let origin = self.pending_edits.remove(&edit_id);
+        self.pending_edits.retain(|id, _| *id > edit_id);
+        origin
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1009,13 +1025,8 @@ impl MemoryTools {
         self.next_edit_id += 1;
         self.pending_edits.insert(edit_id, origin);
         self.shared.push_edit(MemoryEdit { edit_id, path, data });
-        // Edits need the monitor attached to be applied.
+        // The monitor stays attached until the edit is answered (see `needed`).
         self.push_request(core);
-        if !self.attached {
-            core.set_memory_monitor(Some(self.shared.clone()));
-            self.attached = true;
-        }
-        core.wake();
         Ok(edit_id)
     }
 
@@ -1037,7 +1048,7 @@ impl MemoryTools {
         if value.is_some() && let Some(reason) = self.write_blocked() {
             return Err(reason.to_owned())
         }
-        let active_count = self.watches.iter().filter(|w| w.id != id && w.freeze.as_ref().is_some_and(|f| f.active)).count();
+        let limit_error = value.as_ref().and_then(|value| self.freeze_limit_error(id, value.len()));
         let Some(index) = self.watches.iter().position(|w| w.id == id) else {
             return Err("No such watch".to_owned())
         };
@@ -1048,8 +1059,8 @@ impl MemoryTools {
                 if value.len() != watch.format.len() {
                     return Err(format!("The value is {} bytes but the watch is {}", value.len(), watch.format.len()))
                 }
-                if active_count >= MAX_FREEZES {
-                    return Err(format!("At most {MAX_FREEZES} values can be frozen at once"))
+                if let Some(error) = limit_error {
+                    return Err(error)
                 }
                 Some(FreezeState { value, active: true })
             }
@@ -1066,6 +1077,24 @@ impl MemoryTools {
         self.redo_stack.clear();
         self.watches_changed(core);
         Ok(())
+    }
+
+    /// Why freezing `len` bytes with watch `id` (in place of its own freeze, if any) would go over
+    /// what the core accepts.
+    fn freeze_limit_error(&self, id: u32, len: usize) -> Option<String> {
+        let (count, bytes) = self.watches.iter()
+            .filter(|w| w.id != id)
+            .filter_map(|w| w.freeze.as_ref().filter(|f| f.active))
+            .fold((0, 0), |(count, bytes), f| (count + 1, bytes + f.value.len()));
+        if count >= MAX_FREEZES {
+            Some(format!("At most {MAX_FREEZES} values can be frozen at once"))
+        }
+        else if bytes + len > MAX_FREEZE_BYTES {
+            Some(format!("Frozen values can add up to at most {MAX_FREEZE_BYTES} bytes"))
+        }
+        else {
+            None
+        }
     }
 
     /// Freeze `value` at `address` with a new watch (or the existing watch for exactly that
@@ -1256,6 +1285,16 @@ impl MemoryTools {
         let traced = self.watches.iter().enumerate().filter(|(i, w)| Some(*i) != existing && w.is_traced()).count();
         if watch.is_traced() && traced >= MAX_TRACES {
             return Err(format!("At most {MAX_TRACES} watches can log changes or pause emulation at once"))
+        }
+        // Starting a freeze here is held to the same rules as `set_freeze`.
+        if let Some(freeze) = watch.freeze.as_ref().filter(|f| f.active) {
+            let was_frozen = existing.is_some_and(|i| self.watches[i].freeze.as_ref().is_some_and(|f| f.active));
+            if !was_frozen && let Some(reason) = self.write_blocked() {
+                return Err(reason.to_owned())
+            }
+            if let Some(error) = self.freeze_limit_error(watch.id, freeze.value.len()) {
+                return Err(error)
+            }
         }
         match existing {
             Some(index) => {

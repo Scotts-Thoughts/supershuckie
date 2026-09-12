@@ -26,7 +26,7 @@ The tools are built so they do not slow the game down:
   emulated frame, so running at 4x does not cost more than 1x.
 * A watch that logs changes or pauses the game, and a frozen value, are checked once per emulated
   frame: a few dozen nanoseconds each. At most 64 watches can log or pause at once, and at most 256
-  values can be frozen.
+  values (4 KiB in total) can be frozen.
 * A search copies all of memory once per scan (about 0.1-0.4 ms for the 4 MiB of a Nintendo DS)
   and does the comparing on a separate low-priority thread.
 

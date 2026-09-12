@@ -62,9 +62,6 @@ void MemoryToolsController::on_idle_timer() {
         return;
     }
     this->update_regions();
-    if(supershuckie_frontend_watch_generation(this->frontend()) == 0) {
-        return;
-    }
     if(this->watch != nullptr || supershuckie_frontend_memory_has_traces(this->frontend())) {
         if(this->watch == nullptr) {
             this->watch = new RamWatchWindow(this);
