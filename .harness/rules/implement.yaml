@@ -1,0 +1,58 @@
+# Managed by the Claude Code harness. Safe to edit and to commit.
+id: implement
+name: Implement
+enabled: true
+priority: 100
+trigger:
+  type: tab.all_settled
+  filter:
+    id: null
+    name: null
+    name_matches: replay size reduction implementation
+    has_tag: null
+    has_tags: []
+    any_tags: []
+    lacks_tag: null
+    lacks_tags: []
+    model_in: []
+    effort_in: []
+    origin_rule: null
+    state_in: []
+    include_orchestrator: false
+  settled_means:
+  - settled
+  min_instances: 1
+  ignore_tags: []
+actions:
+- type: send_message
+  target:
+    who: source
+    filter:
+      id: null
+      name: null
+      name_matches: null
+      has_tag: null
+      has_tags: []
+      any_tags: []
+      lacks_tag: null
+      lacks_tags: []
+      model_in: []
+      effort_in: []
+      origin_rule: null
+      state_in: []
+      include_orchestrator: false
+  text: Implement the compression. Once you're done. Commit changes. Then build supershuckie's stand alone exe so that I can use it. I want a version that I don't need to launch with the .bat file.
+  queue_if_busy: true
+  on_failure: abort_rule
+  retry:
+    times: 2
+    delay_s: 5
+  if: null
+  capture_as: null
+guards:
+  once: true
+  cooldown_seconds: 30
+  max_runs: null
+  max_runs_per_hour: 20
+  max_concurrent_spawns: 3
+updated_at: 1789188137389
