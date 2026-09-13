@@ -1,7 +1,7 @@
 # Managed by the Claude Code harness. Safe to edit and to commit.
 id: implement
 name: Implement
-enabled: true
+enabled: false
 priority: 100
 trigger:
   type: tab.all_settled
@@ -55,4 +55,4 @@ guards:
   max_runs: null
   max_runs_per_hour: 20
   max_concurrent_spawns: 3
-updated_at: 1789188137389
+updated_at: 1789245395704

@@ -483,10 +483,10 @@ Region switching is a primary control in every tool:
 ### 5.5 `HexViewWidget`
 
 - A `QAbstractScrollArea` subclass that paints **only visible rows**: an address column, then N byte columns (8/16/32 per row, default 16), then a character column (ASCII or a loaded `.tbl` table, §6.2).
-- Painting is one `drawText` per row for the hex text and one for the characters (monospace, cached advance width), plus rectangles for highlights. The scroll range covers the current region (NDS main RAM: 262,144 rows at 16/row).
+- Painting draws each character on its own at a multiple of the whole-pixel advance width (cached `QStaticText` per digit and glyph), so text lines up with the highlight rectangles even when the font's real advance is fractional. The scroll range covers the current region (NDS main RAM: 262,144 rows at 16/row).
 - When scrolling or resizing changes the visible range, it calls `set_viewer_window` for that range.
 - **Highlights:**
-  - Changed bytes fade over ~1 s, tracked with a per-visible-byte `heat` array.
+  - Changed bytes stay highlighted for 2 s, then fade over 2 s, tracked with a per-visible-byte `heat` array (milliseconds left).
   - **Frozen bytes** get a distinct background, from the frontend's frozen-address set.
   - Selection.
   - The byte being edited.

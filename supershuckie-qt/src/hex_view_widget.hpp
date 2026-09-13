@@ -3,6 +3,7 @@
 
 #include <QAbstractScrollArea>
 #include <QElapsedTimer>
+#include <QStaticText>
 #include <QString>
 #include <array>
 #include <cstdint>
@@ -17,7 +18,7 @@ namespace SuperShuckie64 {
  *
  * It does not read memory itself: it asks for the bytes it shows through window_changed() and is
  * handed them with set_data() whenever a new sample arrives. Bytes that change between samples are
- * highlighted and fade out over about a second.
+ * highlighted for two seconds, then fade out over two more.
  */
 class HexViewWidget: public QAbstractScrollArea {
     Q_OBJECT
@@ -106,7 +107,8 @@ private:
     std::uint32_t data_address = 0;
     std::vector<std::uint8_t> data;
     std::size_t data_valid = 0;
-    std::vector<std::uint8_t> heat;
+    /** Milliseconds left before each byte's change highlight is gone. */
+    std::vector<std::uint16_t> heat;
     QElapsedTimer heat_clock;
 
     std::uint32_t cursor = 0;
@@ -133,6 +135,14 @@ private:
     QFont font;
     int char_width = 8;
     int line_height = 16;
+
+    // Every character is drawn on its own at a multiple of char_width: the font's real advance is
+    // usually fractional, so a whole row drawn as one string drifts away from the highlights.
+    std::array<QStaticText, 16> digit_texts;
+    QStaticText unknown_text;
+    std::array<QStaticText, 256> glyph_texts;
+    QStaticText prepared_text(const QString &text) const;
+    void prepare_glyph_texts();
 
     std::pair<std::uint32_t, std::uint32_t> last_window = {0, 0};
 

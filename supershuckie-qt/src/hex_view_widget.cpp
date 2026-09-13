@@ -10,8 +10,9 @@
 
 using namespace SuperShuckie64;
 
-// Changed bytes fade out over this long.
-static constexpr int HEAT_FADE_MS = 1000;
+// Changed bytes stay fully highlighted for HEAT_HOLD_MS, then fade out over HEAT_FADE_MS.
+static constexpr int HEAT_HOLD_MS = 2000;
+static constexpr int HEAT_FADE_MS = 2000;
 
 // Samples an edit stays outlined for while waiting for one that shows it.
 static constexpr std::uint32_t PENDING_SAMPLES = 3;
@@ -28,8 +29,28 @@ HexViewWidget::HexViewWidget(QWidget *parent): QAbstractScrollArea(parent) {
     this->setFocusPolicy(Qt::StrongFocus);
     this->viewport()->setCursor(Qt::IBeamCursor);
 
+    for(int d = 0; d < 16; d++) {
+        this->digit_texts[d] = this->prepared_text(QString(QLatin1Char("0123456789ABCDEF"[d])));
+    }
+    this->unknown_text = this->prepared_text(QStringLiteral("-"));
+
     for(auto &glyph : this->glyphs) {
         glyph.clear();
+    }
+    this->prepare_glyph_texts();
+}
+
+QStaticText HexViewWidget::prepared_text(const QString &text) const {
+    QStaticText result(text);
+    result.setTextFormat(Qt::PlainText);
+    result.prepare(QTransform(), this->font);
+    return result;
+}
+
+void HexViewWidget::prepare_glyph_texts() {
+    for(int b = 0; b < 256; b++) {
+        const QString &glyph = this->glyphs[b];
+        this->glyph_texts[b] = this->prepared_text(glyph.isEmpty() ? QStringLiteral(".") : QString(glyph[0]));
     }
 }
 
@@ -81,10 +102,10 @@ void HexViewWidget::set_data(std::uint32_t address, const std::uint8_t *bytes, s
     if(!this->heat_clock.isValid()) {
         this->heat_clock.start();
     }
-    int decay = static_cast<int>(std::min<qint64>(255, elapsed * 255 / HEAT_FADE_MS));
+    int decay = static_cast<int>(std::min<qint64>(HEAT_HOLD_MS + HEAT_FADE_MS, elapsed));
 
     bool changed = address != this->data_address || length != this->data.size() || valid_length != this->data_valid;
-    std::vector<std::uint8_t> new_heat(length, 0);
+    std::vector<std::uint16_t> new_heat(length, 0);
     for(std::size_t i = 0; i < valid_length; i++) {
         std::uint32_t a = address + static_cast<std::uint32_t>(i);
         auto old_index = this->data_index(a);
@@ -93,13 +114,13 @@ void HexViewWidget::set_data(std::uint32_t address, const std::uint8_t *bytes, s
         }
         int h = std::max(0, static_cast<int>(this->heat[old_index]) - decay);
         if(this->data[old_index] != bytes[i]) {
-            h = 255;
+            h = HEAT_HOLD_MS + HEAT_FADE_MS;
             changed = true;
         }
         if(h != 0) {
             changed = true;
         }
-        new_heat[i] = static_cast<std::uint8_t>(h);
+        new_heat[i] = static_cast<std::uint16_t>(h);
     }
 
     this->data_address = address;
@@ -160,6 +181,7 @@ void HexViewWidget::set_big_endian(bool big_endian) {
 
 void HexViewWidget::set_glyphs(const std::array<QString, 256> &glyphs) {
     this->glyphs = glyphs;
+    this->prepare_glyph_texts();
     this->viewport()->update();
 }
 
@@ -322,6 +344,8 @@ void HexViewWidget::paintEvent(QPaintEvent *) {
 
     QFontMetrics metrics(this->font);
     int ascent = metrics.ascent() + 1;
+    // Static text is placed by its top-left corner; this puts its baseline on the row's baseline.
+    qreal static_text_offset = ascent - QFontMetricsF(this->font).ascent();
     QColor text_color = palette.color(QPalette::Text);
     QColor dim_color = text_color;
     dim_color.setAlpha(110);
@@ -334,12 +358,11 @@ void HexViewWidget::paintEvent(QPaintEvent *) {
 
     // Column header: the offset of each group.
     painter.setPen(header_color);
-    {
-        QString header(this->address_column_width() / this->char_width, QLatin1Char(' '));
-        for(int g = 0; g < this->row_bytes / this->group; g++) {
-            header += QString::asprintf("%02X", g * this->group).leftJustified(this->cell_chars(), QLatin1Char(' '));
-        }
-        painter.drawText(0, ascent + 1, header);
+    for(int g = 0; g < this->row_bytes / this->group; g++) {
+        int offset = g * this->group;
+        int x = this->address_column_width() + g * this->cell_chars() * this->char_width;
+        painter.drawStaticText(QPointF(x, 1 + static_text_offset), this->digit_texts[(offset >> 4) & 0xF]);
+        painter.drawStaticText(QPointF(x + this->char_width, 1 + static_text_offset), this->digit_texts[offset & 0xF]);
     }
     painter.drawLine(0, this->header_height() - 2, this->text_x() + this->row_bytes * this->char_width, this->header_height() - 2);
 
@@ -350,34 +373,25 @@ void HexViewWidget::paintEvent(QPaintEvent *) {
     int first_row = this->verticalScrollBar()->value();
     int rows = std::min(this->visible_rows() + 1, this->total_rows() - first_row);
 
-    QString hex_text;
-    QString char_text;
     for(int r = 0; r < rows; r++) {
         std::uint64_t row_address = static_cast<std::uint64_t>(this->base) + static_cast<std::uint64_t>(first_row + r) * this->row_bytes;
         int y = this->header_height() + r * this->line_height;
+        int row_length = static_cast<int>(std::min<std::uint64_t>(this->row_bytes, region_end - row_address));
 
         painter.setPen(header_color);
         painter.drawText(0, y + ascent, QString::asprintf("0x%0*llX", this->address_digits, static_cast<unsigned long long>(row_address)));
 
-        hex_text.fill(QLatin1Char(' '), (this->row_bytes / this->group) * this->cell_chars());
-        char_text.fill(QLatin1Char(' '), this->row_bytes);
-        bool wide_glyphs = false;
-        bool any_unknown = false;
-
-        for(int i = 0; i < this->row_bytes; i++) {
+        // Backgrounds and outlines first so they never cover a neighbour's text.
+        for(int i = 0; i < row_length; i++) {
             std::uint64_t address64 = row_address + i;
-            if(address64 >= region_end) {
-                break;
-            }
             auto address = static_cast<std::uint32_t>(address64);
             int hx = this->hex_x(i);
             int tx = this->text_x() + i * this->char_width;
             auto index = this->data_index(address);
 
-            // Backgrounds.
             if(index >= 0 && this->heat[index] != 0) {
                 QColor c = heat_base;
-                c.setAlpha(this->heat[index] * 150 / 255);
+                c.setAlpha(std::min<int>(this->heat[index], HEAT_FADE_MS) * 150 / HEAT_FADE_MS);
                 painter.fillRect(hx, y, this->char_width * 2, this->line_height, c);
                 painter.fillRect(tx, y, this->char_width, this->line_height, c);
             }
@@ -389,34 +403,6 @@ void HexViewWidget::paintEvent(QPaintEvent *) {
                 painter.fillRect(hx, y, this->char_width * 2, this->line_height, selection_color);
                 painter.fillRect(tx, y, this->char_width, this->line_height, selection_color);
             }
-
-            int text_column = (hx - this->address_column_width()) / this->char_width;
-            if(index >= 0) {
-                std::uint8_t byte = this->data[index];
-                if(this->editing && address == this->cursor && this->nibble == 1) {
-                    // Half-typed: show the typed high nibble.
-                    byte = this->typed_high_nibble_value(byte);
-                }
-                static const char *digits = "0123456789ABCDEF";
-                hex_text[text_column] = QLatin1Char(digits[byte >> 4]);
-                hex_text[text_column + 1] = QLatin1Char(digits[byte & 0xF]);
-
-                const QString &glyph = this->glyphs[byte];
-                if(glyph.isEmpty()) {
-                    char_text[i] = QLatin1Char('.');
-                }
-                else {
-                    char_text[i] = glyph[0];
-                    wide_glyphs = wide_glyphs || glyph[0].unicode() > 0x2FF;
-                }
-            }
-            else {
-                hex_text[text_column] = QLatin1Char('-');
-                hex_text[text_column + 1] = QLatin1Char('-');
-                char_text[i] = QLatin1Char(' ');
-                any_unknown = true;
-            }
-
             if(this->is_pending(address)) {
                 QPen pen(QColor(255, 190, 0));
                 pen.setStyle(Qt::DashLine);
@@ -424,17 +410,27 @@ void HexViewWidget::paintEvent(QPaintEvent *) {
                 painter.drawRect(hx, y, this->char_width * 2 - 1, this->line_height - 1);
             }
         }
-        (void)any_unknown;
 
         painter.setPen(text_color);
-        painter.drawText(this->address_column_width(), y + ascent, hex_text);
-        if(wide_glyphs) {
-            for(int i = 0; i < this->row_bytes; i++) {
-                painter.drawText(this->text_x() + i * this->char_width, y + ascent, QString(char_text[i]));
+        qreal text_y = y + static_text_offset;
+        for(int i = 0; i < row_length; i++) {
+            auto address = static_cast<std::uint32_t>(row_address + i);
+            int hx = this->hex_x(i);
+            auto index = this->data_index(address);
+            if(index < 0) {
+                painter.drawStaticText(QPointF(hx, text_y), this->unknown_text);
+                painter.drawStaticText(QPointF(hx + this->char_width, text_y), this->unknown_text);
+                continue;
             }
-        }
-        else {
-            painter.drawText(this->text_x(), y + ascent, char_text);
+
+            std::uint8_t byte = this->data[index];
+            if(this->editing && address == this->cursor && this->nibble == 1) {
+                // Half-typed: show the typed high nibble.
+                byte = this->typed_high_nibble_value(byte);
+            }
+            painter.drawStaticText(QPointF(hx, text_y), this->digit_texts[byte >> 4]);
+            painter.drawStaticText(QPointF(hx + this->char_width, text_y), this->digit_texts[byte & 0xF]);
+            painter.drawStaticText(QPointF(this->text_x() + i * this->char_width, text_y), this->glyph_texts[byte]);
         }
     }
 

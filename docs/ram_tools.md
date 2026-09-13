@@ -96,7 +96,7 @@ Little-endian; ARM9 addresses.
 * **Go to address** (Ctrl+G) accepts any address form above and switches to the right region.
   Back and forward (Alt+Left / Alt+Right) walk through where you have been.
 * **Row** sets bytes per row; **Group** shows 2- or 4-byte values in the chosen byte order.
-* Bytes that change flash orange and fade over a second. Frozen bytes have a blue background.
+* Bytes that change turn orange for two seconds, then fade over two more. Frozen bytes have a blue background.
 * The inspector on the right reads the value under the cursor as every integer type, f32, BCD, a
   pointer (double-click it to follow) and text.
 * Right-click for copy, **Freeze**, **Unfreeze**, **Paste hex over selection**, **Fill**, **Add
