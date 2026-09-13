@@ -16,23 +16,59 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join("..").join("build"));
 
-    for (dir, lib) in [
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    let core_libs: Vec<(PathBuf, &str)> = [
         ("melonDS/src", "core"),
         ("melonDS/src/teakra/src", "teakra"),
         ("mgba", "mgba"),
-    ] {
-        let dir = build_dir.join(dir);
+    ]
+    .into_iter()
+    .map(|(dir, lib)| (build_dir.join(dir), lib))
+    .collect();
+
+    for (dir, lib) in &core_libs {
         if !dir.join(format!("lib{lib}.a")).exists() {
             println!(
                 "cargo:warning=lib{lib}.a not found in {}; build the cores first (build.sh) or set SUPERSHUCKIE_BUILD_DIR",
                 dir.display()
             );
         }
-        println!("cargo:rustc-link-search=native={}", dir.display());
-        println!("cargo:rustc-link-lib=static={lib}");
     }
 
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        // mingw's ld resolves archives in a single left-to-right pass, so the circular
+        // references between melonDS/mGBA's own archive members (and the interface glue
+        // objects that call into them) don't resolve with plain `-lcore -lteakra -lmgba`.
+        // CMake's build works around the equivalent Qt problem with LINK_GROUP:RESCAN; do
+        // the same here with an explicit --start-group/--end-group. The system/runtime libs
+        // the cores call into (shlwapi's PathRemoveFileSpecW, ole32/shell32's
+        // SHGetKnownFolderPath, mingwex/msvcrt's strdup & co.) go in the same group: since
+        // rustc appends this link-arg after its own default libs, putting them outside the
+        // group would place them before mgba/melonDS in the final command, too early for
+        // ld's single pass to still be looking for those symbols.
+        let mut group = String::from("-Wl,--start-group");
+        for (dir, lib) in &core_libs {
+            group.push(',');
+            group.push_str(&dir.join(format!("lib{lib}.a")).display().to_string());
+        }
+        for lib in [
+            "shlwapi", "ws2_32", "ole32", "shell32", "mingwex", "msvcrt", "stdc++", "kernel32",
+            "advapi32", "uuid", "gcc", "gcc_eh",
+        ] {
+            group.push(',');
+            group.push_str("-l");
+            group.push_str(lib);
+        }
+        group.push_str(",--end-group");
+        println!("cargo:rustc-link-arg={group}");
+    } else {
+        for (dir, lib) in &core_libs {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+    }
+
     match target_os.as_str() {
         "macos" => {
             println!("cargo:rustc-link-lib=c++");
@@ -49,11 +85,7 @@ fn main() {
             println!("cargo:rustc-link-lib=stdc++");
             println!("cargo:rustc-link-lib=pthread");
         }
-        "windows" => {
-            // shlwapi: mGBA's vfs/config use PathIsRelativeW/PathRemoveFileSpecW. ws2_32: melonDS.
-            println!("cargo:rustc-link-lib=shlwapi");
-            println!("cargo:rustc-link-lib=ws2_32");
-        }
+        "windows" => {}
         _ => {}
     }
 }
