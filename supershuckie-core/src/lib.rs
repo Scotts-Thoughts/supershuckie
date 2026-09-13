@@ -286,9 +286,27 @@ impl SuperShuckieCore {
 
     /// Like [`Self::run_unlocked`], but the frame need not be drawn (used while catching up to a
     /// target frame nobody will look at).
-    fn run_unlocked_hidden(&mut self) {
+    ///
+    /// Emulation is unaffected: only the core's presentation is skipped, so a frame walked past
+    /// with this and then one drawn with [`Self::run_unlocked`] give exactly the pictures that
+    /// drawing every frame would have. Headless consumers (the frame server) use it to step to
+    /// a target frame in slices they can abandon between.
+    pub fn run_unlocked_hidden(&mut self) {
         self.core.set_skip_drawing(true);
         self.do_run_fn(EmulatorCore::run_unlocked, false);
+    }
+
+    /// Like [`Self::run_unlocked`], but the samples the frame produces reach the audio output
+    /// (see [`Self::set_audio_output`]) as they would from a paced [`Self::run`].
+    ///
+    /// For a consumer that wants the sound of a stretch of a replay without playing it in real
+    /// time: install an [`AudioOutput`] whose latency covers the stretch, run it with this and
+    /// read the ring afterwards. Whether sped-up frames are heard follows
+    /// [`Self::set_audio_mute_when_sped_up`] exactly as for paced runs.
+    #[cfg(feature = "std")]
+    pub fn run_unlocked_audible(&mut self) {
+        self.core.set_skip_drawing(false);
+        self.do_run_fn(EmulatorCore::run_unlocked, true);
     }
 
     /// Get the current replay counters.
@@ -1084,7 +1102,8 @@ impl SuperShuckieCore {
     /// of regenerated output buffers (see [`transient_ranges`]); the game rebuilds them on its next
     /// frame (or the one after, for games that only resubmit 3D geometry every other frame), so a
     /// seek always emulates at least this many frames past the keyframe before a frame is shown.
-    const POST_LOAD_FRAMES: u64 = 3;
+    /// A consumer stepping from [`Self::go_to_replay_keyframe`] itself must do the same.
+    pub const POST_LOAD_FRAMES: u64 = 3;
 
     /// Seek to the given frame (if playing back).
     ///
@@ -1108,17 +1127,69 @@ impl SuperShuckieCore {
             return
         }
 
-        if let Err(e) = p.go_to_keyframe(frame) {
-            match e {
-                ReplaySeekError::ReadError { error } => todo!("can't go to {frame}: {error:?} (can't handle this error TODO)"),
-                ReplaySeekError::NoSuchKeyframe { best, .. } => {
-                    return self.go_to_replay_frame_inner(best, desired);
+        if let Err(e) = self.load_replay_keyframe_at_or_before(frame) {
+            todo!("can't go to {frame}: {e} (can't handle this error TODO)")
+        }
+
+        // Only the target frame is looked at; the ones on the way there need not be drawn.
+        while self.total_frames <= desired && !self.replay_stalled {
+            if self.total_frames < desired {
+                self.run_unlocked_hidden();
+            }
+            else {
+                self.run_unlocked();
+            }
+        }
+    }
+
+    /// Load the attached replay's nearest keyframe at or before `frame` without emulating
+    /// anything past it.
+    ///
+    /// Afterwards [`Self::total_frames`] is that keyframe's frame index (returned), the recorded
+    /// input is restored and nothing has been drawn: the screens hold whatever the save state
+    /// left there, so the caller must run at least one frame (see [`Self::run_unlocked_hidden`]
+    /// and [`Self::run_unlocked`]) before showing anything. This is the first half of
+    /// [`Self::go_to_replay_frame`], split out so a headless consumer can do the stepping half
+    /// itself and abandon it part way. A seek should load a keyframe at least
+    /// [`Self::POST_LOAD_FRAMES`] before the frame it will show, as `go_to_replay_frame` does.
+    ///
+    /// Returns an error (and leaves the core positioned wherever it was, marked stalled) when no
+    /// replay is attached or the replay is unreadable at that keyframe.
+    pub fn go_to_replay_keyframe(&mut self, frame: UnsignedInteger) -> Result<UnsignedInteger, String> {
+        if self.replay_player.is_none() {
+            return Err(String::from("no replay is attached"))
+        }
+        self.load_replay_keyframe_at_or_before(frame)?;
+        Ok(self.total_frames)
+    }
+
+    /// Position the player at the nearest keyframe at or before `frame`, load its state and
+    /// restore everything recorded alongside it. No frame is run.
+    fn load_replay_keyframe_at_or_before(&mut self, mut frame: UnsignedInteger) -> Result<(), String> {
+        let Some(p) = self.replay_player.as_mut() else {
+            return Err(String::from("no replay is attached"))
+        };
+
+        loop {
+            match p.go_to_keyframe(frame) {
+                Ok(()) => break,
+                Err(ReplaySeekError::NoSuchKeyframe { best, .. }) => {
+                    if best >= frame {
+                        self.replay_stalled = true;
+                        return Err(format!("no keyframe at or before frame {frame}"))
+                    }
+                    frame = best;
+                }
+                Err(ReplaySeekError::ReadError { error }) => {
+                    self.replay_stalled = true;
+                    return Err(format!("cannot read the keyframe at frame {frame}: {error:?}"))
                 }
             }
         }
 
         let Ok(Some(Packet::Keyframe { metadata, .. })) = p.next_packet() else {
-            todo!("replay file is broken (no keyframe found at frame {frame}!! and error handling not yet implemented)")
+            self.replay_stalled = true;
+            return Err(format!("replay file is broken (no keyframe found at frame {frame})"))
         };
 
         let speed = metadata.speed;
@@ -1127,7 +1198,10 @@ impl SuperShuckieCore {
         let counters = metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
         let input = metadata.input.clone();
 
-        self.core.load_save_state(p.current_keyframe_state()).expect("replay file is broken (can't load save state) and error handling not yet implemented!");
+        if let Err(e) = self.core.load_save_state(p.current_keyframe_state()) {
+            self.replay_stalled = true;
+            return Err(format!("replay file is broken (cannot load the save state at frame {frame}): {e}"))
+        }
         self.state_epoch = self.state_epoch.wrapping_add(1);
         // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
         // next ChangeInput packet may be far away, so restore the input recorded with the
@@ -1144,16 +1218,7 @@ impl SuperShuckieCore {
         self.clear_audio();
 
         self.match_replay_playback_speed();
-
-        // Only the target frame is looked at; the ones on the way there need not be drawn.
-        while self.total_frames <= desired && !self.replay_stalled {
-            if self.total_frames < desired {
-                self.run_unlocked_hidden();
-            }
-            else {
-                self.run_unlocked();
-            }
-        }
+        Ok(())
     }
 
     /// Get any errors for the replay writes.

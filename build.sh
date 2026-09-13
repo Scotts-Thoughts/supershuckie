@@ -15,5 +15,8 @@ make -C build/mgba -j$(nproc)
 # mGBA because the PGO training binary links both libraries.
 scripts/build-melonds.sh build/melonDS
 
+# The frame server (docs/frame_server.md) links the core libraries above straight from cargo.
+cargo build --release -p supershuckie-frame-server && cp target/release/supershuckie-frame-server build/
+
 cmake ./supershuckie-qt  -B build -DCMAKE_BUILD_TYPE=$BUILD_MODE -DSCRIPT_BUILD=ON
 make -C build -j$(nproc)

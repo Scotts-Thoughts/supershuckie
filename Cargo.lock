@@ -967,6 +967,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "supershuckie-frame-server"
+version = "0.4.12"
+dependencies = [
+ "serde_json",
+ "supershuckie-core",
+ "supershuckie-replay-recorder",
+]
+
+[[package]]
 name = "supershuckie-frontend"
 version = "0.4.12"
 dependencies = [
