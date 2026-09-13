@@ -53,3 +53,12 @@ hidden runs and between the frames of a `Run`, and abandons a walk that a newer 
 so audio is always one emulated second per 48 000 samples.
 
 The DS core runs the interpreter only: the JIT is not reproducible against recorded keyframes.
+
+## Stdout is the wire
+
+Nothing but protocol bytes may reach standard output. Before the first request is read, `serve`
+duplicates stdout's handle for the protocol and points descriptor 1 at stderr (`dup2`), so a
+`printf` from the cores' C glue — "Bad BIOS", "Failed to init mGBA", each followed by
+`std::terminate()` — lands in the log the client keeps rather than in the middle of a frame.
+Cutter reads that log back into its error message together with the exit status, which is how a
+server that cannot start on a machine says why.

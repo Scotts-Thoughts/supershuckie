@@ -970,6 +970,7 @@ dependencies = [
 name = "supershuckie-frame-server"
 version = "0.4.12"
 dependencies = [
+ "libc",
  "serde_json",
  "supershuckie-core",
  "supershuckie-replay-recorder",

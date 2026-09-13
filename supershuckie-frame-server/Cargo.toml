@@ -14,3 +14,5 @@ path = "src/main.rs"
 supershuckie-core = { workspace = true }
 supershuckie-replay-recorder = { workspace = true }
 serde_json = { workspace = true }
+# `dup2`, to point descriptor 1 at stderr once the protocol has claimed the real stdout.
+libc = "0.2"

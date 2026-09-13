@@ -2,9 +2,16 @@
 //!
 //! A reader thread parses stdin into a channel so the emulation loop can notice a newer request
 //! (or a `Cancel`) part way through a walk and abandon it. Everything else happens here.
+//!
+//! Stdout is the wire, so nothing else in the process may write to it. The cores' C glue prints
+//! to stdout when it cannot start ("Bad BIOS", "Failed to init mGBA") and then terminates; served
+//! as-is that line would corrupt the stream and never reach anyone. [`claim_stdout`] takes the
+//! pipe for the protocol and points descriptor 1 at stderr before the first core is built, so
+//! such a line lands in the log the client keeps, and is what the user reads.
 
 use std::collections::VecDeque;
-use std::io::{self, BufWriter, Stdout};
+use std::fs::File;
+use std::io::{self, BufWriter};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -64,7 +71,7 @@ struct Session {
 
 struct Server {
     rx: Receiver<Inbound>,
-    out: BufWriter<Stdout>,
+    out: BufWriter<File>,
     /// Requests taken off the channel while polling, still to be handled in arrival order.
     pending: VecDeque<Request>,
     session: Option<Session>,
@@ -72,8 +79,40 @@ struct Server {
     reply_bytes: Vec<u8>,
 }
 
+/// The pipe replies go down, taken away from everything else in the process.
+///
+/// A duplicate of stdout's handle for the protocol, then descriptor 1 is made a second stderr:
+/// a `printf` from the C glue, or a stray `println!`, goes to the log from here on rather than
+/// into the middle of a frame. On Windows the C runtime's `_dup2` moves its descriptor 1 the
+/// same way, which is where the glue's `printf` goes.
+fn claim_stdout() -> io::Result<File> {
+    #[cfg(unix)]
+    let protocol = {
+        use std::os::fd::AsFd;
+        File::from(io::stdout().as_fd().try_clone_to_owned()?)
+    };
+    #[cfg(windows)]
+    let protocol = {
+        use std::os::windows::io::AsHandle;
+        File::from(io::stdout().as_handle().try_clone_to_owned()?)
+    };
+    // SAFETY: `dup2` on the two standard descriptors, both of which this process owns for its
+    // whole life; nothing holds a borrowed handle to descriptor 1 across this call.
+    if unsafe { libc::dup2(2, 1) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(protocol)
+}
+
 /// Run the server on this process's stdin/stdout until `Close` or end of input.
 pub fn serve() -> ExitCode {
+    let protocol = match claim_stdout() {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("frame-server: cannot claim stdout for the protocol: {e}");
+            return ExitCode::from(1);
+        }
+    };
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("stdin reader".into())
@@ -100,7 +139,7 @@ pub fn serve() -> ExitCode {
 
     let mut server = Server {
         rx,
-        out: BufWriter::with_capacity(1 << 20, io::stdout()),
+        out: BufWriter::with_capacity(1 << 20, protocol),
         pending: VecDeque::new(),
         session: None,
         frame_words: Vec::new(),
