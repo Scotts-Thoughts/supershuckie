@@ -27,8 +27,9 @@ use core::mem::transmute;
 use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 use alloc::vec;
-use crate::replay_file::{ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw};
-use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, ByteVec, KeyframeMetadata, Packet, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
+use crate::replay_file::bookmark_section::{decode_bookmark_section, BookmarkSectionError};
+use crate::replay_file::{ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
+use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, BookmarkTable, ByteVec, KeyframeMetadata, Packet, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
 use crate::util::{decompress_data, launder_reference};
 
 type KeyframeMap<'a> = BTreeMap<UnsignedInteger, Vec<&'a KeyframeMetadata>>;
@@ -41,7 +42,12 @@ pub struct ReplayFilePlayer {
     patch_data: Option<Vec<u8>>,
     all_uncompressed_packets: Arc<Vec<Packet>>,
     keyframes: KeyframeMap<'static>,
-    bookmarks: BookmarkMap<'static>,
+    legacy_bookmarks: BookmarkMap<'static>,
+
+    bookmark_table: BookmarkTable,
+    bookmark_table_source: BookmarkTableSource,
+    bookmark_section_error: Option<BookmarkSectionError>,
+    stream_truncated: bool,
 
     total_frame_count: UnsignedInteger,
     total_millis: TimestampMillis,
@@ -69,6 +75,20 @@ pub struct ReplayFilePlayer {
     threading: bool
 }
 
+/// Where [`ReplayFilePlayer::bookmark_table`] came from.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BookmarkTableSource {
+    /// The bookmark section of a closed v5 file.
+    Section,
+    /// The newest `BookmarkTable` snapshot in the packet stream (a v5 file that was never closed, or
+    /// whose section is damaged).
+    StreamSnapshot,
+    /// `Bookmark` packets of a pre-v5 file, converted to untyped points.
+    Legacy,
+    /// The replay has no bookmarks.
+    None
+}
+
 /// Which packet list a chain position refers to.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ListId {
@@ -92,6 +112,8 @@ struct ChainState {
     /// Index within that list of the last keyframe-class packet folded into `state`.
     last_applied: Option<usize>,
     state: Vec<u8>,
+    /// Delta keyframes applied so far (see [`ReplayFilePlayer::chain_folds`]).
+    folds: u64,
 }
 
 fn is_keyframe_class(packet: &Packet) -> bool {
@@ -110,7 +132,7 @@ fn keyframe_metadata(packet: &Packet) -> Option<&KeyframeMetadata> {
 
 impl ChainState {
     const fn new() -> Self {
-        Self { list: None, last_applied: None, state: Vec::new() }
+        Self { list: None, last_applied: None, state: Vec::new(), folds: 0 }
     }
 
     fn is_at(&self, list: ListId, index: usize) -> bool {
@@ -153,6 +175,7 @@ impl ChainState {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe failed to apply") });
                 }
                 self.last_applied = Some(index);
+                self.folds += 1;
             },
 
             Packet::RegionDeltaKeyframe { state_len, control, data, .. } => {
@@ -164,6 +187,7 @@ impl ChainState {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("region delta keyframe is malformed") });
                 }
                 self.last_applied = Some(index);
+                self.folds += 1;
             },
 
             _ => {}
@@ -209,7 +233,21 @@ impl ReplayFilePlayer {
             patch_data = None;
         }
 
-        let mut replay_data = buffer_bytes.get(patch_end..)
+        // A closed v5 file records where its packets end; the bookmark section follows.
+        let mut stream_truncated = false;
+        let stream_end = match header_raw.packet_stream_end() {
+            None => buffer_bytes.len(),
+            Some(end) => match usize::try_from(end) {
+                Ok(end) if end >= patch_end && end <= buffer_bytes.len() => end,
+                Ok(end) if end >= patch_end && allow_some_corruption => {
+                    stream_truncated = true;
+                    buffer_bytes.len()
+                },
+                _ => return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Owned(format!("The packet stream ends out of bounds (byte {end} of a {}-byte file)", buffer_bytes.len())) })
+            }
+        };
+
+        let mut replay_data = buffer_bytes.get(patch_end..stream_end)
             .ok_or_else(|| ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("Cannot read replay data (out-of-bounds)") })?;
 
         let mut all_packets = Vec::new();
@@ -217,7 +255,10 @@ impl ReplayFilePlayer {
         while !replay_data.is_empty() {
             match Packet::read_all(&mut replay_data, header_raw.replay_version) {
                 Ok(n) => all_packets.push(n),
-                Err(_) if allow_some_corruption => break,
+                Err(_) if allow_some_corruption => {
+                    stream_truncated = true;
+                    break
+                },
                 Err(PacketReadError::NotEnoughData) => return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("not enough data for a packet") }),
                 Err(PacketReadError::ParseFail { explanation }) => return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("Parse failure: {explanation}")) })
             }
@@ -234,6 +275,7 @@ impl ReplayFilePlayer {
                 Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } if !have_top_level_keyframe => {
                     if allow_some_corruption {
                         all_packets.truncate(packet_index);
+                        stream_truncated = true;
                         break;
                     }
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("Delta keyframe without a prior keyframe") })
@@ -342,11 +384,38 @@ impl ReplayFilePlayer {
             return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("Replay has no keyframe at index 0") })
         }
 
+        // Bookmarks: the section of a closed v5 file, else the newest snapshot in the stream, else
+        // the legacy bookmark packets.
+        let mut bookmark_section_error = None;
+        let mut resolved = None;
+
+        if header_raw.packet_stream_end().is_some() && !stream_truncated {
+            match decode_bookmark_section(&buffer_bytes[stream_end..]) {
+                Ok(table) => resolved = Some((table, BookmarkTableSource::Section)),
+                Err(e) => bookmark_section_error = Some(e)
+            }
+        }
+
+        if resolved.is_none() && header_raw.replay_version >= REPLAY_VERSION_BOOKMARK_SECTION {
+            resolved = newest_stream_snapshot(&header_raw, all_packets.as_slice()).map(|table| (table, BookmarkTableSource::StreamSnapshot));
+        }
+
+        if resolved.is_none() && !all_bookmarks.is_empty() {
+            let table = BookmarkTable::from_legacy(all_bookmarks.values().flatten().copied());
+            resolved = Some((table, BookmarkTableSource::Legacy));
+        }
+
+        let (bookmark_table, bookmark_table_source) = resolved.unwrap_or((BookmarkTable::new(), BookmarkTableSource::None));
+
         let player = ReplayFilePlayer {
             patch_data,
             replay_file_metadata,
             keyframes: unsafe { transmute::<KeyframeMap, KeyframeMap<'static>>(all_keyframes) },
-            bookmarks: unsafe { transmute::<BookmarkMap, BookmarkMap<'static>>(all_bookmarks) },
+            legacy_bookmarks: unsafe { transmute::<BookmarkMap, BookmarkMap<'static>>(all_bookmarks) },
+            bookmark_table,
+            bookmark_table_source,
+            bookmark_section_error,
+            stream_truncated,
             all_uncompressed_packets: all_packets,
             next_uncompressed_packet_index: 0usize,
             next_compressed_packet_index: None,
@@ -420,11 +489,44 @@ impl ReplayFilePlayer {
         &self.keyframes
     }
 
-    /// Get a reference to a map of bookmarks.
+    /// The legacy (pre-v5) `Bookmark` packets of the replay, keyed by name.
     ///
-    /// The key is the bookmark name.
-    pub fn all_bookmarks(&self) -> &BTreeMap<String, Vec<&BookmarkMetadata>> {
-        &self.bookmarks
+    /// Use [`Self::bookmark_table`] instead; it includes these, converted.
+    pub fn legacy_bookmarks(&self) -> &BTreeMap<String, Vec<&BookmarkMetadata>> {
+        &self.legacy_bookmarks
+    }
+
+    /// The replay's bookmarks, from wherever they could be read (see
+    /// [`Self::bookmark_table_source`]).
+    pub fn bookmark_table(&self) -> &BookmarkTable {
+        &self.bookmark_table
+    }
+
+    /// Where [`Self::bookmark_table`] came from.
+    pub fn bookmark_table_source(&self) -> BookmarkTableSource {
+        self.bookmark_table_source
+    }
+
+    /// Why the bookmark section of a closed v5 file could not be used, if it could not.
+    pub fn bookmark_section_error(&self) -> Option<&BookmarkSectionError> {
+        self.bookmark_section_error.as_ref()
+    }
+
+    /// Whether part of the file was dropped because it was damaged (only possible when the player
+    /// was created with `allow_some_corruption`).
+    pub fn stream_truncated(&self) -> bool {
+        self.stream_truncated
+    }
+
+    /// The header exactly as it is in the file.
+    pub fn raw_header_bytes(&self) -> ReplayHeaderBytes {
+        *self.header_raw.as_bytes()
+    }
+
+    /// Total delta keyframes applied so far while materialising keyframes (a seek to a full
+    /// keyframe applies none).
+    pub fn chain_folds(&self) -> u64 {
+        self.chain.folds
     }
 
     /// Get all top-level uncompressed packets.
@@ -447,57 +549,12 @@ impl ReplayFilePlayer {
     /// Afterwards the next call to [`Self::next_packet`] yields that keyframe as a
     /// [`Packet::Keyframe`] (materialised if it is stored as a delta).
     ///
+    /// When several keyframes share the frame (a full keyframe forced for a keyframe bookmark right
+    /// after a scheduled one), the last one in the stream is used.
+    ///
     /// On failure, `Err` is returned.
     pub fn go_to_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(), ReplaySeekError> {
-        if self.keyframes.get(&keyframe_frames_index).is_none() {
-            return Err(ReplaySeekError::NoSuchKeyframe {
-                given: keyframe_frames_index,
-                best: self.keyframes.keys().copied().filter(|i| *i <= keyframe_frames_index).max().expect("there is always a keyframe at frame index 0")
-            })
-        };
-
-        let matches_frame = |packet: &Packet| keyframe_metadata(packet).is_some_and(|m| m.elapsed_frames == keyframe_frames_index);
-
-        // Locate the list holding the keyframe.
-        let mut location = None;
-        for (top_index, packet) in self.all_uncompressed_packets.iter().enumerate() {
-            match packet {
-                Packet::CompressedBlob { keyframes, .. } => {
-                    if keyframes.iter().any(|k| k.elapsed_frames == keyframe_frames_index) {
-                        location = Some((ListId::Blob(top_index), None));
-                        break;
-                    }
-                },
-                p if matches_frame(p) => {
-                    location = Some((ListId::TopLevel, Some(top_index)));
-                    break;
-                },
-                _ => continue
-            }
-        }
-
-        let Some((list, top_level_target)) = location else {
-            return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::Other { explanation: Cow::Borrowed("keyframe is in the index but not in the packet stream") } })
-        };
-
-        let (packets, target) = match list {
-            ListId::TopLevel => (self.all_uncompressed_packets.clone(), top_level_target.expect("top-level location has an index")),
-            ListId::Blob(top_index) => {
-                self.decompress_immediately(top_index).map_err(|error| ReplaySeekError::ReadError { error })?;
-
-                let packets = self.compressed_blobs_finished
-                    .get(&top_index)
-                    .expect("somehow did not find the blob we just found in compressed_blobs_finished...")
-                    .clone()
-                    .expect("somehow the blob we just decompressed is not decompressed");
-
-                let Some(target) = packets.iter().position(matches_frame) else {
-                    return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("keyframe listed in the blob metadata is not in the blob") } })
-                };
-
-                (packets, target)
-            }
-        };
+        let (list, packets, target) = self.locate_keyframe(keyframe_frames_index)?;
 
         self.fast_forward_chain(list, packets.as_slice(), target).map_err(|error| ReplaySeekError::ReadError { error })?;
 
@@ -513,6 +570,70 @@ impl ReplayFilePlayer {
         }
 
         Ok(())
+    }
+
+    /// Whether the keyframe [`Self::go_to_keyframe`] would use for this frame is stored as a full
+    /// keyframe (so seeking to it applies no deltas). Decompresses its blob if needed; does not
+    /// move the cursor.
+    pub fn keyframe_is_stored_full(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<bool, ReplaySeekError> {
+        let (_, packets, target) = self.locate_keyframe(keyframe_frames_index)?;
+        Ok(matches!(packets[target], Packet::Keyframe { .. }))
+    }
+
+    /// Find the list and index of the last keyframe-class packet on the given frame.
+    fn locate_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(ListId, Arc<Vec<Packet>>, usize), ReplaySeekError> {
+        if self.keyframes.get(&keyframe_frames_index).is_none() {
+            return Err(ReplaySeekError::NoSuchKeyframe {
+                given: keyframe_frames_index,
+                best: self.keyframes.keys().copied().filter(|i| *i <= keyframe_frames_index).max().expect("there is always a keyframe at frame index 0")
+            })
+        };
+
+        let matches_frame = |packet: &Packet| keyframe_metadata(packet).is_some_and(|m| m.elapsed_frames == keyframe_frames_index);
+
+        // Locate the last list holding the keyframe. Keyframes on one frame are never separated by
+        // a NextFrame, so the scan stops at the first NextFrame or keyframe-less blob after a match.
+        let mut location = None;
+        for (top_index, packet) in self.all_uncompressed_packets.iter().enumerate() {
+            match packet {
+                Packet::CompressedBlob { keyframes, .. } => {
+                    if keyframes.iter().any(|k| k.elapsed_frames == keyframe_frames_index) {
+                        location = Some((ListId::Blob(top_index), None));
+                    }
+                    else if location.is_some() {
+                        break;
+                    }
+                },
+                p if matches_frame(p) => {
+                    location = Some((ListId::TopLevel, Some(top_index)));
+                },
+                Packet::NextFrame { .. } if location.is_some() => break,
+                _ => continue
+            }
+        }
+
+        let Some((list, top_level_target)) = location else {
+            return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::Other { explanation: Cow::Borrowed("keyframe is in the index but not in the packet stream") } })
+        };
+
+        match list {
+            ListId::TopLevel => Ok((list, self.all_uncompressed_packets.clone(), top_level_target.expect("top-level location has an index"))),
+            ListId::Blob(top_index) => {
+                self.decompress_immediately(top_index).map_err(|error| ReplaySeekError::ReadError { error })?;
+
+                let packets = self.compressed_blobs_finished
+                    .get(&top_index)
+                    .expect("somehow did not find the blob we just found in compressed_blobs_finished...")
+                    .clone()
+                    .expect("somehow the blob we just decompressed is not decompressed");
+
+                let Some(target) = packets.iter().rposition(matches_frame) else {
+                    return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("keyframe listed in the blob metadata is not in the blob") } })
+                };
+
+                Ok((list, packets, target))
+            }
+        }
     }
 
     /// Bring the chain to the keyframe-class packet just before `target` in `list`, so that
@@ -834,6 +955,26 @@ pub enum ReplayFileReadError {
     Other { explanation: Cow<'static, str> }
 }
 
+/// The newest `BookmarkTable` snapshot of a stream: in the uncompressed tail, or else in the last
+/// blob (the recorder repeats the table at the start of every blob once any was written, so older
+/// blobs never hold a newer one).
+fn newest_stream_snapshot(header: &ReplayHeaderRaw, packets: &[Packet]) -> Option<BookmarkTable> {
+    for packet in packets.iter().rev() {
+        match packet {
+            Packet::BookmarkTable { table } => return Some(table.clone()),
+            Packet::CompressedBlob { compressed_data, uncompressed_size, .. } => {
+                let blob = decompress_compressed_blob(header, compressed_data.as_slice(), usize::try_from(*uncompressed_size).ok()?).ok()?;
+                return blob.iter().rev().find_map(|p| match p {
+                    Packet::BookmarkTable { table } => Some(table.clone()),
+                    _ => None
+                })
+            },
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Decompress a blob into its packet list.
 ///
 /// Delta keyframes are left compact; they are materialised by the player's [`ChainState`] as the
@@ -952,6 +1093,80 @@ mod tests {
         for frame in [2u64, 2, 1, 4, 0, 3, 4, 2, 4, 1] {
             player.go_to_keyframe(frame).unwrap();
             check(&mut player, frame);
+        }
+    }
+
+    /// A blob holding exactly `packets` (which must start with a full keyframe).
+    fn blob_of(packets: &[Packet]) -> Packet {
+        let mut raw = Vec::new();
+        let mut keyframes = Vec::new();
+        let mut frames = 0;
+        for packet in packets {
+            for command in packet.write_packet_instructions() {
+                raw.extend_from_slice(command.bytes());
+            }
+            if let Some(metadata) = keyframe_metadata(packet) {
+                keyframes.push(metadata.clone());
+                frames = metadata.elapsed_frames;
+            }
+            if matches!(packet, Packet::NextFrame { .. }) {
+                frames += 1;
+            }
+        }
+        Packet::CompressedBlob {
+            elapsed_frames_start: keyframes[0].elapsed_frames,
+            elapsed_frames_end: frames,
+            timestamp_start: keyframes[0].elapsed_millis,
+            timestamp_end: (frames * 16).into(),
+            keyframes,
+            bookmarks: Vec::new(),
+            uncompressed_size: raw.len() as u64,
+            compressed_data: ByteVec::Heap(crate::compress_data(&raw, 1).unwrap()),
+        }
+    }
+
+    /// When a blob closes between a scheduled keyframe and a forced full keyframe on the same frame,
+    /// both blobs list that frame; the seek must use the later blob's full keyframe.
+    #[test]
+    fn duplicate_keyframes_resolve_to_the_last() {
+        let s0 = pseudo_random_bytes(1, 1001);
+        let mut s1 = s0.clone();
+        s1[40..60].fill(0xEE);
+        let s1_forced = pseudo_random_bytes(3, 1001);
+
+        let top_level = [
+            Packet::Keyframe { metadata: metadata_at(0), state: bv(&s0) },
+            Packet::NextFrame { timestamp_delta: 16.into() },
+            region_delta(1, &s0, &s1),
+            Packet::Keyframe { metadata: metadata_at(1), state: bv(&s1_forced) },
+            Packet::NextFrame { timestamp_delta: 16.into() },
+            region_delta(2, &s1_forced, &s0),
+        ];
+        let blobs = [
+            blob_of(&top_level[..3]),
+            blob_of(&top_level[3..]),
+        ];
+
+        for (layout, bytes) in [("top level", file_with_packets(&top_level)), ("across blobs", file_with_packets(&blobs))] {
+            let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+            assert_eq!(player.get_total_frames(), 2, "{layout}");
+            assert_eq!(player.all_keyframes()[&1].len(), 2, "{layout}");
+            assert!(player.keyframe_is_stored_full(1).unwrap(), "{layout}");
+
+            let folds = player.chain_folds();
+            player.go_to_keyframe(1).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { state, .. }) => assert_eq!(state.as_slice(), s1_forced.as_slice(), "{layout}"),
+                other => panic!("{layout}: {other:?}")
+            }
+            assert_eq!(player.chain_folds(), folds, "{layout}: no delta applied");
+
+            // The delta after it chains from the forced keyframe.
+            player.go_to_keyframe(2).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { state, .. }) => assert_eq!(state.as_slice(), s0.as_slice(), "{layout}"),
+                other => panic!("{layout}: {other:?}")
+            }
         }
     }
 

@@ -36,6 +36,7 @@ add_library(supershuckie-cpp-static STATIC
     src/ram_search_window.cpp
     src/ram_watch_window.cpp
     src/watch_edit_dialog.cpp
+    src/bookmark_window.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

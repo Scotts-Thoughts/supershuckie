@@ -1,5 +1,5 @@
-use super::{ReplayFileWriteError, ReplayFileRecorder, ReplayFileSink, ReplayFileRecorderFns};
-use crate::{ByteVec, InputBuffer, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
+use super::{KeyframeEncoding, ReplayFileWriteError, ReplayFileRecorder, ReplayFileSink, ReplayFileRecorderFns};
+use crate::{BookmarkTable, ByteVec, InputBuffer, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -101,14 +101,19 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NextFrame { timestamp });
     }
 
-    /// Add a bookmark.
-    pub fn add_bookmark<S: Into<String>>(&mut self, name: S) {
-        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::AddBookmark { bookmark: name.into() });
+    /// Replace the replay's bookmarks (see [`ReplayFileRecorder::set_bookmark_table`]).
+    pub fn set_bookmark_table(&mut self, table: BookmarkTable) {
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::SetBookmarkTable { table });
     }
 
     /// Add a new keyframe.
     pub fn insert_keyframe(&mut self, state: ByteVec, timestamp: TimestampMillis) {
-        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp });
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp, encoding: KeyframeEncoding::Auto });
+    }
+
+    /// Add a new keyframe that is always stored in full (see [`KeyframeEncoding::Full`]).
+    pub fn insert_keyframe_full(&mut self, state: ByteVec, timestamp: TimestampMillis) {
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp, encoding: KeyframeEncoding::Full });
     }
 
     /// Set the current input.
@@ -206,8 +211,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::WriteMemory { address, data } => {
                 recorder.write_memory(address, data)
             },
-            ThreadedReplayFileRecorderCommand::NewKeyframe { timestamp, state } => {
-                let result = recorder.insert_keyframe(state, timestamp);
+            ThreadedReplayFileRecorderCommand::NewKeyframe { timestamp, state, encoding } => {
+                let result = recorder.insert_keyframe_with(state, timestamp, encoding);
                 if let Some(buffer) = recorder.take_recycled_state() {
                     let _ = self.free_buffers.send(buffer);
                 }
@@ -219,8 +224,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::SetSpeed { speed } => {
                 recorder.set_speed(speed)
             },
-            ThreadedReplayFileRecorderCommand::AddBookmark { bookmark } => {
-                recorder.add_bookmark(bookmark)
+            ThreadedReplayFileRecorderCommand::SetBookmarkTable { table } => {
+                recorder.set_bookmark_table(table)
             },
             ThreadedReplayFileRecorderCommand::ResetConsole => {
                 recorder.reset_console()
@@ -246,8 +251,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
 
 enum ThreadedReplayFileRecorderCommand {
     NextFrame { timestamp: TimestampMillis },
-    AddBookmark { bookmark: String },
-    NewKeyframe { state: ByteVec, timestamp: TimestampMillis },
+    SetBookmarkTable { table: BookmarkTable },
+    NewKeyframe { state: ByteVec, timestamp: TimestampMillis, encoding: KeyframeEncoding },
     SetInput { input: InputBuffer },
     SetSpeed { speed: Speed },
     WriteMemory { address: UnsignedInteger, data: ByteVec },
@@ -278,14 +283,20 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
     }
 
     #[inline]
-    fn add_bookmark(&mut self, name: String) -> Result<(), ReplayFileWriteError> {
-        self.add_bookmark(name);
+    fn set_bookmark_table(&mut self, table: BookmarkTable) -> Result<(), ReplayFileWriteError> {
+        self.set_bookmark_table(table);
         Ok(())
     }
 
     #[inline]
     fn insert_keyframe(&mut self, state: ByteVec, timestamp: TimestampMillis) -> Result<(), ReplayFileWriteError> {
         self.insert_keyframe(state, timestamp);
+        Ok(())
+    }
+
+    #[inline]
+    fn insert_keyframe_full(&mut self, state: ByteVec, timestamp: TimestampMillis) -> Result<(), ReplayFileWriteError> {
+        self.insert_keyframe_full(state, timestamp);
         Ok(())
     }
 

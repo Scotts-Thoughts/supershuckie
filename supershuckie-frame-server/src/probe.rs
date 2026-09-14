@@ -15,10 +15,21 @@ pub fn probe(replay: &Path, layout: u8) -> Result<Value, String> {
     let (width, height) = geometry(summary.console, layout);
     let (fps_num, fps_den) = frame_rate(summary.console);
 
-    let bookmarks: Vec<Value> = summary
+    let table = &summary.bookmark_table;
+    let bookmarks: Vec<Value> = table
         .bookmarks
         .iter()
-        .map(|(name, frame)| json!({ "name": name, "frame": frame }))
+        .map(|b| {
+            let kind = table.type_record(b.type_id).map(|t| json!({ "name": t.name, "color": format!("#{:06X}", t.color & 0xFF_FFFF) }));
+            json!({
+                "name": b.name,
+                "frame": b.in_frame,
+                "id": b.id,
+                "out_frame": b.out_frame(),
+                "keyframe": b.keyframe,
+                "type": kind.unwrap_or(Value::Null),
+            })
+        })
         .collect();
 
     let mut counters = Map::new();

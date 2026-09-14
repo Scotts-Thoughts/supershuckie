@@ -24,11 +24,24 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 ///   chains run for minutes rather than ~2 minutes; no new header fields (packets self-describe),
 ///   but the delta chains are only affordable with a player that materialises deltas lazily, so
 ///   older builds refuse v4 files.
-pub const REPLAY_VERSION: u32 = 4;
+/// * v5: bookmarks are a [`BookmarkTable`](crate::BookmarkTable): the header gains
+///   [`ReplayHeaderRaw::packet_stream_end`], a closed file ends with an editable bookmark section
+///   (see [`bookmark_section`](crate::replay_file::bookmark_section)), and the stream carries
+///   `BookmarkTable` snapshots instead of `Bookmark` packets. A v3/v4 file is upgraded in place the
+///   first time its bookmarks are edited; its packets parse identically under a v5 header.
+pub const REPLAY_VERSION: u32 = 5;
+
+/// First format version with [`ReplayHeaderRaw::packet_stream_end`] and a bookmark section.
+pub const REPLAY_VERSION_BOOKMARK_SECTION: u32 = 5;
+
+/// Oldest format version whose packets are encoded the way this build writes them. Re-encoding a
+/// file of this version or newer gains nothing (v5 only added bookmark storage, which a v4 file
+/// gets in place on its first bookmark edit).
+pub const REPLAY_VERSION_CURRENT_ENCODING: u32 = 4;
 
 // Resume support: see replay_file::record::resume (build_resumed_recorder). A resumed file is an
-// ordinary v4 file; no format change. Blobs copied verbatim from the source keep the source's
-// packet encoding (v3 DeltaKeyframes stay v3), which every v4 reader accepts.
+// ordinary file of the current version. Blobs copied verbatim from the source keep the source's
+// packet encoding (v3 DeltaKeyframes stay v3), which every current reader accepts.
 
 /// Blake3 checksum
 pub type ReplayHeaderBlake3Hash = [u8; 32];
@@ -79,7 +92,7 @@ pub struct ReplayHeaderRaw {
     /// 0x00D - crop_end_* are valid
     pub crop_end: bool,
 
-    /// 0x00C - padding
+    /// 0x00E - padding
     pub _padding_0: [u8; 2],
 
     /// 0x010 name of the emulator core, including version
@@ -121,11 +134,16 @@ pub struct ReplayHeaderRaw {
     /// 0x398 - crop range end (milliseconds)
     pub crop_end_millis: TimestampMillis,
 
-    /// 0x390 - crop timer offset
+    /// 0x3A0 - crop timer offset
     pub crop_timer_offset: TimestampMillis,
 
-    /// 0x398 - padding
-    pub _padding_2: [u8; 0x458 - 4],
+    /// 0x3A8 - absolute offset where the packet stream ends and the bookmark section begins
+    /// (format v5+). 0 means the packets run to the end of the file: a recording that was never
+    /// closed, or a file older than v5. See [`Self::packet_stream_end`].
+    pub packet_stream_end: u64,
+
+    /// 0x3B0 - padding
+    pub _padding_2: [u8; 0x7FC - 0x3B0],
 
     /// 0x7FC - signature (must equal [`SIGNATURE_END`])
     pub signature_end: [u8; 4],
@@ -136,6 +154,8 @@ pub type ReplayHeaderBytes = [u8; 2048];
 
 // Ensure that we can safely transmute between the two.
 const _: () = assert!(size_of::<ReplayHeaderRaw>() == size_of::<ReplayHeaderBytes>());
+const _: () = assert!(core::mem::offset_of!(ReplayHeaderRaw, crop_timer_offset) == 0x3A0);
+const _: () = assert!(core::mem::offset_of!(ReplayHeaderRaw, packet_stream_end) == 0x3A8);
 
 /// Metadata to generate a replay file.
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -190,6 +210,25 @@ impl ReplayHeaderRaw {
         // but that's not UB.
         unsafe { reinterpret_ref(bytes) }
     }
+    /// Where the packet stream ends and the bookmark section begins, if this header records it
+    /// (format v5+ and the file was closed).
+    pub fn packet_stream_end(&self) -> Option<u64> {
+        let end = self.packet_stream_end;
+        (self.replay_version >= REPLAY_VERSION_BOOKMARK_SECTION && end != 0).then_some(end)
+    }
+
+    /// Whether two headers describe the same replay, ignoring the fields a bookmark edit rewrites
+    /// (`replay_version` and `packet_stream_end`).
+    pub fn same_replay_as(&self, other: &ReplayHeaderRaw) -> bool {
+        let mut a = *self;
+        let mut b = *other;
+        a.replay_version = 0;
+        b.replay_version = 0;
+        a.packet_stream_end = 0;
+        b.packet_stream_end = 0;
+        a.as_bytes() == b.as_bytes()
+    }
+
     /// Parse the header.
     /// 
     /// Returns an error with a description if it is invalid.
@@ -273,6 +312,8 @@ impl ReplayFileMetadata {
 
             crop_start: self.crop_start.is_some(),
             crop_end: self.crop_end.is_some(),
+
+            packet_stream_end: 0,
 
             _padding_0: [0u8; _],
             _padding_1: [0u8; _],

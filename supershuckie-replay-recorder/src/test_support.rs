@@ -12,10 +12,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use std::sync::Mutex;
 
-use crate::replay_file::playback::ReplayFilePlayer;
+use crate::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
 use crate::replay_file::record::{ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError};
-use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes};
-use crate::{BookmarkMetadata, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, PacketWriteCommand, Speed};
+use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
+use crate::{Bookmark, BookmarkMetadata, BookmarkTable, BookmarkTypeRecord, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, PacketWriteCommand, Speed};
 
 /// Crash-safe (temp-file) layout of the script recorded by the v3 writer: 3 completed blobs
 /// followed by an uncompressed tail holding a full keyframe and 8 `DeltaKeyframe`s (plus 27
@@ -150,10 +150,30 @@ pub enum ScriptOp {
     SetInput(Vec<u8>),
     SetSpeed(f64),
     Counter(String, i64),
+    /// A point bookmark on the current frame (`frame - 1`). The v3 fixtures hold these as `Bookmark`
+    /// packets; the current writer adds them to its bookmark table.
     Bookmark(String),
     WriteMemory(u64, Vec<u8>),
     ResetConsole,
     LoadSaveState(u64),
+    /// Current writer only (not in the v3 fixtures): give bookmark `id` an out frame.
+    BookmarkSetOut(u64, u64),
+    /// Current writer only: give bookmark `id` a type.
+    BookmarkSetType(u64, BookmarkTypeRecord),
+    /// Current writer only: delete bookmark `id`.
+    BookmarkDelete(u64),
+}
+
+impl ScriptOp {
+    /// Whether the op edits the bookmark table (the ops the v3 writer did not have).
+    pub fn is_table_edit(&self) -> bool {
+        matches!(self, ScriptOp::BookmarkSetOut(..) | ScriptOp::BookmarkSetType(..) | ScriptOp::BookmarkDelete(..))
+    }
+}
+
+/// The type the script gives bookmark 2.
+pub fn script_route_type() -> BookmarkTypeRecord {
+    BookmarkTypeRecord { id: 0x55, name: "Route".to_string(), color: 0x1B8577 }
 }
 
 /// The ops that happen just before the given frame's `NextFrame`.
@@ -175,7 +195,10 @@ pub fn ops_before_frame(frame: u64) -> Vec<ScriptOp> {
         33 => ops.push(ScriptOp::SetInput(alloc::vec![0x01])),
         77 => ops.push(ScriptOp::Bookmark("late".to_string())),
         90 => ops.push(ScriptOp::Counter("resets".to_string(), -3)),
+        120 => ops.push(ScriptOp::BookmarkSetOut(2, 119)),
+        121 => ops.push(ScriptOp::BookmarkSetType(2, script_route_type())),
         123 => ops.push(ScriptOp::SetSpeed(0.5)),
+        140 => ops.push(ScriptOp::BookmarkDelete(1)),
         166 => ops.push(ScriptOp::Bookmark("checkpoint".to_string())),
         _ => {}
     }
@@ -210,22 +233,81 @@ impl ReplayFileSink for SharedSink {
     }
 }
 
+/// Apply a bookmark op of frame `frame` to `table`; returns whether it was one.
+fn apply_bookmark_op(table: &mut BookmarkTable, op: &ScriptOp, frame: u64) -> bool {
+    let now = frame - 1;
+    match op {
+        ScriptOp::Bookmark(name) => {
+            table.insert(Bookmark { name: name.clone(), in_frame: now, in_millis: millis_at(now).into(), ..Default::default() });
+        }
+        ScriptOp::BookmarkSetOut(id, out) => {
+            table.get_mut(*id).expect("script bookmark").out = Some((*out, millis_at(*out).into()));
+        }
+        ScriptOp::BookmarkSetType(id, record) => {
+            table.get_mut(*id).expect("script bookmark").type_id = record.id;
+            table.set_type_record(record.clone());
+            table.prune_types();
+        }
+        ScriptOp::BookmarkDelete(id) => {
+            table.remove(*id).expect("script bookmark");
+            table.prune_types();
+        }
+        _ => return false
+    }
+    true
+}
+
+/// The current writer's bookmark table once the ops of frames `1..=frame` have run.
+pub fn script_table_through(frame: u64) -> BookmarkTable {
+    let mut table = BookmarkTable::new();
+    for f in 1..=frame.min(TOTAL_FRAMES) {
+        for op in ops_before_frame(f) {
+            apply_bookmark_op(&mut table, &op, f);
+        }
+    }
+    table
+}
+
+/// The table a pre-v5 player derives from the v3 fixtures' `Bookmark` packets.
+pub fn legacy_script_table() -> BookmarkTable {
+    let mut legacy = Vec::new();
+    for frame in 1..=TOTAL_FRAMES {
+        for op in ops_before_frame(frame) {
+            if let ScriptOp::Bookmark(name) = op {
+                legacy.push(BookmarkMetadata { name, elapsed_frames: frame - 1, elapsed_millis: millis_at(frame - 1).into() });
+            }
+        }
+    }
+    BookmarkTable::from_legacy(&legacy)
+}
+
 /// Drive `recorder` through the whole script.
 ///
 /// `recorder` must already contain the frame-0 keyframe (`state_for(0)` at timestamp 0), i.e. it
-/// was created with `new_with_metadata`.
+/// was created with `new_with_metadata`. `after_frame(frame)` runs after each frame (and its
+/// keyframe), e.g. to snapshot the sinks.
 pub fn run_script<R: ReplayFileRecorderFns + ?Sized>(recorder: &mut R) {
+    run_script_observed(recorder, &mut |_| {});
+}
+
+/// [`run_script`] with a callback after every frame.
+pub fn run_script_observed<R: ReplayFileRecorderFns + ?Sized>(recorder: &mut R, after_frame: &mut dyn FnMut(u64)) {
     let mut running: u64 = 0;
+    let mut table = BookmarkTable::new();
     for frame in 1..=TOTAL_FRAMES {
         for op in ops_before_frame(frame) {
+            if apply_bookmark_op(&mut table, &op, frame) {
+                recorder.set_bookmark_table(table.clone()).unwrap();
+                continue;
+            }
             match op {
                 ScriptOp::SetInput(i) => recorder.set_input(ib(&i)).unwrap(),
                 ScriptOp::SetSpeed(s) => recorder.set_speed(Speed::from_multiplier_float(s)).unwrap(),
                 ScriptOp::Counter(n, d) => recorder.change_counter(n, d).unwrap(),
-                ScriptOp::Bookmark(n) => recorder.add_bookmark(n).unwrap(),
                 ScriptOp::WriteMemory(a, d) => recorder.write_memory(a, bv(&d)).unwrap(),
                 ScriptOp::ResetConsole => recorder.reset_console().unwrap(),
                 ScriptOp::LoadSaveState(f) => recorder.load_save_state(bv(&state_for(f))).unwrap(),
+                ScriptOp::Bookmark(_) | ScriptOp::BookmarkSetOut(..) | ScriptOp::BookmarkSetType(..) | ScriptOp::BookmarkDelete(..) => unreachable!("applied above"),
             }
         }
 
@@ -235,6 +317,8 @@ pub fn run_script<R: ReplayFileRecorderFns + ?Sized>(recorder: &mut R) {
         if frame % KEYFRAME_INTERVAL == 0 {
             recorder.insert_keyframe(bv(&state_for(frame)), running.into()).unwrap();
         }
+
+        after_frame(frame);
     }
 }
 
@@ -277,6 +361,10 @@ pub struct FileStats {
     pub top_level_packets: usize,
     /// `(frame, kind, in_blob)` for every keyframe-class packet in stream order.
     pub keyframes: Vec<(u64, StoredKeyframeKind, bool)>,
+    /// `BookmarkTable` packets, anywhere in the stream.
+    pub bookmark_snapshots: usize,
+    /// Bytes after the packet stream (the bookmark section of a closed v5 file).
+    pub trailing_bytes: usize,
 }
 
 impl FileStats {
@@ -301,11 +389,14 @@ pub fn file_stats(bytes: &[u8]) -> FileStats {
             Packet::Keyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::Full, in_blob)),
             Packet::DeltaKeyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::V3Delta, in_blob)),
             Packet::RegionDeltaKeyframe { metadata, .. } => stats.keyframes.push((metadata.elapsed_frames, StoredKeyframeKind::RegionDelta, in_blob)),
+            Packet::BookmarkTable { .. } => stats.bookmark_snapshots += 1,
             _ => {}
         }
     }
 
-    let mut data = &bytes[2048 + header.patch_data_length as usize..];
+    let stream_end = header.packet_stream_end().map(|end| end as usize).unwrap_or(bytes.len());
+    stats.trailing_bytes = bytes.len() - stream_end;
+    let mut data = &bytes[2048 + header.patch_data_length as usize..stream_end];
     while !data.is_empty() {
         let packet = Packet::read_all(&mut data, version).expect("packet");
         stats.top_level_packets += 1;
@@ -383,10 +474,17 @@ pub fn expected_keyframe(frame: u64) -> Packet {
 
 /// The exact flat packet stream (blobs expanded, deltas materialised) a player must yield for the
 /// script, starting from the frame-0 keyframe.
-pub fn expected_packets() -> Vec<Packet> {
+///
+/// With `legacy_bookmarks` (the v3 fixtures) the stream holds the script's `Bookmark` packets;
+/// otherwise it holds no bookmark packets at all (callers skip the `BookmarkTable` snapshots of a
+/// v5 stream, whose placement depends on the blob layout, and check them separately).
+pub fn expected_packets(legacy_bookmarks: bool) -> Vec<Packet> {
     let mut packets = alloc::vec![expected_keyframe(0)];
     for frame in 1..=TOTAL_FRAMES {
         for op in ops_before_frame(frame) {
+            if op.is_table_edit() || (!legacy_bookmarks && matches!(op, ScriptOp::Bookmark(_))) {
+                continue;
+            }
             packets.push(match op {
                 ScriptOp::SetInput(i) => Packet::ChangeInput { data: ib(&i) },
                 ScriptOp::SetSpeed(s) => Packet::ChangeSpeed { speed: Speed::from_multiplier_float(s) },
@@ -402,6 +500,7 @@ pub fn expected_packets() -> Vec<Packet> {
                 ScriptOp::WriteMemory(address, data) => Packet::WriteMemory { address, data: bv(&data) },
                 ScriptOp::ResetConsole => Packet::ResetConsole,
                 ScriptOp::LoadSaveState(f) => Packet::LoadSaveState { state: bv(&state_for(f)) },
+                ScriptOp::BookmarkSetOut(..) | ScriptOp::BookmarkSetType(..) | ScriptOp::BookmarkDelete(..) => unreachable!("skipped above"),
             });
         }
         packets.push(Packet::NextFrame { timestamp_delta: delta_for(frame).into() });
@@ -461,12 +560,34 @@ pub fn seek_order() -> Vec<u64> {
     order
 }
 
+/// What the bookmarks of a replay of the script must be.
+#[derive(Copy, Clone, Debug)]
+pub enum BookmarkExpectation<'a> {
+    /// Recorded by the current writer running the script: the resolved table is the script's final
+    /// table, and every snapshot in the stream is the script's table as of where it sits.
+    Script,
+    /// The resolved table, and every snapshot in the stream, is this table (re-encoded files, whose
+    /// table is seeded at the start; upgraded files, which have no snapshots).
+    Fixed(&'a BookmarkTable),
+    /// Recorded by the current writer running the script, with its section since rewritten to this
+    /// table: the snapshots follow the script.
+    Rewritten(&'a BookmarkTable),
+}
+
 /// Check that a replay produced from the script (by any writer/layout) plays back exactly.
 ///
-/// Verifies the totals, the keyframe/bookmark indexes, a full sequential walk against
+/// Pre-v5 files must hold the script's `Bookmark` packets; v5 files are checked against
+/// [`BookmarkExpectation::Script`].
+pub fn check_script_replay(bytes: &[u8], context: &str) {
+    check_script_replay_with(bytes, context, BookmarkExpectation::Script)
+}
+
+/// [`check_script_replay`] with explicit expectations for a v5 file's bookmarks.
+///
+/// Verifies the totals, the keyframe index, the bookmarks, a full sequential walk against
 /// [`expected_packets`], and random-access seeks (forward, backward, cross-blob, repeated) each
 /// followed by reading up to the next keyframe.
-pub fn check_script_replay(bytes: &[u8], context: &str) {
+pub fn check_script_replay_with(bytes: &[u8], context: &str, bookmarks: BookmarkExpectation<'_>) {
     let mut player = ReplayFilePlayer::new(bytes, false)
         .unwrap_or_else(|e| panic!("{context}: failed to open: {e:?}"));
 
@@ -480,26 +601,72 @@ pub fn check_script_replay(bytes: &[u8], context: &str) {
         }
     }
 
-    let bookmarks = player.all_bookmarks();
-    assert_eq!(bookmarks.keys().cloned().collect::<Vec<_>>(), alloc::vec!["checkpoint".to_string(), "late".to_string()], "{context}: bookmark index");
-    assert_eq!(bookmarks["checkpoint"].iter().map(|b| b.elapsed_frames).collect::<Vec<_>>(), alloc::vec![7, 165], "{context}: checkpoint frames");
-    assert_eq!(bookmarks["late"].iter().map(|b| b.elapsed_frames).collect::<Vec<_>>(), alloc::vec![76], "{context}: late frames");
+    let header = ReplayHeaderRaw::from_bytes(bytes[..2048].try_into().unwrap());
+    let legacy = header.replay_version < REPLAY_VERSION_BOOKMARK_SECTION;
+    let has_section = header.packet_stream_end().is_some_and(|end| (end as usize) < bytes.len());
 
-    let expected = expected_packets();
+    if legacy {
+        let bookmarks = player.legacy_bookmarks();
+        assert_eq!(bookmarks.keys().cloned().collect::<Vec<_>>(), alloc::vec!["checkpoint".to_string(), "late".to_string()], "{context}: bookmark index");
+        assert_eq!(bookmarks["checkpoint"].iter().map(|b| b.elapsed_frames).collect::<Vec<_>>(), alloc::vec![7, 165], "{context}: checkpoint frames");
+        assert_eq!(bookmarks["late"].iter().map(|b| b.elapsed_frames).collect::<Vec<_>>(), alloc::vec![76], "{context}: late frames");
+        assert_eq!(*player.bookmark_table(), legacy_script_table(), "{context}: legacy bookmark table");
+        assert_eq!(player.bookmark_table_source(), BookmarkTableSource::Legacy, "{context}: bookmark table source");
+    }
+    else {
+        let expected_table = match bookmarks {
+            BookmarkExpectation::Script => script_table_through(TOTAL_FRAMES),
+            BookmarkExpectation::Fixed(table) | BookmarkExpectation::Rewritten(table) => table.clone(),
+        };
+        assert_eq!(*player.bookmark_table(), expected_table, "{context}: bookmark table");
+        if has_section {
+            assert_eq!(player.bookmark_table_source(), BookmarkTableSource::Section, "{context}: bookmark table source");
+            assert!(player.bookmark_section_error().is_none(), "{context}: {:?}", player.bookmark_section_error());
+        }
+    }
+
+    // A snapshot is the table as of its position: `frames` NextFrames in, possibly after the ops of
+    // the next frame.
+    let snapshot_ok = |table: &BookmarkTable, frames: u64| match bookmarks {
+        BookmarkExpectation::Script | BookmarkExpectation::Rewritten(_) => *table == script_table_through(frames) || *table == script_table_through(frames + 1),
+        BookmarkExpectation::Fixed(expected) => table == expected,
+    };
+
+    let expected = expected_packets(legacy);
 
     // Sequential walk.
     player.go_to_keyframe(0).unwrap_or_else(|e| panic!("{context}: seek 0: {e:?}"));
     let mut index = 0usize;
+    let mut frames = 0u64;
+    let mut snapshots = 0usize;
     loop {
         let packet = player.next_packet().unwrap_or_else(|e| panic!("{context}: next_packet at {index}: {e:?}"));
         let Some(packet) = packet else { break };
+        if !legacy {
+            match packet {
+                Packet::BookmarkTable { table } => {
+                    assert!(snapshot_ok(table, frames), "{context}: snapshot after {frames} frames is {table:?}");
+                    snapshots += 1;
+                    continue;
+                }
+                // A v3/v4 file upgraded in place keeps its legacy packets.
+                Packet::Bookmark { .. } => continue,
+                _ => {}
+            }
+        }
         let Some(exp) = expected.get(index) else {
             panic!("{context}: player yielded extra packet {} after the expected {} packets", describe(packet), expected.len());
         };
         assert_packet_eq(packet, exp, &alloc::format!("{context}: sequential packet {index}"));
+        if matches!(packet, Packet::NextFrame { .. }) {
+            frames += 1;
+        }
         index += 1;
     }
     assert_eq!(index, expected.len(), "{context}: sequential walk stopped early");
+    if !legacy && matches!(bookmarks, BookmarkExpectation::Script | BookmarkExpectation::Rewritten(_)) {
+        assert!(snapshots >= 5, "{context}: only {snapshots} bookmark snapshots (the script changes the table 5 times)");
+    }
 
     // Random access.
     for (n, frame) in seek_order().into_iter().enumerate() {
@@ -512,6 +679,9 @@ pub fn check_script_replay(bytes: &[u8], context: &str) {
                 assert_eq!(index, expected.len(), "{context}: stream ended early after seek #{n} to {frame}");
                 break;
             };
+            if !legacy && matches!(packet, Packet::BookmarkTable { .. } | Packet::Bookmark { .. }) {
+                continue;
+            }
             assert_packet_eq(packet, &expected[index], &alloc::format!("{context}: seek #{n} to {frame}, packet {index}"));
             index += 1;
             if !first && matches!(packet, Packet::Keyframe { .. }) {

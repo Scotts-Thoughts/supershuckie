@@ -9,3 +9,4 @@ pub mod frontend;
 pub mod string_array;
 pub mod control_settings;
 pub mod memory;
+pub mod bookmarks;

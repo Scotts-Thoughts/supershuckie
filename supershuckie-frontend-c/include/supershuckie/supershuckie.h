@@ -5,5 +5,6 @@
 #include "frontend.h"
 #include "control_settings.h"
 #include "memory.h"
+#include "bookmarks.h"
 
 #endif

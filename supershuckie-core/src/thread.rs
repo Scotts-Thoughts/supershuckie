@@ -1,7 +1,7 @@
 use crate::emulator::{EmulatorCore, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
 use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
-use crate::{std_timestamp_provider, AudioOutput, ReplayPlayerAttachError, Speed};
+use crate::{std_timestamp_provider, AudioOutput, BookmarkAnchor, BookmarkAnchorError, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
 use spin::RwLock;
 use std::borrow::ToOwned;
@@ -21,7 +21,7 @@ use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
-use supershuckie_replay_recorder::{ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
+use supershuckie_replay_recorder::{BookmarkTable, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
 
 /// A (mostly) non-blocking, threaded wrapper for [`SuperShuckieCore`].
 pub struct ThreadedSuperShuckieCore {
@@ -321,6 +321,7 @@ impl ThreadedSuperShuckieCore {
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
+        bookmarks: Option<BookmarkTable>,
     ) {
         // The source replay was attached for positioning; resuming transitions us out of playback
         // and into live recording, so clear the wrapper's playback state (mirrors detach).
@@ -331,6 +332,7 @@ impl ThreadedSuperShuckieCore {
             resume_at_frame,
             metadata,
             crop_policy,
+            bookmarks,
         }).expect("ResumeRecordingReplay - the core thread has crashed");
     }
 
@@ -528,6 +530,35 @@ impl ThreadedSuperShuckieCore {
         receiver.recv().map_err(|_| ())
     }
 
+    /// Longest a caller waits for the core thread to place a bookmark.
+    const BOOKMARK_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// Place a bookmark at the current moment (see [`SuperShuckieCore::bookmark_anchor`]).
+    ///
+    /// NOTE: This is blocking (for at most half a second).
+    pub fn bookmark_anchor(&self, keyframe: bool) -> Result<BookmarkAnchor, BookmarkAnchorError> {
+        let (sender, receiver) = channel();
+        let _ = self.sender.send(ThreadCommand::BookmarkAnchor(sender, keyframe));
+        self.wake();
+        receiver.recv_timeout(Self::BOOKMARK_TIMEOUT).unwrap_or(Err(BookmarkAnchorError::Busy))
+    }
+
+    /// Estimate the replay time at `frame` (see [`SuperShuckieCore::estimate_millis_at`]).
+    ///
+    /// NOTE: This is blocking (for at most half a second).
+    pub fn estimate_millis_at(&self, frame: UnsignedInteger) -> Result<Option<TimestampMillis>, BookmarkAnchorError> {
+        let (sender, receiver) = channel();
+        let _ = self.sender.send(ThreadCommand::EstimateMillisAt(sender, frame));
+        self.wake();
+        receiver.recv_timeout(Self::BOOKMARK_TIMEOUT).map_err(|_| BookmarkAnchorError::Busy)
+    }
+
+    /// Replace the bookmarks of the replay being recorded (see
+    /// [`SuperShuckieCore::set_replay_bookmarks`]).
+    pub fn set_replay_bookmarks(&self, table: BookmarkTable) {
+        let _ = self.sender.send(ThreadCommand::SetReplayBookmarks(table));
+    }
+
     /// Get the counters.
     #[inline]
     pub fn get_replay_counters(&self) -> BTreeMap<String, SignedInteger> {
@@ -643,6 +674,7 @@ enum ThreadCommand {
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
+        bookmarks: Option<BookmarkTable>,
     },
     ExportVideo {
         sink: Box<dyn VideoFrameSink>,
@@ -669,6 +701,9 @@ enum ThreadCommand {
     SaveSRAM(Sender<Vec<u8>>),
     MarkReplayStart(Sender<(UnsignedInteger, TimestampMillis)>, TimestampMillis),
     MarkReplayEnd(Sender<(UnsignedInteger, TimestampMillis)>),
+    BookmarkAnchor(Sender<Result<BookmarkAnchor, BookmarkAnchorError>>, bool),
+    EstimateMillisAt(Sender<Option<TimestampMillis>>, UnsignedInteger),
+    SetReplayBookmarks(BookmarkTable),
     Close,
     ChangeReplayCounter { name: String, delta: SignedInteger },
     IgnoreSpeedChangesInReplay(bool),
@@ -1073,11 +1108,11 @@ impl ThreadedSuperShuckieCoreThread {
                     self.core.pause_timer();
                 }
             }
-            ThreadCommand::ResumeRecordingReplay { resume_at_frame, metadata, crop_policy } => {
+            ThreadCommand::ResumeRecordingReplay { resume_at_frame, metadata, crop_policy, bookmarks } => {
                 self.replay_errors.lock().expect("resume recording replay failed to get replay errors").clear();
 
                 // FIXME: error if this fails
-                self.core.resume_recording_replay(resume_at_frame, metadata, crop_policy).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
+                self.core.resume_recording_replay(resume_at_frame, metadata, crop_policy, bookmarks).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
                 if !self.is_running() {
                     self.core.pause_timer();
                 }
@@ -1146,6 +1181,15 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::ChangeReplayCounter { name, delta } => {
                 self.core.change_replay_counter(name, delta);
+            }
+            ThreadCommand::BookmarkAnchor(sender, keyframe) => {
+                let _ = sender.send(self.core.bookmark_anchor(keyframe));
+            }
+            ThreadCommand::EstimateMillisAt(sender, frame) => {
+                let _ = sender.send(self.core.estimate_millis_at(frame));
+            }
+            ThreadCommand::SetReplayBookmarks(table) => {
+                self.core.set_replay_bookmarks(table);
             }
             ThreadCommand::IgnoreSpeedChangesInReplay(ignored) => {
                 self.core.set_ignore_speed_changes_in_replays(ignored)

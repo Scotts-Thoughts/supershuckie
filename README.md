@@ -117,6 +117,18 @@ windows. They use the same addresses as Poke-A-Byte and cost next to nothing whi
 edits and freezes made while recording are part of the replay. See
 [docs/ram_tools.md](docs/ram_tools.md).
 
+## Replay bookmarks
+
+While recording or playing back a replay, **Replays → Add bookmark** (Ctrl+B) marks the current
+frame, **Add keyframe bookmark** (Ctrl+Shift+B) marks it so playback can jump back without
+re-emulating, and **Start/end range bookmark** (Ctrl+Alt+B) marks a stretch. **Bookmarks…**
+(Ctrl+Alt+Shift+B) lists them; clicking a row during playback jumps there, and bookmark types
+with colors of your choosing are managed from the same window. The REST API adds, changes,
+deletes and seeks to bookmarks as well (see [docs/external_commands.md](docs/external_commands.md)).
+
+Bookmarks are saved inside the replay file (format v5). Adding one to a replay made by an older
+version upgrades that file in place, after asking; older versions cannot open it afterwards.
+
 ## Converting old replays
 
 Replays recorded before format v4 (September 2026) can be re-encoded offline into the current

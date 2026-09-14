@@ -5,6 +5,7 @@ use std::path::Path;
 use supershuckie_core::ScreenLayout;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplayFileReadError};
 use supershuckie_replay_recorder::replay_file::ReplayConsoleType;
+use supershuckie_replay_recorder::BookmarkTable;
 
 /// Everything `--probe` prints and `Info` carries that does not need a core.
 #[derive(Clone, Debug)]
@@ -13,8 +14,10 @@ pub struct ReplaySummary {
     pub frames: u64,
     /// Frame indices of every keyframe, ascending.
     pub keyframes: Vec<u64>,
-    /// `(name, frame)`, in frame order.
+    /// `(name, in frame)`, in frame order.
     pub bookmarks: Vec<(String, u64)>,
+    /// Every bookmark with its out frame, type and keyframe flag (for `--probe`).
+    pub bookmark_table: BookmarkTable,
     /// `(start, end)` frame indices of the marked range, when both marks are set.
     pub crop: Option<(u64, u64)>,
     /// Counters as of the last keyframe, in name order.
@@ -32,10 +35,13 @@ impl ReplaySummary {
 
         let keyframes: Vec<u64> = player.all_keyframes().keys().copied().collect();
 
-        let mut bookmarks: Vec<(String, u64)> = player
-            .all_bookmarks()
-            .values()
-            .flat_map(|list| list.iter().map(|b| (b.name.clone(), b.elapsed_frames)))
+        // The bookmark section of a closed v5 file, the stream's newest snapshot, or a pre-v5 file's
+        // bookmark packets; the section and the legacy index need no decompression.
+        let bookmark_table = player.bookmark_table().clone();
+        let mut bookmarks: Vec<(String, u64)> = bookmark_table
+            .bookmarks
+            .iter()
+            .map(|b| (b.name.clone(), b.in_frame))
             .collect();
         bookmarks.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -59,6 +65,7 @@ impl ReplaySummary {
             frames: player.get_total_frames(),
             keyframes,
             bookmarks,
+            bookmark_table,
             crop,
             counters,
             rom_checksum: metadata.rom_checksum,

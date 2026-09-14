@@ -30,6 +30,9 @@ class StringAction;
 class VideoExportDialog;
 class AudioOutput;
 class MemoryToolsController;
+class BookmarkWindow;
+class BookmarkTypesDialog;
+class AddBookmarkDialog;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -52,6 +55,9 @@ class MainWindow: public QMainWindow {
     friend StringAction;
     friend VideoExportDialog;
     friend MemoryToolsController;
+    friend BookmarkWindow;
+    friend BookmarkTypesDialog;
+    friend AddBookmarkDialog;
     
 public:
     MainWindow();
@@ -125,6 +131,15 @@ private:
     QAction *disable_speed_changes_when_recording;
     NumberedAction *replay_compression_levels[4];
     QAction *replay_compression_custom;
+
+    QAction *add_bookmark;
+    QAction *add_keyframe_bookmark;
+    QAction *toggle_range_bookmark;
+    QAction *add_bookmark_at_frame;
+    QAction *open_bookmarks;
+    BookmarkWindow *bookmark_window = nullptr;
+    void add_bookmark_now(bool keyframe);
+    QWidget *bookmark_dialog_parent();
 
     QAction *sgb_enabled;
     QMenu *game_boy_settings;
@@ -282,6 +297,11 @@ private slots:
     void do_toggle_confirm_ram_writes();
     void do_open_tables_folder();
     void do_reload_tables();
+    void do_add_bookmark();
+    void do_add_keyframe_bookmark();
+    void do_toggle_range_bookmark();
+    void do_add_bookmark_at_frame();
+    void do_open_bookmarks();
 };
 
 class NumberedAction: public QAction {

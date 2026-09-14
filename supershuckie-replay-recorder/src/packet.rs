@@ -86,9 +86,17 @@ pub enum Packet {
     #[allow(missing_docs)]
     LoadSaveState { state: ByteVec },
 
-    /// Describes a named point in the replay.
+    /// Describes a named point in the replay (format v2-v4; v5 writes [`Packet::BookmarkTable`]).
     #[allow(missing_docs)]
     Bookmark { metadata: BookmarkMetadata },
+
+    /// Every bookmark of the replay as of this point in the stream (format v5).
+    ///
+    /// Written whenever the bookmarks change while recording and after the first keyframe of every
+    /// blob once any were written, so a file that was never closed recovers its newest table from
+    /// its uncompressed tail or its last blob. A closed file's bookmark section takes precedence.
+    #[allow(missing_docs)]
+    BookmarkTable { table: crate::BookmarkTable },
 
     /// Adds a keyframe so the replay can be scanned faster.
     #[allow(missing_docs)]

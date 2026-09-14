@@ -2,8 +2,9 @@
 //!
 //! See [`ReplayFileRecorder`] and [`NonBlockingReplayFileRecorder`].
 
+use crate::replay_file::bookmark_section::encode_bookmark_section;
 use crate::replay_file::{ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw};
-use crate::{BookmarkMetadata, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, PacketIO, PacketWriteCommand, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
+use crate::{BookmarkTable, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, PacketIO, PacketWriteCommand, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
 use alloc::string::String;
 use alloc::borrow::Cow;
 use alloc::vec::Vec;
@@ -31,7 +32,7 @@ use std::{
     io::{Seek, SeekFrom, Write},
     fs::File
 };
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 use crate::keyframe_masks::apply_masks;
 use crate::util::region_diff;
 
@@ -45,7 +46,6 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
 
     current_blob: Vec<u8>,
     current_blob_keyframes: Vec<KeyframeMetadata>,
-    current_blob_bookmarks: Vec<BookmarkMetadata>,
     current_blob_offset: u64,
 
     elapsed_frames: UnsignedInteger,
@@ -65,7 +65,30 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
 
     counters: BTreeMap<String, SignedInteger>,
 
+    /// The replay's bookmarks; written to the stream on every change and as the bookmark section
+    /// when the file is closed.
+    bookmarks: BookmarkTable,
+
+    /// Whether a bookmark table was ever written in this recording; from then on every blob repeats
+    /// the table after its first keyframe (see [`Packet::BookmarkTable`]).
+    bookmarks_written: bool,
+
+    /// A table change arrived while the in-progress blob had no keyframe yet (a blob must start
+    /// with one), so the snapshot is written after the next keyframe instead.
+    bookmark_snapshot_pending: bool,
+
     poisoned: bool
+}
+
+/// How [`ReplayFileRecorder::insert_keyframe_with`] stores a keyframe.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum KeyframeEncoding {
+    /// A region delta against the previous keyframe when that is smaller, else a full keyframe.
+    #[default]
+    Auto,
+
+    /// Always a full keyframe, so seeking to it applies no deltas (keyframe bookmarks).
+    Full
 }
 
 struct SinkTuple<Final: ReplayFileSink, Temp: ReplayFileSink> {
@@ -201,13 +224,15 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             current_input: starting_input,
             current_blob: Vec::new(),
             current_blob_keyframes: Vec::new(),
-            current_blob_bookmarks: Vec::new(),
             current_blob_offset: u64::try_from(current_blob_offset).expect("failed to read"),
             poisoned: false,
             header: metadata,
             last_state_to_diff: None,
             recycled_state: None,
             counters: BTreeMap::new(),
+            bookmarks: BookmarkTable::new(),
+            bookmarks_written: false,
+            bookmark_snapshot_pending: false,
             sink: Some(SinkTuple {
                 final_sink, temp_sink
             })
@@ -264,7 +289,17 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.last_state_to_diff = None;
         self.current_blob.clear();
         self.current_blob_keyframes.clear();
-        self.current_blob_bookmarks.clear();
+    }
+
+    /// Start the resumed recording's bookmarks with `table` (resume support).
+    ///
+    /// Unlike [`Self::set_bookmark_table`] this always writes a snapshot (after the next keyframe),
+    /// even for a table equal to the current one: blobs copied verbatim from the source may carry
+    /// snapshots of bookmarks that the resumed file must not recover.
+    pub(crate) fn seed_bookmark_table(&mut self, table: BookmarkTable) {
+        self.bookmarks = table;
+        self.bookmarks_written = true;
+        self.bookmark_snapshot_pending = true;
     }
 
     /// Returns `true` if the stream was closed.
@@ -274,6 +309,10 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     }
 
     /// Close the replay file recorder.
+    ///
+    /// Flushes the in-progress blob, then records the end of the packet stream in the header and
+    /// appends the bookmark section, in that order: if the process dies in between, the section is
+    /// merely invalid and players recover the bookmarks from the stream.
     ///
     /// You can no longer write to this.
     ///
@@ -286,7 +325,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         // Flush the final in-progress blob (now a no-op if nothing is buffered). Capture the result
         // BEFORE taking the sinks; calling next_blob() again after the take would just fail
         // assert_not_closed and spuriously report the close as failed.
-        let flush_result = self.next_blob();
+        let flush_result = self.next_blob().and_then(|()| self.write_bookmark_section());
 
         let Some(SinkTuple { final_sink, temp_sink }) = self.sink.take() else {
             unreachable!();
@@ -305,6 +344,54 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.poisoned
     }
 
+    /// End the packet stream: record its end in the header, then append the bookmark section.
+    fn write_bookmark_section(&mut self) -> Result<(), ReplayFileWriteError> {
+        self.header.packet_stream_end = self.current_blob_offset;
+        self.sync_header()?;
+
+        let section = encode_bookmark_section(&self.bookmarks);
+        self.do_with_poison(|this| {
+            let (final_sink, temp_sink) = this.get_sinks();
+            final_sink.write_bytes(&section)?;
+            temp_sink.write_bytes(&section)?;
+            Ok(())
+        })
+    }
+
+    /// The replay's bookmarks as last set.
+    pub fn bookmark_table(&self) -> &BookmarkTable {
+        &self.bookmarks
+    }
+
+    /// Replace the replay's bookmarks.
+    ///
+    /// Does nothing if `table` equals the current table. Otherwise the table is written to the
+    /// stream as a [`Packet::BookmarkTable`] (after the next keyframe, if the in-progress blob has
+    /// none yet), repeated after the first keyframe of every later blob, and saved as the bookmark
+    /// section when the file is closed.
+    pub fn set_bookmark_table(&mut self, table: BookmarkTable) -> Result<(), ReplayFileWriteError> {
+        self.assert_not_closed()?;
+        if table == self.bookmarks {
+            return Ok(())
+        }
+
+        self.bookmarks = table;
+        self.bookmarks_written = true;
+
+        if self.current_blob_keyframes.is_empty() {
+            self.bookmark_snapshot_pending = true;
+            return Ok(())
+        }
+
+        self.write_bookmark_snapshot()
+    }
+
+    fn write_bookmark_snapshot(&mut self) -> Result<(), ReplayFileWriteError> {
+        self.bookmark_snapshot_pending = false;
+        let packet = Packet::BookmarkTable { table: self.bookmarks.clone() };
+        self.write_packet_data(&packet)
+    }
+
     /// Advance a new frame.
     pub fn next_frame(&mut self, timestamp: TimestampMillis) -> Result<(), ReplayFileWriteError> {
         let elapsed_old = self.elapsed_millis;
@@ -317,21 +404,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.write_packet_data(&Packet::NextFrame { timestamp_delta: timestamp_delta.into() })
     }
 
-    /// Add a bookmark.
-    pub fn add_bookmark<S: Into<String>>(&mut self, name: S) -> Result<(), ReplayFileWriteError> {
-        self.assert_not_closed()?;
-        let bookmark_data = BookmarkMetadata {
-            name: name.into(),
-            elapsed_frames: self.elapsed_frames,
-            elapsed_millis: self.elapsed_millis
-        };
-
-        self.current_blob_bookmarks.push(bookmark_data.clone());
-        self.write_packet_data(&Packet::Bookmark {
-            metadata: bookmark_data
-        })
-    }
-
     /// Add a new keyframe.
     ///
     /// The keyframe is written as a [`Packet::RegionDeltaKeyframe`] against the previous keyframe
@@ -341,6 +413,16 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     ///
     /// Returns the frame index the keyframe is on.
     pub fn insert_keyframe(&mut self, state: ByteVec, elapsed_millis: TimestampMillis) -> Result<u64, ReplayFileWriteError> {
+        self.insert_keyframe_with(state, elapsed_millis, KeyframeEncoding::Auto)
+    }
+
+    /// Add a new keyframe stored as `encoding` asks (see [`Self::insert_keyframe`]).
+    ///
+    /// A [`KeyframeEncoding::Full`] keyframe may share its frame with a keyframe written just before
+    /// it; seeking to that frame uses the last one.
+    ///
+    /// Returns the frame index the keyframe is on.
+    pub fn insert_keyframe_with(&mut self, state: ByteVec, elapsed_millis: TimestampMillis, encoding: KeyframeEncoding) -> Result<u64, ReplayFileWriteError> {
         assert!(self.elapsed_millis <= elapsed_millis, "Bad timestamp given (time went backwards!!!); expected {} (current) <= {elapsed_millis} (last)", self.elapsed_millis);
         self.assert_not_closed()?;
 
@@ -368,7 +450,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         let mut state = state;
         let delta = match self.last_state_to_diff.as_ref() {
-            Some(previous) if previous.len() == state.len() => {
+            Some(previous) if previous.len() == state.len() && encoding == KeyframeEncoding::Auto => {
                 if self.settings.mask_transient_buffers {
                     apply_masks(self.header.console_type.get_or_default(), previous.as_slice(), state.as_mut_slice());
                 }
@@ -397,6 +479,13 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         // (masked, if it was masked).
         let displaced = self.last_state_to_diff.replace(state);
         self.recycle_state(displaced);
+
+        // A blob that starts after bookmarks were written repeats the table, so a file that is
+        // never closed can recover it from its last blob alone.
+        let first_in_blob = self.current_blob_keyframes.len() == 1;
+        if self.bookmark_snapshot_pending || (first_in_blob && self.bookmarks_written) {
+            self.write_bookmark_snapshot()?;
+        }
 
         Ok(self.elapsed_frames)
     }
@@ -454,7 +543,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
                 timestamp_end: this.elapsed_millis,
 
                 keyframes: core::mem::take(&mut this.current_blob_keyframes),
-                bookmarks: core::mem::take(&mut this.current_blob_bookmarks),
+                // Format v5 keeps bookmarks in `BookmarkTable` packets and the bookmark section.
+                bookmarks: Vec::new(),
                 compressed_data: ByteVec::Heap(compressed),
                 uncompressed_size: u64::try_from(uncompressed_size).expect("failed to convert uncompressed_size from usize to u64"),
             };
@@ -777,8 +867,9 @@ pub trait ReplayFileRecorderFns: core::any::Any + 'static + Send {
     fn is_closed(&self) -> bool;
     fn close(&mut self) -> Result<(), ReplayFileWriteError>;
     fn next_frame(&mut self, timestamp_millis: TimestampMillis) -> Result<(), ReplayFileWriteError>;
-    fn add_bookmark(&mut self, name: String) -> Result<(), ReplayFileWriteError>;
+    fn set_bookmark_table(&mut self, table: BookmarkTable) -> Result<(), ReplayFileWriteError>;
     fn insert_keyframe(&mut self, state: ByteVec, timestamp_millis: TimestampMillis) -> Result<(), ReplayFileWriteError>;
+    fn insert_keyframe_full(&mut self, state: ByteVec, timestamp_millis: TimestampMillis) -> Result<(), ReplayFileWriteError>;
     fn set_input(&mut self, input_buffer: InputBuffer) -> Result<(), ReplayFileWriteError>;
     fn reset_console(&mut self) -> Result<(), ReplayFileWriteError>;
     fn write_memory(&mut self, address: UnsignedInteger, data: ByteVec) -> Result<(), ReplayFileWriteError>;
@@ -819,13 +910,19 @@ impl<Final: ReplayFileSink + 'static + Send, Temp: ReplayFileSink + 'static + Se
     }
 
     #[inline]
-    fn add_bookmark(&mut self, name: String) -> Result<(), ReplayFileWriteError> {
-        self.add_bookmark(name)
+    fn set_bookmark_table(&mut self, table: BookmarkTable) -> Result<(), ReplayFileWriteError> {
+        self.set_bookmark_table(table)
     }
 
     #[inline]
     fn insert_keyframe(&mut self, state: ByteVec, timestamp: TimestampMillis) -> Result<(), ReplayFileWriteError> {
         self.insert_keyframe(state, timestamp)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn insert_keyframe_full(&mut self, state: ByteVec, timestamp: TimestampMillis) -> Result<(), ReplayFileWriteError> {
+        self.insert_keyframe_with(state, timestamp, KeyframeEncoding::Full)?;
         Ok(())
     }
 
@@ -1072,6 +1169,173 @@ mod tests {
                 };
                 assert!(bytes.len() < unmasked - 5 * 0xC60, "masked {} vs unmasked {unmasked}", bytes.len());
             }
+        }
+    }
+
+    /// A recording that is never closed must recover the bookmark table as of the moment it
+    /// stopped from its temp file, and as of its last completed blob from its final file.
+    #[test]
+    fn bookmark_tables_are_recovered_at_every_point() {
+        use crate::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
+
+        for (name, settings) in [("frame cap 45", settings(45, usize::MAX)), ("one keyframe per blob", settings(1, usize::MAX)), ("no cap", settings(0, usize::MAX))] {
+            let temp = SharedSink::default();
+            let final_sink = SharedSink::default();
+            let mut recorder = ReplayFileRecorder::new_with_metadata(
+                make_metadata(), ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), final_sink.clone(), temp.clone()
+            ).unwrap();
+
+            run_script_observed(&mut recorder, &mut |frame| {
+                let expected = script_table_through(frame);
+                let player = ReplayFilePlayer::new(temp.snapshot(), false).unwrap();
+                assert_eq!(*player.bookmark_table(), expected, "{name}: temp file after frame {frame}");
+                let source = if expected.is_empty() && frame < 8 { BookmarkTableSource::None } else { BookmarkTableSource::StreamSnapshot };
+                assert_eq!(player.bookmark_table_source(), source, "{name}: temp file after frame {frame}");
+
+                let final_bytes = final_sink.snapshot();
+                if let Ok(player) = ReplayFilePlayer::new(&final_bytes, false) {
+                    let last_blob_end = player.all_uncompressed_packets().iter().rev().find_map(|p| match p {
+                        Packet::CompressedBlob { elapsed_frames_end, .. } => Some(*elapsed_frames_end),
+                        _ => None
+                    }).unwrap();
+                    assert_eq!(*player.bookmark_table(), script_table_through(last_blob_end), "{name}: final file after frame {frame}");
+                }
+            });
+
+            recorder.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn closed_files_end_with_the_bookmark_section() {
+        use crate::replay_file::bookmark_section::{decode_bookmark_section, BookmarkSectionError};
+        use crate::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
+
+        let (_, closed) = record_script(settings(45, usize::MAX));
+        let header = ReplayHeaderRaw::from_bytes(closed[..2048].try_into().unwrap());
+        let stream_end = header.packet_stream_end().expect("a closed file records its stream end") as usize;
+        let stats = file_stats(&closed);
+        assert_eq!(stats.trailing_bytes, closed.len() - stream_end);
+        assert_eq!(decode_bookmark_section(&closed[stream_end..]), Ok(script_table_through(TOTAL_FRAMES)));
+
+        // Losing the section (a crash while closing) falls back to the stream.
+        let player = ReplayFilePlayer::new(&closed[..stream_end], false).unwrap();
+        assert_eq!(player.bookmark_table_source(), BookmarkTableSource::StreamSnapshot);
+        assert_eq!(player.bookmark_section_error(), Some(&BookmarkSectionError::Truncated));
+        assert_eq!(*player.bookmark_table(), script_table_through(TOTAL_FRAMES));
+        check_script_replay(&closed[..stream_end], "section cut off");
+
+        let mut damaged = closed.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0x40;
+        let player = ReplayFilePlayer::new(&damaged, false).unwrap();
+        assert_eq!(player.bookmark_table_source(), BookmarkTableSource::StreamSnapshot);
+        assert_eq!(player.bookmark_section_error(), Some(&BookmarkSectionError::HashMismatch));
+        assert_eq!(*player.bookmark_table(), script_table_through(TOTAL_FRAMES));
+
+        // A file cut inside its packets is refused, or read as far as possible when allowed.
+        let cut = &closed[..stream_end - 100];
+        assert!(ReplayFilePlayer::new(cut, false).is_err());
+        let player = ReplayFilePlayer::new(cut, true).unwrap();
+        assert!(player.stream_truncated());
+        assert_eq!(player.bookmark_section_error(), None, "a truncated stream has no section to check");
+    }
+
+    #[test]
+    fn recordings_without_bookmarks_write_no_snapshots() {
+        use crate::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
+
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(5, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        for frame in 1..=20u64 {
+            recorder.set_bookmark_table(BookmarkTable::new()).unwrap();
+            recorder.next_frame((frame * 16).into()).unwrap();
+            if frame % 5 == 0 {
+                recorder.insert_keyframe(bv(&state_for(frame)), (frame * 16).into()).unwrap();
+            }
+        }
+        let (closed, _) = recorder.close().unwrap();
+        assert_eq!(file_stats(&closed).bookmark_snapshots, 0);
+
+        let player = ReplayFilePlayer::new(&closed, false).unwrap();
+        assert_eq!(player.bookmark_table_source(), BookmarkTableSource::Section);
+        assert!(player.bookmark_table().is_empty());
+    }
+
+    /// A keyframe bookmark forces a full keyframe, sometimes on a frame that already has a
+    /// scheduled one; a seek to that frame must land on the full keyframe and apply no deltas, in
+    /// both the temp (top-level) and closed (blob) layouts.
+    #[test]
+    fn forced_full_keyframes_are_seeked_to_without_folds() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+
+        let alternate = pseudo_random_bytes(77, STATE_LEN);
+        let temp = SharedSink::default();
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), Vec::<u8>::new(), temp.clone()
+        ).unwrap();
+        for frame in 1..=30u64 {
+            recorder.next_frame((frame * 16).into()).unwrap();
+            if frame % 5 == 0 {
+                recorder.insert_keyframe(bv(&state_for(frame)), (frame * 16).into()).unwrap();
+            }
+            if frame == 12 {
+                recorder.insert_keyframe_with(bv(&state_for(frame)), (frame * 16).into(), KeyframeEncoding::Full).unwrap();
+            }
+            if frame == 15 {
+                // Same frame as the scheduled keyframe; a different state tells the two apart.
+                recorder.insert_keyframe_with(bv(&alternate), (frame * 16).into(), KeyframeEncoding::Full).unwrap();
+            }
+        }
+        let temp_bytes = temp.snapshot();
+        let (closed, _) = recorder.close().unwrap();
+
+        let stats = file_stats(&closed);
+        assert_eq!(stats.keyframes.iter().filter(|k| k.0 == 15).map(|k| k.1).collect::<Vec<_>>(), [StoredKeyframeKind::RegionDelta, StoredKeyframeKind::Full]);
+        assert_eq!(stats.kind_at(12), StoredKeyframeKind::Full);
+        // The alternate state shares nothing with the next scheduled state (so 20 falls back to full);
+        // the chain then continues with deltas.
+        assert_eq!(stats.kind_at(20), StoredKeyframeKind::Full);
+        assert_eq!(stats.kind_at(25), StoredKeyframeKind::RegionDelta);
+
+        for (layout, bytes) in [("temp", &temp_bytes), ("closed", &closed)] {
+            let mut player = ReplayFilePlayer::new(bytes, false).unwrap();
+            assert!(player.keyframe_is_stored_full(12).unwrap(), "{layout}");
+            assert!(player.keyframe_is_stored_full(15).unwrap(), "{layout}");
+            assert!(!player.keyframe_is_stored_full(10).unwrap(), "{layout}");
+
+            for (frame, expected) in [(15u64, alternate.clone()), (12, state_for(12)), (25, state_for(25)), (15, alternate.clone())] {
+                // Park the chain somewhere unrelated first, so the seek cannot fold incrementally.
+                player.go_to_keyframe(0).unwrap();
+                player.next_packet().unwrap();
+
+                let folds = player.chain_folds();
+                player.go_to_keyframe(frame).unwrap();
+                match player.next_packet().unwrap() {
+                    Some(Packet::Keyframe { state, metadata }) => {
+                        assert_eq!(metadata.elapsed_frames, frame);
+                        assert_eq!(state.as_slice(), expected.as_slice(), "{layout}: state at {frame}");
+                    }
+                    other => panic!("{layout}: expected keyframe {frame}, got {other:?}")
+                }
+                let applied = player.chain_folds() - folds;
+                if frame == 25 {
+                    assert!(applied > 0, "{layout}: a delta keyframe is folded");
+                } else {
+                    assert_eq!(applied, 0, "{layout}: a seek to the full keyframe at {frame} folds nothing");
+                }
+            }
+
+            // A sequential walk still passes both keyframes of frame 15.
+            player.go_to_keyframe(0).unwrap();
+            let mut at_15 = 0;
+            while let Some(packet) = player.next_packet().unwrap() {
+                if matches!(packet, Packet::Keyframe { metadata, .. } if metadata.elapsed_frames == 15) {
+                    at_15 += 1;
+                }
+            }
+            assert_eq!(at_15, 2, "{layout}");
         }
     }
 

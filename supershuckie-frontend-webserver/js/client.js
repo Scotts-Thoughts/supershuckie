@@ -105,6 +105,73 @@ export class SuperShuckieClient {
         await this._handle_error(result)
     }
 
+    async bookmarks() {
+        const result = await fetch(this._construct_url(`bookmarks`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async add_bookmark(options = {}) {
+        const result = await fetch(this._construct_url(`add-bookmark${this._bookmark_query(options)}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async update_bookmark(id, options = {}) {
+        this._check_bookmark_id("update_bookmark", id)
+
+        const result = await fetch(this._construct_url(`update-bookmark${this._bookmark_query(options, { id })}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async delete_bookmark(id) {
+        this._check_bookmark_id("delete_bookmark", id)
+
+        const result = await fetch(this._construct_url(`delete-bookmark?id=${id}`))
+        await this._handle_error(result)
+    }
+
+    async toggle_range_bookmark(options = {}) {
+        const result = await fetch(this._construct_url(`toggle-range-bookmark${this._bookmark_query(options)}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async go_to_bookmark(id, point = "in") {
+        this._check_bookmark_id("go_to_bookmark", id)
+        if(point !== "in" && point !== "out") {
+            throw new TypeError("go_to_bookmark point must be \"in\" or \"out\"")
+        }
+
+        const result = await fetch(this._construct_url(`go-to-bookmark?id=${id}&point=${point}`))
+        await this._handle_error(result)
+    }
+
+    _check_bookmark_id(method, id) {
+        if(typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+            throw new TypeError(`${method} id must be an unsigned integer`)
+        }
+    }
+
+    _bookmark_query(options, extra = {}) {
+        const params = new URLSearchParams()
+        for(const [key, value] of Object.entries(extra)) {
+            params.set(key, String(value))
+        }
+        for(const key of ["name", "type", "type_id", "frame", "out", "keyframe"]) {
+            if(options[key] !== undefined && options[key] !== null) {
+                params.set(key, String(options[key]))
+            }
+        }
+        const query = params.toString()
+        return query === "" ? "" : `?${query}`
+    }
+
     _construct_url(resource) {
         return new URL(resource, this._server)
     }

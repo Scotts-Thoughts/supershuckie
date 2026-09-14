@@ -2,6 +2,7 @@ pub mod util;
 pub mod settings;
 pub mod replay_convert;
 pub mod memory_tools;
+pub mod bookmarks;
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -154,6 +155,12 @@ pub struct SuperShuckieFrontend {
     /// RAM viewer, search, watch, editing and freezing.
     memory_tools: memory_tools::MemoryTools,
 
+    /// The current replay's bookmarks.
+    bookmarks: bookmarks::ReplayBookmarks,
+
+    /// Changes whenever the user's bookmark types do (see [`Self::bookmark_generation`]).
+    bookmark_types_generation: u64,
+
     settings: Settings
 }
 
@@ -202,7 +209,9 @@ impl SuperShuckieFrontend {
             pending_conversion_plan: None,
             current_conversion: None,
             audio_output,
-            memory_tools
+            memory_tools,
+            bookmarks: bookmarks::ReplayBookmarks::new(),
+            bookmark_types_generation: 0
         };
 
         // This is not tied to the core, so we want to immediately enable this.
@@ -385,7 +394,7 @@ impl SuperShuckieFrontend {
             return Ok(false)
         }
 
-        let file = match std::fs::read(replay_file) {
+        let file = match std::fs::read(&replay_file) {
             Ok(n) => n,
             Err(e) => {
                 return Err(format!("Failed to read replay {name}:\n\n{e}").into())
@@ -420,8 +429,21 @@ impl SuperShuckieFrontend {
             timer_offset: metadata.timer_offset
         });
 
+        let bookmark_table = player.bookmark_table().clone();
+        let loaded_bookmarks = bookmarks::LoadedReplay {
+            name: name.to_owned(),
+            path: replay_file.clone(),
+            header: player.raw_header_bytes(),
+            version: player.get_replay_version(),
+            truncated: player.stream_truncated()
+        };
+
         // TODO: let the user supply their own bios override instead
         self.load_builtin_bios_override(metadata.bios_checksum);
+
+        // Whatever replay was loaded is going away (attaching replaces it even if it fails); save
+        // its bookmark changes first.
+        self.finish_replay_bookmarks();
 
         if current_emulator_type != expected_type || self.bios_override.is_some() {
             self.instantiate_and_load_core(expected_type);
@@ -450,6 +472,7 @@ impl SuperShuckieFrontend {
         self.save_file = Some(Arc::new("replay".into()));
         self.current_replay = Some(name.into());
         self.last_replay_and_frame = None;
+        self.bookmarks.set_playback(loaded_bookmarks, bookmark_table);
 
         Ok(true)
     }
@@ -460,6 +483,8 @@ impl SuperShuckieFrontend {
         let Some(r) = self.current_replay.take() else {
             return
         };
+
+        self.finish_replay_bookmarks();
 
         self.last_replay_and_frame = Some((r, self.last_read_elapsed_time_stats.frames));
         self.last_read_replay_stats = None;
@@ -1172,6 +1197,11 @@ impl SuperShuckieFrontend {
             if let Some(r) = self.recording_replay_file.take() {
                 errors += &format!("\n\nYour recording was stopped. The temp file ({}) was not deleted.", r.temp_replay_path.file_name().expect("no temp file filename???").display());
             }
+            self.bookmarks.clear();
+        }
+
+        if let Some(error) = self.tick_bookmarks() {
+            errors += &format!("{error}\n");
         }
 
         if let Some(mut s) = self.web_server.take() {
@@ -1237,6 +1267,7 @@ impl SuperShuckieFrontend {
                         frame_time_ms: frame_times.average_frame_micros as f64 / 1000.0,
                         frame_budget_ms: frame_times.budget_micros as f64 / 1000.0,
                         frames_over_budget: frame_times.frames_over_budget,
+                        bookmark_generation: what.bookmark_generation(),
                     })
                 }).clone()
             };
@@ -1245,6 +1276,10 @@ impl SuperShuckieFrontend {
                 match s {
                     SuperShuckieServerCommand::Stats(t) => {
                         let _ = t.send(make_stats(self, &stats).clone());
+                    }
+                    SuperShuckieServerCommand::Bookmarks(t, request) => {
+                        reset_stats(&mut stats);
+                        let _ = t.send(self.handle_bookmark_request(request));
                     }
                     SuperShuckieServerCommand::MarkStart(t, timer_offset) => {
                         reset_stats(&mut stats);
@@ -1559,7 +1594,12 @@ impl SuperShuckieFrontend {
         let save_states_dir = self.get_replays_dir_for_rom(current_rom_name.as_str());
 
         let (final_file, final_replay, final_replay_path) = self.load_file_or_make_generic(&save_states_dir, name, None, REPLAY_EXTENSION)?;
-        let (temp_file, _, temp_replay) = self.load_file_or_make_generic(&save_states_dir, name, Some("temp"), REPLAY_EXTENSION)?;
+        // An explicit name would give the temp file the final file's path (the generic prefix only
+        // applies to generic names), and stopping deletes the temp file.
+        let temp_name = name.map(|n| format!("temp-{n}"));
+        let (temp_file, _, temp_replay) = self.load_file_or_make_generic(&save_states_dir, temp_name.as_deref(), Some("temp"), REPLAY_EXTENSION)?;
+
+        self.finish_replay_bookmarks();
 
         if self.settings.replay.auto_pause_on_record {
             self.set_paused(true);
@@ -1585,6 +1625,8 @@ impl SuperShuckieFrontend {
             final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
             temp_file: BufWriter::with_capacity(8 * 1024 * 1024, temp_file),
         });
+
+        self.bookmarks.set_recording(replay_name_without_extension(&final_replay), Default::default());
 
         self.recording_replay_file = Some(ReplayFileInfo {
             final_replay_name: final_replay.clone().into(),
@@ -1676,11 +1718,21 @@ impl SuperShuckieFrontend {
             temp_file: BufWriter::with_capacity(8 * 1024 * 1024, temp_file),
         };
 
+        // The new replay starts with the source's bookmarks (including unsaved changes, which are
+        // saved into the source as well) up to the resume frame.
+        let resume_frame = resume_at_frame.map(|f| f as u64).unwrap_or(self.core.get_playback_total_frames() as u64);
+        let bookmarks = self.bookmarks.table().truncated_to(resume_frame);
+        if let Err(e) = self.flush_bookmarks() {
+            self.bookmarks_report(format!("Bookmark changes to {source_name} were not saved: {e}"));
+        }
+
         self.core.resume_recording_replay(
             resume_at_frame.map(|f| f as u64),
             partial,
             ResumeCropPolicy::PreserveStartDropEnd,
+            Some(bookmarks.clone()),
         );
+        self.bookmarks.set_recording(new_name.clone(), bookmarks);
 
         // load_replay_if_exists force-paused the game for playback positioning. Now that we're
         // recording live, honor auto_pause_on_record: pause if set, otherwise hand control back.
@@ -1939,6 +1991,10 @@ impl SuperShuckieFrontend {
         let zero_frames = self.core.get_elapsed_time().frames == 0;
 
         self.last_read_replay_stats = None;
+
+        // The recording's bookmarks are written when it closes; hand over the latest first.
+        self.push_bookmarks_to_core();
+        self.bookmarks.clear();
 
         self.core.stop_recording_replay();
         let _ = std::fs::remove_file(&replay_file.temp_replay_path);
@@ -2343,6 +2399,11 @@ pub enum SuperShuckieReplayState {
     NoReplay,
     Recording,
     Playback
+}
+
+/// `name.replay` -> `name`.
+fn replay_name_without_extension(file_name: &str) -> String {
+    file_name.strip_suffix(&format!(".{REPLAY_EXTENSION}")).unwrap_or(file_name).to_owned()
 }
 
 fn list_files_in_dir_with_extension(dir: &Path, extension: &str) -> Vec<UTF8CString> {

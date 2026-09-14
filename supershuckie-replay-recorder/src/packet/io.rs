@@ -299,6 +299,9 @@ pub enum PacketDiscriminator {
     /// Describes a keyframe with a region diff (format v4)
     RegionDeltaKeyframe = 0xF7,
 
+    /// Snapshot of the replay's bookmark table (format v5)
+    BookmarkTable = 0xF8,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -376,6 +379,7 @@ impl Packet {
             },
             Packet::ChangeSpeed { .. } => PacketDiscriminator::ChangeSpeed as u8,
             Packet::Bookmark { .. } => PacketDiscriminator::Bookmark as u8,
+            Packet::BookmarkTable { .. } => PacketDiscriminator::BookmarkTable as u8,
             Packet::Keyframe { .. } => PacketDiscriminator::Keyframe as u8,
             Packet::DeltaKeyframe { .. } => PacketDiscriminator::DeltaKeyframe as u8,
             Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframe as u8,
@@ -462,6 +466,10 @@ impl PacketIO<'_> for Packet {
                 commands.extend(metadata.write_packet_instructions());
             },
 
+            Packet::BookmarkTable { table } => {
+                commands.extend(table.write_packet_instructions());
+            },
+
             Packet::ChangeSpeed { speed } => {
                 commands.extend(speed.write_packet_instructions());
             },
@@ -536,6 +544,7 @@ impl PacketIO<'_> for Packet {
                 data: ByteVec::read_all(from, version)?
             }),
             PacketDiscriminator::Bookmark => Ok(Packet::Bookmark { metadata: BookmarkMetadata::read_all(from, version)? }),
+            PacketDiscriminator::BookmarkTable => Ok(Packet::BookmarkTable { table: crate::BookmarkTable::read_all(from, version)? }),
             PacketDiscriminator::ChangeSpeed => Ok(Packet::ChangeSpeed { speed: Speed::read_all(from, version)? }),
             PacketDiscriminator::CompressedBlob => Ok(Packet::CompressedBlob {
                 keyframes: Vec::read_all(from, version)?,
@@ -708,6 +717,13 @@ mod tests {
                 elapsed_frames_end: 4,
             },
             Packet::IncrementCounter { name: "c".into(), delta: -1 },
+            Packet::BookmarkTable { table: crate::BookmarkTable::new() },
+            Packet::BookmarkTable { table: {
+                let mut table = crate::BookmarkTable::new();
+                table.insert(crate::Bookmark { name: "b".into(), type_id: 3, in_frame: 9, in_millis: 10.into(), out: Some((12, 40.into())), keyframe: true, ..Default::default() });
+                table.set_type_record(crate::BookmarkTypeRecord { id: 3, name: "t".into(), color: 0xABCDEF });
+                table
+            } },
         ];
         for packet in &packets {
             assert_eq!(&round_trip(packet, REPLAY_VERSION), packet);
@@ -716,7 +732,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xF8, 0, 0];
+        let mut slice: &[u8] = &[0xF9, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 }

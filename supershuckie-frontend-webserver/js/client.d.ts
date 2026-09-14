@@ -78,6 +78,105 @@ export class SuperShuckieClient {
      * @param paused if true, pause. otherwise, unpause
      */
     set_paused(paused: boolean): Promise<void>
+
+    /**
+     * Get the bookmarks of the replay being recorded or played back
+     */
+    bookmarks(): Promise<SuperShuckieBookmarks>
+
+    /**
+     * Add a bookmark (at the current frame unless a frame is given)
+     * @param options name, type, frame, out and keyframe (all optional)
+     */
+    add_bookmark(options?: SuperShuckieBookmarkOptions): Promise<SuperShuckieBookmark>
+
+    /**
+     * Change a bookmark; only the options given change
+     * @param id bookmark id
+     * @param options name, type, frame and out (out: "none" removes it)
+     */
+    update_bookmark(id: number, options?: SuperShuckieBookmarkOptions): Promise<SuperShuckieBookmark>
+
+    /**
+     * Delete a bookmark
+     * @param id bookmark id
+     */
+    delete_bookmark(id: number): Promise<void>
+
+    /**
+     * Start a range bookmark at the current frame, or end the one started last
+     * @param options name, type and keyframe for a new range (all optional)
+     */
+    toggle_range_bookmark(options?: SuperShuckieBookmarkOptions): Promise<{ bookmark: SuperShuckieBookmark, started: boolean }>
+
+    /**
+     * Seek playback to a bookmark (playback only)
+     * @param id bookmark id
+     * @param point "in" (default) or "out"
+     */
+    go_to_bookmark(id: number, point?: "in" | "out"): Promise<void>
+}
+
+/**
+ * Options for adding and changing bookmarks (see external_commands.md)
+ */
+export interface SuperShuckieBookmarkOptions {
+    /** Name; a generic one is used when adding without it */
+    name?: string,
+    /** Type name (created if new); "none" for untyped */
+    type?: string,
+    /** Type id (hex), instead of type */
+    type_id?: string,
+    /** In frame; the current frame when adding without it */
+    frame?: number,
+    /** Out frame: a frame, "now", or "none" to remove it */
+    out?: number | "now" | "none",
+    /** Place a keyframe bookmark (adding only, without frame) */
+    keyframe?: boolean
+}
+
+/**
+ * A bookmark type
+ */
+export interface SuperShuckieBookmarkType {
+    /** 16 hex digits */
+    id: string,
+    name: string,
+    /** "#RRGGBB" */
+    color: string,
+    /** false if the type is only known from the replay, not the user's settings */
+    saved: boolean
+}
+
+/**
+ * A bookmark
+ */
+export interface SuperShuckieBookmark {
+    id: number,
+    name: string,
+    type: SuperShuckieBookmarkType | null,
+    in_frame: number,
+    in_millis: number,
+    out_frame: number | null,
+    out_millis: number | null,
+    keyframe: boolean
+}
+
+/**
+ * The current replay's bookmarks (see external_commands.md)
+ */
+export interface SuperShuckieBookmarks {
+    replay: string | null,
+    state: "none" | "recording" | "playback",
+    generation: number,
+    editable: boolean,
+    needs_upgrade: boolean,
+    replay_version: number | null,
+    problem: string | null,
+    open_range: number | null,
+    active_type: string | null,
+    bookmarks: SuperShuckieBookmark[],
+    types: SuperShuckieBookmarkType[]
 }
 
 /**
@@ -99,7 +198,15 @@ export interface SuperShuckieStats {
 
     counters: Record<string, number>,
 
-    current_speed: number
+    current_speed: number,
+
+    emulation_fps: number,
+    frame_time_ms: number,
+    frame_budget_ms: number,
+    frames_over_budget: number,
+
+    /** Changes whenever the bookmarks change; fetch bookmarks() when it does */
+    bookmark_generation: number
 }
 
 /**

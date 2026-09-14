@@ -19,7 +19,7 @@ use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
 use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
-use supershuckie_replay_recorder::{ByteVec, Packet, SignedInteger, TimestampMillis, UnsignedInteger};
+use supershuckie_replay_recorder::{BookmarkTable, ByteVec, Packet, SignedInteger, TimestampMillis, UnsignedInteger, KEYFRAME_BOOKMARK_LEAD_FRAMES};
 
 pub mod emulator;
 
@@ -88,6 +88,11 @@ pub struct SuperShuckieCore {
     frames_since_last_keyframe: u64,
     frames_per_keyframe: u64,
     total_frames: u64,
+
+    /// A keyframe bookmark asked for a full keyframe while a frame was partly emulated; it is
+    /// written when that frame completes (see [`Self::bookmark_anchor`]).
+    full_keyframe_pending: bool,
+
     ignore_speed_changes_in_replays: bool,
     auto_resync_keyframes_in_replays: bool,
 
@@ -121,6 +126,40 @@ pub struct SuperShuckieCore {
 
     /// Discard audio while the game runs at any speed other than 1x.
     audio_mute_when_sped_up: bool
+}
+
+/// Where a bookmark requested at the current moment goes (see
+/// [`SuperShuckieCore::bookmark_anchor`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct BookmarkAnchor {
+    /// The bookmark's in frame.
+    pub in_frame: UnsignedInteger,
+
+    /// Replay time at the in frame (for a keyframe bookmark, the time of its keyframe, a few frames
+    /// earlier).
+    pub in_millis: TimestampMillis,
+
+    /// Whether the replay has a keyframe the bookmark can be reached from without re-emulation.
+    pub keyframe: bool
+}
+
+/// Why no bookmark could be placed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum BookmarkAnchorError {
+    /// No replay is being recorded or played back.
+    NoReplay,
+
+    /// The core thread did not answer in time (it is busy, e.g. exporting a video).
+    Busy
+}
+
+impl Display for BookmarkAnchorError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NoReplay => f.write_str("Bookmarks need a replay that is recording or playing back."),
+            Self::Busy => f.write_str("The emulator is busy; try again in a moment.")
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -183,6 +222,7 @@ impl SuperShuckieCore {
             frames_since_last_keyframe: 0,
             frames_per_keyframe: 0,
             total_frames: 0,
+            full_keyframe_pending: false,
             replay_player: None,
             replay_stalled: false,
             paused_timer_at: None,
@@ -259,6 +299,12 @@ impl SuperShuckieCore {
     #[inline]
     pub fn is_playing_back(&self) -> bool {
         self.replay_player.is_some()
+    }
+
+    /// The attached replay player, if any (for diagnostics; the core drives its cursor).
+    #[inline]
+    pub fn replay_player(&self) -> Option<&ReplayFilePlayer> {
+        self.replay_player.as_ref()
     }
 
     /// How many `WriteMemory` packets of played-back replays could not be applied (for example a
@@ -511,6 +557,95 @@ impl SuperShuckieCore {
         Some((self.total_frames, self.total_milliseconds))
     }
 
+    /// Place a bookmark at the current moment of the replay being recorded or played back.
+    ///
+    /// A plain bookmark goes on the current frame (the last one completed, which is on screen). For
+    /// a keyframe bookmark while recording, a full keyframe is written right away and the bookmark
+    /// goes [`KEYFRAME_BOOKMARK_LEAD_FRAMES`] later, so that seeking to it loads exactly that
+    /// keyframe; if a frame is partly emulated (the Game Boy core runs in slices), the keyframe is
+    /// written when that frame completes instead, and the bookmark counts from it. Nothing is
+    /// emulated here: finishing a frame while paused would record it at the wrong time.
+    ///
+    /// During playback no keyframe can be written; the bookmark goes the same distance after the
+    /// replay's existing keyframe at or before that point.
+    pub fn bookmark_anchor(&mut self, keyframe: bool) -> Result<BookmarkAnchor, BookmarkAnchorError> {
+        if self.replay_file_recorder.is_some() {
+            let ms = self.total_milliseconds;
+
+            if !keyframe {
+                return Ok(BookmarkAnchor { in_frame: self.total_frames, in_millis: ms, keyframe: false })
+            }
+
+            if self.mid_frame {
+                self.full_keyframe_pending = true;
+                return Ok(BookmarkAnchor { in_frame: self.total_frames + 1 + KEYFRAME_BOOKMARK_LEAD_FRAMES, in_millis: ms, keyframe: true })
+            }
+
+            self.write_keyframe(true);
+            return Ok(BookmarkAnchor { in_frame: self.total_frames + KEYFRAME_BOOKMARK_LEAD_FRAMES, in_millis: ms, keyframe: true })
+        }
+
+        let Some(player) = self.replay_player.as_ref() else {
+            return Err(BookmarkAnchorError::NoReplay)
+        };
+
+        if !keyframe {
+            return Ok(BookmarkAnchor { in_frame: self.total_frames, in_millis: self.total_milliseconds, keyframe: false })
+        }
+
+        let latest = self.total_frames.saturating_sub(KEYFRAME_BOOKMARK_LEAD_FRAMES);
+        let (&frame, metadata) = player.all_keyframes().range(..=latest).next_back().expect("replays always have a keyframe at frame 0");
+        let in_millis = metadata.last().map(|m| m.elapsed_millis).unwrap_or_default();
+        Ok(BookmarkAnchor { in_frame: frame + KEYFRAME_BOOKMARK_LEAD_FRAMES, in_millis, keyframe: true })
+    }
+
+    /// Estimate the replay time at `frame` of the replay being recorded or played back, for a
+    /// bookmark placed at an explicit frame. Playback interpolates between the surrounding
+    /// keyframes; recording counts back from now at the console's nominal frame rate. `None` without
+    /// a replay.
+    pub fn estimate_millis_at(&self, frame: UnsignedInteger) -> Option<TimestampMillis> {
+        if let Some(player) = self.replay_player.as_ref() {
+            let keyframes = player.all_keyframes();
+            let before = keyframes.range(..=frame).next_back().and_then(|(&f, m)| Some((f, m.last()?.elapsed_millis.0)));
+            let after = keyframes.range(frame..).next().and_then(|(&f, m)| Some((f, m.first()?.elapsed_millis.0)))
+                .or(Some((player.get_total_frames(), player.get_total_milliseconds().0)));
+
+            return Some(match (before, after) {
+                (Some((f0, ms0)), Some((f1, ms1))) if f1 > f0 && frame >= f0 => {
+                    let frame = frame.min(f1);
+                    (ms0 + (ms1.saturating_sub(ms0)) * (frame - f0) / (f1 - f0)).into()
+                }
+                (Some((_, ms0)), _) => ms0.into(),
+                _ => 0.into()
+            })
+        }
+
+        if self.replay_file_recorder.is_some() {
+            let frames_back = self.total_frames.saturating_sub(frame);
+            let back_micros = frames_back.saturating_mul(self.nominal_frame_micros());
+            return Some(self.total_milliseconds.0.saturating_sub(back_micros / 1000).into())
+        }
+
+        None
+    }
+
+    /// Length of one frame at 1x speed on the loaded console, in microseconds.
+    fn nominal_frame_micros(&self) -> u64 {
+        match self.core.replay_console_type() {
+            // 4194304 Hz / 70224 cycles per frame = 59.7275 Hz (the GBA's refresh is the same)
+            Some(ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor | ReplayConsoleType::GameBoyAdvance) => 16_743,
+            // 59.8261 Hz
+            Some(ReplayConsoleType::NintendoDS) => 16_715,
+            _ => 16_667
+        }
+    }
+
+    /// Replace the bookmarks of the replay being recorded (written into it; see
+    /// `ReplayFileRecorder::set_bookmark_table`). Does nothing when not recording.
+    pub fn set_replay_bookmarks(&mut self, table: BookmarkTable) {
+        self.with_recorder(|r| r.set_bookmark_table(table));
+    }
+
     fn handle_replay(&mut self) {
         if self.replay_stalled {
             return
@@ -559,7 +694,7 @@ impl SuperShuckieCore {
                             let _ = self.core.load_save_state(state.as_slice());
                             self.bump_state_epoch();
                         },
-                        Packet::Bookmark { .. } => {}
+                        Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => {}
                         Packet::Keyframe { .. } => {
                             if self.auto_resync_keyframes_in_replays {
                                 // The player is told not to copy states into packets (see
@@ -805,6 +940,7 @@ impl SuperShuckieCore {
         )?);
 
         self.frames_per_keyframe = partial_replay_record_metadata.frames_per_keyframe.get();
+        self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(recorder));
         self.replay_counters = Some(BTreeMap::new());
 
@@ -817,11 +953,14 @@ impl SuperShuckieCore {
     /// `attach_replay_player`); this method consumes that player to build the new file's prefix and
     /// then continues recording live. `resume_at_frame == None` resumes from the final frame. Never
     /// mutates the source.
+    ///
+    /// The new file starts with `bookmarks` (`None` = the source's) cut at the resume frame.
     pub fn resume_recording_replay<FS, TS>(
         &mut self,
         resume_at_frame: Option<UnsignedInteger>,
         partial: PartialReplayRecordMetadata<FS, TS>,
         crop_policy: ResumeCropPolicy,
+        bookmarks: Option<BookmarkTable>,
     ) -> Result<(), ReplayResumeError>
     where
         FS: ReplayFileSink + Send + Sync + 'static,
@@ -855,6 +994,7 @@ impl SuperShuckieCore {
             resume_at_frame,
             partial.settings,
             crop_policy,
+            bookmarks,
             partial.final_file,
             partial.temp_file,
         )?;
@@ -882,6 +1022,7 @@ impl SuperShuckieCore {
         self.core.set_input_encoded(info.input.as_slice());
 
         // Install the resumed recorder.
+        self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(NonBlockingReplayFileRecorder::new(recorder)));
         self.frames_per_keyframe = partial.frames_per_keyframe.get();
 
@@ -990,23 +1131,41 @@ impl SuperShuckieCore {
     }
 
     fn push_keyframe_if_needed(&mut self) {
-        if self.mid_frame || self.replay_file_recorder.is_none() || self.frames_since_last_keyframe < self.frames_per_keyframe {
+        if self.mid_frame || self.replay_file_recorder.is_none() {
             return
         }
 
+        let full = core::mem::take(&mut self.full_keyframe_pending);
+        if full || self.frames_since_last_keyframe >= self.frames_per_keyframe {
+            self.write_keyframe(full);
+        }
+    }
+
+    /// Write a keyframe of the current state into the recording (always stored in full if `full`)
+    /// and restart the keyframe interval.
+    fn write_keyframe(&mut self, full: bool) {
         self.frames_since_last_keyframe = 0;
         let ms = self.total_milliseconds;
 
-        // Fill a recycled buffer: a fresh multi-megabyte allocation costs milliseconds of page
-        // faults, a reused one is a plain copy.
+        let mut buffer = self.take_state_buffer();
+        self.core.create_save_state_into(&mut buffer);
+        self.with_recorder(|f| if full {
+            f.insert_keyframe_full(ByteVec::Heap(buffer), ms)
+        }
+        else {
+            f.insert_keyframe(ByteVec::Heap(buffer), ms)
+        });
+    }
+
+    /// A buffer to create a keyframe state into: a recycled one when available, since a fresh
+    /// multi-megabyte allocation costs milliseconds of page faults and a reused one is a plain copy.
+    fn take_state_buffer(&mut self) -> Vec<u8> {
         while self.state_buffers.len() < Self::STATE_BUFFER_POOL
             && let Some(buffer) = self.replay_file_recorder.as_mut().and_then(|r| r.take_free_state_buffer())
         {
             self.state_buffers.push(buffer);
         }
-        let mut buffer = self.state_buffers.pop().unwrap_or_default();
-        self.core.create_save_state_into(&mut buffer);
-        self.with_recorder(|f| f.insert_keyframe(ByteVec::Heap(buffer), ms));
+        self.state_buffers.pop().unwrap_or_default()
     }
 
     /// Attach a replay file player to the core.
@@ -1098,12 +1257,17 @@ impl SuperShuckieCore {
 
     /// Minimum number of frames emulated after loading a keyframe when seeking.
     ///
+    /// Keyframe bookmarks sit this many frames after their keyframe
+    /// ([`KEYFRAME_BOOKMARK_LEAD_FRAMES`]), so a seek to one loads exactly that keyframe.
+    ///
     /// A keyframe loaded from the middle of a delta chain may hold its chain restart's stale copy
     /// of regenerated output buffers (see [`transient_ranges`]); the game rebuilds them on its next
     /// frame (or the one after, for games that only resubmit 3D geometry every other frame), so a
     /// seek always emulates at least this many frames past the keyframe before a frame is shown.
     /// A consumer stepping from [`Self::go_to_replay_keyframe`] itself must do the same.
     pub const POST_LOAD_FRAMES: u64 = 3;
+
+    const _KEYFRAME_BOOKMARKS_MATCH_SEEKS: () = assert!(Self::POST_LOAD_FRAMES == KEYFRAME_BOOKMARK_LEAD_FRAMES);
 
     /// Seek to the given frame (if playing back).
     ///

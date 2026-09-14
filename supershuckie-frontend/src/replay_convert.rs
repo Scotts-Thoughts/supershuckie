@@ -18,6 +18,8 @@ use supershuckie_replay_recorder::replay_file::convert::{
 };
 pub use supershuckie_replay_recorder::replay_file::convert::ConvertPhase;
 use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
+use supershuckie_replay_recorder::replay_file::REPLAY_VERSION_CURRENT_ENCODING;
+#[cfg(test)]
 use supershuckie_replay_recorder::replay_file::REPLAY_VERSION;
 
 /// File extension of replays.
@@ -58,7 +60,7 @@ impl ConversionPlan {
 
         let mut skipped = Vec::new();
         if self.skipped_current > 0 {
-            skipped.push(format!("{} already format v{REPLAY_VERSION}", self.skipped_current));
+            skipped.push(format!("{} already format v{REPLAY_VERSION_CURRENT_ENCODING} or newer", self.skipped_current));
         }
         if self.skipped_recent > 0 {
             skipped.push(format!("{} written in the last 10 minutes", self.skipped_recent));
@@ -91,7 +93,7 @@ fn plan_file(plan: &mut ConversionPlan, path: PathBuf, exclude: &[PathBuf]) {
     }
 
     match replay_file_version(&path) {
-        Ok(version) if version >= REPLAY_VERSION => plan.skipped_current += 1,
+        Ok(version) if version >= REPLAY_VERSION_CURRENT_ENCODING => plan.skipped_current += 1,
         Ok(_) => {
             plan.total_bytes += metadata.len();
             plan.files.push(path);
@@ -131,7 +133,7 @@ pub fn plan_conversion(path: &Path, exclude: &[PathBuf]) -> Result<ConversionPla
         plan_file(&mut plan, path.to_path_buf(), exclude);
         if plan.files.is_empty() {
             return match (plan.skipped_current, plan.skipped_recent) {
-                (1, _) => Err(format!("{} is already format v{REPLAY_VERSION}.", path.display())),
+                (1, _) => Err(format!("{} is already format v{REPLAY_VERSION_CURRENT_ENCODING} or newer.", path.display())),
                 (_, 1) => Err(format!("{} was written in the last 10 minutes; if it is being recorded, stop the recording first.", path.display())),
                 _ => Err(format!("{} could not be read as a replay.", path.display())),
             };
@@ -478,7 +480,7 @@ mod tests {
         std::fs::write(replays.join("notes.txt"), b"ignored").unwrap();
         std::fs::write(replays.join("leftover.v4-tmp.replay"), V3_SMALL_CLOSED).unwrap();
 
-        // A v4 file: convert one first.
+        // A current file: convert one first.
         let current = replays.join("current.replay");
         let job = ConversionJob::start(plan_conversion(&old, &[]).unwrap(), ReplayFileRecorderSettings::default(), false);
         let summary = wait(job);
@@ -495,7 +497,7 @@ mod tests {
         assert!(plan.describe().starts_with("1 replay ("));
 
         // Single-file plans explain why nothing would be done.
-        assert!(plan_conversion(&current, &[]).unwrap_err().contains("already format v4"));
+        assert!(plan_conversion(&current, &[]).unwrap_err().contains("already format v4 or newer"));
         assert!(plan_conversion(&recent, &[]).unwrap_err().contains("last 10 minutes"));
         assert!(plan_conversion(&junk, &[]).unwrap_err().contains("could not be read"));
         assert!(plan_conversion(&replays.join("notes.txt"), &[]).is_err());
@@ -533,7 +535,7 @@ mod tests {
         assert!(summary.describe().contains("Converted 2 of 3 replays"));
         assert!(summary.describe().contains("FAILED"));
 
-        // Converted files are v4 and smaller; originals sit in .bak files; the bad one is untouched.
+        // Converted files are current and smaller; originals sit in .bak files; the bad one is untouched.
         assert_eq!(replay_file_version(&a).unwrap(), REPLAY_VERSION);
         assert_eq!(replay_file_version(&b).unwrap(), REPLAY_VERSION);
         assert!(std::fs::metadata(&a).unwrap().len() < V3_SMALL_CLOSED.len() as u64);

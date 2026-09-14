@@ -20,7 +20,9 @@ use crate::replay_file::playback::ReplayFilePlayer;
 use crate::replay_file::record::{
     build_reencoded_recorder, NullReplayFileSink, ReplayFileRecorderSettings, ReplayResumeError,
 };
+use crate::replay_file::playback::ReplayFileReadError;
 use crate::replay_file::{ReplayConsoleType, ReplayHeaderBytes, ReplayHeaderRaw};
+use crate::util::launder_reference;
 use crate::{Packet, UnsignedInteger};
 
 /// How to re-encode a replay.
@@ -277,10 +279,27 @@ fn check_states(console: ReplayConsoleType, masked: bool, frame: UnsignedInteger
     Ok(())
 }
 
+/// The next packet that is not a bookmark packet. Bookmark packets are compared as whole tables
+/// instead: the output carries the source's table as snapshots of its own, not the source's
+/// `Bookmark`/`BookmarkTable` packets.
+fn next_non_bookmark_packet(player: &mut ReplayFilePlayer) -> Result<Option<&Packet>, ReplayFileReadError> {
+    loop {
+        let packet = player.next_packet()?;
+        if matches!(packet, Some(Packet::Bookmark { .. } | Packet::BookmarkTable { .. })) {
+            continue;
+        }
+        // SAFETY: the packet is owned by `player` and stays valid until its next `next_packet`
+        // call, which the caller's borrow of `player` rules out; laundering only works around the
+        // borrow checker rejecting a borrow returned from one iteration of a loop that re-borrows.
+        return Ok(packet.map(|p| unsafe { launder_reference(p) }));
+    }
+}
+
 /// Re-open `input` and `output` and check that they describe the same replay: same totals,
-/// header metadata, patch, keyframe and bookmark indexes, and the same packet stream, with every
+/// header metadata, patch, keyframe index and bookmarks, and the same packet stream, with every
 /// keyframe state reconstructing bit-exactly — outside the transient ranges if `masked` (the
-/// output was written with `mask_transient_buffers`).
+/// output was written with `mask_transient_buffers`). Keyframes that the output's keyframe
+/// bookmarks rely on must be stored full.
 pub fn verify_replay_files(
     input: &Path,
     output: &Path,
@@ -299,14 +318,16 @@ pub fn verify_replay_files(
     check_eq("header metadata", source.get_replay_metadata(), result.get_replay_metadata())?;
     check_eq("patch data", source.get_patch_data(), result.get_patch_data())?;
     check_eq("keyframe frames", source.all_keyframes().keys().collect::<Vec<_>>(), result.all_keyframes().keys().collect::<Vec<_>>())?;
-    let bookmark_index = |player: &ReplayFilePlayer| {
-        player
-            .all_bookmarks()
-            .iter()
-            .map(|(name, list)| (name.clone(), list.iter().map(|b| (b.elapsed_frames, b.elapsed_millis)).collect::<Vec<_>>()))
-            .collect::<Vec<_>>()
-    };
-    check_eq("bookmarks", bookmark_index(&source), bookmark_index(&result))?;
+    check_eq("bookmarks", source.bookmark_table(), result.bookmark_table())?;
+    if let Some(error) = result.bookmark_section_error() {
+        return Err(format!("output: the bookmark section is unusable: {error}").into());
+    }
+    for frame in result.bookmark_table().keyframe_anchor_frames().collect::<Vec<_>>() {
+        let full = result.keyframe_is_stored_full(frame).map_err(|e| format!("output: cannot read the keyframe a keyframe bookmark relies on at frame {frame}: {e:?}"))?;
+        if !full {
+            return Err(format!("output: the keyframe a keyframe bookmark relies on at frame {frame} is not stored full").into());
+        }
+    }
     let console = source.get_replay_metadata().console_type;
 
     source.go_to_keyframe(0).map_err(|e| format!("source: cannot seek to frame 0: {e:?}"))?;
@@ -318,8 +339,8 @@ pub fn verify_replay_files(
     let mut frames = 0u64;
 
     loop {
-        let a = source.next_packet().map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?;
-        let b = result.next_packet().map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?;
+        let a = next_non_bookmark_packet(&mut source).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?;
+        let b = next_non_bookmark_packet(&mut result).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?;
 
         let (a, b) = match (a, b) {
             (None, None) => break,
@@ -418,13 +439,17 @@ mod tests {
         assert_eq!(verify.keyframes as usize, keyframe_frames().len());
         assert!(verify.packets > 200);
 
-        // A tampered output fails verification.
-        let mut bytes = std::fs::read(&output).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        let tampered = dir.join("tampered.replay");
-        std::fs::write(&tampered, &bytes).unwrap();
-        assert!(matches!(verify_replay_files(&input, &tampered, true, false, &mut |_, _, _| true), Err(ConvertError::Failed(_))));
+        // A tampered output fails verification, whether the damage is in the packets or in the
+        // bookmark section.
+        let bytes = std::fs::read(&output).unwrap();
+        let stream_end = ReplayHeaderRaw::from_bytes(bytes[..2048].try_into().unwrap()).packet_stream_end().unwrap() as usize;
+        for at in [stream_end - 1, bytes.len() - 1] {
+            let mut tampered_bytes = bytes.clone();
+            tampered_bytes[at] ^= 0xFF;
+            let tampered = dir.join("tampered.replay");
+            std::fs::write(&tampered, &tampered_bytes).unwrap();
+            assert!(matches!(verify_replay_files(&input, &tampered, true, false, &mut |_, _, _| true), Err(ConvertError::Failed(_))), "damage at byte {at}");
+        }
 
         // Cancelling removes the partial output.
         let cancelled = dir.join("cancelled.replay");

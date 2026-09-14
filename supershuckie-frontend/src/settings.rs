@@ -83,6 +83,9 @@ pub struct Settings {
     #[serde(default = "MemoryToolsSettings::default")]
     pub memory_tools: MemoryToolsSettings,
 
+    #[serde(default = "BookmarkSettings::default")]
+    pub bookmarks: BookmarkSettings,
+
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub custom: BTreeMap<String, UTF8CString>
@@ -287,6 +290,106 @@ impl MemoryToolsSettings {
 impl Default for MemoryToolsSettings {
     fn default() -> Self {
         Self { confirm_writes_while_recording: Self::DEFAULT_CONFIRM_WRITES_WHILE_RECORDING() }
+    }
+}
+
+/// Replay bookmark types and preferences.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct BookmarkSettings {
+    /// The user's bookmark types, in the order they were created.
+    #[serde(default = "Vec::new")]
+    pub types: Vec<BookmarkTypeSetting>,
+
+    /// Type given to new bookmarks unless one is asked for; 0 is untyped.
+    #[serde(default = "BookmarkSettings::DEFAULT_ACTIVE_TYPE", with = "hex_type_id")]
+    pub active_type: u64,
+
+    /// Ask before the first bookmark edit upgrades a pre-v5 replay (older builds cannot open it
+    /// afterwards).
+    #[serde(default = "BookmarkSettings::DEFAULT_CONFIRM_REPLAY_UPGRADE")]
+    pub confirm_replay_upgrade: bool
+}
+
+impl BookmarkSettings {
+    const DEFAULT_ACTIVE_TYPE: fn() -> u64 = || 0;
+    const DEFAULT_CONFIRM_REPLAY_UPGRADE: fn() -> bool = || true;
+
+    /// The type with this id.
+    pub fn get_type(&self, id: u64) -> Option<&BookmarkTypeSetting> {
+        (id != 0).then(|| self.types.iter().find(|t| t.id == id)).flatten()
+    }
+}
+
+impl Default for BookmarkSettings {
+    fn default() -> Self {
+        Self {
+            types: Vec::new(),
+            active_type: Self::DEFAULT_ACTIVE_TYPE(),
+            confirm_replay_upgrade: Self::DEFAULT_CONFIRM_REPLAY_UPGRADE()
+        }
+    }
+}
+
+/// A user-defined bookmark type.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct BookmarkTypeSetting {
+    /// Non-zero id, stored in replays as well; written as 16 hex digits.
+    #[serde(with = "hex_type_id")]
+    pub id: u64,
+
+    pub name: String,
+
+    /// `0xRRGGBB`; written as `#RRGGBB`.
+    #[serde(with = "hex_color")]
+    pub color: u32
+}
+
+/// Bookmark type ids as 16 hex digits (`""` for 0), so they survive JSON readers that cannot hold a u64.
+pub mod hex_type_id {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn format(id: u64) -> String {
+        if id == 0 { String::new() } else { format!("{id:016x}") }
+    }
+
+    pub fn parse(text: &str) -> Option<u64> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Some(0)
+        }
+        u64::from_str_radix(text, 16).ok()
+    }
+
+    pub fn serialize<S: Serializer>(id: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format(*id))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse(&text).ok_or_else(|| serde::de::Error::custom(format!("invalid bookmark type id {text:?}")))
+    }
+}
+
+/// Colors as `#RRGGBB`.
+pub mod hex_color {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn format(color: u32) -> String {
+        format!("#{:06X}", color & 0xFF_FFFF)
+    }
+
+    pub fn parse(text: &str) -> Option<u32> {
+        let hex = text.trim().strip_prefix('#')?;
+        (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit())).then(|| u32::from_str_radix(hex, 16).ok()).flatten()
+    }
+
+    pub fn serialize<S: Serializer>(color: &u32, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format(*color))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse(&text).ok_or_else(|| serde::de::Error::custom(format!("invalid color {text:?} (expected #RRGGBB)")))
     }
 }
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Batch-converts old Super Shuckie replays (format v2/v3) to format v4 in place, verifying each one.
+    Batch-converts old Super Shuckie replays (format v2/v3) to the current format in place, verifying each one.
 
 .DESCRIPTION
     Walks every "*-data\replays\*.replay" under -Root, skips files that are already v4, and for the

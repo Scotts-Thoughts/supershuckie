@@ -29,6 +29,11 @@ sample rate, ROM hash (blake3, lowercase hex) and names, recording core, keyfram
 bookmarks, crop range and counters. A 120 MB DS replay probes in well under 100 ms. A file it
 cannot read prints `{"error": "..."}` and exits 1.
 
+Each bookmark in the probe is `{"name", "frame", "id", "out_frame", "keyframe", "type"}`: `frame`
+is the in frame, `out_frame` is `null` for a point, and `type` is `{"name", "color": "#RRGGBB"}` as
+recorded in the replay, or `null`. The `Info` reply carries only each bookmark's name and in frame,
+in frame order, as the protocol defines.
+
 ## What "frame `n`" means
 
 Picture `n` is what the screens hold after `n` emulated frames, with picture `0` being the first

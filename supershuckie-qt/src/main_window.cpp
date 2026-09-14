@@ -39,6 +39,7 @@
 #include "replay_playback_controls.hpp"
 #include "video_export_dialog.hpp"
 #include "memory_tools_controller.hpp"
+#include "bookmark_window.hpp"
 
 #include <QProgressDialog>
 #include <QToolButton>
@@ -46,6 +47,8 @@
 #include <QThread>
 #include <QPushButton>
 #include <QCoreApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 using namespace SuperShuckie64;
 
@@ -54,6 +57,7 @@ static const char *WINDOW_XY = "qt__window_xy";
 static const char *DISPLAY_STATUS_BAR = "qt__display_status_bar";
 static const char *KEYBOARD_REPLAY_CONTROLS_DISABLED = "qt__replay_controls_disabled";
 static const char *HORIZONTAL_NDS = "qt__horizontal_nds";
+static const char *BOOKMARK_WINDOW_STATE = "qt__bookmark_window";
 
 class SuperShuckie64::SuperShuckieTimestamp: public QWidget {
 public:
@@ -280,6 +284,12 @@ MainWindow::MainWindow(): QMainWindow() {
 
     this->memory_tools = new MemoryToolsController(this);
     this->memory_tools->restore_windows();
+
+    const char *bookmark_window_state = supershuckie_frontend_get_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE);
+    if(bookmark_window_state != nullptr) {
+        this->bookmark_window = new BookmarkWindow(this);
+        this->bookmark_window->restore_state(QString::fromUtf8(bookmark_window_state));
+    }
     this->confirm_ram_writes->setChecked(supershuckie_frontend_memory_get_confirm_writes_while_recording(this->frontend));
 
     this->ticker.start();
@@ -452,6 +462,10 @@ void MainWindow::tick() {
     }
 
     this->playback_bar->tick();
+
+    if(this->bookmark_window != nullptr && this->bookmark_window->isVisible()) {
+        this->bookmark_window->tick();
+    }
 
     if(--this->memory_status_countdown <= 0) {
         this->memory_status_countdown = 100;
@@ -673,6 +687,27 @@ void MainWindow::set_up_replays_menu() {
 
     this->replays_menu->addSeparator();
 
+    // Bookmarks: the shortcuts also work while the bookmark window has focus.
+    this->add_bookmark = this->replays_menu->addAction("Add bookmark");
+    this->add_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_B));
+    this->add_keyframe_bookmark = this->replays_menu->addAction("Add keyframe bookmark");
+    this->add_keyframe_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_B));
+    this->toggle_range_bookmark = this->replays_menu->addAction("Start/end range bookmark");
+    this->toggle_range_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_B));
+    this->add_bookmark_at_frame = this->replays_menu->addAction("Add bookmark at frame…");
+    this->open_bookmarks = this->replays_menu->addAction("Bookmarks…");
+    this->open_bookmarks->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier | Qt::ShiftModifier, Qt::Key_B));
+    for(auto *action : { this->add_bookmark, this->add_keyframe_bookmark, this->toggle_range_bookmark, this->open_bookmarks }) {
+        action->setShortcutContext(Qt::ApplicationShortcut);
+    }
+    connect(this->add_bookmark, SIGNAL(triggered()), this, SLOT(do_add_bookmark()));
+    connect(this->add_keyframe_bookmark, SIGNAL(triggered()), this, SLOT(do_add_keyframe_bookmark()));
+    connect(this->toggle_range_bookmark, SIGNAL(triggered()), this, SLOT(do_toggle_range_bookmark()));
+    connect(this->add_bookmark_at_frame, SIGNAL(triggered()), this, SLOT(do_add_bookmark_at_frame()));
+    connect(this->open_bookmarks, SIGNAL(triggered()), this, SLOT(do_open_bookmarks()));
+
+    this->replays_menu->addSeparator();
+
     this->export_video = this->replays_menu->addAction("Export video…");
 
     this->replays_menu->addSeparator();
@@ -865,6 +900,83 @@ void MainWindow::set_up_tools_menu() {
     connect(reload_tables, SIGNAL(triggered()), this, SLOT(do_reload_tables()));
 }
 
+QWidget *MainWindow::bookmark_dialog_parent() {
+    if(this->bookmark_window != nullptr && this->bookmark_window->isActiveWindow()) {
+        return this->bookmark_window;
+    }
+    return this;
+}
+
+void MainWindow::add_bookmark_now(bool keyframe) {
+    auto *frontend = this->frontend;
+    const char *request = keyframe ? "{\"keyframe\":true}" : "{}";
+    auto result = BookmarkWindow::run_operation(this, this->bookmark_dialog_parent(), [frontend, request](bool allow_upgrade, char *out, std::size_t out_len) {
+        return supershuckie_frontend_bookmark_add_json(frontend, request, allow_upgrade, out, out_len);
+    });
+    if(!result.has_value()) {
+        return;
+    }
+    auto text = QString("Added %1bookmark \"%2\" at frame %3")
+        .arg(keyframe ? "keyframe " : "")
+        .arg((*result)["name"].toString())
+        .arg(static_cast<qulonglong>((*result)["in_frame"].toDouble()));
+    this->set_title(text.toUtf8().constData());
+}
+
+void MainWindow::do_add_bookmark() {
+    this->add_bookmark_now(false);
+}
+
+void MainWindow::do_add_keyframe_bookmark() {
+    this->add_bookmark_now(true);
+}
+
+void MainWindow::do_toggle_range_bookmark() {
+    auto *frontend = this->frontend;
+    auto result = BookmarkWindow::run_operation(this, this->bookmark_dialog_parent(), [frontend](bool allow_upgrade, char *out, std::size_t out_len) {
+        return supershuckie_frontend_bookmark_toggle_range_json(frontend, "{}", allow_upgrade, out, out_len);
+    });
+    if(!result.has_value()) {
+        return;
+    }
+    auto bookmark = (*result)["bookmark"].toObject();
+    auto in_frame = static_cast<qulonglong>(bookmark["in_frame"].toDouble());
+    QString text;
+    if((*result)["started"].toBool()) {
+        text = QString("Started range bookmark \"%1\" at frame %2").arg(bookmark["name"].toString()).arg(in_frame);
+    }
+    else {
+        text = QString("Ended range bookmark \"%1\" (frames %2 to %3)").arg(bookmark["name"].toString()).arg(in_frame).arg(static_cast<qulonglong>(bookmark["out_frame"].toDouble()));
+    }
+    this->set_title(text.toUtf8().constData());
+}
+
+void MainWindow::do_add_bookmark_at_frame() {
+    AddBookmarkDialog dialog(this, this->bookmark_dialog_parent());
+    if(dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+    auto *frontend = this->frontend;
+    auto request = QJsonDocument(dialog.request()).toJson(QJsonDocument::Compact).toStdString();
+    auto result = BookmarkWindow::run_operation(this, this->bookmark_dialog_parent(), [frontend, &request](bool allow_upgrade, char *out, std::size_t out_len) {
+        return supershuckie_frontend_bookmark_add_json(frontend, request.c_str(), allow_upgrade, out, out_len);
+    });
+    if(result.has_value()) {
+        auto text = QString("Added bookmark \"%1\" at frame %2").arg((*result)["name"].toString()).arg(static_cast<qulonglong>((*result)["in_frame"].toDouble()));
+        this->set_title(text.toUtf8().constData());
+    }
+}
+
+void MainWindow::do_open_bookmarks() {
+    if(this->bookmark_window == nullptr) {
+        this->bookmark_window = new BookmarkWindow(this);
+    }
+    this->bookmark_window->show();
+    this->bookmark_window->raise();
+    this->bookmark_window->activateWindow();
+    this->bookmark_window->tick();
+}
+
 void MainWindow::do_open_ram_viewer() {
     if(this->memory_tools != nullptr) {
         this->memory_tools->open_viewer();
@@ -1034,6 +1146,11 @@ void MainWindow::refresh_action_states() {
     }
 
     this->continue_last_replay->setEnabled(this->frontend != nullptr && supershuckie_frontend_can_continue_last_replay(this->frontend));
+
+    bool bookmarks_available = game_loaded && replay_state != SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
+    for(auto *action : { this->add_bookmark, this->add_keyframe_bookmark, this->toggle_range_bookmark, this->add_bookmark_at_frame }) {
+        action->setEnabled(bookmarks_available);
+    }
 
     auto volume = this->frontend != nullptr ? supershuckie_frontend_get_audio_volume(this->frontend) : 100;
     for(auto *v : this->audio_volumes) {
@@ -1251,7 +1368,14 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         if(this->memory_tools != nullptr) {
             this->memory_tools->save_windows();
         }
+        if(this->bookmark_window != nullptr) {
+            supershuckie_frontend_set_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE, this->bookmark_window->save_state().toUtf8().constData());
+        }
         supershuckie_frontend_watch_save(this->frontend);
+        char bookmark_error[512] = {};
+        if(!supershuckie_frontend_bookmark_flush(this->frontend, bookmark_error, sizeof(bookmark_error))) {
+            DISPLAY_ERROR_DIALOG("Bookmarks were not saved", "%s", bookmark_error);
+        }
         supershuckie_frontend_stop_recording_replay(this->frontend);
         supershuckie_frontend_write_settings(this->frontend);
         supershuckie_frontend_save_sram(this->frontend, nullptr, 0);
