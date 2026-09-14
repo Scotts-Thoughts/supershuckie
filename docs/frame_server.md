@@ -54,6 +54,15 @@ so audio is always one emulated second per 48 000 samples.
 
 The DS core runs the interpreter only: the JIT is not reproducible against recorded keyframes.
 
+## One file on Windows
+
+The Windows build links libstdc++ and winpthread as static archives (`build.rs` names
+`libstdc++.a` and `libpthread.a` outright), so the executable is the whole install: point the
+editor at it and nothing else has to be beside it or on `PATH`. `objdump -p
+supershuckie-frame-server.exe | findstr DLL` should list only system libraries (`KERNEL32`,
+`msvcrt`, `SHLWAPI`, …); a `libstdc++-6.dll` or `libgcc_s_seh-1.dll` in that list means the
+static archives were not found and the import libraries were taken instead.
+
 ## Stdout is the wire
 
 Nothing but protocol bytes may reach standard output. Before the first request is read, `serve`

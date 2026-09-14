@@ -53,15 +53,31 @@ fn main() {
             group.push_str(&dir.join(format!("lib{lib}.a")).display().to_string());
         }
         for lib in [
-            "shlwapi", "ws2_32", "ole32", "shell32", "mingwex", "msvcrt", "stdc++", "kernel32",
-            "advapi32", "uuid", "gcc", "gcc_eh",
+            "shlwapi", "ws2_32", "ole32", "shell32", "mingwex", "msvcrt", "kernel32", "advapi32",
+            "uuid", "gcc", "gcc_eh",
         ] {
             group.push(',');
             group.push_str("-l");
             group.push_str(lib);
         }
+        // The C++ runtime, as static archives named outright. `-lstdc++` takes mingw's
+        // `libstdc++.dll.a` when both flavours are installed, and the server then needs
+        // `libstdc++-6.dll`, `libgcc_s_seh-1.dll` and `libwinpthread-1.dll` beside it or on
+        // PATH — three files nobody copying one executable knows about, and an exit with
+        // 0xC0000135 (STATUS_DLL_NOT_FOUND) before the first byte of protocol when they are
+        // missing. `-l:` names the archive file itself, so the runtime goes into the
+        // executable and pointing Cutter at the .exe is the whole setup. libstdc++'s thread
+        // support comes from libpthread.a, the static winpthread rustc itself links by that
+        // name, and it sits in the group for the same ordering reason as everything else.
+        for archive in ["libstdc++.a", "libpthread.a"] {
+            group.push_str(",-l:");
+            group.push_str(archive);
+        }
         group.push_str(",--end-group");
         println!("cargo:rustc-link-arg={group}");
+        // And tell the driver the same, for any runtime library it adds on its own.
+        println!("cargo:rustc-link-arg=-static-libgcc");
+        println!("cargo:rustc-link-arg=-static-libstdc++");
     } else {
         for (dir, lib) in &core_libs {
             println!("cargo:rustc-link-search=native={}", dir.display());
