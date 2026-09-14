@@ -8,10 +8,12 @@
 #include <chrono>
 #include <supershuckie/supershuckie.h>
 #include "sdl_event_wrapper.hpp"
+#include "shortcuts_settings_window.hpp"
 
 class QMenu;
 class QAction;
 class QCloseEvent;
+class QKeyEvent;
 class QLabel;
 class QToolButton;
 
@@ -50,6 +52,7 @@ class MainWindow: public QMainWindow {
     friend AskForTextDialog;
     friend SelectItemDialog;
     friend ControlsSettingsWindow;
+    friend ShortcutsSettingsWindow;
     friend ReplayPlaybackControls;
     friend NDSDateDialog;
     friend StringAction;
@@ -181,6 +184,21 @@ private:
     QAction *quick_load_save_states[QUICK_SAVE_STATE_COUNT];
     QAction *quick_save_save_states[QUICK_SAVE_STATE_COUNT];
 
+    QAction *playback_toggle_pause;
+    QAction *playback_skip_back;
+    QAction *playback_skip_forward;
+    QAction *playback_step_back;
+    QAction *playback_step_forward;
+    QAction *playback_action_for(const QKeyEvent *event) const;
+
+    std::vector<ShortcutBinding> shortcut_bindings;
+    void set_up_shortcuts();
+    void collect_shortcut_bindings(QMenu *menu, const QStringList &path);
+    void set_default_shortcut(QAction *action, const QKeySequence &shortcut);
+    void load_shortcuts();
+    void save_shortcuts();
+    void apply_shortcuts();
+
     static const std::size_t VIDEO_SCALE_COUNT = 12;
 
     NumberedAction *change_video_scale[VIDEO_SCALE_COUNT];
@@ -268,6 +286,7 @@ private slots:
     void do_toggle_pokeabyte();
     void do_toggle_stop_replay_on_input();
     void do_open_controls_settings_dialog() noexcept;
+    void do_open_shortcuts_dialog();
     void do_toggle_auto_unpause_on_input();
     void do_toggle_auto_pause_on_record();
     void do_open_user_dir();

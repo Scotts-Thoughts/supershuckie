@@ -114,47 +114,51 @@ void GameRenderWidget::keyPressEvent(QKeyEvent *event) {
             this->main_window->keyboard_replay_controls->isChecked() && 
             supershuckie_frontend_get_replay_state(this->main_window->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Playback
         ) {
-            switch(key) {
-                case Qt::Key_Space:
-                    if(!auto_repeat) {
-                        supershuckie_frontend_set_paused(
-                            this->main_window->frontend,
-                            !supershuckie_frontend_is_paused(this->main_window->frontend)
-                        );
-                    }
-                    return;
-                case Qt::Key_Left:
+            auto *playback_action = this->main_window->playback_action_for(event);
+            if(playback_action == this->main_window->playback_toggle_pause) {
+                if(!auto_repeat) {
+                    supershuckie_frontend_set_paused(
+                        this->main_window->frontend,
+                        !supershuckie_frontend_is_paused(this->main_window->frontend)
+                    );
+                }
+                return;
+            }
+            if(playback_action == this->main_window->playback_skip_back) {
+                supershuckie_frontend_advance_playback_frames(
+                    this->main_window->frontend,
+                    -240
+                );
+                return;
+            }
+            if(playback_action == this->main_window->playback_skip_forward) {
+                supershuckie_frontend_advance_playback_frames(
+                    this->main_window->frontend,
+                    240
+                );
+                return;
+            }
+            if(playback_action == this->main_window->playback_step_back) {
+                if(is_paused) {
                     supershuckie_frontend_advance_playback_frames(
                         this->main_window->frontend,
-                        -240
+                        -1
                     );
-                    return;
-                case Qt::Key_Right:
+                }
+                return;
+            }
+            if(playback_action == this->main_window->playback_step_forward) {
+                if(is_paused) {
                     supershuckie_frontend_advance_playback_frames(
                         this->main_window->frontend,
-                        240
+                        1
                     );
-                    return;
-                case Qt::Key_Up:
-                case Qt::Key_Down:
-                    // up/down arrow keys do not do anything yet
-                    return;
-                case Qt::Key_Comma:
-                    if(is_paused) {
-                        supershuckie_frontend_advance_playback_frames(
-                            this->main_window->frontend,
-                            -1
-                        );
-                    }
-                    return;
-                case Qt::Key_Period:
-                    if(is_paused) {
-                        supershuckie_frontend_advance_playback_frames(
-                            this->main_window->frontend,
-                            1
-                        );
-                    }
-                    return;
+                }
+                return;
+            }
+            if(key == Qt::Key_Up || key == Qt::Key_Down) {
+                // up/down arrow keys do not do anything yet
+                return;
             }
         }
 

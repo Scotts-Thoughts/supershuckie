@@ -123,6 +123,7 @@ QJsonObject BookmarkWindow::read_state(MainWindow *main_window) {
 
 BookmarkWindow::BookmarkWindow(MainWindow *main_window): QWidget(main_window, Qt::Window), main_window(main_window) {
     this->setWindowTitle("Bookmarks");
+    this->addActions({ main_window->add_bookmark, main_window->add_keyframe_bookmark, main_window->toggle_range_bookmark, main_window->open_bookmarks });
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(8, 8, 8, 8);

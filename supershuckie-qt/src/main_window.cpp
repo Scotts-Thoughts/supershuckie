@@ -1,5 +1,5 @@
 // FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.4.12stp"
+#define SUPERSHUCKIE_VERSION "0.4.13stp"
 
 #include <cstdio>
 #include <cstdint>
@@ -47,8 +47,11 @@
 #include <QThread>
 #include <QPushButton>
 #include <QCoreApplication>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
+#include <QSet>
 
 using namespace SuperShuckie64;
 
@@ -58,6 +61,7 @@ static const char *DISPLAY_STATUS_BAR = "qt__display_status_bar";
 static const char *KEYBOARD_REPLAY_CONTROLS_DISABLED = "qt__replay_controls_disabled";
 static const char *HORIZONTAL_NDS = "qt__horizontal_nds";
 static const char *BOOKMARK_WINDOW_STATE = "qt__bookmark_window";
+static const char *SHORTCUTS = "qt__shortcuts";
 
 class SuperShuckie64::SuperShuckieTimestamp: public QWidget {
 public:
@@ -228,8 +232,9 @@ MainWindow::MainWindow(): QMainWindow() {
     if(quick_slots != nullptr && quick_slots[0] == '1') {
         this->use_number_keys_for_quick_slots = true;
         this->use_number_row_for_quick_slots->setChecked(true);
-        this->set_quick_load_shortcuts();
     }
+    this->load_shortcuts();
+    this->set_quick_load_shortcuts();
 
     const char *horizontal_nds = supershuckie_frontend_get_custom_setting(this->frontend, HORIZONTAL_NDS);
     if(horizontal_nds != nullptr && horizontal_nds[0] == '1') {
@@ -532,35 +537,42 @@ void MainWindow::set_up_menu() {
     this->set_up_settings_menu();
 
     this->refresh_action_states();
+    this->set_up_shortcuts();
 }
 
 void MainWindow::set_up_file_menu() {
     this->file_menu = this->menu_bar->addMenu("File");
 
     this->open_rom = this->file_menu->addAction("Open ROM...");
+    this->open_rom->setObjectName("open-rom");
     this->open_rom->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_O));
     connect(this->open_rom, SIGNAL(triggered()), this, SLOT(do_open_rom()));
 
     this->recent_roms_menu = this->file_menu->addMenu("Open recent ROM");
 
     this->close_rom = this->file_menu->addAction("Close ROM");
+    this->close_rom->setObjectName("close-rom");
     this->close_rom->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_W));
     connect(this->close_rom, SIGNAL(triggered()), this, SLOT(do_close_rom()));
 
     this->unload_rom = this->file_menu->addAction("Unload ROM without saving");
+    this->unload_rom->setObjectName("unload-rom");
     this->unload_rom->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_W));
     connect(this->unload_rom, SIGNAL(triggered()), this, SLOT(do_unload_rom()));
 
     this->file_menu->addSeparator();
     this->screenshot = this->file_menu->addAction("Screenshot");
+    this->screenshot->setObjectName("screenshot");
     this->screenshot->setShortcut(QKeyCombination(Qt::Key_F12));
     connect(this->screenshot, SIGNAL(triggered()), this, SLOT(do_screenshot()));
 
     this->file_menu->addSeparator();
     auto *open_user_dir = this->file_menu->addAction("Open data directory");
+    open_user_dir->setObjectName("open-data-directory");
     connect(open_user_dir, SIGNAL(triggered()), this, SLOT(do_open_user_dir()));
 
     this->quit = this->file_menu->addAction("Quit");
+    this->quit->setObjectName("quit");
     this->quit->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_Q));
     connect(this->quit, SIGNAL(triggered()), this, SLOT(close()));
 }
@@ -569,35 +581,43 @@ void MainWindow::set_up_gameplay_menu() {
     this->gameplay_menu = this->menu_bar->addMenu("Gameplay");
 
     this->new_game = this->gameplay_menu->addAction("New game...");
+    this->new_game->setObjectName("new-game");
     this->new_game->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_N));
     connect(this->new_game, SIGNAL(triggered()), this, SLOT(do_new_game()));
 
     this->load_game = this->gameplay_menu->addAction("Load game...");
+    this->load_game->setObjectName("load-game");
     connect(this->load_game, SIGNAL(triggered()), this, SLOT(do_load_game()));
 
     this->save_game = this->gameplay_menu->addAction("Save game");
+    this->save_game->setObjectName("save-game");
     this->save_game->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_S));
     connect(this->save_game, SIGNAL(triggered()), this, SLOT(do_save_game()));
 
     this->save_new_game = this->gameplay_menu->addAction("Save as new game...");
+    this->save_new_game->setObjectName("save-as-new-game");
     this->save_new_game->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_S));
     connect(this->save_new_game, SIGNAL(triggered()), this, SLOT(do_save_new_game()));
 
     this->gameplay_menu->addSeparator();
 
     this->reset_console = this->gameplay_menu->addAction("Reset console");
+    this->reset_console->setObjectName("reset-console");
     connect(this->reset_console, SIGNAL(triggered()), this, SLOT(do_reset_console()));
 
     this->reload_core = this->gameplay_menu->addAction("Reload core");
+    this->reload_core->setObjectName("reload-core");
     connect(this->reload_core, SIGNAL(triggered()), this, SLOT(do_reload_core()));
 
     this->pause = this->gameplay_menu->addAction("Pause");
+    this->pause->setObjectName("pause");
     this->pause->setCheckable(true);
     this->pause->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_P));
     connect(this->pause, SIGNAL(triggered()), this, SLOT(do_toggle_pause()));
 
     this->gameplay_menu->addSeparator();
     this->auto_unpause_on_input = this->gameplay_menu->addAction("Unpause on input");
+    this->auto_unpause_on_input->setObjectName("unpause-on-input");
     this->auto_unpause_on_input->setCheckable(true);
     connect(this->auto_unpause_on_input, SIGNAL(triggered()), this, SLOT(do_toggle_auto_unpause_on_input()));
 }
@@ -614,9 +634,11 @@ void MainWindow::set_up_save_states_menu() {
 
         std::snprintf(fmt, sizeof(fmt), "Load quick slot #%zu", i);
         auto *quick_load = new NumberedAction(this, fmt, i, &MainWindow::quick_load);
+        quick_load->setObjectName(QString("quick-load-%1").arg(i));
 
         std::snprintf(fmt, sizeof(fmt), "Save quick slot #%zu", i);
         auto *quick_save = new NumberedAction(this, fmt, i, &MainWindow::quick_save);
+        quick_save->setObjectName(QString("quick-save-%1").arg(i));
 
         this->quick_load_save_states[i - 1] = quick_load;
         menu->addAction(quick_load);
@@ -627,39 +649,45 @@ void MainWindow::set_up_save_states_menu() {
     quick_slots->addSeparator();
     
     this->use_number_row_for_quick_slots = quick_slots->addAction("Use number row instead of function keys");
+    this->use_number_row_for_quick_slots->setObjectName("quick-slots-use-number-row");
     this->use_number_row_for_quick_slots->setCheckable(true);
     connect(this->use_number_row_for_quick_slots, SIGNAL(triggered()), this, SLOT(do_toggle_number_row_for_save_states()));
 
     this->save_states_menu->addSeparator();
     
     this->undo_load_save_state = this->save_states_menu->addAction("Undo load save state");
+    this->undo_load_save_state->setObjectName("undo-load-save-state");
     this->undo_load_save_state->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_U));
     connect(this->undo_load_save_state, SIGNAL(triggered()), this, SLOT(do_undo_load_save_state()));
     
     this->redo_load_save_state = this->save_states_menu->addAction("Redo load save state");
+    this->redo_load_save_state->setObjectName("redo-load-save-state");
     this->redo_load_save_state->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_U));
     connect(this->redo_load_save_state, SIGNAL(triggered()), this, SLOT(do_redo_load_save_state()));
-
-    this->set_quick_load_shortcuts();
 }
 
 void MainWindow::set_up_replays_menu() {
     this->replays_menu = this->menu_bar->addMenu("Replays");
     
     this->record_replay = this->replays_menu->addAction("Record (unset)");
+    this->record_replay->setObjectName("record-replay");
     this->resume_replay = this->replays_menu->addAction("Resume recording replay");
+    this->resume_replay->setObjectName("resume-replay");
 
     this->replays_menu->addSeparator();
 
     this->auto_pause_on_record = this->replays_menu->addAction("Start recordings paused");
+    this->auto_pause_on_record->setObjectName("start-recordings-paused");
     connect(this->auto_pause_on_record, SIGNAL(triggered()), this, SLOT(do_toggle_auto_pause_on_record()));
     this->auto_pause_on_record->setCheckable(true);
 
     this->disable_save_states_when_recording = this->replays_menu->addAction("Disable save states when recording");
+    this->disable_save_states_when_recording->setObjectName("disable-save-states-when-recording");
     connect(this->disable_save_states_when_recording, SIGNAL(triggered()), this, SLOT(do_toggle_disable_save_states_when_recording()));
     this->disable_save_states_when_recording->setCheckable(true);
 
     this->disable_speed_changes_when_recording = this->replays_menu->addAction("Disable speed changes when recording");
+    this->disable_speed_changes_when_recording->setObjectName("disable-speed-changes-when-recording");
     connect(this->disable_speed_changes_when_recording, SIGNAL(triggered()), this, SLOT(do_toggle_disable_speed_changes_when_recording()));
     this->disable_speed_changes_when_recording->setCheckable(true);
 
@@ -671,6 +699,7 @@ void MainWindow::set_up_replays_menu() {
     this->replay_compression_levels[2] = new NumberedAction(this, "Balanced (level 9, default)", 9, &MainWindow::set_replay_compression_level);
     this->replay_compression_levels[3] = new NumberedAction(this, "Smallest (level 19, slow to write)", 19, &MainWindow::set_replay_compression_level);
     for(auto *level : this->replay_compression_levels) {
+        level->setObjectName(QString("replay-compression-%1").arg(level->number));
         level->setCheckable(true);
         compression_items->addAction(level);
     }
@@ -683,23 +712,27 @@ void MainWindow::set_up_replays_menu() {
     this->replays_menu->addSeparator();
 
     this->play_replay = this->replays_menu->addAction("Play (unset)");
+    this->play_replay->setObjectName("play-replay");
     this->continue_last_replay = this->replays_menu->addAction("Continue last replay");
+    this->continue_last_replay->setObjectName("continue-last-replay");
 
     this->replays_menu->addSeparator();
 
-    // Bookmarks: the shortcuts also work while the bookmark window has focus.
-    this->add_bookmark = this->replays_menu->addAction("Add bookmark");
+    // Bookmarks: BookmarkWindow adds these actions to itself so the shortcuts work there too.
+    this->add_bookmark =this->replays_menu->addAction("Add bookmark");
+    this->add_bookmark->setObjectName("add-bookmark");
     this->add_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_B));
     this->add_keyframe_bookmark = this->replays_menu->addAction("Add keyframe bookmark");
+    this->add_keyframe_bookmark->setObjectName("add-keyframe-bookmark");
     this->add_keyframe_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_B));
     this->toggle_range_bookmark = this->replays_menu->addAction("Start/end range bookmark");
+    this->toggle_range_bookmark->setObjectName("toggle-range-bookmark");
     this->toggle_range_bookmark->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_B));
     this->add_bookmark_at_frame = this->replays_menu->addAction("Add bookmark at frame…");
+    this->add_bookmark_at_frame->setObjectName("add-bookmark-at-frame");
     this->open_bookmarks = this->replays_menu->addAction("Bookmarks…");
+    this->open_bookmarks->setObjectName("bookmarks");
     this->open_bookmarks->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier | Qt::ShiftModifier, Qt::Key_B));
-    for(auto *action : { this->add_bookmark, this->add_keyframe_bookmark, this->toggle_range_bookmark, this->open_bookmarks }) {
-        action->setShortcutContext(Qt::ApplicationShortcut);
-    }
     connect(this->add_bookmark, SIGNAL(triggered()), this, SLOT(do_add_bookmark()));
     connect(this->add_keyframe_bookmark, SIGNAL(triggered()), this, SLOT(do_add_keyframe_bookmark()));
     connect(this->toggle_range_bookmark, SIGNAL(triggered()), this, SLOT(do_toggle_range_bookmark()));
@@ -709,11 +742,14 @@ void MainWindow::set_up_replays_menu() {
     this->replays_menu->addSeparator();
 
     this->export_video = this->replays_menu->addAction("Export video…");
+    this->export_video->setObjectName("export-video");
 
     this->replays_menu->addSeparator();
 
     this->convert_replay = this->replays_menu->addAction("Convert replay to current format…");
+    this->convert_replay->setObjectName("convert-replay");
     this->convert_replay_folder = this->replays_menu->addAction("Convert folder of replays to current format…");
+    this->convert_replay_folder->setObjectName("convert-replay-folder");
 
     connect(this->record_replay, SIGNAL(triggered()), this, SLOT(do_record_replay()));
     connect(this->resume_replay, SIGNAL(triggered()), this, SLOT(do_resume_replay()));
@@ -732,19 +768,23 @@ void MainWindow::set_up_replays_menu() {
     this->replays_menu->addSeparator();
 
     this->auto_stop_replay_on_input = this->replays_menu->addAction("Stop playback on input");
+    this->auto_stop_replay_on_input->setObjectName("stop-playback-on-input");
     this->auto_stop_replay_on_input->setCheckable(true);
     connect(this->auto_stop_replay_on_input, SIGNAL(triggered()), this, SLOT(do_toggle_stop_replay_on_input()));
 
     this->keyboard_replay_controls = this->replays_menu->addAction("Allow keyboard to control replay playback");
+    this->keyboard_replay_controls->setObjectName("keyboard-replay-controls");
     connect(this->keyboard_replay_controls, SIGNAL(triggered()), this, SLOT(do_toggle_replay_keyboard_controls()));
     this->keyboard_replay_controls->setCheckable(true);
     this->keyboard_replay_controls->setChecked(true);
 
     this->ignore_speed_changes_in_replay = this->replays_menu->addAction("Ignore speed changes in replay");
+    this->ignore_speed_changes_in_replay->setObjectName("ignore-speed-changes-in-replay");
     connect(this->ignore_speed_changes_in_replay, SIGNAL(triggered()), this, SLOT(do_toggle_ignore_speed_changes_in_replay()));
     this->ignore_speed_changes_in_replay->setCheckable(true);
 
     this->auto_resync_keyframes_in_replay = this->replays_menu->addAction("Auto-resync keyframes in replay");
+    this->auto_resync_keyframes_in_replay->setObjectName("auto-resync-keyframes-in-replay");
     connect(this->auto_resync_keyframes_in_replay, SIGNAL(triggered()), this, SLOT(do_toggle_auto_resync_keyframes_in_replay()));
     this->auto_resync_keyframes_in_replay->setCheckable(true);
 }
@@ -824,16 +864,19 @@ void MainWindow::set_up_audio_menu() {
     this->audio_menu = this->menu_bar->addMenu("Audio");
 
     this->audio_enabled = this->audio_menu->addAction("Enable audio");
+    this->audio_enabled->setObjectName("enable-audio");
     this->audio_enabled->setCheckable(true);
     connect(this->audio_enabled, SIGNAL(triggered()), this, SLOT(do_toggle_audio_enabled()));
 
     this->audio_muted = this->audio_menu->addAction("Mute");
+    this->audio_muted->setObjectName("mute");
     this->audio_muted->setCheckable(true);
     connect(this->audio_muted, SIGNAL(triggered()), this, SLOT(do_toggle_audio_muted()));
 
     // Someone who turbos through one stretch and plays the next at 1x should not get a barrage of
     // sped-up audio in between; the emulator drops the samples while the speed is not 1x.
     this->audio_mute_when_sped_up = this->audio_menu->addAction("Mute when sped up");
+    this->audio_mute_when_sped_up->setObjectName("mute-when-sped-up");
     this->audio_mute_when_sped_up->setCheckable(true);
     connect(this->audio_mute_when_sped_up, SIGNAL(triggered()), this, SLOT(do_toggle_audio_mute_when_sped_up()));
 
@@ -843,6 +886,7 @@ void MainWindow::set_up_audio_menu() {
         char fmt[32];
         std::snprintf(fmt, sizeof(fmt), "%u%%", static_cast<unsigned>(percent));
         auto *action = new NumberedAction(this, fmt, percent, &MainWindow::set_audio_volume);
+        action->setObjectName(QString("volume-%1").arg(percent));
         action->setCheckable(true);
         this->audio_volume_menu->addAction(action);
         this->audio_volumes[i] = action;
@@ -856,6 +900,7 @@ void MainWindow::set_up_audio_menu() {
     const char *buffer_names[MainWindow::AUDIO_BUFFER_PRESETS] = { "Low (32 ms)", "Normal (64 ms)", "High (128 ms)" };
     for(std::size_t i = 0; i < MainWindow::AUDIO_BUFFER_PRESETS; i++) {
         auto *action = new NumberedAction(this, buffer_names[i], static_cast<std::uint8_t>(i), &MainWindow::set_audio_buffer);
+        action->setObjectName(QString("audio-buffer-%1ms").arg(MainWindow::audio_buffer_ms[i]));
         action->setCheckable(true);
         buffer_menu->addAction(action);
         this->audio_buffers[i] = action;
@@ -866,27 +911,33 @@ void MainWindow::set_up_tools_menu() {
     this->tools_menu = this->menu_bar->addMenu("Tools");
 
     auto *ram_viewer = this->tools_menu->addAction("RAM viewer");
+    ram_viewer->setObjectName("ram-viewer");
     ram_viewer->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_V));
     connect(ram_viewer, SIGNAL(triggered()), this, SLOT(do_open_ram_viewer()));
 
     auto *new_ram_viewer = this->tools_menu->addAction("New RAM viewer window");
+    new_ram_viewer->setObjectName("new-ram-viewer");
     connect(new_ram_viewer, SIGNAL(triggered()), this, SLOT(do_new_ram_viewer()));
 
     auto *ram_search = this->tools_menu->addAction("RAM search");
+    ram_search->setObjectName("ram-search");
     ram_search->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_F));
     connect(ram_search, SIGNAL(triggered()), this, SLOT(do_open_ram_search()));
 
     auto *ram_watch = this->tools_menu->addAction("RAM watch");
+    ram_watch->setObjectName("ram-watch");
     ram_watch->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::AltModifier, Qt::Key_W));
     connect(ram_watch, SIGNAL(triggered()), this, SLOT(do_open_ram_watch()));
 
     this->tools_menu->addSeparator();
 
     this->unfreeze_all = this->tools_menu->addAction("Unfreeze all");
+    this->unfreeze_all->setObjectName("unfreeze-all");
     connect(this->unfreeze_all, SIGNAL(triggered()), this, SLOT(do_unfreeze_all()));
     this->unfreeze_all->setEnabled(false);
 
     this->confirm_ram_writes = this->tools_menu->addAction("Ask before editing memory while recording");
+    this->confirm_ram_writes->setObjectName("confirm-ram-writes-while-recording");
     this->confirm_ram_writes->setCheckable(true);
     this->confirm_ram_writes->setChecked(true);
     connect(this->confirm_ram_writes, SIGNAL(triggered()), this, SLOT(do_toggle_confirm_ram_writes()));
@@ -894,9 +945,11 @@ void MainWindow::set_up_tools_menu() {
     this->tools_menu->addSeparator();
 
     auto *open_tables = this->tools_menu->addAction("Open character tables folder");
+    open_tables->setObjectName("open-character-tables-folder");
     connect(open_tables, SIGNAL(triggered()), this, SLOT(do_open_tables_folder()));
 
     auto *reload_tables = this->tools_menu->addAction("Reload character tables");
+    reload_tables->setObjectName("reload-character-tables");
     connect(reload_tables, SIGNAL(triggered()), this, SLOT(do_reload_tables()));
 }
 
@@ -1026,10 +1079,16 @@ void MainWindow::set_up_settings_menu() {
     this->settings_menu = this->menu_bar->addMenu("Settings");
 
     auto *game_speed = this->settings_menu->addAction("Game speed...");
+    game_speed->setObjectName("game-speed");
     connect(game_speed, SIGNAL(triggered()), this, SLOT(do_open_game_speed_dialog()));
 
-    auto *controller_settings = this->settings_menu->addAction("Controls settings...");
+    auto *controller_settings = this->settings_menu->addAction("Controls");
+    controller_settings->setObjectName("controls");
     connect(controller_settings, SIGNAL(triggered()), this, SLOT(do_open_controls_settings_dialog()));
+
+    auto *shortcut_settings = this->settings_menu->addAction("Shortcuts");
+    shortcut_settings->setObjectName("shortcuts");
+    connect(shortcut_settings, SIGNAL(triggered()), this, SLOT(do_open_shortcuts_dialog()));
     
     auto *video_scaling = this->settings_menu->addMenu("Video scaling");
     for(std::size_t i = 1; i <= MainWindow::VIDEO_SCALE_COUNT; i++) {
@@ -1037,6 +1096,7 @@ void MainWindow::set_up_settings_menu() {
         std::snprintf(fmt, sizeof(fmt), "%zux", i);
 
         auto *action = new NumberedAction(this, fmt, static_cast<uint8_t>(i), &MainWindow::set_video_scale);
+        action->setObjectName(QString("video-scale-%1").arg(i));
         video_scaling->addAction(action);
         this->change_video_scale[i - 1] = action;
         action->setCheckable(true);
@@ -1053,43 +1113,52 @@ void MainWindow::set_up_settings_menu() {
     this->gbc_mode[2] = new NumberedAction(this, "Always Game Boy", SuperShuckieGBCMode::SuperShuckieGBCMode__AlwaysGB, &MainWindow::set_gbc_mode);
 
     for(auto m : this->gbc_mode) {
+        m->setObjectName(QString("gbc-mode-%1").arg(m->number));
         m->setCheckable(true);
         gbc_mode_items->addAction(m);
     }
 
     this->sgb_enabled = this->game_boy_settings->addAction("Enable SGB colors");
+    this->sgb_enabled->setObjectName("enable-sgb-colors");
     connect(this->sgb_enabled, SIGNAL(triggered()), this, SLOT(do_toggle_sgb()));
     this->sgb_enabled->setCheckable(true);
 
     auto *nds_settings = this->settings_menu->addMenu("Nintendo DS settings");
     auto *set_nds_date = nds_settings->addAction("Set date...");
+    set_nds_date->setObjectName("nds-set-date");
     connect(set_nds_date, SIGNAL(triggered()), this, SLOT(do_open_nds_date_dialog()));
     
     this->horizontal_nds = nds_settings->addAction("Arrange horizontally");
+    this->horizontal_nds->setObjectName("nds-arrange-horizontally");
     this->horizontal_nds->setCheckable(true);
     connect(this->horizontal_nds, SIGNAL(triggered()), this, SLOT(do_toggle_horizontal_nds()));
 
     this->swap_nds_screens = nds_settings->addAction("Swap screens");
+    this->swap_nds_screens->setObjectName("nds-swap-screens");
     this->swap_nds_screens->setCheckable(true);
     connect(this->swap_nds_screens, SIGNAL(triggered()), this, SLOT(do_toggle_swap_nds_screens()));
 
     this->nds_jit = nds_settings->addAction("Enable JIT (disables replays)");
+    this->nds_jit->setObjectName("nds-enable-jit");
     this->nds_jit->setCheckable(true);
     connect(this->nds_jit, SIGNAL(triggered()), this, SLOT(do_toggle_nds_jit()));
 
     this->settings_menu->addSeparator();
 
     this->enable_pokeabyte_integration = this->settings_menu->addAction("Enable Poke-A-Byte integration");
+    this->enable_pokeabyte_integration->setObjectName("enable-pokeabyte-integration");
     this->enable_pokeabyte_integration->setCheckable(true);
     connect(this->enable_pokeabyte_integration, SIGNAL(triggered()), this, SLOT(do_toggle_pokeabyte()));
 
     this->enable_external_commands = this->settings_menu->addAction("Enable external commands");
+    this->enable_external_commands->setObjectName("enable-external-commands");
     this->enable_external_commands->setCheckable(true);
     connect(this->enable_external_commands, SIGNAL(triggered()), this, SLOT(do_toggle_external_commands()));
 
     this->settings_menu->addSeparator();
 
     this->show_status_bar = this->settings_menu->addAction("Show status bar");
+    this->show_status_bar->setObjectName("show-status-bar");
     this->show_status_bar->setCheckable(true);
     connect(this->show_status_bar, SIGNAL(triggered()), this, SLOT(do_toggle_status_bar()));
 }
@@ -1352,9 +1421,183 @@ void MainWindow::set_quick_load_shortcuts() {
 
     for(std::size_t i = 0; i < MainWindow::QUICK_SAVE_STATE_COUNT; i++) {
         Qt::Key key = static_cast<Qt::Key>((this->use_number_keys_for_quick_slots ? Qt::Key_1 : Qt::Key_F1) + i);
-        this->quick_save_save_states[i]->setShortcut(QKeyCombination(control | Qt::ShiftModifier, key));
-        this->quick_load_save_states[i]->setShortcut(QKeyCombination(control, key));
+        this->set_default_shortcut(this->quick_save_save_states[i], QKeyCombination(control | Qt::ShiftModifier, key));
+        this->set_default_shortcut(this->quick_load_save_states[i], QKeyCombination(control, key));
     }
+
+    this->apply_shortcuts();
+}
+
+static QString shortcut_function_name(const QString &text) {
+    auto name = text.trimmed();
+    if(name.endsWith("...")) {
+        name.chop(3);
+    }
+    else if(name.endsWith(QChar(u'…'))) {
+        name.chop(1);
+    }
+    return name.trimmed();
+}
+
+void MainWindow::set_up_shortcuts() {
+    // Never added to a widget, so Qt doesn't fire these; the render widget matches them during playback.
+    auto playback_action = [this](const char *id, const char *name, Qt::Key key) {
+        auto *action = new QAction(name, this);
+        action->setObjectName(id);
+        action->setShortcut(QKeyCombination(key));
+        return action;
+    };
+    this->playback_toggle_pause = playback_action("playback-pause", "Pause or resume playback", Qt::Key_Space);
+    this->playback_skip_back = playback_action("playback-skip-back", "Skip back 240 frames", Qt::Key_Left);
+    this->playback_skip_forward = playback_action("playback-skip-forward", "Skip forward 240 frames", Qt::Key_Right);
+    this->playback_step_back = playback_action("playback-step-back", "Step back one frame (while paused)", Qt::Key_Comma);
+    this->playback_step_forward = playback_action("playback-step-forward", "Step forward one frame (while paused)", Qt::Key_Period);
+
+    for(auto *menu_action : this->menu_bar->actions()) {
+        auto *menu = QMenu::menuInAction(menu_action);
+        if(menu == nullptr) {
+            continue;
+        }
+        this->collect_shortcut_bindings(menu, { shortcut_function_name(menu->title()) });
+
+        if(menu == this->replays_menu) {
+            for(auto *action : { this->playback_toggle_pause, this->playback_skip_back, this->playback_skip_forward, this->playback_step_back, this->playback_step_forward }) {
+                ShortcutBinding binding;
+                binding.id = action->objectName();
+                binding.path = QStringList("Replay playback");
+                binding.name = action->text();
+                binding.action = action;
+                binding.playback_control = true;
+                binding.defaults = action->shortcuts();
+                this->shortcut_bindings.push_back(std::move(binding));
+            }
+        }
+    }
+
+    QSet<QString> ids;
+    for(const auto &binding : this->shortcut_bindings) {
+        Q_ASSERT_X(!ids.contains(binding.id), "set_up_shortcuts", qPrintable("duplicate shortcut id " + binding.id));
+        ids.insert(binding.id);
+    }
+}
+
+void MainWindow::collect_shortcut_bindings(QMenu *menu, const QStringList &path) {
+    for(auto *action : menu->actions()) {
+        if(auto *submenu = QMenu::menuInAction(action)) {
+            this->collect_shortcut_bindings(submenu, path + QStringList(shortcut_function_name(submenu->title())));
+            continue;
+        }
+        // Saved shortcuts are keyed by objectName, so only actions given one are rebindable. That leaves
+        // out separators and dynamic entries such as recent ROMs.
+        if(action->objectName().isEmpty()) {
+            continue;
+        }
+
+        ShortcutBinding binding;
+        binding.id = action->objectName();
+        binding.path = path;
+        binding.name = shortcut_function_name(action->text());
+        binding.action = action;
+        binding.defaults = action->shortcuts();
+        this->shortcut_bindings.push_back(std::move(binding));
+    }
+}
+
+void MainWindow::set_default_shortcut(QAction *action, const QKeySequence &shortcut) {
+    for(auto &binding : this->shortcut_bindings) {
+        if(binding.action == action) {
+            binding.defaults = { shortcut };
+            return;
+        }
+    }
+}
+
+void MainWindow::load_shortcuts() {
+    const char *setting = supershuckie_frontend_get_custom_setting(this->frontend, SHORTCUTS);
+    if(setting == nullptr) {
+        return;
+    }
+
+    auto saved = QJsonDocument::fromJson(QByteArray(setting)).object();
+    for(auto &binding : this->shortcut_bindings) {
+        auto value = saved.value(binding.id);
+        if(!value.isArray()) {
+            continue;
+        }
+
+        QList<QKeySequence> shortcuts;
+        for(const auto &entry : value.toArray()) {
+            auto sequence = QKeySequence::fromString(entry.toString(), QKeySequence::PortableText);
+            if(sequence.count() == 1 && sequence[0].key() != Qt::Key_unknown && shortcuts.size() < SHORTCUT_SLOTS) {
+                shortcuts.append(sequence);
+            }
+        }
+        binding.custom = shortcuts;
+    }
+}
+
+void MainWindow::save_shortcuts() {
+    // Keep saved entries this build doesn't know, such as from another version sharing the settings file.
+    QJsonObject saved;
+    if(const char *setting = supershuckie_frontend_get_custom_setting(this->frontend, SHORTCUTS)) {
+        saved = QJsonDocument::fromJson(QByteArray(setting)).object();
+    }
+
+    for(const auto &binding : this->shortcut_bindings) {
+        saved.remove(binding.id);
+        if(binding.custom.has_value()) {
+            QJsonArray shortcuts;
+            for(const auto &sequence : *binding.custom) {
+                shortcuts.append(sequence.toString(QKeySequence::PortableText));
+            }
+            saved.insert(binding.id, shortcuts);
+        }
+    }
+
+    if(saved.isEmpty()) {
+        supershuckie_frontend_set_custom_setting(this->frontend, SHORTCUTS, nullptr);
+    }
+    else {
+        supershuckie_frontend_set_custom_setting(this->frontend, SHORTCUTS, QJsonDocument(saved).toJson(QJsonDocument::Compact).constData());
+    }
+}
+
+void MainWindow::apply_shortcuts() {
+    resolve_shortcuts(this->shortcut_bindings);
+    for(const auto &binding : this->shortcut_bindings) {
+        binding.action->setShortcuts(binding.current);
+    }
+}
+
+QAction *MainWindow::playback_action_for(const QKeyEvent *event) const {
+    QAction *const actions[] = { this->playback_toggle_pause, this->playback_skip_back, this->playback_skip_forward, this->playback_step_back, this->playback_step_forward };
+    auto key = static_cast<Qt::Key>(event->key());
+    auto modifiers = event->modifiers() & ~(Qt::KeypadModifier | Qt::GroupSwitchModifier);
+
+    // Exact match, then without Shift: shifted symbols such as "!" are recorded without it.
+    for(auto held : { modifiers, modifiers & ~Qt::ShiftModifier }) {
+        QKeySequence pressed(QKeyCombination(held, key));
+        for(auto *action : actions) {
+            if(action->shortcuts().contains(pressed)) {
+                return action;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void MainWindow::do_open_shortcuts_dialog() {
+    ShortcutsSettingsWindow dialog(this, this->shortcut_bindings);
+    if(dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    for(std::size_t i = 0; i < this->shortcut_bindings.size(); i++) {
+        this->shortcut_bindings[i].custom = dialog.bindings[i].custom;
+    }
+    this->apply_shortcuts();
+    this->save_shortcuts();
+    supershuckie_frontend_write_settings(this->frontend);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {

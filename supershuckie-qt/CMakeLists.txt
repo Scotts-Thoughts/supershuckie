@@ -24,6 +24,7 @@ add_library(supershuckie-cpp-static STATIC
     src/ask_for_text_dialog.cpp
     src/select_item_dialog.cpp
     src/controller_settings_window.cpp
+    src/shortcuts_settings_window.cpp
     src/sdl_event_wrapper.cpp
     src/theme.cpp
     src/replay_playback_controls.cpp
@@ -50,7 +51,8 @@ target_include_directories(supershuckie-cpp-static
 # point CMAKE_PREFIX_PATH/Qt6_DIR at the static Qt when enabling this.
 option(SUPERSHUCKIE_STATIC "Statically link Qt, SDL, and the runtime into a single exe" OFF)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+# 6.5 for QKeySequenceEdit::setMaximumSequenceLength (Shortcuts dialog).
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets)
 if(SUPERSHUCKIE_STATIC)
     find_package(SDL3 REQUIRED CONFIG COMPONENTS SDL3-static)
     set(SUPERSHUCKIE_SDL_TARGET SDL3::SDL3-static)

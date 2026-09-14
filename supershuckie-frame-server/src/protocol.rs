@@ -502,7 +502,7 @@ mod tests {
     fn every_reply_round_trips() {
         round_trip_reply(Reply::Hello {
             protocol: 1,
-            server: "supershuckie-frame-server 0.4.12".into(),
+            server: "supershuckie-frame-server 0.4.13".into(),
             cores: vec!["Game Boy".into(), "Nintendo DS".into()],
         });
         round_trip_reply(Reply::Hello { protocol: 1, server: String::new(), cores: vec![] });
