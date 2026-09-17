@@ -84,6 +84,14 @@ pub struct SuperShuckieCore {
     /// frame, racing the recorded inputs ahead of the emulator and ending playback early.
     replay_frame_pending: bool,
 
+    /// The live-side counterpart of [`Self::replay_frame_pending`]: whether
+    /// [`Self::update_input`] has already applied (and recorded) the input for the next frame.
+    /// Cleared once a run actually emulates a frame, or when the input to apply changes. Without
+    /// this, every pacing-miss poll of a paced core's `run` re-encoded the input and sent the
+    /// recorder a `ChangeInput` packet -- hundreds per frame while the thread loop spins through
+    /// the last millisecond before a frame deadline.
+    input_latched: bool,
+
     /// Whether the attached replay is stopped: still attached (so it can be seeked in and
     /// resumed) but no longer driving the emulator, which runs live under the user's input from
     /// wherever playback left off. See [`Self::stop_replay_playback`]. Meaningless without a
@@ -241,6 +249,7 @@ impl SuperShuckieCore {
             replay_player: None,
             replay_stalled: false,
             replay_frame_pending: false,
+            input_latched: false,
             replay_playback_stopped: false,
             replay_resume_point: (0, 0.into()),
             paused_timer_at: None,
@@ -392,6 +401,8 @@ impl SuperShuckieCore {
         self.replay_stalled = false;
         // Whatever the RAM tools queued while the replay owned memory belongs to that timeline.
         self.writes.clear();
+        // The replay set the console's input; the user's applies from the next run.
+        self.input_latched = false;
         self.resume_timer(self.total_milliseconds, self.total_frames);
     }
 
@@ -936,10 +947,15 @@ impl SuperShuckieCore {
         self.bump_state_epoch();
         self.clear_audio();
         self.with_recorder(|r| r.reset_console());
+        // The console's own input state was just replaced; apply ours again on the next run.
+        self.input_latched = false;
     }
 
     /// Set the current rapid fire input.
     pub fn set_rapid_fire_input(&mut self, input: Option<SuperShuckieRapidFire>) {
+        // The input to apply changed without a new `enqueue_input`; re-apply it on the next run.
+        self.input_latched = false;
+
         let Some(mut input) = input else {
             self.rapid_fire_input = None;
             return
@@ -994,6 +1010,8 @@ impl SuperShuckieCore {
             self.finish_current_frame();
             let _ = self.core.load_save_state(state);
         }
+        // See `hard_reset`.
+        self.input_latched = false;
     }
 
     /// Set the current toggled input.
@@ -1001,6 +1019,8 @@ impl SuperShuckieCore {
     /// Any activated buttons will be "stuck".
     pub fn set_toggled_input(&mut self, input: Option<Input>) {
         self.toggled_input = input;
+        // See `set_rapid_fire_input`.
+        self.input_latched = false;
     }
 
     /// Modify a counter, adding `delta`.
@@ -1082,6 +1102,8 @@ impl SuperShuckieCore {
         self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(recorder));
         self.replay_counters = Some(BTreeMap::new());
+        // Record the input with the first frame rather than rely on the header's initial input.
+        self.input_latched = false;
 
         Ok(())
     }
@@ -1157,6 +1179,7 @@ impl SuperShuckieCore {
         drop(source_player);
         self.replay_stalled = false;
         self.replay_frame_pending = false;
+        self.input_latched = false;
         self.replay_playback_stopped = false;
         self.replay_counters = None;
 
@@ -1239,6 +1262,13 @@ impl SuperShuckieCore {
             return
         }
 
+        // A paced core's `run` is polled many times per emulated frame: apply the input once, on
+        // the first poll after a frame, and again only if a new one has arrived since.
+        if self.input_latched && self.next_input.is_none() {
+            return
+        }
+        self.input_latched = true;
+
         if let Some(pending_input) = self.next_input.take() {
             self.base_input = pending_input;
         };
@@ -1271,6 +1301,7 @@ impl SuperShuckieCore {
 
         if time.frames > 0 {
             self.replay_frame_pending = false;
+            self.input_latched = false;
 
             if let Some(rf) = self.rapid_fire_input.as_mut() {
                 // Advance the duty cycle once per emulated frame (not once per call: a paced core's
@@ -1395,6 +1426,7 @@ impl SuperShuckieCore {
         self.replay_counters = Some(BTreeMap::new());
         self.replay_stalled = false;
         self.replay_frame_pending = false;
+        self.input_latched = false;
         self.replay_playback_stopped = false;
         self.restart_timer();
 
@@ -1414,6 +1446,7 @@ impl SuperShuckieCore {
 
         self.replay_stalled = false;
         self.replay_frame_pending = false;
+        self.input_latched = false;
         self.replay_playback_stopped = false;
         self.replay_player = None;
         self.replay_counters = None;
@@ -2153,6 +2186,70 @@ mod tests {
         let seen = log.lock().unwrap().clone();
         let expected: Vec<u8> = (0..12u8).map(|i| u8::from((i % 6) < 3)).collect();
         assert_eq!(seen, expected, "rapid fire should hold for 3 frames then release for 3, repeating");
+    }
+
+    /// The thread loop polls a paced core's `run` many times per emulated frame (it wakes 1 ms
+    /// before the deadline and spins through the loop until the core lets the frame through).
+    /// Recording must write the input once per emulated frame, not once per poll: each extra
+    /// `ChangeInput` packet is an allocation, a channel send and a temp-sink write on the hot
+    /// path, and it bloats the replay.
+    #[test]
+    fn recording_writes_one_change_input_per_emulated_frame_on_a_paced_core() {
+        const FRAMES: u64 = 20;
+        const POLLS_PER_FRAME: u64 = 50;
+
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let final_buf = SharedSink::default();
+        let temp_buf = SharedSink::default();
+        core.start_recording_replay(metadata(final_buf.clone(), temp_buf.clone())).expect("start recording");
+
+        for frame in 0..FRAMES {
+            // Pacing misses: the deadline has not arrived, so every one of these is a poll that
+            // emulates nothing.
+            for poll in 0..POLLS_PER_FRAME {
+                // An input that arrives late in the interval (after the first poll has already
+                // applied the previous one) must still reach the very next frame.
+                if poll == POLLS_PER_FRAME / 2 {
+                    core.enqueue_input(Input { a: frame % 2 == 0, ..Input::default() });
+                }
+                core.run();
+                assert_eq!(core.last_run_time().frames, 0);
+            }
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(core.total_frames(), FRAMES);
+
+        let seen = log.lock().unwrap().clone();
+        let expected: Vec<u8> = (0..FRAMES).map(|frame| u8::from(frame % 2 == 0)).collect();
+        assert_eq!(seen, expected, "an input enqueued between frames should apply to the next frame");
+
+        assert!(core.poll_replay_recording_errors().is_empty(), "the recording hit an error");
+        assert_eq!(core.stop_recording_replay(), Some(true));
+
+        let bytes = final_buf.0.lock().unwrap().clone();
+        let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse the recorded replay");
+        assert_eq!(player.get_total_frames(), FRAMES);
+
+        let mut change_inputs = 0u64;
+        let mut next_frames = 0u64;
+        while let Some(packet) = player.next_packet().expect("read packet") {
+            match packet {
+                Packet::ChangeInput { .. } => change_inputs += 1,
+                Packet::NextFrame { .. } => next_frames += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(next_frames, FRAMES);
+        // One per frame from the first poll after the previous frame, plus one for the input
+        // that arrived mid-interval.
+        assert!(
+            change_inputs <= 2 * FRAMES,
+            "{change_inputs} ChangeInput packets for {FRAMES} frames: the input is being written on every pacing poll"
+        );
     }
 
     /// C2 / general sanity: `finish_current_frame` must run a mid-frame-stepping core (the only
