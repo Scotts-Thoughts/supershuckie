@@ -338,6 +338,14 @@ Rename `all_bookmarks()` to `legacy_bookmarks()` and move its callers (frame ser
 - **v2 is refused.** Its `KeyframeMetadata` has no `counters`, so it would misparse under a v5
   header. Error: "Convert this replay to the current format before adding bookmarks."
 - **A replay loaded with `stream_truncated()` is refused.** Error: "This replay is damaged; convert it before adding bookmarks."
+  - This check is the **caller's** responsibility (the frontend already does it before offering
+    bookmark edits), not `write_bookmark_section`'s: that function takes a file path, not a loaded
+    `ReplayFilePlayer`, so it has no `stream_truncated()` to consult and cannot cheaply re-parse a
+    v3/v4 packet stream to confirm it reaches `file_len` cleanly before upgrading the file. A file
+    with a partial trailing packet (e.g. a crash mid-write) would otherwise have that corruption
+    silently folded into `packet_stream_end` by the upgrade, and a tolerant loader would then skip
+    it rather than surface it. Never call `write_bookmark_section` on a replay whose player reported
+    `stream_truncated() == true`.
 
 ### 5.8 Several keyframes on one frame
 
@@ -433,6 +441,12 @@ current table as a `BookmarkTable` packet.
 - **Blob starts:** a snapshot is never the first packet of a blob, because blobs must start with a
   full `Keyframe`.
 - **Resume:** the seed snapshot (§8) is written after the re-feed's first keyframe for the same reason.
+  On the blob-copy fast path this opens a window: every blob `copy_completed_blobs_before_boundary`
+  copies verbatim predates the seed snapshot, so until that first keyframe (and its snapshot) is
+  written, the **final** sink's newest in-stream `BookmarkTable` is still whichever one the *source*
+  file's copied blobs happen to hold (i.e. the source's untruncated table), not the resumed file's
+  `seed`. Only the **temp** sink — written incrementally as the new recording proceeds — carries
+  `seed` right away. See §8.
 
 ### 7.3 Rate
 
@@ -447,6 +461,14 @@ Each change writes the whole table. The frontend coalesces changes to at most on
 - Gains `bookmarks: Option<BookmarkTable>`. `None` means `source.bookmark_table()`. The frontend
   passes its own table so that unsaved playback edits carry over.
 - The seed is `table.truncated_to(target)`.
+- **Blob-copy fast-path window (§7.2):** every blob copied verbatim by
+  `copy_completed_blobs_before_boundary` is written to the final sink before `seed` is ever written
+  anywhere in that sink. Until `prime_and_refeed` writes the boundary keyframe and its
+  `BookmarkTable` snapshot, a reader of the **final** sink (e.g. a crash right after the copy step)
+  resolves its bookmarks from the source's own last in-stream snapshot — the untruncated table —
+  via `StreamSnapshot`, not `seed`. The **temp** sink does not have this gap: it is written
+  incrementally as the resumed recording proceeds, so it carries `seed` as soon as
+  `set_bookmark_table` runs, before any further packets exist to read it back from anyway.
 
 **`prime_and_refeed`:**
 - Ignores `Packet::BookmarkTable` and `Packet::Bookmark`.

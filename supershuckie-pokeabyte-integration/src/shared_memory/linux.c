@@ -10,12 +10,21 @@
 #include <stdbool.h>
 
 static int fd = -1;
+static uint8_t *mapped = NULL;
+static size_t mapped_len = 0;
 static const char *shm = "/dev/shm/EDPS_MemoryData.bin";
 
 uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char **error) {
     if(fd != -1) {
         if(error) {
             *error = "shared memory already created";
+        }
+        return NULL;
+    }
+
+    if(len == 0) {
+        if(error) {
+            *error = "zero-length mapping";
         }
         return NULL;
     }
@@ -28,7 +37,14 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
         return NULL;
     }
 
-    ftruncate(new_fd, len);
+    if(ftruncate(new_fd, len) != 0) {
+        if(error) {
+            *error = "ftruncate failed";
+        }
+        close(new_fd);
+        return NULL;
+    }
+
     uint8_t *f = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, new_fd, 0);
 
     if(f == (void *)-1) {
@@ -40,6 +56,8 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
     }
 
     fd = new_fd;
+    mapped = f;
+    mapped_len = len;
 
     if(error) {
         *error = "succeeded";
@@ -50,7 +68,15 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
 
 void supershuckie_pokeabyte_close_shared_memory(void) {
     if(fd == -1) {
-        abort();
+        // Nothing was ever created (or it was already closed); a caller relying on Drop running
+        // more than once should not crash the process.
+        return;
+    }
+
+    if(mapped != NULL) {
+        munmap(mapped, mapped_len);
+        mapped = NULL;
+        mapped_len = 0;
     }
 
     close(fd);

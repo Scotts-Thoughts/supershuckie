@@ -8,6 +8,16 @@ SDLEventWrapper::SDLEventWrapper() {
 
 }
 
+SDLEventWrapper::~SDLEventWrapper() {
+    // Runs as part of ~MainWindow, before SDL_Quit() (main.cpp destroys MainWindow before calling
+    // SDL_Quit()), so it's safe to close every gamepad we still hold open here.
+    for(auto &[id, controller] : this->connected_controllers) {
+        if(controller.gamepad != nullptr) {
+            SDL_CloseGamepad(controller.gamepad);
+        }
+    }
+}
+
 SDLEventWrapperResult SDLEventWrapper::next() {
     SDLEventWrapperResult result = {};
     char msg[256];
@@ -23,22 +33,24 @@ SDLEventWrapperResult SDLEventWrapper::next() {
             case SDL_EventType::SDL_EVENT_GAMEPAD_ADDED: {
                 auto id = event.gdevice.which;
                 auto *gamepad = SDL_OpenGamepad(id);
-                if(SDL_OpenGamepad(id) == nullptr) {
+                if(gamepad == nullptr) {
                     break;
                 }
-                auto *name = SDL_GetGamepadName(gamepad);
-                auto mapping = supershuckie_frontend_connect_controller(this->frontend, name);
+                const char *sdl_name = SDL_GetGamepadName(gamepad);
+                std::string name = sdl_name ? sdl_name : "Unknown gamepad";
+                auto mapping = supershuckie_frontend_connect_controller(this->frontend, name.c_str());
 
-                std::snprintf(msg, sizeof(msg), "Connected controller \"%s\"", name);
+                std::snprintf(msg, sizeof(msg), "Connected controller \"%s\"", name.c_str());
                 this->events_to_print.emplace_back(msg);
 
                 ConnectedController controller;
                 controller.name = std::move(name);
                 controller.mapping = mapping;
+                controller.gamepad = gamepad;
                 this->connected_controllers.emplace(id, std::move(controller));
                 break;
             }
-            
+
             case SDL_EventType::SDL_EVENT_GAMEPAD_REMOVED: {
                 auto id = event.gdevice.which;
                 if(!this->connected_controllers.contains(id)) {
@@ -46,10 +58,14 @@ SDLEventWrapperResult SDLEventWrapper::next() {
                 }
 
                 auto &disconnected = this->connected_controllers[id];
-                supershuckie_frontend_disconnect_controller(this->frontend, this->connected_controllers[id].mapping);
+                supershuckie_frontend_disconnect_controller(this->frontend, disconnected.mapping);
 
                 std::snprintf(msg, sizeof(msg), "Disconnected controller \"%s\"", disconnected.name.c_str());
                 this->events_to_print.emplace_back(msg);
+
+                if(disconnected.gamepad != nullptr) {
+                    SDL_CloseGamepad(disconnected.gamepad);
+                }
 
                 this->connected_controllers.erase(id);
                 break;

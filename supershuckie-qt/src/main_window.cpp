@@ -1,8 +1,9 @@
 // FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.4.13stp"
+#define SUPERSHUCKIE_VERSION "0.4.14stp"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstdarg>
 #include <string>
 #include <QLayout>
 #include <SDL3/SDL.h>
@@ -31,7 +32,6 @@
 #include "nds_date_dialog.hpp"
 #include "select_item_dialog.hpp"
 #include "error.hpp"
-#include "file_rw.hpp"
 #include "game_speed_dialog.hpp"
 #include "render_widget.hpp"
 #include "main_window.hpp"
@@ -40,6 +40,7 @@
 #include "video_export_dialog.hpp"
 #include "memory_tools_controller.hpp"
 #include "bookmark_window.hpp"
+#include "landing_widget.hpp"
 
 #include <QProgressDialog>
 #include <QToolButton>
@@ -138,6 +139,11 @@ MainWindow::MainWindow(): QMainWindow() {
     this->render_widget = new GameRenderWidget(this, center_widget);
     layout->addWidget(this->render_widget, 0, 0);
 
+    // Shares the game view's cell; exactly one of the two is visible at a time.
+    this->landing_widget = new LandingWidget(this, center_widget);
+    layout->addWidget(this->landing_widget, 0, 0);
+    this->landing_widget->hide();
+
     this->playback_bar = new ReplayPlaybackControls(this, center_widget);
     layout->addWidget(this->playback_bar, 1, 0);
     this->playback_bar->hide();
@@ -219,13 +225,13 @@ MainWindow::MainWindow(): QMainWindow() {
         this->enable_pokeabyte_integration->setChecked(true);
     }
     else if(buf[0] != 0) {
-        DISPLAY_ERROR_DIALOG("Failed to automatically start Poke-A-Byte integration", "An error occurred on startup when trying to enable Poke-A-Byte integration:\n\n%s", buf);
+        this->show_error("Failed to automatically start Poke-A-Byte integration", "An error occurred on startup when trying to enable Poke-A-Byte integration:\n\n%s", buf);
     }
     if(supershuckie_frontend_get_external_commands_enabled(this->frontend, buf, sizeof(buf))) {
         this->enable_external_commands->setChecked(true);
     }
     else if(buf[0] != 0) {
-        DISPLAY_ERROR_DIALOG("Failed to automatically start external commands", "An error occurred on startup when trying to enable external commands:\n\n%s", buf);
+        this->show_error("Failed to automatically start external commands", "An error occurred on startup when trying to enable external commands:\n\n%s", buf);
     }
 
     const char *quick_slots = supershuckie_frontend_get_custom_setting(this->frontend, USE_NUMBER_KEYS_FOR_QUICK_SLOTS);
@@ -280,20 +286,27 @@ MainWindow::MainWindow(): QMainWindow() {
     if(supershuckie_frontend_get_audio_enabled(this->frontend) && !this->audio->open()) {
         supershuckie_frontend_set_audio_enabled(this->frontend, false);
         this->audio_enabled->setChecked(false);
-        DISPLAY_ERROR_DIALOG("Failed to open the audio device", "Audio has been turned off. Enable it again from the Audio menu to retry.\n\n%s", this->audio->last_error().c_str());
+        this->show_error("Failed to open the audio device", "Audio has been turned off. Enable it again from the Audio menu to retry.\n\n%s", this->audio->last_error().c_str());
     }
 
     this->sdl.frontend = this->frontend;
     this->render_widget->setFocus(Qt::OtherFocusReason);
     this->rebuild_recent_roms_menu();
 
+    // The frontend exists now, so the favorites list can be read; the video-mode callback that
+    // fired during supershuckie_frontend_new already chose which view to show.
+    this->landing_widget->reload();
+
     this->memory_tools = new MemoryToolsController(this);
     this->memory_tools->restore_windows();
 
     const char *bookmark_window_state = supershuckie_frontend_get_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE);
     if(bookmark_window_state != nullptr) {
+        // Copy out of the FFI buffer before constructing the window: its own constructor makes
+        // many further API calls, any of which can invalidate the pointer returned above.
+        QString bookmark_window_state_copy = QString::fromUtf8(bookmark_window_state);
         this->bookmark_window = new BookmarkWindow(this);
-        this->bookmark_window->restore_state(QString::fromUtf8(bookmark_window_state));
+        this->bookmark_window->restore_state(bookmark_window_state_copy);
     }
     this->confirm_ram_writes->setChecked(supershuckie_frontend_memory_get_confirm_writes_while_recording(this->frontend));
 
@@ -433,7 +446,11 @@ void MainWindow::tick() {
     }
 
     if(!supershuckie_frontend_tick(this->frontend, buf, sizeof(buf))) {
-        DISPLAY_ERROR_DIALOG("Error!", "%s", buf);
+        // The dialog's own event loop would otherwise let the 1 ms ticker re-enter tick() while
+        // this error box is up.
+        this->stop_timer();
+        DISPLAY_ERROR_DIALOG_P(this, "Error!", "%s", buf);
+        this->start_timer();
     }
 
     this->pause->setChecked(supershuckie_frontend_is_paused(this->frontend));
@@ -462,7 +479,7 @@ void MainWindow::tick() {
         this->paused_state->hide();
     }
 
-    if(this->last_known_replay_state != state) {
+    if(this->last_known_replay_state != state || this->last_known_replay_stopped != supershuckie_frontend_is_replay_playback_stopped(this->frontend)) {
         this->refresh_action_states();
     }
 
@@ -711,10 +728,25 @@ void MainWindow::set_up_replays_menu() {
 
     this->replays_menu->addSeparator();
 
-    this->play_replay = this->replays_menu->addAction("Play (unset)");
+    // "Play replay" stays available while a replay is already playing: picking another one
+    // replaces it (the frontend detaches the old replay itself), so closing is a separate action.
+    // Stopping playback without closing the replay is the timeline's stop button.
+    this->play_replay = this->replays_menu->addAction("Play replay");
     this->play_replay->setObjectName("play-replay");
+    this->close_replay = this->replays_menu->addAction("Close replay");
+    this->close_replay->setObjectName("close-replay");
     this->continue_last_replay = this->replays_menu->addAction("Continue last replay");
     this->continue_last_replay->setObjectName("continue-last-replay");
+
+    this->replays_menu->addSeparator();
+
+    // The timeline's buttons (see ReplayPlaybackControls), here so they are rebindable.
+    this->stop_playback = this->replays_menu->addAction("Stop playback (take control)");
+    this->stop_playback->setObjectName("stop-playback");
+    this->resume_playback = this->replays_menu->addAction("Resume playback from the resume point");
+    this->resume_playback->setObjectName("resume-playback");
+    this->go_to_resume_point = this->replays_menu->addAction("Go back to the resume point");
+    this->go_to_resume_point->setObjectName("go-to-resume-point");
 
     this->replays_menu->addSeparator();
 
@@ -754,6 +786,10 @@ void MainWindow::set_up_replays_menu() {
     connect(this->record_replay, SIGNAL(triggered()), this, SLOT(do_record_replay()));
     connect(this->resume_replay, SIGNAL(triggered()), this, SLOT(do_resume_replay()));
     connect(this->play_replay, SIGNAL(triggered()), this, SLOT(do_play_replay()));
+    connect(this->close_replay, SIGNAL(triggered()), this, SLOT(do_close_replay()));
+    connect(this->stop_playback, SIGNAL(triggered()), this, SLOT(do_stop_playback()));
+    connect(this->resume_playback, SIGNAL(triggered()), this, SLOT(do_resume_playback()));
+    connect(this->go_to_resume_point, SIGNAL(triggered()), this, SLOT(do_go_to_resume_point()));
     connect(this->continue_last_replay, SIGNAL(triggered()), this, SLOT(do_continue_last_replay()));
     connect(this->export_video, SIGNAL(triggered()), this, SLOT(do_export_video()));
     connect(this->convert_replay, SIGNAL(triggered()), this, SLOT(do_convert_replay()));
@@ -764,6 +800,10 @@ void MainWindow::set_up_replays_menu() {
     this->play_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_P));
     this->continue_last_replay->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_C));
     this->export_video->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_E));
+    // Modified so they never collide with the keys the game is being played with.
+    this->stop_playback->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_T));
+    this->resume_playback->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_G));
+    this->go_to_resume_point->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_J));
 
     this->replays_menu->addSeparator();
 
@@ -824,7 +864,7 @@ void MainWindow::make_save_state(const char *state) {
         this->set_title(title);
     }
     else {
-        DISPLAY_ERROR_DIALOG("Failed to create save state", "%s", error);
+        this->show_error("Failed to create save state", "%s", error);
     }
 }
 
@@ -837,7 +877,7 @@ void MainWindow::load_save_state(const char *state) {
         this->set_title(title);
     }
     else if(error[0] != 0) {
-        DISPLAY_ERROR_DIALOG("Failed to load save state", "%s", error);
+        this->show_error("Failed to load save state", "%s", error);
     }
     else {
         char title[512];
@@ -1111,6 +1151,7 @@ void MainWindow::set_up_settings_menu() {
     this->gbc_mode[0] = new NumberedAction(this, "Always Game Boy Color", SuperShuckieGBCMode::SuperShuckieGBCMode__AlwaysGBC, &MainWindow::set_gbc_mode);
     this->gbc_mode[1] = new NumberedAction(this, "Game Boy Color games only", SuperShuckieGBCMode::SuperShuckieGBCMode__GBInGBMode, &MainWindow::set_gbc_mode);
     this->gbc_mode[2] = new NumberedAction(this, "Always Game Boy", SuperShuckieGBCMode::SuperShuckieGBCMode__AlwaysGB, &MainWindow::set_gbc_mode);
+    this->gbc_mode[2]->setToolTip("Game Boy Color-only games (such as Pokemon Crystal) cannot run as a Game Boy and always use Game Boy Color mode");
 
     for(auto m : this->gbc_mode) {
         m->setObjectName(QString("gbc-mode-%1").arg(m->number));
@@ -1169,6 +1210,11 @@ void MainWindow::refresh_action_states() {
     auto replay_state = this->frontend != nullptr ?
         supershuckie_frontend_get_replay_state(this->frontend) : SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
 
+    // A loaded replay is either driving the game (playing back) or stopped, with the game live
+    // under the user; only the former takes anything away from the user.
+    bool replay_stopped = this->frontend != nullptr && supershuckie_frontend_is_replay_playback_stopped(this->frontend);
+    bool replay_playing = replay_state == SuperShuckieReplayState::SuperShuckieReplayState__Playback && !replay_stopped;
+
     this->gameplay_menu->setEnabled(game_loaded);
     this->replays_menu->setEnabled(true);
     this->close_rom->setEnabled(game_loaded);
@@ -1182,7 +1228,7 @@ void MainWindow::refresh_action_states() {
     // prevent loading any save states if playing back OR recording and it is disabled
     bool enable_load_save_state_buttons = this->frontend != nullptr
         && (!supershuckie_frontend_get_disable_save_states_when_recording(this->frontend) || replay_state != SuperShuckieReplayState::SuperShuckieReplayState__Recording)
-        && replay_state != SuperShuckieReplayState::SuperShuckieReplayState__Playback;
+        && !replay_playing;
 
     for(auto &state : this->quick_load_save_states) {
         state->setEnabled(enable_load_save_state_buttons);
@@ -1192,9 +1238,12 @@ void MainWindow::refresh_action_states() {
     this->undo_load_save_state->setEnabled(enable_load_save_state_buttons);
 
     this->record_replay->setText("Record replay");
-    this->play_replay->setText("Play replay");
 
     this->play_replay->setEnabled(game_loaded);
+    this->close_replay->setEnabled(false);
+    this->stop_playback->setEnabled(false);
+    this->resume_playback->setEnabled(false);
+    this->go_to_resume_point->setEnabled(false);
     this->record_replay->setEnabled(game_loaded);
     this->resume_replay->setEnabled(game_loaded);
     this->export_video->setEnabled(game_loaded);
@@ -1262,14 +1311,20 @@ void MainWindow::refresh_action_states() {
         case SuperShuckieReplayState::SuperShuckieReplayState__Playback:
             this->record_replay->setEnabled(false);
             // resume_replay stays enabled here: resuming while watching continues from the
-            // current playback frame into a new, separate replay.
+            // current playback frame (a stopped replay's resume point) into a new, separate replay.
             this->reload_core->setEnabled(false);
-            this->reset_console->setEnabled(false);
+            // The game is the user's again while the replay is stopped; resuming playback seeks
+            // back to the resume point whatever they did to it.
+            this->reset_console->setEnabled(replay_stopped);
             this->export_video->setEnabled(false);
-            this->current_state->setText("PLAYBACK");
+            this->current_state->setText(replay_stopped ? "PLAYBACK STOPPED" : "PLAYBACK");
             this->current_state->show();
 
-            this->play_replay->setText("Stop replay");
+            // play_replay stays enabled here: choosing another replay swaps it in directly.
+            this->close_replay->setEnabled(true);
+            this->stop_playback->setEnabled(!replay_stopped);
+            this->resume_playback->setEnabled(replay_stopped);
+            this->go_to_resume_point->setEnabled(replay_stopped);
             this->game_boy_settings->setEnabled(false);
             break;
 
@@ -1279,10 +1334,11 @@ void MainWindow::refresh_action_states() {
     }
 
     this->last_known_replay_state = replay_state;
+    this->last_known_replay_stopped = replay_stopped;
 }
 
 void MainWindow::do_open_rom() {
-    QFileDialog rom_opener;
+    QFileDialog rom_opener(this);
     rom_opener.setFileMode(QFileDialog::FileMode::ExistingFile);
     rom_opener.setNameFilters(QStringList({
         "All compatible ROM files (*.gb *.gbc *.gba *.nds)",
@@ -1292,22 +1348,31 @@ void MainWindow::do_open_rom() {
         "Any files (*)"
     }));
     rom_opener.setWindowTitle("Select a ROM to open");
+
+    // exec() runs a nested event loop; keep the 1 ms ticker from re-entering tick() underneath it.
+    this->stop_timer();
     rom_opener.exec();
+    this->start_timer();
 
     auto files = rom_opener.selectedFiles();
     if(files.size() != 1) {
         return;
     }
 
-    this->load_rom(files[0].toStdString());
+    this->load_rom(std::filesystem::path(files[0].toStdU16String()));
 }
 
 void MainWindow::load_rom(const std::filesystem::path &path) {
     char error[256] = "";
 
-    auto path_string = path.string();
-    if(!supershuckie_frontend_load_rom(this->frontend, path.string().c_str(), error, sizeof(error))) {
-        DISPLAY_ERROR_DIALOG("Can't load ROM", "\"%s\" failed to load:\n\n%s", path_string.c_str(), error);
+    // path.string() converts to the narrow "native" encoding and throws for characters that
+    // encoding can't represent; u8string() always succeeds and is what the Rust side expects.
+    auto path_utf8 = path.u8string();
+    const char *path_utf8_str = reinterpret_cast<const char *>(path_utf8.c_str());
+    if(!supershuckie_frontend_load_rom(this->frontend, path_utf8_str, error, sizeof(error))) {
+        this->stop_timer();
+        DISPLAY_ERROR_DIALOG_P(this, "Can't load ROM", "\"%s\" failed to load:\n\n%s", path_utf8_str, error);
+        this->start_timer();
     }
 
     this->rebuild_recent_roms_menu();
@@ -1336,14 +1401,14 @@ void MainWindow::do_screenshot() {
     // during replay playback, so it works in all of those states.
     QImage image = this->render_widget->capture();
     if(image.isNull()) {
-        DISPLAY_ERROR_DIALOG("Screenshot", "%s", "No frame is available to capture. Load a ROM first.");
+        this->show_error("Screenshot", "%s", "No frame is available to capture. Load a ROM first.");
         return;
     }
 
     // Screenshots live in a "screenshots" folder alongside the ROM's replays and save data.
     std::size_t len = supershuckie_frontend_get_screenshot_directory(this->frontend, nullptr, 0);
     if(len == 0) {
-        DISPLAY_ERROR_DIALOG("Screenshot", "%s", "Could not determine where to save the screenshot.");
+        this->show_error("Screenshot", "%s", "Could not determine where to save the screenshot.");
         return;
     }
     std::vector<char> dir_buf(len, '\0');
@@ -1359,7 +1424,7 @@ void MainWindow::do_screenshot() {
         this->set_title(title);
     }
     else {
-        DISPLAY_ERROR_DIALOG("Screenshot", "Failed to save screenshot to:\n\n%s", path.toStdString().c_str());
+        this->show_error("Screenshot", "Failed to save screenshot to:\n\n%s", path.toStdString().c_str());
     }
 }
 
@@ -1385,7 +1450,7 @@ void MainWindow::do_save_game() {
         this->set_title("Saved SRAM successfully!");
     }
     else {
-        DISPLAY_ERROR_DIALOG("Can't save SRAM", "%s", err);
+        this->show_error("Can't save SRAM", "%s", err);
     }
 }
 
@@ -1617,9 +1682,14 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         supershuckie_frontend_watch_save(this->frontend);
         char bookmark_error[512] = {};
         if(!supershuckie_frontend_bookmark_flush(this->frontend, bookmark_error, sizeof(bookmark_error))) {
-            DISPLAY_ERROR_DIALOG("Bookmarks were not saved", "%s", bookmark_error);
+            this->show_error("Bookmarks were not saved", "%s", bookmark_error);
         }
-        supershuckie_frontend_stop_recording_replay(this->frontend);
+        char stop_recording_error[1024];
+        if(!supershuckie_frontend_stop_recording_replay(this->frontend, stop_recording_error, sizeof(stop_recording_error))) {
+            this->stop_timer();
+            DISPLAY_ERROR_DIALOG_P(this, "Failed to stop recording", "%s", stop_recording_error);
+            this->start_timer();
+        }
         supershuckie_frontend_write_settings(this->frontend);
         supershuckie_frontend_save_sram(this->frontend, nullptr, 0);
     }
@@ -1644,7 +1714,12 @@ void MainWindow::do_record_replay() {
     if(current_replay != nullptr) {
         char saved[512];
         std::snprintf(saved, sizeof(saved), "Saved replay \"%s\"", current_replay);
-        supershuckie_frontend_stop_recording_replay(this->frontend);
+        char stop_recording_error[1024];
+        if(!supershuckie_frontend_stop_recording_replay(this->frontend, stop_recording_error, sizeof(stop_recording_error))) {
+            this->stop_timer();
+            DISPLAY_ERROR_DIALOG_P(this, "Failed to stop recording", "%s", stop_recording_error);
+            this->start_timer();
+        }
         this->set_title(saved);
     }
     else {
@@ -1658,7 +1733,7 @@ void MainWindow::do_record_replay() {
             this->set_title(fmt);
         }
         else {
-            DISPLAY_ERROR_DIALOG("Failed to start recording replay", "%s", result);
+            this->show_error("Failed to start recording replay", "%s", result);
         }
     }
     this->refresh_action_states();
@@ -1720,19 +1795,50 @@ void MainWindow::do_resume_replay() {
         this->set_title(fmt);
     }
     else {
-        DISPLAY_ERROR_DIALOG("Failed to resume recording replay", "%s", result);
+        this->show_error("Failed to resume recording replay", "%s", result);
     }
 
     this->refresh_action_states();
 }
 
-void MainWindow::do_play_replay() {
-    if(supershuckie_frontend_get_replay_state(this->frontend) != SuperShuckieReplayState::SuperShuckieReplayState__NoReplay) {
-        supershuckie_frontend_stop_replay_playback(this->frontend);
-        this->set_title("Closed replay");
+void MainWindow::do_close_replay() {
+    if(supershuckie_frontend_get_replay_state(this->frontend) != SuperShuckieReplayState::SuperShuckieReplayState__Playback) {
         return;
     }
+    supershuckie_frontend_close_replay(this->frontend);
+    this->set_title("Closed replay");
+    this->refresh_action_states();
+}
 
+void MainWindow::do_stop_playback() {
+    if(this->frontend == nullptr || supershuckie_frontend_is_replay_playback_stopped(this->frontend)) {
+        return;
+    }
+    supershuckie_frontend_stop_replay_playback(this->frontend);
+    this->refresh_action_states();
+    this->playback_bar->tick();
+}
+
+void MainWindow::do_resume_playback() {
+    if(this->frontend == nullptr || !supershuckie_frontend_is_replay_playback_stopped(this->frontend)) {
+        return;
+    }
+    char err[512];
+    if(!supershuckie_frontend_resume_replay_playback(this->frontend, err, sizeof(err))) {
+        this->show_error("Could not resume the replay", "%s", err);
+    }
+    this->refresh_action_states();
+    this->playback_bar->tick();
+}
+
+void MainWindow::do_go_to_resume_point() {
+    if(this->frontend == nullptr || !supershuckie_frontend_is_replay_playback_stopped(this->frontend)) {
+        return;
+    }
+    supershuckie_frontend_go_to_replay_resume_point(this->frontend);
+}
+
+void MainWindow::do_play_replay() {
     auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
     auto text = SelectItemDialog::ask(this, replays, "Select a replay", "Select a replay file to play.");
     if(text == std::nullopt) {
@@ -1741,17 +1847,21 @@ void MainWindow::do_play_replay() {
 
     char err[512];
     char fmt[512];
-    
+
+    // A failed load can still have detached a replay that was playing, so the menu is refreshed
+    // on every path from here on.
     if(!supershuckie_frontend_load_replay(this->frontend, text->c_str(), false, err, sizeof(err))) {
         std::snprintf(fmt, sizeof(fmt), "%s", err);
-        DISPLAY_ERROR_DIALOG("Replay file issues detected", "%s", fmt);
+        this->show_error("Replay file issues detected", "%s", fmt);
 
         if(!supershuckie_frontend_load_replay(this->frontend, text->c_str(), true, err, sizeof(err))) {
+            this->refresh_action_states();
             return;
         }
     }
 
     if(!supershuckie_frontend_get_replay_playback_time(this->frontend, nullptr, nullptr)) {
+        this->refresh_action_states();
         return;
     }
 
@@ -1764,7 +1874,7 @@ void MainWindow::do_play_replay() {
 void MainWindow::do_export_video() {
     auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
     if(replays.empty()) {
-        DISPLAY_ERROR_DIALOG("Export video", "%s", "No replays found for this ROM.");
+        this->show_error("Export video", "%s", "No replays found for this ROM.");
         return;
     }
 
@@ -1788,7 +1898,7 @@ void MainWindow::do_export_video() {
         replay.c_str(), out_path.c_str(), use_range, start, end, preset,
         preset == 2 ? custom.c_str() : nullptr, scale, layout, err, sizeof(err));
     if(!ok) {
-        DISPLAY_ERROR_DIALOG("Export failed to start", "%s", err);
+        this->show_error("Export failed to start", "%s", err);
         return;
     }
 
@@ -1812,7 +1922,7 @@ void MainWindow::do_export_video() {
             break;
         }
         if(fin == 2) {
-            DISPLAY_ERROR_DIALOG("Export failed", "%s", poll_err);
+            this->show_error("Export failed", "%s", poll_err);
             break;
         }
 
@@ -1901,7 +2011,7 @@ void MainWindow::convert_replays_at(const QString &path) {
 
     char err[1024];
     if(!supershuckie_frontend_start_replay_conversion(this->frontend, keep_backups, err, sizeof(err))) {
-        DISPLAY_ERROR_DIALOG("Convert replays", "%s", err);
+        this->show_error("Convert replays", "%s", err);
         return;
     }
 
@@ -1985,7 +2095,29 @@ void MainWindow::on_change_video_mode(void *user_data, std::size_t screen_count,
         scale->setChecked(scale->number == video_scale);
     }
 
+    self->update_landing_visibility();
     self->refresh_action_states();
+}
+
+void MainWindow::update_landing_visibility() {
+    bool running = this->is_game_running();
+    bool landing_shown = this->landing_widget->isVisibleTo(this->landing_widget->parentWidget());
+
+    if(running) {
+        if(landing_shown) {
+            this->landing_widget->hide();
+            this->render_widget->show();
+            // The landing screen had the mouse and keyboard; give the keyboard back to the game.
+            this->render_widget->setFocus(Qt::OtherFocusReason);
+        }
+    }
+    else {
+        // Take over the exact footprint of the (blank) game view so the fixed-size window doesn't
+        // jump when switching between the two.
+        this->landing_widget->setFixedSize(this->render_widget->size());
+        this->render_widget->hide();
+        this->landing_widget->show();
+    }
 }
 
 bool MainWindow::is_game_running() {
@@ -2030,7 +2162,7 @@ void MainWindow::do_toggle_pokeabyte() {
 
     bool enabled = this->enable_pokeabyte_integration->isChecked();
     if(!supershuckie_frontend_set_pokeabyte_enabled(this->frontend, enabled, err, sizeof(err))) {
-        DISPLAY_ERROR_DIALOG("Failed to enable Poke-A-Byte integration", "An error occurred when enabling Poke-A-Byte integration:\n\n%s", err);
+        this->show_error("Failed to enable Poke-A-Byte integration", "An error occurred when enabling Poke-A-Byte integration:\n\n%s", err);
         this->enable_pokeabyte_integration->setChecked(false);
     }
 }
@@ -2039,13 +2171,29 @@ void MainWindow::do_toggle_stop_replay_on_input() {
     supershuckie_frontend_set_auto_stop_playback_on_input_setting(this->frontend, this->auto_stop_replay_on_input->isChecked());
 }
 
+void MainWindow::show_error(const char *title, const char *fmt, ...) {
+    char message[1024];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    this->stop_timer();
+    DISPLAY_ERROR_DIALOG_P(this, title, "%s", message);
+    this->start_timer();
+}
+
 void MainWindow::start_timer() {
     this->timer_stack--;
     if(this->timer_stack == 0) {
         this->ticker.start();
     }
     if(this->timer_stack < 0) {
-        DISPLAY_ERROR_DIALOG("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        // Deliberately not routed through show_error(): we're already inside start_timer(), and
+        // show_error() calls stop_timer()/start_timer() around the dialog, which would re-enter
+        // this function while the stack counter is already unbalanced. Parent it and skip the
+        // timer guard instead.
+        DISPLAY_ERROR_DIALOG_P(this, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         this->timer_stack = 0;
     }
 }
@@ -2127,7 +2275,7 @@ void MainWindow::do_toggle_audio_enabled() {
     bool enable = this->audio_enabled->isChecked();
     if(enable && !this->audio->open()) {
         this->audio_enabled->setChecked(false);
-        DISPLAY_ERROR_DIALOG("Failed to open the audio device", "%s", this->audio->last_error().c_str());
+        this->show_error("Failed to open the audio device", "%s", this->audio->last_error().c_str());
         this->refresh_action_states();
         return;
     }
@@ -2216,7 +2364,7 @@ void MainWindow::do_reload_core() {
 void MainWindow::do_toggle_external_commands() {
     char buf[256];
     if(!supershuckie_frontend_set_external_commands_enabled(this->frontend, this->enable_external_commands->isChecked(), buf, sizeof(buf))) {
-        DISPLAY_ERROR_DIALOG("Failed to start remote commands", "%s", buf);
+        this->show_error("Failed to start remote commands", "%s", buf);
     }
 }
 
@@ -2231,7 +2379,7 @@ void MainWindow::do_toggle_auto_resync_keyframes_in_replay() {
 void MainWindow::do_continue_last_replay() {
     char buf[512];
     if(!supershuckie_frontend_continue_last_replay(this->frontend, buf, sizeof(buf))) {
-        DISPLAY_ERROR_DIALOG("Failed to continue replay", "%s", buf);
+        this->show_error("Failed to continue replay", "%s", buf);
     }
 }
 

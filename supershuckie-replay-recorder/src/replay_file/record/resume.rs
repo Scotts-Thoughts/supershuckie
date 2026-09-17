@@ -58,6 +58,17 @@ pub enum ReplayResumeError {
     Cancelled,
 }
 
+impl core::fmt::Display for ReplayResumeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReplayResumeError::BadSource { explanation } => write!(f, "the source replay could not be resumed: {explanation}"),
+            ReplayResumeError::Write(error) => write!(f, "writing the resumed replay failed: {error}"),
+            ReplayResumeError::Read(error) => write!(f, "reading the source replay failed: {error:?}"),
+            ReplayResumeError::Cancelled => f.write_str("resuming was cancelled"),
+        }
+    }
+}
+
 /// Build a recorder primed to continue from `resume_at_frame` (`None` = end of replay).
 ///
 /// Writes header + patch + the prefix `[0 ..= target]` into the two sinks and returns the OPEN
@@ -203,6 +214,15 @@ fn blank_recorder_from_source<FS: ReplayFileSink, TS: ReplayFileSink>(
 /// `target <= total` (the last blob ends at `total`). Since `target` lies within that blob, the
 /// stop condition in [`prime_and_refeed`] fires before the cursor can spill into any later blob, so
 /// later blobs are correctly dropped from the prefix.
+///
+/// Bookmark snapshot window: every blob copied here goes into `recorder`'s **final** sink before
+/// the resumed bookmark table (`seed` in [`build_resumed_recorder`]) is written anywhere. Until
+/// `prime_and_refeed` writes the boundary keyframe and its `BookmarkTable` snapshot afterward, the
+/// final sink's newest in-stream snapshot is still whatever the *source*'s last copied blob held
+/// (the source's untruncated table), not `seed` — a reader of the final sink in that narrow window
+/// (e.g. right after a crash) would resolve the wrong table via `StreamSnapshot`. Only the *temp*
+/// sink avoids this, since it is written incrementally and picks up `seed` as soon as
+/// `set_bookmark_table` runs. See replay-bookmarks-spec.md §7.2/§8.
 fn copy_completed_blobs_before_boundary<FS: ReplayFileSink, TS: ReplayFileSink>(
     recorder: &mut ReplayFileRecorder<FS, TS>,
     source: &ReplayFilePlayer,
@@ -266,6 +286,15 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     let anchors: BTreeSet<UnsignedInteger> = bookmarks.keyframe_anchor_frames().collect();
     let encoding_for = |frame: UnsignedInteger| if anchors.contains(&frame) { KeyframeEncoding::Full } else { KeyframeEncoding::Auto };
 
+    // `start_frame` (from `copy_completed_blobs_before_boundary`) is the frame of the boundary
+    // blob's *first* listed keyframe, but `go_to_keyframe` resolves a frame to the *last*
+    // keyframe-class packet on it (§5.8 of replay-bookmarks-spec.md). So if that blob happens to
+    // open with two keyframes sharing this frame (a scheduled keyframe forced full because it
+    // started the blob, immediately followed by another full keyframe for the same frame, e.g. a
+    // keyframe bookmark's anchor), this seeks to the *later* one rather than the blob's first
+    // packet. That is correct, not a bug: the later keyframe's state and metadata (input/speed/
+    // counters) already include every packet recorded between the two — they share a frame, so
+    // there was no `NextFrame` between them — so re-feeding from it loses nothing observable.
     source.go_to_keyframe(start_frame).map_err(ReplayResumeError::Read)?;
 
     // The first packet must be the keyframe at `start_frame`. Clone everything out before any
@@ -376,7 +405,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
         match action {
             Action::Stop => break,
             Action::NextFrame(delta) => {
-                running_ms += delta;
+                running_ms = running_ms.checked_add(delta).ok_or_else(|| ReplayResumeError::BadSource {
+                    explanation: Cow::Borrowed("timestamp overflowed while re-feeding the source"),
+                })?;
                 recorder
                     .next_frame(running_ms.into())
                     .map_err(ReplayResumeError::Write)?;
@@ -587,6 +618,22 @@ mod tests {
         .unwrap();
         let (final_sink, _temp) = recorder.close().unwrap();
         (final_sink, info)
+    }
+
+    /// Every variant renders a human-readable message (downstream code formats these into error
+    /// dialogs).
+    #[test]
+    fn replay_resume_error_has_a_display_message_for_every_variant() {
+        let variants = [
+            ReplayResumeError::BadSource { explanation: Cow::Borrowed("no frame-0 keyframe") },
+            ReplayResumeError::Write(ReplayFileWriteError::StreamClosed),
+            ReplayResumeError::Read(ReplaySeekError::NoSuchKeyframe { given: 5, best: 0 }),
+            ReplayResumeError::Cancelled,
+        ];
+        for variant in variants {
+            let message = format!("{variant}");
+            assert!(!message.is_empty(), "{variant:?}");
+        }
     }
 
     #[test]

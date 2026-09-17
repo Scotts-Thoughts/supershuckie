@@ -396,7 +396,7 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 /// Rename with a few retries: Dropbox and antivirus scanners briefly hold freshly written files.
-fn rename_with_retry(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..5 {
         if attempt > 0 {

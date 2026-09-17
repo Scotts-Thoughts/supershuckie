@@ -17,3 +17,7 @@ mgba-rs = { workspace = true }
 default = ["std", "pokeabyte"]
 pokeabyte = ["supershuckie-pokeabyte-integration"]
 std = []
+
+[dev-dependencies]
+melonds-rs = { workspace = true, features = ["link-cores"] }
+mgba-rs = { workspace = true, features = ["link-cores"] }

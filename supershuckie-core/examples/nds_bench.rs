@@ -219,7 +219,7 @@ fn repro(o: &Options, rom: &[u8], k: u64) {
     pa.go_to_keyframe(0).expect("seek");
     pb.go_to_keyframe(0).expect("seek");
 
-    let mut a = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit);
+    let mut a = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit).expect("failed to load ROM");
     let mut seen_a = 0u64;
     let mut seen_b = 0u64;
     let mut input_a = Vec::new();
@@ -230,14 +230,14 @@ fn repro(o: &Options, rom: &[u8], k: u64) {
         a.run_unlocked();
     }
     // Advance player B to the same position without emulating (its core is replaced below).
-    let mut scratch = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit);
+    let mut scratch = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit).expect("failed to load ROM");
     for _ in 0..k {
         assert!(feed_frame(&mut pb, &mut scratch, &mut seen_b, false, &mut input_b), "replay too short");
     }
     drop(scratch);
 
     let snapshot = a.create_save_state();
-    let mut b = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit);
+    let mut b = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), o.jit).expect("failed to load ROM");
     b.load_save_state(&snapshot).expect("load snapshot into B");
     // melonDS save states do not carry KeyInput, so mirror A's current input explicitly.
     if !input_a.is_empty() {
@@ -282,7 +282,7 @@ fn main() {
         repro(&o, &rom, k);
         return;
     }
-    let mut core = NintendoDS::new_from_rom(&rom, None, std_timestamp_provider(), o.jit);
+    let mut core = NintendoDS::new_from_rom(&rom, None, std_timestamp_provider(), o.jit).expect("failed to load ROM");
     core.set_audio_enabled(o.audio);
     let mut audio_scratch: Vec<i16> = Vec::new();
     let mut audio_frames: u64 = 0;

@@ -5,46 +5,72 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::fs;
-use std::fs::File;
 use std::hint::unreachable_unchecked;
-use std::io::{Read, Seek, SeekFrom};
 use std::num::{NonZeroIsize, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use std::path::Path;
 use std::path::PathBuf;
 use supershuckie_core::emulator::Input;
 use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
+use supershuckie_replay_recorder::Speed;
 
-pub(crate) fn try_to_init_data_dir_and_get_settings(data_dir: &Path, config_dir: &Path) -> Result<Settings, String> {
-    if !data_dir.exists() {
-        fs::create_dir(&data_dir).map_err(|e| format!("Failed to create the data_dir: {e}"))?;
-    }
-    if !config_dir.exists() {
-        fs::create_dir(&config_dir).map_err(|e| format!("Failed to create the config_dir: {e}"))?;
-    }
+/// Name of the file a settings file that could not be read or parsed is copied to (next to the
+/// original, which is left in place), in the config dir.
+const BAD_SETTINGS_FILE: &str = "settings.json.bad";
 
-    let settings_json = config_dir.join(SETTINGS_FILE);
-    let mut settings_file = File::options()
-        .write(true)
-        .read(true)
-        .create(true)
-        .open(settings_json)
-        .map_err(|e| format!("Failed to open the config file for write access: {e}"))?;
-
-    settings_file.seek(SeekFrom::Start(0)).map_err(|e| format!("Failed to seek the config file: {e}"))?;
-
-    let mut settings_str = String::new();
-    settings_file.read_to_string(&mut settings_str).map_err(|e| format!("Failed to read the config file: {e}"))?;
-
-    if settings_str.trim().is_empty() {
-        settings_str = "{}".to_owned();
-    }
-
-    let mut settings: Settings = serde_json::from_str::<Settings>(&settings_str).map_err(|e| format!("Failed to parse the config file: {e}"))?;
-    settings.audio.clamp();
-    Ok(settings)
+/// Copy the unreadable settings file aside (best-effort) and fall back to default settings, with
+/// a warning to surface on the first tick (C4).
+fn settings_read_fallback(settings_path: &Path, config_dir: &Path, error: impl std::fmt::Display) -> (Settings, String) {
+    let _ = fs::copy(settings_path, config_dir.join(BAD_SETTINGS_FILE));
+    let mut settings = Settings::default();
+    settings.clamp();
+    (settings, format!("Your settings file could not be read and default settings are in use. The unreadable file was kept as {BAD_SETTINGS_FILE}. ({error})"))
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// Prepare the data and config directories and load settings from them. Never fails: directory
+/// creation failures and an unreadable/unparsable settings file become warnings (returned
+/// alongside the settings to use) instead of aborting startup (C4).
+pub(crate) fn try_to_init_data_dir_and_get_settings(data_dir: &Path, config_dir: &Path) -> (Settings, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    if !data_dir.exists() {
+        if let Err(e) = fs::create_dir_all(data_dir) {
+            warnings.push(format!("Failed to create the data directory {}: {e}", data_dir.display()));
+        }
+    }
+    if !config_dir.exists() {
+        if let Err(e) = fs::create_dir_all(config_dir) {
+            warnings.push(format!("Failed to create the config directory {}: {e}", config_dir.display()));
+        }
+    }
+
+    let settings_path = config_dir.join(SETTINGS_FILE);
+
+    let settings_str = match fs::read_to_string(&settings_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            let (settings, warning) = settings_read_fallback(&settings_path, config_dir, e);
+            warnings.push(warning);
+            return (settings, warnings);
+        }
+    };
+
+    let settings_str = if settings_str.trim().is_empty() { "{}".to_owned() } else { settings_str };
+
+    let mut settings: Settings = match serde_json::from_str(&settings_str) {
+        Ok(s) => s,
+        Err(e) => {
+            let (settings, warning) = settings_read_fallback(&settings_path, config_dir, e);
+            warnings.push(warning);
+            return (settings, warnings);
+        }
+    };
+
+    settings.clamp();
+    (settings, warnings)
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "ReplaySettings::default")]
     pub replay: ReplaySettings,
@@ -151,7 +177,27 @@ impl Settings {
         }
         self.rom_config.get_mut(rom).expect("we just added the rom??")
     }
+
+    /// Bring out-of-range values loaded from (or set directly into) the settings file back into
+    /// range, so a hand-edited or old config file cannot leave the app in a broken state (L13).
+    pub(crate) fn clamp(&mut self) {
+        self.audio.clamp();
+        self.replay.zstd_compression_level = self.replay.zstd_compression_level.clamp(1, 22);
+
+        // Same normalisation `set_speed_settings` applies: NaN/zero/negative collapse to the
+        // minimum representable speed, and the value is otherwise snapped to the fixed-point grid
+        // `Speed` stores it as.
+        self.emulation.base_speed_multiplier = Speed::from_multiplier_float(self.emulation.base_speed_multiplier).into_multiplier_float();
+        self.emulation.turbo_speed_multiplier = Speed::from_multiplier_float(self.emulation.turbo_speed_multiplier).into_multiplier_float();
+
+        self.export.default_crf = self.export.default_crf.min(51);
+
+        self.recent_roms.clamp();
+    }
 }
+
+/// Hard upper bound on how many entries the "Open recent ROM" menu shows.
+pub const MAX_RECENT_ROMS: usize = 10;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct RecentROMs {
@@ -162,9 +208,20 @@ pub struct RecentROMs {
 impl Default for RecentROMs {
     fn default() -> Self {
         Self {
-            max_recent_roms: unsafe { NonZeroIsize::new_unchecked(20) },
+            max_recent_roms: unsafe { NonZeroIsize::new_unchecked(MAX_RECENT_ROMS as isize) },
             recent_roms: Vec::new()
         }
+    }
+}
+
+impl RecentROMs {
+    /// Cap `max_recent_roms` to [`MAX_RECENT_ROMS`] and truncate the list to match.
+    pub(crate) fn clamp(&mut self) {
+        if self.max_recent_roms.get() > MAX_RECENT_ROMS as isize {
+            self.max_recent_roms = NonZeroIsize::new(MAX_RECENT_ROMS as isize).unwrap();
+        }
+        let max = self.max_recent_roms.get().max(0) as usize;
+        self.recent_roms.truncate(max);
     }
 }
 
@@ -628,10 +685,12 @@ impl NintendoDSDate {
 
         cleaned.day = cleaned.day.min(max_days_per_month(cleaned.month));
 
-        // handle leap years
+        // handle leap years (M9: February is 29 days in a leap year and 28 otherwise; this used
+        // to be backwards, capping at 28 only IN leap years)
         //
         // (the % 100/400 is technically redundant since the range is 2000-2099, and 2000 was a leap year; idc)
-        if cleaned.month == 2 && cleaned.year % 4 == 0 && (cleaned.year % 100 != 0 || cleaned.year % 400 == 0) {
+        let is_leap = cleaned.year % 4 == 0 && (cleaned.year % 100 != 0 || cleaned.year % 400 == 0);
+        if cleaned.month == 2 && !is_leap {
             cleaned.day = cleaned.day.min(28);
         }
 
@@ -651,7 +710,8 @@ pub enum GameBoyMode {
     #[serde(rename = "GBC-auto")]
     GBInGBMode = 1,
 
-    /// Run all Game Boy games in Game Boy mode, even incompatible Game Boy Color games
+    /// Run all Game Boy games in Game Boy mode (except Game Boy Color-only games, which cannot
+    /// run there and always get a Game Boy Color)
     #[serde(rename = "GBC-never")]
     AlwaysGB = 2
 }
@@ -877,5 +937,117 @@ impl Control {
             Control::X | Control::Y | Control::SwapScreens => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS),
             _ => true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dirs(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("supershuckie-frontend-settings-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        (root.join("data"), root.join("config"))
+    }
+
+    #[test]
+    fn bad_settings_fall_back_to_defaults_and_keep_a_bad_copy() {
+        let (data_dir, config_dir) = temp_dirs("bad");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join(SETTINGS_FILE), b"{not valid json at all").unwrap();
+
+        let (settings, warnings) = try_to_init_data_dir_and_get_settings(&data_dir, &config_dir);
+
+        assert_eq!(warnings.len(), 1, "a single warning should be reported: {warnings:?}");
+        assert!(warnings[0].contains("settings.json.bad"), "warning should mention the backup: {}", warnings[0]);
+        assert_eq!(settings.audio.volume, AudioSettings::DEFAULT_VOLUME(), "defaults should be in use");
+
+        let backup = fs::read_to_string(config_dir.join(BAD_SETTINGS_FILE)).expect("the bad file should have been copied aside");
+        assert_eq!(backup, "{not valid json at all", "the original bad content should be preserved verbatim");
+
+        // The original (unreadable) file is left in place, untouched.
+        let original = fs::read_to_string(config_dir.join(SETTINGS_FILE)).unwrap();
+        assert_eq!(original, "{not valid json at all");
+
+        let _ = fs::remove_dir_all(data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn missing_or_blank_settings_use_defaults_with_no_warning() {
+        let (data_dir, config_dir) = temp_dirs("missing");
+
+        let (settings, warnings) = try_to_init_data_dir_and_get_settings(&data_dir, &config_dir);
+        assert!(warnings.is_empty(), "a missing settings file is not an error: {warnings:?}");
+        assert_eq!(settings.audio.volume, AudioSettings::DEFAULT_VOLUME());
+        assert!(data_dir.is_dir(), "the data dir should have been created");
+        assert!(config_dir.is_dir(), "the config dir should have been created");
+
+        fs::write(config_dir.join(SETTINGS_FILE), b"   \n").unwrap();
+        let (settings, warnings) = try_to_init_data_dir_and_get_settings(&data_dir, &config_dir);
+        assert!(warnings.is_empty(), "a blank settings file is not an error: {warnings:?}");
+        assert_eq!(settings.audio.volume, AudioSettings::DEFAULT_VOLUME());
+
+        let _ = fs::remove_dir_all(data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped_on_load() {
+        let (data_dir, config_dir) = temp_dirs("clamped");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        // Hand-written JSON: NaN/Infinity have no JSON representation (serde_json serializes them
+        // as `null`, which then fails to parse back as f64), so a negative and a huge-but-finite
+        // multiplier stand in here to exercise the same `Speed` normalisation; NaN/Infinity are
+        // covered directly against `Settings::clamp` below.
+        let json = r#"{
+            "replay": { "zstd_compression_level": 99 },
+            "emulation": { "base_speed_multiplier": -5.0, "turbo_speed_multiplier": 1000000.0 },
+            "export": { "default_crf": 255 },
+            "recent_roms": { "max_recent_roms": 2, "recent_roms": ["a", "b", "c", "d"] }
+        }"#;
+        fs::write(config_dir.join(SETTINGS_FILE), json).unwrap();
+
+        let (loaded, warnings) = try_to_init_data_dir_and_get_settings(&data_dir, &config_dir);
+        assert!(warnings.is_empty(), "a parseable file with out-of-range values is not a warning: {warnings:?}");
+
+        assert_eq!(loaded.replay.zstd_compression_level, 22);
+        assert_eq!(loaded.emulation.base_speed_multiplier, Speed::from_multiplier_float(-5.0).into_multiplier_float());
+        assert_eq!(loaded.emulation.turbo_speed_multiplier, Speed::from_multiplier_float(1000000.0).into_multiplier_float());
+        assert_eq!(loaded.export.default_crf, 51);
+        assert_eq!(loaded.recent_roms.recent_roms.len(), 2, "recent ROMs must be capped to max_recent_roms");
+
+        let mut roms = RecentROMs {
+            max_recent_roms: NonZeroIsize::new(50).unwrap(),
+            recent_roms: (0..30).map(|i| UTF8CString::from_str(&i.to_string())).collect(),
+        };
+        roms.clamp();
+        assert_eq!(roms.max_recent_roms.get(), MAX_RECENT_ROMS as isize, "max_recent_roms must never exceed the hard cap");
+        assert_eq!(roms.recent_roms.len(), MAX_RECENT_ROMS);
+
+        let _ = fs::remove_dir_all(data_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn nan_and_infinite_speeds_collapse_to_the_minimum_speed_via_clamp() {
+        // NaN/Infinity cannot round-trip through JSON (see the test above), but `clamp()` must
+        // still defend against them turning up in memory some other way (e.g. a bad division).
+        let minimum_speed = Speed::from_multiplier_float(0.0).into_multiplier_float();
+
+        let mut settings = Settings::default();
+        settings.emulation.base_speed_multiplier = f64::NAN;
+        settings.emulation.turbo_speed_multiplier = f64::NEG_INFINITY;
+        settings.clamp();
+
+        assert_eq!(settings.emulation.base_speed_multiplier, minimum_speed, "NaN must collapse to the minimum speed");
+        assert_eq!(settings.emulation.turbo_speed_multiplier, minimum_speed, "-Infinity must collapse to the minimum speed");
+    }
+
+    #[test]
+    fn nintendo_ds_date_leap_years_are_cleaned_correctly() {
+        let date = |year: u16| NintendoDSDate { year, month: 2, day: 29, hour: 0, minute: 0, second: 0 };
+
+        assert_eq!(date(2024).get_cleaned().day, 29, "2024 is a leap year");
+        assert_eq!(date(2023).get_cleaned().day, 28, "2023 is not a leap year");
+        assert_eq!(date(2100).get_cleaned().day, 28, "2100 is not a leap year (divisible by 100, not 400)");
     }
 }

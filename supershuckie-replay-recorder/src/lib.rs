@@ -17,6 +17,8 @@ mod util;
 
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod corruption_tests;
 
 pub use packet::*;
 pub use util::*;

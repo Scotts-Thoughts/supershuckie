@@ -228,6 +228,16 @@ pub trait EmulatorCore: Send + 'static {
     fn is_null(&self) -> bool {
         false
     }
+
+    /// Whether the last `run`/`run_unlocked` stopped inside a frame (a partial step, not a
+    /// pacing wait): only cores that step in sub-frame slices (the Game Boy core) ever return
+    /// `true`. Paced cores (Game Boy Advance, Nintendo DS) report `RunTime::NONE` on a pacing
+    /// miss too, but that is not "mid-frame" -- nothing has been partly emulated -- so they
+    /// never override this.
+    #[inline]
+    fn is_mid_frame(&self) -> bool {
+        false
+    }
 }
 
 /// Amount of time passed when running the emulator core.

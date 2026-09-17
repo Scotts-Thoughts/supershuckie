@@ -71,8 +71,11 @@ static archives were not found and the import libraries were taken instead.
 ## Stdout is the wire
 
 Nothing but protocol bytes may reach standard output. Before the first request is read, `serve`
-duplicates stdout's handle for the protocol and points descriptor 1 at stderr (`dup2`), so a
-`printf` from the cores' C glue — "Bad BIOS", "Failed to init mGBA", each followed by
-`std::terminate()` — lands in the log the client keeps rather than in the middle of a frame.
+duplicates stdout's handle for the protocol and points descriptor 1 at stderr (`dup2`). This
+redirects the C runtime's descriptor 1 — what the cores' C glue writes to with `printf` ("Bad
+BIOS", "Failed to init mGBA", each followed by `std::terminate()`) — so that output lands in the
+log the client keeps rather than in the middle of a frame. It does not touch Rust's own stdout
+(on Windows in particular, `_dup2` on descriptor 1 does not move the Win32 handle Rust's stdout
+writes through), so Rust code in the server uses `eprintln!` directly instead, which it does.
 Cutter reads that log back into its error message together with the exit status, which is how a
 server that cannot start on a machine says why.

@@ -25,10 +25,16 @@ struct SuperShuckieAudioOutputRaw;
  * Represents an opaque SuperShuckie frontend created with supershuckie_frontend_new() and freed with supershuckie_frontend_free().
  *
  * EXCEPT for supershuckie_frontend_free, no functions that take a pointer to a frontend accept a null SuperShuckieFrontendRaw pointer.
+ *
+ * Unless documented otherwise, an (error, error_len) output pair may be given as (NULL, 0) to skip
+ * the error message entirely; any error is silently dropped in that case.
  */
 struct SuperShuckieFrontendRaw;
 
 typedef uint32_t SuperShuckieConnectedControllerIndex;
+
+/** Never a real controller index; returned by supershuckie_frontend_connect_controller() on a null name. */
+#define SUPERSHUCKIE_INVALID_CONTROLLER_INDEX UINT32_MAX
 
 struct SuperShuckieScreenData {
     uint32_t width;
@@ -56,7 +62,20 @@ typedef void (*SuperShuckieChangeVideoModeCallback)(void *user_data, size_t scre
 struct SuperShuckieFrontendCallbacks {
     void *user_data;
 
+    /**
+     * Called with the freshly rendered screens' pixels. The core's screens mutex is held for the
+     * duration of this call (and the frontend is not otherwise usable from it), so this callback
+     * must NOT call back into the frontend (no supershuckie_frontend_* calls).
+     */
     SuperShuckieRefreshScreensCallback refresh_screens;
+
+    /**
+     * Called when the video mode (screen count/geometry/encoding or the display scale) changes.
+     * `screen_data` only has `width`/`height`/`encoding` filled in; there is no pixel data (and no
+     * pixel pointers) here, use refresh_screens for pixels. Unlike refresh_screens, this is called
+     * with no lock held, so it MAY call back into the frontend -- but only through its read-only
+     * getters; nothing that could reenter the core or the screens lock.
+     */
     SuperShuckieChangeVideoModeCallback change_video_mode;
 };
 
@@ -109,7 +128,7 @@ void supershuckie_frontend_set_sgb_enabled(struct SuperShuckieFrontendRaw *front
 /**
  * Get whether or not SGB is enabled.
  */
-bool supershuckie_frontend_is_sgb_enabled(struct SuperShuckieFrontendRaw *frontend);
+bool supershuckie_frontend_is_sgb_enabled(const struct SuperShuckieFrontendRaw *frontend);
 
 enum SuperShuckieGBCMode {
     SuperShuckieGBCMode__AlwaysGBC = 0,
@@ -125,12 +144,7 @@ void supershuckie_frontend_set_gbc_mode(struct SuperShuckieFrontendRaw *frontend
 /**
  * Get the GBC mode.
  */
-uint32_t supershuckie_frontend_get_gbc_mode(struct SuperShuckieFrontendRaw *frontend);
-
-/**
- * Get whether or not SGB is enabled.
- */
-bool supershuckie_frontend_is_sgb_enabled(struct SuperShuckieFrontendRaw *frontend);
+uint32_t supershuckie_frontend_get_gbc_mode(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * Set whether or not the frontend is paused.
@@ -177,7 +191,7 @@ const char *supershuckie_frontend_get_custom_setting(const struct SuperShuckieFr
  * Safety:
  * - setting must not be null
  */
-void supershuckie_frontend_set_custom_setting(const struct SuperShuckieFrontendRaw *frontend, const char *setting, const char *value);
+void supershuckie_frontend_set_custom_setting(struct SuperShuckieFrontendRaw *frontend, const char *setting, const char *value);
 
 /**
  * Start recording a replay with the given name, or null to use a default name.
@@ -264,8 +278,14 @@ uint32_t supershuckie_frontend_export_poll_finished(struct SuperShuckieFrontendR
 
 /**
  * Stop recording a replay.
+ *
+ * Returns false (with an error written to error) if the recording could not be finalised; its
+ * temp file is then kept rather than deleted, so it can be recovered.
+ *
+ * Safety:
+ * - error may be null if error_len is 0.
  */
-void supershuckie_frontend_stop_recording_replay(struct SuperShuckieFrontendRaw *frontend);
+bool supershuckie_frontend_stop_recording_replay(struct SuperShuckieFrontendRaw *frontend, char *error, size_t error_len);
 
 /**
  * Get the replays directory of the current ROM (a starting point for file dialogs).
@@ -377,7 +397,7 @@ bool supershuckie_frontend_get_external_commands_enabled(const struct SuperShuck
  * Safety:
  * - error must not be null and must be at least error_len bytes long.
  */
-bool supershuckie_frontend_set_external_commands_enabled(const struct SuperShuckieFrontendRaw *frontend, bool enabled, char *error, size_t error_len);
+bool supershuckie_frontend_set_external_commands_enabled(struct SuperShuckieFrontendRaw *frontend, bool enabled, char *error, size_t error_len);
 
 /**
  * Return true if the emulator is currently manually paused.
@@ -475,6 +495,17 @@ void supershuckie_frontend_set_auto_pause_on_record_setting(struct SuperShuckieF
 bool supershuckie_frontend_get_auto_pause_on_record_setting(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
+ * Set whether replays are fully decompressed into memory up front when loaded, rather than
+ * decompressed incrementally as playback reaches each part.
+ */
+void supershuckie_frontend_set_auto_decompress_replays_upfront_setting(struct SuperShuckieFrontendRaw *frontend, bool new_setting);
+
+/**
+ * Get whether replays are fully decompressed into memory up front when loaded.
+ */
+bool supershuckie_frontend_get_auto_decompress_replays_upfront_setting(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
  * Set the current frame for playback.
  */
 void supershuckie_frontend_set_playback_frame(struct SuperShuckieFrontendRaw *frontend, uint32_t frame);
@@ -490,7 +521,8 @@ void supershuckie_frontend_advance_playback_frames(struct SuperShuckieFrontendRa
 void supershuckie_frontend_set_playback_frozen(struct SuperShuckieFrontendRaw *frontend, bool paused);
 
 /**
- * Get the replay playback stats, returning true if currently playing back a replay.
+ * Get the replay playback stats, returning true if a replay is loaded for playback (playing or
+ * stopped; see supershuckie_frontend_is_replay_playback_stopped).
  *
  * total_frames and total_milliseconds, if non-null, will be written their respective values.
  */
@@ -499,6 +531,13 @@ bool supershuckie_frontend_get_replay_playback_time(
     uint32_t *total_frames,
     uint32_t *total_milliseconds
 );
+
+/**
+ * Get the loaded replay's position: the frame being played back, or, while the replay is stopped,
+ * the frame playback resumes from (the elapsed frame count keeps counting the live play then).
+ * 0 without a replay.
+ */
+uint32_t supershuckie_frontend_get_replay_frame(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * Get the emulation rate: emulated frames per second over roughly the last second, whether or
@@ -572,9 +611,50 @@ bool supershuckie_frontend_can_continue_last_replay(
 );
 
 /**
- * Stop the currently playing replay, if any.
+ * Close (unload) the loaded replay, if any, whether it is playing or stopped. Live play continues
+ * from the current frame.
+ */
+void supershuckie_frontend_close_replay(struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Stop the loaded replay from driving the emulator without closing it: the game keeps running
+ * from the current frame, live and under the user's input, while the replay stays loaded (the
+ * replay state stays Playback). Its timeline can still be seeked in, which puts the game at the
+ * chosen frame and hands it back, and playback can be resumed from where it was stopped or last
+ * seeked to with supershuckie_frontend_resume_replay_playback.
+ *
+ * Does nothing unless a replay is playing back.
  */
 void supershuckie_frontend_stop_replay_playback(struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Resume playing back a stopped replay from its resume point, discarding whatever was played live
+ * since. The pause state is left alone. Does nothing unless a replay is stopped.
+ *
+ * Returns false (writing a message to error) if the replay could not be read there.
+ *
+ * Safety:
+ * - error must point to a buffer of at least `error_len` bytes (it can be null if error_len is 0)
+ */
+bool supershuckie_frontend_resume_replay_playback(
+    struct SuperShuckieFrontendRaw *frontend,
+    char *error,
+    size_t error_len
+);
+
+/**
+ * Put a stopped replay back at its resume point (the frame supershuckie_frontend_resume_replay_playback
+ * would resume from) without resuming playback: whatever was played live since is discarded and the
+ * user stays in control from that frame. Does nothing unless a replay is stopped. Like
+ * supershuckie_frontend_set_playback_frame, the seek happens on the core thread and a failure is
+ * reported by the next supershuckie_frontend_tick.
+ */
+void supershuckie_frontend_go_to_replay_resume_point(struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Return true if the loaded replay is stopped (see supershuckie_frontend_stop_replay_playback).
+ */
+bool supershuckie_frontend_is_replay_playback_stopped(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * If there is a ROM running, return the name. Otherwise, return null.
@@ -583,6 +663,8 @@ const char *supershuckie_frontend_get_rom_name(const struct SuperShuckieFrontend
 
 /**
  * Write settings to the given settings file.
+ *
+ * There is no way to observe failure from C; a write error is logged to stderr.
  */
 void supershuckie_frontend_write_settings(const struct SuperShuckieFrontendRaw *frontend);
 
@@ -627,8 +709,12 @@ void supershuckie_frontend_set_current_save_file(struct SuperShuckieFrontendRaw 
  * Get the current save file.
  *
  * Returns NULL if no current save file and does not write to length.
+ *
+ * The returned pointer is NOT NUL-terminated: it points directly into the frontend's internal
+ * string, and *length (in bytes) is the only way to know where it ends. It is only valid until the
+ * next call into the frontend.
  */
-char *supershuckie_frontend_get_current_save_file(const struct SuperShuckieFrontendRaw *frontend, size_t *length);
+const char *supershuckie_frontend_get_current_save_file(const struct SuperShuckieFrontendRaw *frontend, size_t *length);
 
 /**
  * Hard reset the console, simulating switching off/on.
@@ -696,13 +782,17 @@ bool supershuckie_frontend_emulator_type_uses_shared_config(uint8_t emulator_typ
  * This array must be freed with supershuckie_stringarray_free
  */
 SuperShuckieStringArrayRaw *supershuckie_frontend_get_connected_controllers(
-    struct SuperShuckieFrontendRaw *frontend
+    const struct SuperShuckieFrontendRaw *frontend
 );
 
 /**
  * Connect a controller.
  *
- * Safety: The name must be a null-terminated UTF-8 string
+ * If name is null, no controller is connected and SUPERSHUCKIE_INVALID_CONTROLLER_INDEX (a value
+ * that never maps to a real controller) is returned. A non-UTF-8 name is not rejected; invalid
+ * bytes are replaced (see the C++ std::string -> Rust lossy conversion).
+ *
+ * Safety: name, if non-null, must be a null-terminated string.
  */
 SuperShuckieConnectedControllerIndex supershuckie_frontend_connect_controller(
     struct SuperShuckieFrontendRaw *frontend,
@@ -915,7 +1005,7 @@ struct SuperShuckieStringArrayRaw *supershuckie_frontend_get_recent_roms(const s
 /**
  * Clear all recent ROMs.
  */
-struct SuperShuckieStringArrayRaw *supershuckie_frontend_clear_recent_roms(struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_clear_recent_roms(struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * Get the current data directory, returning the length.
@@ -940,6 +1030,8 @@ size_t supershuckie_frontend_get_screenshot_directory(const struct SuperShuckieF
  * Reload the current core.
  *
  * This will end any replay and automatically save the current game.
+ *
+ * There is no way to observe failure from C; an error reloading the core is logged to stderr.
  */
 void supershuckie_frontend_reload_core(struct SuperShuckieFrontendRaw *frontend);
 

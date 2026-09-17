@@ -173,7 +173,7 @@ impl BookmarkTable {
     /// Reserve a new bookmark id.
     pub fn allocate_id(&mut self) -> UnsignedInteger {
         let id = self.next_id.max(1);
-        self.next_id = id + 1;
+        self.next_id = id.saturating_add(1);
         id
     }
 
@@ -184,7 +184,7 @@ impl BookmarkTable {
             bookmark.id = self.allocate_id();
         }
         else if bookmark.id >= self.next_id {
-            self.next_id = bookmark.id + 1;
+            self.next_id = bookmark.id.saturating_add(1);
         }
 
         let id = bookmark.id;
@@ -323,7 +323,7 @@ impl BookmarkTable {
         let mut table = BookmarkTable { next_id, types, bookmarks };
         table.sort();
         let highest = table.bookmarks.iter().map(|b| b.id).max().unwrap_or(0);
-        table.next_id = table.next_id.max(highest + 1).max(1);
+        table.next_id = table.next_id.max(highest.saturating_add(1)).max(1);
         Ok(table)
     }
 }
@@ -454,6 +454,23 @@ mod tests {
         assert_eq!(cut.bookmarks.iter().map(|b| b.id).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(cut.types.iter().map(|t| t.id).collect::<Vec<_>>(), vec![0x55], "unused type records are dropped");
         assert_eq!(cut.next_id, table.next_id, "ids are never reused");
+    }
+
+    /// Ids near `UnsignedInteger::MAX` must saturate instead of overflowing (which would panic in
+    /// debug builds and silently wrap in release).
+    #[test]
+    fn id_allocation_saturates_instead_of_overflowing() {
+        let mut table = BookmarkTable::new();
+        table.next_id = UnsignedInteger::MAX;
+        assert_eq!(table.allocate_id(), UnsignedInteger::MAX);
+        assert_eq!(table.next_id, UnsignedInteger::MAX);
+
+        let mut table = BookmarkTable::new();
+        table.insert(Bookmark { id: UnsignedInteger::MAX, name: "max".into(), ..Default::default() });
+        assert_eq!(table.next_id, UnsignedInteger::MAX);
+
+        let decoded = BookmarkTable::decode(&table.encode()).unwrap();
+        assert_eq!(decoded.next_id, UnsignedInteger::MAX);
     }
 
     #[test]

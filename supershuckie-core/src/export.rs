@@ -13,6 +13,7 @@
 //! an ffmpeg subprocess) lives in the frontend.
 
 use alloc::borrow::Cow;
+use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -158,12 +159,18 @@ pub fn composite_screens(screens: &[ScreenData], layout: ScreenLayout, out: &mut
 impl SuperShuckieCore {
     /// Export `range` of the attached replay to `sink`.
     ///
-    /// Calls `progress(done, total)` once per frame. Returns [`VideoExportError::Cancelled`] if
-    /// `cancel` flips. Requires a [`ReplayFilePlayer`](supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer)
+    /// Calls `progress(done, total)` once per frame, ending with `progress(span, span)`. Returns
+    /// [`VideoExportError::Cancelled`] if `cancel` flips. Requires a
+    /// [`ReplayFilePlayer`](supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer)
     /// to already be attached (else [`VideoExportError::NoReplayAttached`]).
     ///
     /// One emulated frame becomes exactly one video frame; recorded timestamps and replay speed are
     /// ignored for timing. Stepping uses `run_unlocked`, so there is no real-time throttle.
+    ///
+    /// Exports exactly `span = end - start` pictures, following the same `picture_of(i) =
+    /// max(i, 1)` convention as [`crate::SuperShuckieCore::go_to_replay_frame`] (and the frame
+    /// server): picture 0 is the same picture as picture 1, since nothing is drawn before the
+    /// first frame runs. `sink.abort()` is always called before returning an error.
     pub fn export_frames(
         &mut self,
         range: ExportRange,
@@ -176,6 +183,8 @@ impl SuperShuckieCore {
             Some(p) => p.get_total_frames(),
             None => return Err(VideoExportError::NoReplayAttached),
         };
+        // The export steps through the replay itself; a stopped one would not be read.
+        self.replay_playback_stopped = false;
 
         let start = range.start_frame.min(total);
         let end = range.end_frame.unwrap_or(total).min(total);
@@ -183,18 +192,35 @@ impl SuperShuckieCore {
 
         // Empty range: begin with the right geometry, push nothing, finish cleanly.
         if end <= start {
-            self.go_to_replay_frame(start);
-            let (width, height) = output_geometry(self.core.get_screens(), layout)
-                .ok_or_else(|| VideoExportError::Sink { explanation: Cow::Borrowed("core has no screens") })?;
-            sink.begin(width, height, fps_num, fps_den)?;
+            if let Err(e) = self.go_to_replay_frame(start) {
+                sink.abort();
+                return Err(VideoExportError::Sink { explanation: Cow::Owned(e) });
+            }
+            let (width, height) = match output_geometry(self.core.get_screens(), layout) {
+                Some(g) => g,
+                None => {
+                    sink.abort();
+                    return Err(VideoExportError::Sink { explanation: Cow::Borrowed("core has no screens") });
+                }
+            };
+            if let Err(e) = sink.begin(width, height, fps_num, fps_den) {
+                sink.abort();
+                return Err(e);
+            }
             progress(0, 0);
-            sink.finish()?;
+            if let Err(e) = sink.finish() {
+                sink.abort();
+                return Err(e);
+            }
             return Ok(());
         }
 
-        // Position the emulator at the start frame. Afterwards total_frames == start and the
-        // framebuffer holds frame `start`.
-        self.go_to_replay_frame(start);
+        // Position the emulator at the start frame. Afterwards total_frames == max(start, 1) and
+        // the framebuffer holds that picture.
+        if let Err(e) = self.go_to_replay_frame(start) {
+            sink.abort();
+            return Err(VideoExportError::Sink { explanation: Cow::Owned(e) });
+        }
 
         let (width, height) = match output_geometry(self.core.get_screens(), layout) {
             Some(g) => g,
@@ -212,33 +238,41 @@ impl SuperShuckieCore {
         let span = end - start;
         let mut frame_buf: Vec<u32> = Vec::new();
 
-        loop {
-            if self.total_frames >= end || self.replay_stalled {
-                break;
-            }
-
+        for i in start..end {
             if cancel.load(Ordering::Relaxed) {
                 sink.abort();
                 return Err(VideoExportError::Cancelled);
             }
 
-            // Composite + push the CURRENT frame (frame `start` on the first iteration).
+            // The picture for index `i` is the one after `max(i, 1)` emulated frames.
+            let target = i.max(1);
+            while self.total_frames < target && !self.replay_stalled {
+                self.run_unlocked();
+            }
+
+            if self.replay_stalled && self.total_frames < target {
+                sink.abort();
+                return Err(VideoExportError::Sink {
+                    explanation: Cow::Owned(format!(
+                        "replay ended at frame {} before the requested end",
+                        self.total_frames
+                    )),
+                });
+            }
+
             composite_screens(self.core.get_screens(), layout, &mut frame_buf);
             if let Err(e) = sink.push_frame(&frame_buf) {
                 sink.abort();
                 return Err(e);
             }
 
-            progress(self.total_frames - start, span);
-
-            // Advance exactly one emulated frame.
-            let target = self.total_frames + 1;
-            while self.total_frames < target && !self.replay_stalled {
-                self.run_unlocked();
-            }
+            progress(i + 1 - start, span);
         }
 
-        sink.finish()?;
+        if let Err(e) = sink.finish() {
+            sink.abort();
+            return Err(e);
+        }
         Ok(())
     }
 }

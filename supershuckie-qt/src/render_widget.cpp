@@ -110,9 +110,12 @@ void GameRenderWidget::keyPressEvent(QKeyEvent *event) {
         bool auto_repeat = event->isAutoRepeat();
         bool is_paused = supershuckie_frontend_is_paused(this->main_window->frontend);
 
+        // Only while the replay is driving the game: once it is stopped the keyboard is the
+        // user's game input again (the timeline keeps its own buttons).
         if(
             this->main_window->keyboard_replay_controls->isChecked() && 
-            supershuckie_frontend_get_replay_state(this->main_window->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Playback
+            supershuckie_frontend_get_replay_state(this->main_window->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Playback &&
+            !supershuckie_frontend_is_replay_playback_stopped(this->main_window->frontend)
         ) {
             auto *playback_action = this->main_window->playback_action_for(event);
             if(playback_action == this->main_window->playback_toggle_pause) {
@@ -225,7 +228,9 @@ void GameRenderWidget::mousePressEvent(QMouseEvent *event) {
             y -= screen.y;
         }
 
-        if(x < 0 || x > screen.width || y < 0 || y > screen.height) {
+        // >= : x == screen.width (one pixel past the right/bottom edge) is out of bounds, but
+        // would otherwise wrap around to 0 when narrowed to the uint8_t x/y that set_touch takes.
+        if(x < 0 || x >= static_cast<int>(screen.width) || y < 0 || y >= static_cast<int>(screen.height)) {
             return;
         }
         supershuckie_frontend_set_touch(this->main_window->frontend, true, x, y);

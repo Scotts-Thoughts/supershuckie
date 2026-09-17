@@ -35,6 +35,7 @@ class MemoryToolsController;
 class BookmarkWindow;
 class BookmarkTypesDialog;
 class AddBookmarkDialog;
+class LandingWidget;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -61,6 +62,7 @@ class MainWindow: public QMainWindow {
     friend BookmarkWindow;
     friend BookmarkTypesDialog;
     friend AddBookmarkDialog;
+    friend LandingWidget;
     
 public:
     MainWindow();
@@ -69,11 +71,24 @@ public:
     void load_rom(const std::filesystem::path &path);
     void load_rom(const char *path);
 
+    /**
+     * Show a modal, MainWindow-parented error dialog while the 1 ms ticker is paused, so
+     * `tick()` can't re-enter `supershuckie_frontend_tick` underneath it. Pairs stop_timer()
+     * and start_timer() itself (nesting-safe via the stack counter) so callers can never leave
+     * one unbalanced with an early return.
+     */
+    void show_error(const char *title, const char *fmt, ...);
+
 private:
     typedef std::chrono::steady_clock clock;
 
     void set_title(const char *title = "");
     GameRenderWidget *render_widget;
+
+    // Shown in the game view's place while no ROM is loaded (see update_landing_visibility()).
+    LandingWidget *landing_widget;
+    void update_landing_visibility();
+
     SuperShuckieFrontendRaw *frontend = nullptr;
 
     QTimer ticker;
@@ -117,6 +132,13 @@ private:
     QAction *record_replay;
     QAction *resume_replay;
     QAction *play_replay;
+    QAction *close_replay;
+    // The timeline's stop/resume and back-to-the-resume-point buttons, as menu actions so they
+    // can be given shortcuts (they have to work while the keyboard is game input, unlike the
+    // "Replay playback" controls the render widget matches during playback).
+    QAction *stop_playback;
+    QAction *resume_playback;
+    QAction *go_to_resume_point;
     QAction *export_video;
     QAction *convert_replay;
     QAction *convert_replay_folder;
@@ -178,6 +200,8 @@ private:
     QAction *enable_external_commands;
 
     SuperShuckieReplayState last_known_replay_state = SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
+    // Playback has a sub-state (the replay stopped, the game live under the user) that changes what the menus allow.
+    bool last_known_replay_stopped = false;
 
     static const std::size_t QUICK_SAVE_STATE_COUNT = 9;
 
@@ -276,6 +300,10 @@ private slots:
     void do_record_replay();
     void do_resume_replay();
     void do_play_replay();
+    void do_close_replay();
+    void do_stop_playback();
+    void do_resume_playback();
+    void do_go_to_resume_point();
     void do_export_video();
     void do_convert_replay();
     void do_convert_replay_folder();

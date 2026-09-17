@@ -97,7 +97,7 @@ fn nds_transient_range(state: &[u8]) -> Option<Range<usize>> {
     if state.get(..4)? != MELN_MAGIC {
         return None;
     }
-    let major = u16::from_le_bytes([state[4], state[5]]);
+    let major = u16::from_le_bytes(state.get(4..6)?.try_into().ok()?);
     if major != MELN_MAJOR {
         return None;
     }
@@ -168,19 +168,27 @@ pub fn transient_ranges(console: ReplayConsoleType, state: &[u8]) -> Vec<Range<u
 ///
 /// Does nothing unless both states have the same length and the same transient layout (a layout
 /// change between two consecutive keyframes would mean the copied bytes are not the same buffers).
-pub fn apply_masks(console: ReplayConsoleType, prev: &[u8], cur: &mut [u8]) {
+///
+/// Returns what was overwritten as `(range, original bytes)` pairs, empty when nothing was masked.
+/// A caller that falls back to storing `cur` as a full keyframe (because the masked diff was not
+/// smaller than the state) must restore these bytes first: full keyframes are documented to be
+/// exact, and masking must never leak into one.
+pub fn apply_masks(console: ReplayConsoleType, prev: &[u8], cur: &mut [u8]) -> Vec<(Range<usize>, Vec<u8>)> {
     if prev.len() != cur.len() {
-        return;
+        return Vec::new();
     }
 
     let ranges = transient_ranges(console, cur);
     if ranges.is_empty() || ranges != transient_ranges(console, prev) {
-        return;
+        return Vec::new();
     }
 
+    let mut overwritten = Vec::with_capacity(ranges.len());
     for range in ranges {
+        overwritten.push((range.clone(), cur[range.clone()].to_vec()));
         cur[range.clone()].copy_from_slice(&prev[range]);
     }
+    overwritten
 }
 
 #[cfg(test)]
@@ -257,6 +265,17 @@ mod tests {
         let mut bad = state.clone();
         bad[16 + 4..16 + 8].copy_from_slice(&0u32.to_le_bytes());
         assert!(transient_ranges(ReplayConsoleType::NintendoDS, &bad).is_empty());
+    }
+
+    /// A truncated melonDS state (shorter than the major-version field) must not panic, whether
+    /// through the public masks API or through `apply_masks`.
+    #[test]
+    fn nds_truncated_states_do_not_panic() {
+        for state in [&b"MELN"[..], &b"MELN\x0D"[..]] {
+            assert!(transient_ranges(ReplayConsoleType::NintendoDS, state).is_empty());
+            let mut cur = state.to_vec();
+            assert!(apply_masks(ReplayConsoleType::NintendoDS, state, &mut cur).is_empty());
+        }
     }
 
     /// A synthetic mGBA state with a SoundInfo block at IWRAM address `sound_info`.

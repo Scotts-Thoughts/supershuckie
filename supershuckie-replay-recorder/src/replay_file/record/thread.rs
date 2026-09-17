@@ -1,12 +1,19 @@
 use super::{KeyframeEncoding, ReplayFileWriteError, ReplayFileRecorder, ReplayFileSink, ReplayFileRecorderFns};
 use crate::{BookmarkTable, ByteVec, InputBuffer, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
+use alloc::borrow::Cow;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Mutex;
 use std::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use std::time::Duration;
+
+/// How many displaced keyframe state buffers the recorder thread will hold onto for the producer
+/// to reclaim before it starts dropping them. Bounds the channel's own memory use if the producer
+/// stops draining it (each buffer can be tens of MiB for a large console's save state) -- unlike an
+/// unbounded channel, which would otherwise grow by one buffer per keyframe forever.
+const FREE_BUFFER_CHANNEL_CAPACITY: usize = 4;
 
 type RecorderMutex<Final, Temp> = Mutex<ReplayFileRecorder<Final, Temp>>;
 
@@ -30,7 +37,7 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let (sender_main, receiver_helper) = channel();
         let (sender_helper, receiver_main) = channel();
         let (closed_helper, closed_main) = channel();
-        let (free_sender, free_receiver) = channel();
+        let (free_sender, free_receiver) = sync_channel(FREE_BUFFER_CHANNEL_CAPACITY);
 
         let helper = ThreadedReplayFileRecorderThread {
             recorder: Arc::downgrade(&recorder),
@@ -61,6 +68,14 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         self.free_buffers.try_recv().ok()
     }
 
+    /// Test-only: the shared recorder mutex, so a test can poison it (simulating a panic while it
+    /// was held) to check that the recorder thread and [`Self::close`] both recover from that
+    /// instead of panicking themselves.
+    #[cfg(test)]
+    fn recorder_mutex_for_test(&self) -> Arc<RecorderMutex<Final, Temp>> {
+        self.recorder.clone().expect("not yet closed")
+    }
+
     /// Return `true` if the recorder was already closed.
     #[inline]
     pub fn is_closed(&self) -> bool {
@@ -89,8 +104,10 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
             std::thread::sleep(Duration::from_millis(25));
         };
 
-        // This should work unless the thread panicked.
-        let mut recorder = recorder.into_inner().expect("failed to get the inner value");
+        // If the recorder thread panicked while holding the lock, the mutex is poisoned; recover
+        // the (possibly inconsistent, but still usable -- writes are append-only) recorder rather
+        // than panicking here too.
+        let mut recorder = recorder.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // Done.
         recorder.close()
@@ -175,33 +192,60 @@ struct ThreadedReplayFileRecorderThread<Final: ReplayFileSink, Temp: ReplayFileS
     // eventually be closed if it fails
     error_sender: Sender<ReplayFileWriteError>,
     receiver: Receiver<ThreadedReplayFileRecorderCommand>,
-    /// Displaced keyframe state buffers go back to the producer through here.
-    free_buffers: Sender<Vec<u8>>,
+    /// Displaced keyframe state buffers go back to the producer through here. Bounded (see
+    /// [`FREE_BUFFER_CHANNEL_CAPACITY`]): if the producer stops draining it, buffers are dropped
+    /// instead of piling up unboundedly.
+    free_buffers: SyncSender<Vec<u8>>,
     closed: Sender<()>
+}
+
+/// Reports, via `errors`, that the recorder thread stopped without a clean `Close` command -- a
+/// panic (leaving the mutex poisoned, though still recovered by [`NonBlockingReplayFileRecorder::close`])
+/// or the recorder being dropped out from under the thread. Without this, such a stop is silent:
+/// nothing more is ever written, but nothing says so either.
+struct ExitNotice {
+    errors: Sender<ReplayFileWriteError>,
+    /// Set only on the `Close` command path; every other way out of the loop leaves this `false`.
+    clean: bool
+}
+
+impl Drop for ExitNotice {
+    fn drop(&mut self) {
+        if !self.clean {
+            let _ = self.errors.send(ReplayFileWriteError::Other {
+                explanation: Cow::Borrowed("the replay recorder thread stopped unexpectedly (poisoned lock or panic); the recording is no longer being written")
+            });
+        }
+    }
 }
 
 impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThread<Final, Temp> {
     fn run(mut self) {
+        let mut exit_notice = ExitNotice { errors: self.error_sender.clone(), clean: false };
+
         loop {
             // If any of these fails, abort the thread.
             let Ok(command) = self.receiver.recv() else {
                 break
             };
             if matches!(command, ThreadedReplayFileRecorderCommand::Close) {
+                exit_notice.clean = true;
                 break
             }
             let Some(recorder) = self.recorder.upgrade() else {
                 break
             };
-            let Ok(mut recorder) = recorder.lock() else {
-                break
-            };
+            // Recover a poisoned lock (the recorder itself panicked while holding it) instead of
+            // silently exiting the thread: append-only writes stay valid even after a panic
+            // mid-write, and this lets the thread keep serving commands.
+            let mut recorder = recorder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
             if let Err(e) = self.handle_command(command, &mut recorder) {
                 let _ = self.error_sender.send(e);
             }
         }
 
+        drop(exit_notice);
         let _ = self.closed.send(());
     }
 
@@ -214,7 +258,9 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::NewKeyframe { timestamp, state, encoding } => {
                 let result = recorder.insert_keyframe_with(state, timestamp, encoding);
                 if let Some(buffer) = recorder.take_recycled_state() {
-                    let _ = self.free_buffers.send(buffer);
+                    // If the producer isn't draining these (channel full), drop the buffer rather
+                    // than growing the channel without bound.
+                    let _ = self.free_buffers.try_send(buffer);
                 }
                 result.map(|_| ())
             }
@@ -359,4 +405,198 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
     }
 }
 
-// TODO: write unit tests
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay_file::ReplayHeaderBytes;
+    use crate::test_support::*;
+    use crate::{ByteVec, PacketWriteCommand, Speed};
+    use alloc::boxed::Box;
+
+    fn settings() -> crate::replay_file::record::ReplayFileRecorderSettings {
+        crate::replay_file::record::ReplayFileRecorderSettings {
+            minimum_uncompressed_bytes_per_blob: usize::MAX,
+            max_frames_per_blob: 0,
+            compression_level: crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+            mask_transient_buffers: true,
+        }
+    }
+
+    /// Polls `poll` (typically `nb.poll_errors`) until it returns something or `timeout` elapses.
+    fn wait_for_errors(mut poll: impl FnMut() -> Vec<ReplayFileWriteError>, timeout: Duration) -> Vec<ReplayFileWriteError> {
+        let start = std::time::Instant::now();
+        loop {
+            let errors = poll();
+            if !errors.is_empty() || start.elapsed() > timeout {
+                return errors;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Runs `f` with the default panic hook replaced by a no-op, so a deliberately triggered panic
+    /// (in a spawned thread, or one this test expects the recorder thread to take) does not spam
+    /// the test output with a panic backtrace.
+    fn silencing_panics<T>(f: impl FnOnce() -> T) -> T {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = f();
+        std::panic::set_hook(previous);
+        result
+    }
+
+    /// A temp sink that fails every write from its `fail_from`-th call (1-based) onward.
+    #[derive(Clone)]
+    struct FailingTempSink {
+        calls: Arc<Mutex<usize>>,
+        fail_from: usize,
+    }
+
+    impl FailingTempSink {
+        fn new(fail_from: usize) -> Self {
+            Self { calls: Arc::new(Mutex::new(0)), fail_from }
+        }
+
+        /// Bumps the call counter; returns `true` if this call should fail.
+        fn bump(&self) -> bool {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls >= self.fail_from
+        }
+    }
+
+    impl ReplayFileSink for FailingTempSink {
+        fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), ReplayFileWriteError> {
+            if self.bump() {
+                return Err(ReplayFileWriteError::Other { explanation: Cow::Borrowed("injected temp failure") });
+            }
+            Ok(())
+        }
+        fn truncate(&mut self, _size: u64) -> Result<(), ReplayFileWriteError> {
+            Ok(())
+        }
+        fn overwrite_header(&mut self, _header_data: &ReplayHeaderBytes) -> Result<(), ReplayFileWriteError> {
+            Ok(())
+        }
+        fn write_packet_data(&mut self, instructions: &[PacketWriteCommand<'_>]) -> Result<usize, ReplayFileWriteError> {
+            if self.bump() {
+                return Err(ReplayFileWriteError::Other { explanation: Cow::Borrowed("injected temp failure") });
+            }
+            Ok(instructions.iter().map(|i| i.bytes().len()).sum())
+        }
+    }
+
+    /// A temp sink that panics (rather than erroring) on its `panic_from`-th write call (1-based),
+    /// simulating the recorder thread dying instead of a write merely failing.
+    #[derive(Clone)]
+    struct PanicOnWriteSink {
+        calls: Arc<Mutex<usize>>,
+        panic_from: usize,
+    }
+
+    impl PanicOnWriteSink {
+        fn new(panic_from: usize) -> Self {
+            Self { calls: Arc::new(Mutex::new(0)), panic_from }
+        }
+
+        fn bump(&self) {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls >= self.panic_from {
+                panic!("PanicOnWriteSink: simulated recorder thread panic");
+            }
+        }
+    }
+
+    impl ReplayFileSink for PanicOnWriteSink {
+        fn write_bytes(&mut self, _bytes: &[u8]) -> Result<(), ReplayFileWriteError> {
+            self.bump();
+            Ok(())
+        }
+        fn truncate(&mut self, _size: u64) -> Result<(), ReplayFileWriteError> {
+            Ok(())
+        }
+        fn overwrite_header(&mut self, _header_data: &ReplayHeaderBytes) -> Result<(), ReplayFileWriteError> {
+            Ok(())
+        }
+        fn write_packet_data(&mut self, instructions: &[PacketWriteCommand<'_>]) -> Result<usize, ReplayFileWriteError> {
+            self.bump();
+            Ok(instructions.iter().map(|i| i.bytes().len()).sum())
+        }
+    }
+
+    fn make_recorder<Temp: ReplayFileSink + Send + 'static>(temp: Temp) -> ReplayFileRecorder<Vec<u8>, Temp> {
+        ReplayFileRecorder::new_with_metadata(
+            make_metadata(),
+            ByteVec::new(),
+            settings(),
+            0u64.into(),
+            ib(&[0]),
+            Speed::default(),
+            bv(&state_for(0)),
+            Vec::<u8>::new(),
+            temp,
+        )
+        .unwrap()
+    }
+
+    /// A mutex poisoned by an unrelated panic (simulating the recorder thread having panicked at
+    /// some earlier point while holding it) must not stop the recorder thread from continuing to
+    /// process commands, nor stop `close()` from finishing normally.
+    #[test]
+    fn close_recovers_a_poisoned_recorder_mutex() {
+        let mut nb = NonBlockingReplayFileRecorder::new(make_recorder(SharedSink::default()));
+        let mutex = nb.recorder_mutex_for_test();
+
+        silencing_panics(|| {
+            let _ = std::thread::spawn(move || {
+                let _guard = mutex.lock().unwrap();
+                panic!("intentionally poisoning the mutex for the test");
+            })
+            .join();
+        });
+
+        // The background thread must still be able to process a command through the now-poisoned
+        // mutex, and close() must still finish (and succeed: nothing else about the recording is
+        // broken -- only the mutex's poison flag was set).
+        nb.next_frame(16u64.into());
+        let result = nb.close();
+        assert!(result.is_ok(), "{:?}", result.err().map(|(_, _, e)| e));
+    }
+
+    /// A temp-sink failure reaches the caller through `poll_errors()` (asynchronously, since the
+    /// write happens on the recorder thread), and does not stop `close()` from succeeding.
+    #[test]
+    fn errors_are_polled() {
+        // Calls on the temp sink so far once construction finishes: #1 header, #2 (empty) patch,
+        // #3 the frame-0 keyframe. #4 is the first `next_frame`, which is where the injected
+        // failure starts.
+        let mut nb = NonBlockingReplayFileRecorder::new(make_recorder(FailingTempSink::new(4)));
+
+        nb.next_frame(16u64.into());
+
+        let errors = wait_for_errors(|| nb.poll_errors(), Duration::from_secs(2));
+        assert!(errors.iter().any(|e| matches!(e, ReplayFileWriteError::TempSink { .. })), "{errors:?}");
+
+        let result = nb.close();
+        assert!(result.is_ok(), "{:?}", result.err().map(|(_, _, e)| e));
+    }
+
+    /// If the recorder thread itself dies (here, a write panics instead of merely failing) rather
+    /// than exiting cleanly through `Close`, that is reported through `poll_errors()` instead of
+    /// being silent.
+    #[test]
+    fn thread_death_is_reported() {
+        let mut nb = NonBlockingReplayFileRecorder::new(make_recorder(PanicOnWriteSink::new(4)));
+
+        let errors = silencing_panics(|| {
+            nb.next_frame(16u64.into());
+            wait_for_errors(|| nb.poll_errors(), Duration::from_secs(2))
+        });
+
+        assert!(
+            errors.iter().any(|e| matches!(e, ReplayFileWriteError::Other { explanation } if explanation.contains("stopped unexpectedly"))),
+            "{errors:?}"
+        );
+    }
+}

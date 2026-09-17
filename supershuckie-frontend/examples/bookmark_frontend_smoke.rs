@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use supershuckie_core::emulator::ScreenData;
 use supershuckie_frontend::bookmarks::{BookmarkError, BookmarkParams, BookmarkTypeUpsert};
-use supershuckie_frontend::{SuperShuckieFrontend, SuperShuckieFrontendCallbacks};
+use supershuckie_frontend::{ScreenInfo, SuperShuckieFrontend, SuperShuckieFrontendCallbacks};
 use supershuckie_replay_recorder::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
 use supershuckie_replay_recorder::replay_file::{ReplayHeaderRaw, REPLAY_VERSION};
 
@@ -26,7 +26,7 @@ struct NoScreen;
 
 impl SuperShuckieFrontendCallbacks for NoScreen {
     fn refresh_screens(&mut self, _: &[ScreenData]) {}
-    fn change_video_mode(&mut self, _: &[ScreenData], _: NonZeroU8) {}
+    fn change_video_mode(&mut self, _: &[ScreenInfo], _: NonZeroU8) {}
 }
 
 fn tick_for(frontend: &mut SuperShuckieFrontend, duration: Duration) {
@@ -166,7 +166,7 @@ fn main() {
 
     tick_for(&mut frontend, Duration::from_millis(300));
     let expected = frontend.bookmarks_view();
-    frontend.stop_recording_replay();
+    frontend.stop_recording_replay().expect("stop recording");
 
     let replay_path = dir.join("data").join(format!("{rom_file_name}-data")).join("replays").join(&replay_name);
     let on_disk = file_table(&replay_path);
@@ -218,7 +218,7 @@ fn main() {
 
     // Stopping playback saves what is still pending.
     let before_stop = frontend.bookmarks_view();
-    frontend.stop_replay_playback();
+    frontend.close_replay();
     let on_disk = file_table(&replay_path);
     assert_eq!(on_disk.bookmarks.iter().map(|b| (b.id, b.name.as_str())).collect::<Vec<_>>(), before_stop.bookmarks.iter().map(|b| (b.id, b.name.as_str())).collect::<Vec<_>>());
     if deaths_id.is_some() {
@@ -233,7 +233,7 @@ fn main() {
     frontend.set_paused(false);
     tick_for(&mut frontend, Duration::from_millis(300));
     assert_eq!(frontend.bookmarks_view().state, "recording");
-    frontend.stop_recording_replay();
+    frontend.stop_recording_replay().expect("stop recording");
     let resumed_path = replay_path.with_file_name(&resumed_name);
     let resumed = file_table(&resumed_path);
     assert_eq!(resumed, source_table.truncated_to(resume_at), "resumed bookmarks");
@@ -263,7 +263,7 @@ fn main() {
     let version = ReplayHeaderRaw::from_bytes(upgraded[..2048].try_into().unwrap()).replay_version;
     assert_eq!(version, REPLAY_VERSION);
     assert_eq!(file_table(&old_path).bookmarks[0].name, "After upgrade");
-    frontend.stop_replay_playback();
+    frontend.close_replay();
     println!("old replay upgraded on its first bookmark");
 
     frontend.unload_rom();

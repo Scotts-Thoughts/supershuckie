@@ -287,6 +287,17 @@ pub fn format_hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
+/// Reject non-ASCII text before it is sliced by byte index, which would otherwise panic when a
+/// multi-byte character straddles the cut (e.g. a fullwidth digit or an accented letter).
+pub(crate) fn ascii_only<'a>(text: &'a str, what: &str) -> Result<&'a str, String> {
+    if text.is_ascii() {
+        Ok(text)
+    }
+    else {
+        Err(format!("{what} must be ASCII (got \"{text}\")"))
+    }
+}
+
 /// Parse hexadecimal bytes: `12 34 AB`, `1234AB` or `0x12, 0x34`.
 pub fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, String> {
     let cleaned: String = text
@@ -297,6 +308,7 @@ pub fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, String> {
     if cleaned.is_empty() {
         return Err("no bytes given".to_owned())
     }
+    let cleaned = ascii_only(&cleaned, "hex bytes")?;
     if cleaned.len() % 2 != 0 {
         return Err("hexadecimal bytes need two digits each".to_owned())
     }
@@ -318,7 +330,7 @@ pub struct PatternByte {
 pub fn parse_pattern(text: &str) -> Result<Vec<PatternByte>, String> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let tokens: Vec<String> = if tokens.len() == 1 && tokens[0].len() > 2 {
-        let t = tokens[0];
+        let t = ascii_only(tokens[0], "the pattern")?;
         if t.len() % 2 != 0 {
             return Err("pattern bytes need two digits each".to_owned())
         }
@@ -528,5 +540,14 @@ mod tests {
         assert!(parse_pattern("123").is_err());
         assert!(parse_pattern("1G").is_err());
         assert_eq!(parse_hex_bytes("0x12, 0x34"), Ok(vec![0x12, 0x34]));
+    }
+
+    #[test]
+    fn non_ascii_input_is_an_error_not_a_panic() {
+        // A multi-byte character straddling a byte-index cut must not panic (H6).
+        assert!(parse_hex_bytes("aéa").is_err());
+        assert!(parse_hex_bytes("ｆｆ").is_err());
+        assert!(parse_pattern("ａａ").is_err());
+        assert!(parse_pattern("1é").is_err());
     }
 }

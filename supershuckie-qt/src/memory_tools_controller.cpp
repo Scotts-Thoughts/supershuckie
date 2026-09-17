@@ -15,7 +15,6 @@
 #include <QMenu>
 #include <QMessageBox>
 #include "main_window.hpp"
-#include "error.hpp"
 
 using namespace SuperShuckie64;
 
@@ -100,7 +99,7 @@ void MemoryToolsController::add_watches(const std::vector<std::uint32_t> &addres
         auto watch = WatchEditDialog::new_watch(address, value_type, size, big_endian, this->format_address(address, true));
         auto id = this->upsert_watch(QJsonDocument(watch).toJson(QJsonDocument::Compact), error, sizeof(error));
         if(id == 0) {
-            DISPLAY_ERROR_DIALOG("Can't add watch", "%s", error);
+            this->main_window()->show_error("Can't add watch", "%s", error);
             break;
         }
         last = id;
@@ -493,7 +492,7 @@ void MemoryToolsController::reload_tables() {
     this->glyph_cache.clear();
     emit this->tables_changed();
     if(!ok) {
-        DISPLAY_ERROR_DIALOG("Some character tables could not be loaded", "%s", error);
+        this->main_window()->show_error("Some character tables could not be loaded", "%s", error);
     }
 }
 
@@ -608,8 +607,11 @@ void MemoryToolsController::restore_windows() {
         if(state == nullptr) {
             continue;
         }
+        // Copy out of the FFI buffer before constructing the window: the pointer is only valid
+        // until the next API call, and the window's constructor makes plenty of those.
+        QString state_copy = QString::fromUtf8(state);
         this->viewers[slot] = new HexViewerWindow(this, static_cast<std::uint8_t>(slot));
-        this->viewers[slot]->restore_state(QString::fromUtf8(state));
+        this->viewers[slot]->restore_state(state_copy);
     }
 
     const char *open = supershuckie_frontend_get_custom_setting(this->frontend(), RAM_VIEWERS_OPEN);

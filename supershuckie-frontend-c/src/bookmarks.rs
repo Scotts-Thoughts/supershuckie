@@ -1,8 +1,7 @@
 //! C API for replay bookmarks (see `include/supershuckie/bookmarks.h`).
 
-use crate::frontend::write_str_to_data;
+use crate::frontend::write_error;
 use std::ffi::{c_char, CStr, CString};
-use std::slice::from_raw_parts_mut;
 use supershuckie_frontend::bookmarks::{BookmarkError, BookmarkParams, BookmarkTypeUpsert};
 use supershuckie_frontend::SuperShuckieFrontend;
 
@@ -18,12 +17,6 @@ unsafe fn c_str<'a>(text: *const c_char) -> &'a str {
         return ""
     }
     unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("")
-}
-
-unsafe fn write_out(text: &str, out: *mut u8, out_len: usize) {
-    if !out.is_null() && out_len > 0 {
-        write_str_to_data(text, unsafe { from_raw_parts_mut(out, out_len) });
-    }
 }
 
 fn into_c_string(text: String) -> *mut c_char {
@@ -44,11 +37,11 @@ unsafe fn finish<T: serde::Serialize>(result: Result<Option<T>, BookmarkError>, 
     match result {
         Ok(value) => {
             let json = value.map(|v| serde_json::to_string(&v).unwrap_or_default()).unwrap_or_default();
-            unsafe { write_out(&json, out, out_len) };
+            unsafe { write_error(&json, out, out_len) };
             RESULT_OK
         }
         Err(e) => {
-            unsafe { write_out(&e.to_string(), out, out_len) };
+            unsafe { write_error(&e.to_string(), out, out_len) };
             match e {
                 BookmarkError::NeedsUpgradeConfirmation { .. } => RESULT_NEEDS_UPGRADE_CONFIRMATION,
                 _ => RESULT_ERROR
@@ -134,7 +127,7 @@ pub unsafe extern "C" fn supershuckie_frontend_bookmark_go_to(
     match frontend.go_to_bookmark(id, out_point) {
         Ok(()) => true,
         Err(e) => {
-            unsafe { write_out(&e.to_string(), error, error_len) };
+            unsafe { write_error(&e.to_string(), error, error_len) };
             false
         }
     }
@@ -149,7 +142,7 @@ pub unsafe extern "C" fn supershuckie_frontend_bookmark_flush(
     match frontend.flush_bookmarks() {
         Ok(()) => true,
         Err(e) => {
-            unsafe { write_out(&e.to_string(), error, error_len) };
+            unsafe { write_error(&e.to_string(), error, error_len) };
             false
         }
     }
@@ -181,7 +174,7 @@ pub unsafe extern "C" fn supershuckie_frontend_bookmark_type_delete(
     match frontend.delete_bookmark_type(unsafe { c_str(type_id) }) {
         Ok(()) => true,
         Err(e) => {
-            unsafe { write_out(&e.to_string(), error, error_len) };
+            unsafe { write_error(&e.to_string(), error, error_len) };
             false
         }
     }
@@ -194,7 +187,7 @@ pub unsafe extern "C" fn supershuckie_frontend_bookmark_active_type(
     out_len: usize
 ) -> usize {
     let id = frontend.get_active_bookmark_type().unwrap_or_default();
-    unsafe { write_out(&id, out, out_len) };
+    unsafe { write_error(&id, out, out_len) };
     id.len() + 1
 }
 

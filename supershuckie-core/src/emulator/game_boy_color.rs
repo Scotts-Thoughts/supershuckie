@@ -55,7 +55,11 @@ pub struct GameBoyColor {
 
     /// Memory regions (see [`GameBoyColor::memory_regions`]) and where each one's bytes live.
     regions: Vec<MemoryRegionInfo>,
-    region_sources: Vec<RegionSource>
+    region_sources: Vec<RegionSource>,
+
+    /// Whether the last [`Self::step`] stopped inside a frame (see
+    /// [`EmulatorCore::is_mid_frame`]).
+    mid_frame: bool
 }
 
 /// Where a [`MemoryRegionInfo`] of a [`GameBoyColor`] is backed: `len` bytes of a SameBoy direct
@@ -201,7 +205,8 @@ impl GameBoyColor {
             cycles: 0,
             shadow: None,
             regions: Vec::new(),
-            region_sources: Vec::new()
+            region_sources: Vec::new(),
+            mid_frame: false
         };
         r.hard_reset();
         (r.regions, r.region_sources) = build_memory_regions(&r.core);
@@ -219,6 +224,7 @@ impl GameBoyColor {
         let cycles = self.core.run() as u64;
         self.cycles += cycles;
         let frames = self.callback_data.run_frames.swap(0, Ordering::Relaxed) as u64;
+        self.mid_frame = frames == 0;
 
         if let Some(shadow) = self.shadow.as_mut() {
             // Same instruction stream, same step sizes: one GB_run each keeps them exactly
@@ -426,6 +432,7 @@ impl EmulatorCore for GameBoyColor {
     fn load_save_state(&mut self, state: &[u8]) -> Result<(), String> {
         let r = self.core.load_save_state(state).map_err(|e| alloc::format!("{e:?}"));
         self.resync_shadow();
+        self.mid_frame = false;
         r
     }
 
@@ -444,10 +451,11 @@ impl EmulatorCore for GameBoyColor {
     #[inline]
     fn set_input_encoded(&mut self, input: &[u8]) {
         debug_assert!(input.len() == 1, "set_input_encoded with wrong number of bytes {}", input.len());
-        self.input_mask = input[0];
-        self.core.set_input_button_mask(input[0]);
+        let mask = input.first().copied().unwrap_or(0);
+        self.input_mask = mask;
+        self.core.set_input_button_mask(mask);
         if let Some(shadow) = self.shadow.as_mut() {
-            shadow.gb.set_input_button_mask(input[0]);
+            shadow.gb.set_input_button_mask(mask);
         }
     }
 
@@ -478,12 +486,15 @@ impl EmulatorCore for GameBoyColor {
         // skip the intro
         if self.core.is_hle_sgb() {
             let mut state = self.core.create_save_state();
-            state[0x1AB66] = 201;
-            state[0x1AB67] = 0;
-            let _ = self.core.load_save_state(&state);
+            if let Some(b) = state.get_mut(0x1AB66..0x1AB68) {
+                b[0] = 201;
+                b[1] = 0;
+                let _ = self.core.load_save_state(&state);
+            }
         }
 
         self.resync_shadow();
+        self.mid_frame = false;
     }
 
     fn replay_console_type(&self) -> Option<ReplayConsoleType> {
@@ -520,6 +531,11 @@ impl EmulatorCore for GameBoyColor {
     fn frame_rate(&self) -> (u32, u32) {
         // GB/GBC: 4194304 Hz CPU clock / 70224 dots per frame ~= 59.7275 Hz.
         (4194304, 70224)
+    }
+
+    #[inline]
+    fn is_mid_frame(&self) -> bool {
+        self.mid_frame
     }
 }
 

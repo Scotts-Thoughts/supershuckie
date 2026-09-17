@@ -19,7 +19,6 @@ add_library(supershuckie-cpp-static STATIC
     src/main.cpp
     src/main_window.cpp
     src/render_widget.cpp
-    src/file_rw.cpp
     src/game_speed_dialog.cpp
     src/ask_for_text_dialog.cpp
     src/select_item_dialog.cpp
@@ -38,6 +37,7 @@ add_library(supershuckie-cpp-static STATIC
     src/ram_watch_window.cpp
     src/watch_edit_dialog.cpp
     src/bookmark_window.cpp
+    src/landing_widget.cpp
 )
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)

@@ -4,12 +4,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use rouille::{Response, Server};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// How long a client waits for a reply before it gives up and gets a 503/timeout error. A queued
+/// command still sitting in the backlog at or beyond this age has already been answered that way,
+/// so `next_server_command` skips it instead of executing it late.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many bind attempts `SuperShuckieWebserver::new` makes before giving up: the first attempt
+/// plus this many retries, 50 ms apart, to ride out tiny_http's asynchronous listener teardown
+/// after a disable immediately followed by an enable.
+const BIND_RETRIES: u32 = 10;
+
 pub struct SuperShuckieWebserver {
-    backlog: Receiver<SuperShuckieServerCommand>,
+    backlog: Receiver<(Instant, SuperShuckieServerCommand)>,
     should_continue: Arc<AtomicBool>
 }
 
@@ -21,7 +31,13 @@ struct Error {
 impl SuperShuckieWebserver {
     /// Instantiate the server.
     pub fn new<S: ToSocketAddrs>(addr: S) -> Result<Self, String> {
-        let (backlog_sender, backlog_receiver) = sync_channel(1024);
+        // Resolved once so every bind attempt below targets the same address without requiring
+        // `S` itself to be `Clone`.
+        let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()
+            .map_err(|e| format!("Failed to make SuperShuckieServer:\n\n{e}"))?
+            .collect();
+
+        let (backlog_sender, backlog_receiver) = sync_channel(64);
         let should_continue = Arc::new(AtomicBool::new(true));
         let emulator_not_available_error = || {
             fixup_response(Response::json(&Error {
@@ -29,7 +45,8 @@ impl SuperShuckieWebserver {
             }).with_status_code(503))
         };
 
-        let server = Server::new(addr, move |request| {
+        // Built once so a bind failure (see below) can retry with the exact same handler.
+        let handler = move |request: &rouille::Request| {
             let url = request.url();
 
             if let Some(route) = BookmarkRoute::from_path(url.as_str()) {
@@ -39,11 +56,11 @@ impl SuperShuckieWebserver {
                 };
 
                 let (sender, response) = channel();
-                if backlog_sender.try_send(SuperShuckieServerCommand::Bookmarks(sender, bookmark_request)).is_err() {
+                if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::Bookmarks(sender, bookmark_request))).is_err() {
                     return emulator_not_available_error();
                 }
 
-                return fixup_response(match response.recv_timeout(Duration::from_secs(60)) {
+                return fixup_response(match response.recv_timeout(REPLY_TIMEOUT) {
                     Ok(Ok(Some(json))) => Response::from_data("application/json", json),
                     Ok(Ok(None)) => Response::empty_204(),
                     Ok(Err((status, error))) => Response::json(&Error { error }).with_status_code(status),
@@ -55,11 +72,11 @@ impl SuperShuckieWebserver {
                 "/stats" => {
                     let (responder, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::Stats(responder)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::Stats(responder))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(n) => Response::json(Arc::as_ref(&n)),
                         Err(_) => return emulator_not_available_error()
                     }
@@ -79,11 +96,11 @@ impl SuperShuckieWebserver {
                         }
                     };
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::MarkStart(responder, offset)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::MarkStart(responder, offset))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (probably not recording a replay)".to_owned()
@@ -93,11 +110,11 @@ impl SuperShuckieWebserver {
                 },
                 "/mark-end" => {
                     let (responder, response) = channel();
-                    if backlog_sender.try_send(SuperShuckieServerCommand::MarkEnd(responder)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::MarkEnd(responder))).is_err() {
                         return emulator_not_available_error()
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (probably not recording a replay)".to_owned()
@@ -128,11 +145,11 @@ impl SuperShuckieWebserver {
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::IncrementCounter(sender, name, by)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::IncrementCounter(sender, name, by))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (probably not recording a replay)".to_owned()
@@ -143,11 +160,11 @@ impl SuperShuckieWebserver {
                 "/enumerate-replays" => {
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::EnumerateReplays(sender)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::EnumerateReplays(sender))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(n) => Response::json(n.as_ref()),
                         Err(_) => return emulator_not_available_error()
                     }
@@ -160,7 +177,7 @@ impl SuperShuckieWebserver {
                             }).with_status_code(400)
                         ),
                         Some(n) => match n.parse::<f64>() {
-                            Ok(n) if n.is_finite() && n.is_sign_positive() => n,
+                            Ok(n) if n.is_finite() && n > 0.0 => n,
                             _ => return fixup_response(
                                 Response::json(&Error {
                                     error: format!("failed (can't parse {n} as an float)")
@@ -171,11 +188,11 @@ impl SuperShuckieWebserver {
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::SetPlaybackSpeed(sender, speed)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::SetPlaybackSpeed(sender, speed))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (probably not playing a game)".to_owned()
@@ -194,11 +211,11 @@ impl SuperShuckieWebserver {
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::LoadReplay(sender, name)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::LoadReplay(sender, name))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (replay probably not found or is invalid)".to_owned()
@@ -210,7 +227,7 @@ impl SuperShuckieWebserver {
                     let paused = match request.get_param("paused") {
                         None => return fixup_response(
                             Response::json(&Error {
-                                error: "failed (missing the frame parameter)".to_owned()
+                                error: "failed (missing the paused parameter)".to_owned()
                             }).with_status_code(400)
                         ),
                         Some(n) => match n.parse() {
@@ -225,11 +242,11 @@ impl SuperShuckieWebserver {
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::SetPaused(sender, paused)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::SetPaused(sender, paused))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (unknown reason)".to_owned()
@@ -256,11 +273,11 @@ impl SuperShuckieWebserver {
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::GoToFrame(sender, frame)).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::GoToFrame(sender, frame))).is_err() {
                         return emulator_not_available_error();
                     }
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(true) => Response::empty_204(),
                         Ok(false) => Response::json(&Error {
                             error: "error (probably not playing back a replay)".to_owned()
@@ -270,18 +287,18 @@ impl SuperShuckieWebserver {
                 }
                 "/load-rom" => {
                     let Some(path) = request.get_param("path") else {
-                        return Response::json(&Error {
+                        return fixup_response(Response::json(&Error {
                             error: "failed (missing the path parameter)".to_owned()
-                        }).with_status_code(400);
+                        }).with_status_code(400));
                     };
 
                     let (sender, response) = channel();
 
-                    if backlog_sender.try_send(SuperShuckieServerCommand::LoadROM(sender, path.into())).is_err() {
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::LoadROM(sender, path.into()))).is_err() {
                         return emulator_not_available_error();
                     };
 
-                    match response.recv_timeout(Duration::from_secs(60)) {
+                    match response.recv_timeout(REPLY_TIMEOUT) {
                         Ok(Ok(_)) => Response::empty_204(),
                         Ok(Err(error)) => Response::json(&Error { error }).with_status_code(404),
                         Err(_) => return emulator_not_available_error()
@@ -294,9 +311,22 @@ impl SuperShuckieWebserver {
                             "text/javascript; charset=utf-8"
                         )
                 }
-                _ => Response::empty_400()
+                _ => Response::empty_404()
             })
-        }).map_err(|e| format!("Failed to make SuperShuckieServer:\n\n{e}"))?;
+        };
+
+        // Disabling the server drops it, but tiny_http closes its listening socket
+        // asynchronously; an immediate re-enable can otherwise race that teardown and fail to
+        // bind. Retry a few times, 50 ms apart, before giving up with the bind error.
+        let mut bind_result = Server::new(addrs.as_slice(), handler.clone()).map(|s| s.pool_size(4));
+        for _ in 0..BIND_RETRIES {
+            if bind_result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            bind_result = Server::new(addrs.as_slice(), handler.clone()).map(|s| s.pool_size(4));
+        }
+        let server = bind_result.map_err(|e| format!("Failed to make SuperShuckieServer:\n\n{e}"))?;
 
         let should_continue_inner = should_continue.clone();
 
@@ -314,9 +344,18 @@ impl SuperShuckieWebserver {
     }
 
     /// Get the next server command.
+    ///
+    /// A command issued long enough ago that its client already gave up and received a
+    /// 503/timeout error (see `REPLY_TIMEOUT`) is skipped rather than executed late; its reply
+    /// channel is dropped along with it, which is harmless since nothing is listening any more.
     #[inline]
     pub fn next_server_command(&mut self) -> Option<SuperShuckieServerCommand> {
-        self.backlog.try_recv().ok()
+        loop {
+            let (issued, command) = self.backlog.try_recv().ok()?;
+            if issued.elapsed() < REPLY_TIMEOUT {
+                return Some(command);
+            }
+        }
     }
 }
 
@@ -476,7 +515,11 @@ pub struct Stats {
     pub total_elapsed_frames: u32,
 
     pub is_recording: bool,
+    /// A replay is loaded for playback (playing, or stopped: see `is_playback_stopped`).
     pub is_playing_back: bool,
+    /// The loaded replay is stopped: still loaded (seekable, resumable) but the game is running
+    /// live under the user's control.
+    pub is_playback_stopped: bool,
     pub is_paused: bool,
     pub is_playback_finished: bool,
 
@@ -534,5 +577,31 @@ mod tests {
         assert!(parse("/add-bookmark", &[("frame", "soon")]).unwrap_err().contains("frame"));
         assert!(parse("/add-bookmark", &[("keyframe", "yes")]).unwrap_err().contains("keyframe"));
         assert!(parse("/go-to-bookmark", &[("id", "1"), ("point", "middle")]).unwrap_err().contains("in or out"));
+    }
+
+    /// Builds a `SuperShuckieWebserver` directly on top of a fresh backlog channel, bypassing
+    /// `new` (and its HTTP listener) entirely, so `next_server_command`'s age-based skipping can
+    /// be tested without a real client.
+    fn webserver_with_backlog() -> (SuperShuckieWebserver, SyncSender<(Instant, SuperShuckieServerCommand)>) {
+        let (sender, backlog) = sync_channel(4);
+        (SuperShuckieWebserver { backlog, should_continue: Arc::new(AtomicBool::new(true)) }, sender)
+    }
+
+    #[test]
+    fn stale_commands_are_skipped_but_fresh_ones_are_returned() {
+        let (mut server, sender) = webserver_with_backlog();
+
+        let (stale_responder, _stale_response) = channel();
+        sender.send((Instant::now() - REPLY_TIMEOUT - Duration::from_secs(1), SuperShuckieServerCommand::Stats(stale_responder))).unwrap();
+
+        let (fresh_responder, _fresh_response) = channel();
+        sender.send((Instant::now(), SuperShuckieServerCommand::Stats(fresh_responder))).unwrap();
+
+        // Drop the sender now: the messages above are already buffered, but the test would
+        // otherwise hang in `Drop::drop`'s drain loop, which waits for the channel to disconnect.
+        drop(sender);
+
+        assert!(matches!(server.next_server_command(), Some(SuperShuckieServerCommand::Stats(_))), "the fresh command should still come back");
+        assert!(server.next_server_command().is_none(), "the stale command should have been skipped, and nothing else is queued");
     }
 }

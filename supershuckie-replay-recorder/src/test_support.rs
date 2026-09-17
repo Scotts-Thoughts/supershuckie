@@ -144,6 +144,73 @@ pub fn bv(bytes: &[u8]) -> ByteVec {
     v
 }
 
+/// Build a replay from the v3 fixture's header followed by `packets`.
+pub fn file_with_packets(packets: &[Packet]) -> Vec<u8> {
+    use crate::PacketIO;
+
+    let mut bytes = V3_SMALL[..size_of::<ReplayHeaderBytes>()].to_vec();
+    for packet in packets {
+        for command in packet.write_packet_instructions() {
+            bytes.extend_from_slice(command.bytes());
+        }
+    }
+    bytes
+}
+
+/// Keyframe metadata for a synthetic keyframe at `frame` (arbitrary except for the millisecond
+/// scale, which keeps timestamps monotonic with the frame index).
+pub fn metadata_at(frame: u64) -> KeyframeMetadata {
+    KeyframeMetadata { elapsed_frames: frame, elapsed_millis: (frame * 16).into(), ..Default::default() }
+}
+
+/// A `RegionDeltaKeyframe` packet encoding the change from `prev` to `cur` at `frame`.
+pub fn region_delta(frame: u64, prev: &[u8], cur: &[u8]) -> Packet {
+    let d = crate::region_diff(prev, cur).unwrap();
+    Packet::RegionDeltaKeyframe { metadata: metadata_at(frame), state_len: cur.len() as u64, control: bv(&d.control), data: bv(&d.data) }
+}
+
+/// Keyframe metadata of any keyframe-class packet (a standalone copy of
+/// `playback::keyframe_metadata`, kept private to that module).
+fn keyframe_metadata_of(packet: &Packet) -> Option<&KeyframeMetadata> {
+    match packet {
+        Packet::Keyframe { metadata, .. }
+        | Packet::DeltaKeyframe { metadata, .. }
+        | Packet::RegionDeltaKeyframe { metadata, .. } => Some(metadata),
+        _ => None
+    }
+}
+
+/// A `CompressedBlob` packet holding exactly `packets` (which must start with a full keyframe).
+pub fn blob_of(packets: &[Packet]) -> Packet {
+    use crate::PacketIO;
+
+    let mut raw = Vec::new();
+    let mut keyframes = Vec::new();
+    let mut frames = 0;
+    for packet in packets {
+        for command in packet.write_packet_instructions() {
+            raw.extend_from_slice(command.bytes());
+        }
+        if let Some(metadata) = keyframe_metadata_of(packet) {
+            keyframes.push(metadata.clone());
+            frames = metadata.elapsed_frames;
+        }
+        if matches!(packet, Packet::NextFrame { .. }) {
+            frames += 1;
+        }
+    }
+    Packet::CompressedBlob {
+        elapsed_frames_start: keyframes[0].elapsed_frames,
+        elapsed_frames_end: frames,
+        timestamp_start: keyframes[0].elapsed_millis,
+        timestamp_end: (frames * 16).into(),
+        keyframes,
+        bookmarks: Vec::new(),
+        uncompressed_size: raw.len() as u64,
+        compressed_data: ByteVec::Heap(crate::compress_data(&raw, 1).unwrap()),
+    }
+}
+
 /// One step of the script, applied *before* the `NextFrame` of frame `frame` (1-based).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScriptOp {
@@ -319,6 +386,18 @@ pub fn run_script_observed<R: ReplayFileRecorderFns + ?Sized>(recorder: &mut R, 
         }
 
         after_frame(frame);
+    }
+}
+
+/// Recorder settings that split blobs purely by frame count: `max_frames_per_blob` frames per blob,
+/// with `minimum_uncompressed_bytes_per_blob` as an additional (usually disabled, via `usize::MAX`)
+/// byte-size trigger.
+pub fn settings(max_frames_per_blob: u64, minimum_uncompressed_bytes_per_blob: usize) -> crate::replay_file::record::ReplayFileRecorderSettings {
+    crate::replay_file::record::ReplayFileRecorderSettings {
+        minimum_uncompressed_bytes_per_blob,
+        max_frames_per_blob,
+        compression_level: crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
+        mask_transient_buffers: true,
     }
 }
 

@@ -1,12 +1,11 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
-use std::mem::MaybeUninit;
 use std::num::NonZeroU8;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 use std::slice::from_raw_parts_mut;
 use std::sync::Arc;
 use supershuckie_core::emulator::{ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use supershuckie_core::AudioOutput;
-use supershuckie_frontend::{ConnectedControllerIndex, SuperShuckieEmulatorType, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState, UserInput};
+use supershuckie_frontend::{ConnectedControllerIndex, ScreenInfo, SuperShuckieEmulatorType, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState, UserInput};
 use supershuckie_frontend::settings::{GameBoyMode, NintendoDSDate};
 use supershuckie_frontend::util::UTF8CString;
 use crate::control_settings::SuperShuckieControlSettings;
@@ -41,19 +40,20 @@ impl SuperShuckieFrontendCallbacks for SuperShuckieFrontendCallbacksC {
         unsafe { s(self.userdata, screens.len(), screens_buf.as_ptr()) };
     }
 
-    fn change_video_mode(&mut self, screens: &[ScreenData], scaling: NonZeroU8) {
+    fn change_video_mode(&mut self, screens: &[ScreenInfo], scaling: NonZeroU8) {
         let Some(s) = self.change_video_mode else { return };
 
-        let mut screens_buf = [MaybeUninit::<SuperShuckieScreenDataC>::uninit(); 4];
+        // No pixel data is passed to this callback; only width/height/encoding are valid.
+        let mut screens_buf = [SuperShuckieScreenDataC { width: 0, height: 0, screen_data_encoding: ScreenDataEncoding::A8R8G8B8 }; 4];
         for (index, screen) in screens.iter().enumerate() {
-            screens_buf[index].write(SuperShuckieScreenDataC {
+            screens_buf[index] = SuperShuckieScreenDataC {
                 width: screen.width as u32,
                 height: screen.height as u32,
                 screen_data_encoding: screen.encoding
-            });
+            };
         }
 
-        unsafe { s(self.userdata, screens.len(), screens_buf.as_ptr() as *const SuperShuckieScreenDataC, scaling) };
+        unsafe { s(self.userdata, screens.len(), screens_buf.as_ptr(), scaling) };
     }
 }
 
@@ -116,12 +116,12 @@ pub unsafe extern "C" fn supershuckie_frontend_tick(
     error: *mut u8,
     error_len: usize
 ) -> bool {
-    if let Err(e) = frontend.tick() {
-        write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
-        false
-    }
-    else {
-        true
+    match frontend.tick() {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
     }
 }
 
@@ -133,12 +133,12 @@ pub unsafe extern "C" fn supershuckie_frontend_load_rom(
     error_len: usize
 ) -> bool {
     let path = unsafe { CStr::from_ptr(path) };
-    if error_len > 0 && let Err(e) = frontend.load_rom(path.to_str().expect("supershuckie_frontend_load_rom with non-UTF-8 path")) {
-        write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
-        false
-    }
-    else {
-        true
+    match frontend.load_rom(path.to_str().expect("supershuckie_frontend_load_rom with non-UTF-8 path")) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
     }
 }
 
@@ -177,7 +177,7 @@ pub unsafe extern "C" fn supershuckie_frontend_set_current_save_file(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_get_current_save_file(
-    frontend: &mut SuperShuckieFrontend,
+    frontend: &SuperShuckieFrontend,
     length: *mut usize
 ) -> *const u8 {
     let Some(n) = frontend.get_current_save_name() else {
@@ -201,6 +201,17 @@ pub extern "C" fn supershuckie_frontend_is_game_running(
     frontend: &SuperShuckieFrontend
 ) -> bool {
     frontend.is_game_running()
+}
+
+/// Write `message` into the caller's `(error, error_len)` buffer, NUL-terminating (and truncating
+/// if needed). A no-op if `error` is null or `error_len` is 0, so every `(error, error_len)` site
+/// can call this unconditionally without checking first.
+///
+/// Safety: `error` must be valid for `error_len` bytes when non-null.
+pub(crate) unsafe fn write_error(message: &str, error: *mut u8, error_len: usize) {
+    if !error.is_null() && error_len > 0 {
+        write_str_to_data(message, unsafe { from_raw_parts_mut(error, error_len) });
+    }
 }
 
 pub(crate) fn write_str_to_data(string: &str, buffer: &mut [u8]) {
@@ -264,7 +275,7 @@ pub unsafe extern "C" fn supershuckie_frontend_start_recording_replay(
         Err(n) => (false, n)
     };
 
-    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    unsafe { write_error(msg.as_str(), result, result_len) };
     success
 }
 
@@ -287,7 +298,7 @@ pub unsafe extern "C" fn supershuckie_frontend_resume_recording_from_replay(
         Err(n) => (false, n)
     };
 
-    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    unsafe { write_error(msg.as_str(), result, result_len) };
     success
 }
 
@@ -302,15 +313,29 @@ pub unsafe extern "C" fn supershuckie_frontend_resume_recording_from_current_rep
         Err(n) => (false, n)
     };
 
-    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    unsafe { write_error(msg.as_str(), result, result_len) };
     success
 }
 
+/// Stop recording a replay.
+///
+/// Returns false (with an error written to `error`) if the recording could not be finalised; its
+/// temp file is then kept rather than deleted, so it can be recovered.
+///
+/// Safety: `error` must be valid for `error_len` bytes (may be null if `error_len` is 0).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_stop_recording_replay(
-    frontend: &mut SuperShuckieFrontend
-) {
-    frontend.stop_recording_replay();
+    frontend: &mut SuperShuckieFrontend,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.stop_recording_replay() {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
 }
 
 /// Get the replays directory of the current ROM (a starting point for file dialogs).
@@ -326,7 +351,7 @@ pub unsafe extern "C" fn supershuckie_frontend_get_replays_dir_for_current_rom(
 ) -> bool {
     match frontend.get_replays_dir_for_current_rom() {
         Some(dir) => {
-            write_str_to_data(&dir.to_string_lossy(), unsafe { from_raw_parts_mut(path, path_len) });
+            unsafe { write_error(&dir.to_string_lossy(), path, path_len) };
             true
         }
         None => false
@@ -354,7 +379,7 @@ pub unsafe extern "C" fn supershuckie_frontend_plan_replay_conversion(
         Ok(description) => (true, UTF8CString::from(description)),
         Err(e) => (false, e)
     };
-    write_str_to_data(message.as_str(), unsafe { from_raw_parts_mut(description, description_len) });
+    unsafe { write_error(message.as_str(), description, description_len) };
     ok
 }
 
@@ -378,7 +403,7 @@ pub unsafe extern "C" fn supershuckie_frontend_start_replay_conversion(
     match frontend.start_replay_conversion(keep_backups) {
         Ok(()) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -413,9 +438,7 @@ pub unsafe extern "C" fn supershuckie_frontend_replay_conversion_poll(
     if !phase.is_null() { unsafe { *phase = if status.phase == ConvertPhase::Verifying { 1 } else { 0 }; } }
     if !frames_done.is_null() { unsafe { *frames_done = status.done; } }
     if !frames_total.is_null() { unsafe { *frames_total = status.total; } }
-    if !current_name.is_null() {
-        write_str_to_data(status.current_name.as_str(), unsafe { from_raw_parts_mut(current_name, current_name_len) });
-    }
+    unsafe { write_error(status.current_name.as_str(), current_name, current_name_len) };
     true
 }
 
@@ -442,7 +465,7 @@ pub unsafe extern "C" fn supershuckie_frontend_replay_conversion_poll_finished(
     match frontend.poll_replay_conversion_finished() {
         None => 0,
         Some(result) => {
-            write_str_to_data(result.describe().as_str(), unsafe { from_raw_parts_mut(summary, summary_len) });
+            unsafe { write_error(result.describe().as_str(), summary, summary_len) };
             1
         }
     }
@@ -508,7 +531,7 @@ pub unsafe extern "C" fn supershuckie_frontend_export_replay_video(
     match frontend.start_replay_video_export(replay_name, range, std::path::Path::new(output_path), preset, scale, layout) {
         Ok(()) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -554,7 +577,7 @@ pub unsafe extern "C" fn supershuckie_frontend_export_poll_finished(
         None => 0,
         Some(Ok(())) => 1,
         Some(Err(e)) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             2
         }
     }
@@ -580,7 +603,7 @@ pub unsafe extern "C" fn supershuckie_frontend_create_save_state(
         Err(n) => (false, n)
     };
 
-    write_str_to_data(msg.as_str(), unsafe { from_raw_parts_mut(result, result_len) });
+    unsafe { write_error(msg.as_str(), result, result_len) };
     success
 }
 
@@ -609,14 +632,11 @@ pub unsafe extern "C" fn supershuckie_frontend_load_save_state(
     match frontend.load_save_state_if_exists(name) {
         Ok(true) => true,
         Ok(false) => {
-            if error_len >= 1 {
-                unsafe { *error = 0 };
-            }
+            unsafe { write_error("", error, error_len) };
             false
         }
-        Err(_) if error_len == 0 => false,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -624,17 +644,17 @@ pub unsafe extern "C" fn supershuckie_frontend_load_save_state(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_is_pokeabyte_enabled(
-    frontend: &mut SuperShuckieFrontend,
+    frontend: &SuperShuckieFrontend,
     error: *mut u8,
     error_len: usize
 ) -> bool {
     match frontend.is_pokeabyte_enabled() {
         Ok(n) => {
-            unsafe { *error = 0 };
+            unsafe { write_error("", error, error_len) };
             n
         },
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -642,17 +662,17 @@ pub unsafe extern "C" fn supershuckie_frontend_is_pokeabyte_enabled(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_get_external_commands_enabled(
-    frontend: &mut SuperShuckieFrontend,
+    frontend: &SuperShuckieFrontend,
     error: *mut u8,
     error_len: usize
 ) -> bool {
     match frontend.get_external_commands_enabled() {
         Ok(n) => {
-            unsafe { *error = 0 };
+            unsafe { write_error("", error, error_len) };
             n
         },
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -675,7 +695,7 @@ pub unsafe extern "C" fn supershuckie_frontend_set_pokeabyte_enabled(
     match frontend.set_pokeabyte_enabled(enabled) {
         Ok(_) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -691,7 +711,7 @@ pub unsafe extern "C" fn supershuckie_frontend_set_external_commands_enabled(
     match frontend.set_external_commands_enabled(enabled) {
         Ok(_) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -757,9 +777,8 @@ pub unsafe extern "C" fn supershuckie_frontend_save_sram(
 ) -> bool {
     match frontend.save_sram() {
         Ok(_) => true,
-        Err(_) if error_len == 0 => false,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -793,7 +812,9 @@ pub unsafe extern "C" fn supershuckie_frontend_get_rom_name(
 pub unsafe extern "C" fn supershuckie_frontend_write_settings(
     frontend: &SuperShuckieFrontend
 ) {
-    frontend.write_config();
+    if let Err(e) = frontend.write_config() {
+        eprintln!("supershuckie_frontend_write_settings: {}", e.as_str());
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -938,7 +959,7 @@ pub unsafe extern "C" fn supershuckie_frontend_load_replay(
     match frontend.load_replay_if_exists(name, override_errors) {
         Ok(_) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -953,7 +974,7 @@ pub unsafe extern "C" fn supershuckie_frontend_continue_last_replay(
     match frontend.continue_last_replay() {
         Ok(_) => true,
         Err(e) => {
-            write_str_to_data(e.as_str(), unsafe { from_raw_parts_mut(error, error_len) });
+            unsafe { write_error(e.as_str(), error, error_len) };
             false
         }
     }
@@ -967,10 +988,53 @@ pub unsafe extern "C" fn supershuckie_frontend_can_continue_last_replay(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_close_replay(
+    frontend: &mut SuperShuckieFrontend
+) {
+    frontend.close_replay();
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_stop_replay_playback(
     frontend: &mut SuperShuckieFrontend
 ) {
     frontend.stop_replay_playback();
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_resume_replay_playback(
+    frontend: &mut SuperShuckieFrontend,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.resume_replay_playback() {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_go_to_replay_resume_point(
+    frontend: &mut SuperShuckieFrontend
+) {
+    frontend.go_to_replay_resume_point();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_is_replay_playback_stopped(
+    frontend: &SuperShuckieFrontend
+) -> bool {
+    frontend.is_replay_playback_stopped()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_replay_frame(
+    frontend: &SuperShuckieFrontend
+) -> u32 {
+    frontend.get_replay_frame()
 }
 
 unsafe fn current_rom_or_null(frontend: &SuperShuckieFrontend, rom: *const c_char) -> Option<&str> {
@@ -987,7 +1051,7 @@ pub extern "C" fn supershuckie_frontend_get_control_settings(
     frontend: &SuperShuckieFrontend,
     emulator_type: u8
 ) -> *mut SuperShuckieControlSettings {
-    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { panic!("Unknown emulator_type {emulator_type}") };
+    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { return null_mut() };
     Box::into_raw(Box::new(SuperShuckieControlSettings(frontend.get_control_settings(emulator_type).clone())))
 }
 
@@ -997,7 +1061,7 @@ pub extern "C" fn supershuckie_frontend_set_control_settings(
     settings: &SuperShuckieControlSettings,
     emulator_type: u8
 ) {
-    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { panic!("Unknown emulator_type {emulator_type}") };
+    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { return };
     frontend.set_control_settings(settings.0.clone(), emulator_type)
 }
 
@@ -1013,8 +1077,12 @@ pub unsafe extern "C" fn supershuckie_frontend_connect_controller(
     frontend: &mut SuperShuckieFrontend,
     controller: *const c_char
 ) -> ConnectedControllerIndex {
-    let controller_name = unsafe { CStr::from_ptr(controller).to_str().expect("controller name not UTF-8") };
-    frontend.connect_controller(controller_name)
+    if controller.is_null() {
+        // No mapping; this index never corresponds to a connected controller.
+        return ConnectedControllerIndex::MAX;
+    }
+    let controller_name = unsafe { CStr::from_ptr(controller) }.to_string_lossy();
+    frontend.connect_controller(&controller_name)
 }
 
 #[unsafe(no_mangle)]
@@ -1239,7 +1307,7 @@ pub unsafe extern "C" fn supershuckie_frontend_get_current_data_directory(
     let path_bytes = path.as_c_str().to_bytes_with_nul();
     let path_bytes_len = path_bytes.len();
 
-    if dir_len >= path_bytes_len {
+    if !dir.is_null() && dir_len >= path_bytes_len {
         unsafe { from_raw_parts_mut(dir, path_bytes_len) }.copy_from_slice(path_bytes)
     }
 
@@ -1262,7 +1330,7 @@ pub unsafe extern "C" fn supershuckie_frontend_get_screenshot_directory(
     let path_bytes = path.as_c_str().to_bytes_with_nul();
     let path_bytes_len = path_bytes.len();
 
-    if dir_len >= path_bytes_len {
+    if !dir.is_null() && dir_len >= path_bytes_len {
         unsafe { from_raw_parts_mut(dir, path_bytes_len) }.copy_from_slice(path_bytes)
     }
 
@@ -1273,7 +1341,9 @@ pub unsafe extern "C" fn supershuckie_frontend_get_screenshot_directory(
 pub extern "C" fn supershuckie_frontend_reload_core(
     frontend: &mut SuperShuckieFrontend
 ) {
-    frontend.reload_core();
+    if let Err(e) = frontend.reload_core() {
+        eprintln!("supershuckie_frontend_reload_core: {}", e.as_str());
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1373,4 +1443,23 @@ pub extern "C" fn supershuckie_frontend_set_disable_speed_changes_when_recording
     disabled: bool
 ) {
     frontend.set_disable_speed_changes_when_recording(disabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_error;
+    use std::ptr::null_mut;
+
+    #[test]
+    fn write_error_with_null_buffer_is_a_no_op() {
+        // Must not dereference/UB even though error_len is 0 (and even if it were non-zero).
+        unsafe { write_error("x", null_mut(), 0) };
+    }
+
+    #[test]
+    fn write_error_truncates_to_a_single_nul_byte() {
+        let mut buf = [0xFFu8; 4];
+        unsafe { write_error("hello", buf.as_mut_ptr(), 1) };
+        assert_eq!(buf, [0, 0xFF, 0xFF, 0xFF]);
+    }
 }

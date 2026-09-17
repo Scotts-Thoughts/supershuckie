@@ -227,6 +227,16 @@ std::vector<std::uint64_t> BookmarkWindow::selected_ids() const {
     return ids;
 }
 
+QTreeWidgetItem *BookmarkWindow::item_for_id(std::uint64_t id) const {
+    for(int i = 0; i < this->tree->topLevelItemCount(); i++) {
+        auto *item = this->tree->topLevelItem(i);
+        if(item->data(Name, Qt::UserRole).toULongLong() == id) {
+            return item;
+        }
+    }
+    return nullptr;
+}
+
 void BookmarkWindow::rebuild() {
     this->rebuilding = true;
     this->state = BookmarkWindow::read_state(this->main_window);
@@ -466,6 +476,13 @@ void BookmarkWindow::on_context_menu(const QPoint &position) {
         this->go_to(id, true);
     }
     else if(chosen == rename) {
+        // menu.exec() runs a nested event loop that does not stop the main ticker; rebuild() may
+        // have deleted `item` in the meantime (tick() -> rebuild() -> tree->clear()), so look it
+        // up again by id before touching it.
+        item = this->item_for_id(id);
+        if(item == nullptr) {
+            return;
+        }
         this->tree->editItem(item, Name);
     }
     else if(chosen == set_in || chosen == set_out) {

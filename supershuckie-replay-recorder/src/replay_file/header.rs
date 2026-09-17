@@ -86,11 +86,15 @@ pub struct ReplayHeaderRaw {
     /// 0x008 - type of the console
     pub console_type: MaybeEnum<ReplayConsoleType>,
 
-    /// 0x00C - crop_start_* and crop_timer_offset are valid
-    pub crop_start: bool,
+    /// 0x00C - non-zero if crop_start_* and crop_timer_offset are valid
+    ///
+    /// This is a `u8`, not a `bool`, because [`Self::from_bytes`] transmutes raw file bytes: a
+    /// `bool` field would be undefined behaviour for any byte value other than 0 or 1 (which a
+    /// corrupt or hand-edited file cannot be assumed to avoid). Treat any non-zero value as set.
+    pub crop_start: u8,
 
-    /// 0x00D - crop_end_* are valid
-    pub crop_end: bool,
+    /// 0x00D - non-zero if crop_end_* are valid (see [`Self::crop_start`] for why this is a `u8`)
+    pub crop_end: u8,
 
     /// 0x00E - padding
     pub _padding_0: [u8; 2],
@@ -267,9 +271,9 @@ impl ReplayHeaderRaw {
             rom_filename: parse_string_buffer(&self.rom_filename, "rom_filename")?,
             emulator_core_name: parse_string_buffer(&self.emulator_core_name, "emulator_core_name")?,
 
-            crop_start: self.crop_start.then_some((self.crop_start_frame, self.crop_start_millis)),
-            crop_end: self.crop_end.then_some((self.crop_end_frame, self.crop_end_millis)),
-            timer_offset: self.crop_start.then_some(self.crop_timer_offset)
+            crop_start: (self.crop_start != 0).then_some((self.crop_start_frame, self.crop_start_millis)),
+            crop_end: (self.crop_end != 0).then_some((self.crop_end_frame, self.crop_end_millis)),
+            timer_offset: (self.crop_start != 0).then_some(self.crop_timer_offset)
         })
     }
 }
@@ -310,8 +314,8 @@ impl ReplayFileMetadata {
             crop_end_millis: self.crop_end.map(|i| i.1).unwrap_or(0.into()),
             crop_timer_offset: self.timer_offset.unwrap_or(0.into()),
 
-            crop_start: self.crop_start.is_some(),
-            crop_end: self.crop_end.is_some(),
+            crop_start: u8::from(self.crop_start.is_some()),
+            crop_end: u8::from(self.crop_end.is_some()),
 
             packet_stream_end: 0,
 
@@ -398,4 +402,40 @@ pub enum ReplayPatchFormat {
 
     /// The patch is in BPS format
     BPS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_bytes(crop_start_byte: u8) -> ReplayHeaderBytes {
+        let mut bytes = [0u8; 2048];
+        bytes[0..4].copy_from_slice(&SIGNATURE_START);
+        bytes[4..8].copy_from_slice(&REPLAY_VERSION.to_le_bytes());
+        bytes[0x0C] = crop_start_byte;
+        bytes[2044..2048].copy_from_slice(&SIGNATURE_END);
+        bytes
+    }
+
+    /// The raw `crop_start` byte is a flag (any non-zero value means "set"), not a literal `bool`
+    /// (which would be undefined behaviour to read from an arbitrary file byte via transmute).
+    #[test]
+    fn crop_start_byte_is_treated_as_a_flag_not_a_literal_bool() {
+        for (byte, expect_some) in [(0x7Fu8, true), (0u8, false), (1u8, true), (0xFFu8, true)] {
+            let bytes = header_bytes(byte);
+            let header = ReplayHeaderRaw::from_bytes(&bytes);
+            let parsed = header.parse().unwrap_or_else(|e| panic!("byte {byte:#X}: {e}"));
+            assert_eq!(parsed.crop_start.is_some(), expect_some, "byte {byte:#X}");
+            assert_eq!(parsed.timer_offset.is_some(), expect_some, "byte {byte:#X}");
+        }
+    }
+
+    /// `as_raw_header` always normalizes a set flag to exactly `1`.
+    #[test]
+    fn as_raw_header_writes_exactly_one_for_a_set_flag() {
+        let metadata = ReplayFileMetadata { crop_start: Some((5, 10.into())), timer_offset: Some(1.into()), ..Default::default() };
+        let raw = metadata.as_raw_header().unwrap();
+        assert_eq!(raw.crop_start, 1);
+        assert_eq!(raw.crop_end, 0);
+    }
 }

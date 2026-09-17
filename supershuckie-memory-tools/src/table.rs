@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::value::ascii_only;
+
 /// A character table.
 #[derive(Clone, Debug)]
 pub struct CharTable {
@@ -69,6 +71,7 @@ impl CharTable {
             if key.is_empty() || key.len() % 2 != 0 || key.len() > 8 {
                 return Err(format!("line {}: \"{key}\" is not 1-4 hexadecimal bytes", number + 1))
             }
+            let key = ascii_only(key, "byte codes").map_err(|e| format!("line {}: {e}", number + 1))?;
             let bytes = (0..key.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&key[i..i + 2], 16))
@@ -159,5 +162,14 @@ mod tests {
         assert!(CharTable::parse_tbl("bad", "ZZ=a").is_err());
         assert!(CharTable::parse_tbl("bad", "ABC=a").is_err());
         assert!(CharTable::parse_tbl("bad", "nothing").is_err());
+    }
+
+    #[test]
+    fn non_ascii_byte_codes_are_an_error_not_a_panic() {
+        // A multi-byte character on the byte-code side must not panic when sliced (H6).
+        assert!(CharTable::parse_tbl("t", "aé=X").is_err());
+        assert!(CharTable::parse_tbl("t", "é=X").is_err());
+        // Non-ASCII text is legal; only the byte-code side is restricted.
+        assert!(CharTable::parse_tbl("t", "41=é").is_ok());
     }
 }

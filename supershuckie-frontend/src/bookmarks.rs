@@ -32,6 +32,10 @@ const WRITE_DELAY: Duration = Duration::from_millis(250);
 /// Longest bookmark or type name kept.
 const MAX_NAME_CHARS: usize = 200;
 
+/// Most bookmark types the user's settings keep at once (M10: the REST API can create types
+/// without bound otherwise).
+const MAX_BOOKMARK_TYPES: usize = 256;
+
 /// Name used for untyped generic bookmarks.
 const GENERIC_NAME: &str = "Bookmark";
 
@@ -191,6 +195,8 @@ pub struct LoadedReplay {
 
 struct WriteJob {
     serial: u64,
+    /// The [`ReplayBookmarks::epoch`] this job was started in; see [`WriteResult::epoch`].
+    epoch: u64,
     path: PathBuf,
     header: ReplayHeaderBytes,
     table: BookmarkTable
@@ -198,6 +204,10 @@ struct WriteJob {
 
 struct WriteResult {
     serial: u64,
+    /// Copied from the [`WriteJob`] that produced this result. A result whose epoch no longer
+    /// matches [`ReplayBookmarks::epoch`] belongs to a replay this frontend has since switched
+    /// away from (a `reset()` happened while the write was in flight) and is ignored (L10).
+    epoch: u64,
     path: PathBuf,
     result: Result<BookmarkSectionWriteOutcome, BookmarkSectionWriteError>
 }
@@ -216,7 +226,7 @@ impl Writer {
             .spawn(move || {
                 while let Ok(job) = job_receiver.recv() {
                     let result = write_bookmark_section(&job.path, Some(&job.header), &job.table);
-                    if result_sender.send(WriteResult { serial: job.serial, path: job.path, result }).is_err() {
+                    if result_sender.send(WriteResult { serial: job.serial, epoch: job.epoch, path: job.path, result }).is_err() {
                         break
                     }
                 }
@@ -232,6 +242,11 @@ pub struct ReplayBookmarks {
     target: Target,
     generation: u64,
     open_range: Option<u64>,
+
+    /// Bumped by every [`Self::reset`] (a replay switch); tags in-flight writes so a result that
+    /// arrives after the replay it was writing has been switched away from is recognised as stale
+    /// and ignored rather than resurrecting `in_flight` or touching the new replay's state (L10).
+    epoch: u64,
 
     /// Recording: the core has not been given the latest table.
     core_dirty: bool,
@@ -262,6 +277,7 @@ impl ReplayBookmarks {
             target: Target::None,
             generation: 1,
             open_range: None,
+            epoch: 0,
             core_dirty: false,
             edit_serial: 0,
             saved_serial: 0,
@@ -291,6 +307,11 @@ impl ReplayBookmarks {
         self.table = table;
         self.target = target;
         self.open_range = None;
+        // L10: a write started for the replay we're leaving must not be mistaken for one for the
+        // new replay when its result eventually arrives (see `handle_write_result`), and the new
+        // replay must not wait on it either.
+        self.epoch = self.epoch.wrapping_add(1);
+        self.in_flight = None;
         self.core_dirty = false;
         self.edit_serial = 0;
         self.saved_serial = 0;
@@ -394,6 +415,11 @@ impl ReplayBookmarks {
     }
 
     fn handle_write_result(&mut self, result: WriteResult) {
+        if result.epoch != self.epoch {
+            // Stale: this write was for a replay we've since switched away from (see L10).
+            // `in_flight`, if set, belongs to the current epoch and is left alone.
+            return
+        }
         self.in_flight = None;
         let Target::Playback(p) = &mut self.target else {
             return
@@ -439,7 +465,7 @@ impl ReplayBookmarks {
         if self.writer.is_none() {
             self.writer = Writer::spawn();
         }
-        let job = WriteJob { serial: self.edit_serial, path: p.path.clone(), header: p.header, table: self.table.clone() };
+        let job = WriteJob { serial: self.edit_serial, epoch: self.epoch, path: p.path.clone(), header: p.header, table: self.table.clone() };
         match self.writer.as_ref().map(|w| w.jobs.send(job)) {
             Some(Ok(())) => {
                 self.in_flight = Some(self.edit_serial);
@@ -456,7 +482,10 @@ impl ReplayBookmarks {
     /// Write any unsaved playback edits now.
     pub fn flush(&mut self) -> Result<(), BookmarkError> {
         if self.in_flight.is_some() {
-            let received = self.writer.as_ref().map(|w| w.results.recv_timeout(Duration::from_secs(10)));
+            // L10: shorter than before (was 10s) so a stuck writer thread doesn't wedge the UI for
+            // long; a timeout here just means the caller sees an error, it doesn't lose the write
+            // (the writer thread, if merely slow rather than stuck, still finishes it).
+            let received = self.writer.as_ref().map(|w| w.results.recv_timeout(Duration::from_secs(3)));
             match received {
                 Some(Ok(result)) => self.handle_write_result(result),
                 Some(Err(RecvTimeoutError::Timeout)) => return Err(BookmarkError::WriteFailed("Saving bookmarks is taking too long.".to_owned())),
@@ -472,11 +501,12 @@ impl ReplayBookmarks {
         }
 
         let serial = self.edit_serial;
+        let epoch = self.epoch;
         let path = p.path.clone();
         let result = write_bookmark_section(&path, Some(&p.header), &self.table);
         let failed = result.as_ref().err().map(|e| e.to_string());
         self.dirty_since = None;
-        self.handle_write_result(WriteResult { serial, path, result });
+        self.handle_write_result(WriteResult { serial, epoch, path, result });
         match failed {
             None => Ok(()),
             Some(e) => Err(BookmarkError::WriteFailed(e))
@@ -598,6 +628,9 @@ fn resolve_type(settings: &mut BookmarkSettings, table: &BookmarkTable, choice: 
             let name = clean_name(&name).ok_or_else(|| BookmarkError::Invalid("A bookmark type needs a name.".to_owned()))?;
             if let Some(t) = settings.types.iter().find(|t| t.name.to_lowercase() == name.to_lowercase()) {
                 return Ok((t.id, false))
+            }
+            if settings.types.len() >= MAX_BOOKMARK_TYPES {
+                return Err(BookmarkError::Invalid(format!("Too many bookmark types (limit {MAX_BOOKMARK_TYPES}).")))
             }
             if let Some(record) = table.types.iter().find(|t| t.name.to_lowercase() == name.to_lowercase()) && settings.get_type(record.id).is_none() {
                 settings.types.push(BookmarkTypeSetting { id: record.id, name: record.name.clone(), color: record.color });
@@ -745,7 +778,7 @@ impl SuperShuckieFrontend {
 
     fn bookmark_types_changed(&mut self) {
         self.bookmark_types_generation = self.bookmark_types_generation.wrapping_add(1);
-        self.write_config();
+        self.mark_settings_dirty();
     }
 
     fn generic_bookmark_prefix(&self, type_id: u64) -> String {
@@ -944,6 +977,9 @@ impl SuperShuckieFrontend {
                     }
                     None => {
                         // Adopting a type only known from the replay.
+                        if settings.types.len() >= MAX_BOOKMARK_TYPES {
+                            return Err(BookmarkError::Invalid(format!("Too many bookmark types (limit {MAX_BOOKMARK_TYPES}).")))
+                        }
                         let record = self.bookmarks.table().type_record(id).ok_or_else(|| BookmarkError::NotFound(format!("bookmark type with id {text}")))?;
                         settings.types.push(BookmarkTypeSetting { id, name: name.unwrap_or_else(|| record.name.clone()), color: color.unwrap_or(record.color) });
                     }
@@ -952,6 +988,9 @@ impl SuperShuckieFrontend {
             }
             None => {
                 let name = name.ok_or_else(|| BookmarkError::Invalid("A bookmark type needs a name.".to_owned()))?;
+                if settings.types.len() >= MAX_BOOKMARK_TYPES {
+                    return Err(BookmarkError::Invalid(format!("Too many bookmark types (limit {MAX_BOOKMARK_TYPES}).")))
+                }
                 let table = self.bookmarks.table();
                 let id = new_type_id(|id| settings.get_type(id).is_some() || table.type_record(id).is_some());
                 let color = color.unwrap_or_else(|| palette_color(settings.types.len()));
@@ -1011,7 +1050,7 @@ impl SuperShuckieFrontend {
     pub fn set_confirm_replay_upgrade(&mut self, confirm: bool) {
         if self.settings.bookmarks.confirm_replay_upgrade != confirm {
             self.settings.bookmarks.confirm_replay_upgrade = confirm;
-            self.write_config();
+            self.mark_settings_dirty();
         }
     }
 
@@ -1293,5 +1332,43 @@ mod tests {
         bookmarks.edit(&settings, |_| Ok(())).unwrap();
         assert_eq!(bookmarks.generation(), generation);
         assert!(bookmarks.take_core_update().is_none());
+    }
+
+    /// L10: a write started for replay A must not be mistaken for a write of replay B when its
+    /// result arrives after `reset()` (switching to B) has already run.
+    #[test]
+    fn stale_write_results_are_ignored_after_a_replay_switch() {
+        let dir = temp_dir("stale");
+        let (path_a, loaded_a) = replay_file(&dir, "a", REPLAY_VERSION_BOOKMARK_SECTION);
+        let (path_b, loaded_b) = replay_file(&dir, "b", REPLAY_VERSION_BOOKMARK_SECTION);
+        let settings = BookmarkSettings::default();
+        let mut bookmarks = ReplayBookmarks::new();
+        bookmarks.set_playback(loaded_a, BookmarkTable::new());
+
+        bookmarks.edit(&settings, |t| Ok(t.insert(bookmark("first", 10)))).unwrap();
+        bookmarks.poll_writes(Instant::now() + WRITE_DELAY * 2);
+        assert!(bookmarks.in_flight.is_some(), "a write for replay a should now be in flight");
+        let stale_epoch = bookmarks.epoch;
+
+        // Switch to a different replay before the write for `a` lands.
+        bookmarks.set_playback(loaded_b, BookmarkTable::new());
+        assert!(bookmarks.in_flight.is_none(), "reset() must clear in_flight (L10)");
+        assert_ne!(bookmarks.epoch, stale_epoch, "reset() must bump the epoch (L10)");
+
+        // The stale write for `a` finishes on the writer thread and its result arrives late.
+        let stale_result = bookmarks.writer.as_ref().unwrap().results.recv_timeout(Duration::from_secs(5)).expect("the write for a should complete");
+        assert_eq!(stale_result.epoch, stale_epoch);
+        bookmarks.handle_write_result(stale_result);
+
+        // The stale result must not resurrect in_flight, nor touch b's saved_serial.
+        assert!(bookmarks.in_flight.is_none(), "a stale result must not set in_flight for the new replay");
+        assert_eq!(bookmarks.saved_serial, 0, "b's saved_serial must be untouched by a's result");
+
+        // The write itself was not cancelled -- only the frontend's bookkeeping about it is
+        // ignored -- so a's bookmark did land on disk, and b's file is untouched.
+        assert_eq!(table_on_disk(&path_a).bookmarks.len(), 1);
+        assert!(table_on_disk(&path_b).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

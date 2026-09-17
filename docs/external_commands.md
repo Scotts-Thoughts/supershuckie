@@ -308,8 +308,8 @@ Arguments:
 
 ### mark-end
 
-Mark the start of a replay and enables the timer feature. A replay must be
-recording for this to work.
+Mark the end of the replay's timed section (started with [mark-start](#mark-start)).
+A replay must be recording for this to work.
 
 Usage:
 
@@ -363,7 +363,8 @@ Usage:
 | `total_elapsed_time`   | `number`                 | Total time the core has been running. If in a replay, this is the elapsed time of the replay, instead.              |
 | `total_elapsed_frames` | `number`                 | Total number of frames the core has been running. If in a replay, this is the frame counter of the replay, instead. |
 | `is_recording`         | `boolean`                | `true` if currently recording a replay, `false` if not.                                                             |
-| `is_playing_back`      | `boolean`                | `true` if currently playing back a replay, `false` if not.                                                          |
+| `is_playing_back`      | `boolean`                | `true` if a replay is loaded for playback (playing, or stopped: see `is_playback_stopped`), `false` if not.          |
+| `is_playback_stopped`  | `boolean`                | `true` if the loaded replay is stopped: still loaded (seekable, resumable) but the game runs live under the user.     |
 | `is_paused`            | `boolean`                | `true` if the user has manually paused, `false` if not.                                                             |
 | `is_playback_finished` | `boolean`                | `true` if the current replay has reached the end, `false` if not (or no replay playing).                            |
 | `current_speed`        | `number`                 | The current playback speed multiplier.                                                                              |
@@ -422,3 +423,6 @@ argument), `404` (no replay is recording or playing back, or there is no such
 bookmark), `409` (not possible right now, for example seeking while recording or
 a replay that must be converted first), `500` (saving the bookmarks into the
 replay file failed) or `503` (the emulator is busy).
+
+A request to an unknown route (not one of the ones listed above, or `/client.js`)
+returns `404` with no body.

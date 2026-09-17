@@ -82,9 +82,11 @@ struct Server {
 /// The pipe replies go down, taken away from everything else in the process.
 ///
 /// A duplicate of stdout's handle for the protocol, then descriptor 1 is made a second stderr:
-/// a `printf` from the C glue, or a stray `println!`, goes to the log from here on rather than
-/// into the middle of a frame. On Windows the C runtime's `_dup2` moves its descriptor 1 the
-/// same way, which is where the glue's `printf` goes.
+/// this redirects the C runtime's descriptor 1 — where the cores' C glue's `printf` goes — so
+/// that output lands in the log from here on rather than into the middle of a frame. It does not
+/// move Rust's own stdout (on Windows, `_dup2` on descriptor 1 does not touch the Win32 handle
+/// Rust's stdout writes through), so Rust code in the server must use `eprintln!` instead, which
+/// it does.
 fn claim_stdout() -> io::Result<File> {
     #[cfg(unix)]
     let protocol = {
@@ -552,9 +554,9 @@ fn build_core(console: ReplayConsoleType, rom: &[u8]) -> Result<Box<dyn Emulator
         ReplayConsoleType::GameBoy => Box::new(GameBoyColor::new_from_rom(rom, DMG_BOOT, None, Model::DmgB)),
         ReplayConsoleType::SuperGameBoy2 => Box::new(GameBoyColor::new_from_rom(rom, DMG_BOOT, None, Model::Sgb2)),
         ReplayConsoleType::GameBoyColor => Box::new(GameBoyColor::new_from_rom(rom, CGB_BOOT, None, Model::Cgb0)),
-        ReplayConsoleType::GameBoyAdvance => Box::new(GameBoyAdvance::new_from_rom(rom, None, GBA_BIOS, std_timestamp_provider())),
+        ReplayConsoleType::GameBoyAdvance => Box::new(GameBoyAdvance::new_from_rom(rom, None, GBA_BIOS, std_timestamp_provider())?),
         // The JIT is not reproducible; recordings are only bit-exact under the interpreter.
-        ReplayConsoleType::NintendoDS => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false)),
+        ReplayConsoleType::NintendoDS => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false)?),
         ReplayConsoleType::Unknown => return Err("the recording's console type is unknown".into()),
     })
 }

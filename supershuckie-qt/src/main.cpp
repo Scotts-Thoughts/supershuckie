@@ -1,7 +1,10 @@
 #include <stdio.h>
 
+#include <filesystem>
+
 #include <SDL3/SDL.h>
 #include <QApplication>
+#include <QCoreApplication>
 
 #ifdef _WIN32
 #include <QStyleFactory>
@@ -43,16 +46,27 @@ int main(int argc, char **argv) {
 
     QApplication app(argc, argv);
 
-    SixShooter::Theme theme;
+    // `theme`, `window` (and anything it owns, notably AudioOutput's SDL_AudioStream) must be
+    // destroyed before SDL_Quit() runs below: SDL_Quit() tears down SDL's audio subsystem, which
+    // frees every "simplified" audio stream itself, and ~MainWindow -> AudioOutput::close() would
+    // otherwise call SDL_DestroyAudioStream() on an already-freed stream.
+    int result;
+    {
+        SixShooter::Theme theme;
 
-    SuperShuckie64::MainWindow window;
-    window.show();
+        SuperShuckie64::MainWindow window;
+        window.show();
 
-    if(argc == 2) {
-        window.load_rom(argv[1]);
+        // argv[i] is in the process's ANSI code page on Windows, but libstdc++'s
+        // std::filesystem::path(const char*) always decodes narrow input as UTF-8; go through Qt's
+        // own argv parsing (which is code-page aware) and convert via UTF-16 instead.
+        auto args = QCoreApplication::arguments();
+        if(args.size() == 2) {
+            window.load_rom(std::filesystem::path(args[1].toStdU16String()));
+        }
+
+        result = app.exec();
     }
-
-    int result = app.exec();
     SDL_Quit();
 
     return result;

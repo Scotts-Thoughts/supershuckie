@@ -349,6 +349,7 @@ Expose the policy so the frontend can offer `DropAll` (clean re-mark) or `Preser
 - **Chained resume:** a resumed file is a normal v3 file; resuming it again works because absolute `elapsed_millis` is always carried forward (read `millis0` from the frame-0 keyframe rather than assuming 0).
 - **Two-file model on the new recording:** the in-progress prefix tail lives uncompressed in the new temp file and compresses on the next blob split or on `close()` — identical to normal mid-recording state. Do not special-case it.
 - **`stop_recording_replay` afterwards:** unchanged. It closes the recorder (flushing the final blob) and removes the temp file. The resumed final file is a complete, valid replay.
+- **Boundary blob opening with two same-frame keyframes (blob-copy fast path):** the re-feed's `go_to_keyframe(start_frame)` resolves to the *later* keyframe on that frame (per the "several keyframes on one frame" rule), not the blob's first packet; since the two share a frame (no `NextFrame` between them), the later one's state and metadata already cover everything, so nothing is lost.
 
 ---
 

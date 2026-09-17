@@ -92,6 +92,9 @@ private:
     QJsonObject bookmark(std::uint64_t id) const;
     bool update_bookmark(std::uint64_t id, const QJsonObject &patch);
     void go_to(std::uint64_t id, bool out_point);
+
+    /** Find the tree item holding this bookmark id, or null if rebuild() has since dropped it. */
+    QTreeWidgetItem *item_for_id(std::uint64_t id) const;
 };
 
 /** Manage the user's bookmark types and their colors. */

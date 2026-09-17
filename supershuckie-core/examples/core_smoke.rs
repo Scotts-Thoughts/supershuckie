@@ -28,7 +28,7 @@ fn main_ram(core: &SuperShuckieCore) -> Vec<u8> {
 }
 
 fn new_core(rom: &[u8]) -> SuperShuckieCore {
-    let nds = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false);
+    let nds = NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false).expect("failed to load ROM");
     SuperShuckieCore::new(Box::new(nds), std_timestamp_provider())
 }
 
@@ -86,12 +86,12 @@ fn main() {
     println!("playback of the recording matches ({keyframes} keyframes)");
 
     // --- 3. Seeks (clone-free keyframe states): same target twice must give the same state. ---
-    play.go_to_replay_frame(400);
+    play.go_to_replay_frame(400).expect("seek");
     assert_eq!(play.total_frames(), 400);
     let a = main_ram(&play);
-    play.go_to_replay_frame(120);
+    play.go_to_replay_frame(120).expect("seek");
     assert_eq!(play.total_frames(), 120);
-    play.go_to_replay_frame(400);
+    play.go_to_replay_frame(400).expect("seek");
     let b = main_ram(&play);
     assert!(a == b, "seeking to the same frame twice gave different states");
     println!("seeks are reproducible");
@@ -105,16 +105,16 @@ fn main() {
         let mut core = new_core(&rom);
         core.attach_replay_player(player, true).expect("attach");
         let target = total / 3;
-        core.go_to_replay_frame(target);
+        core.go_to_replay_frame(target).expect("seek");
         assert_eq!(core.total_frames(), target);
         let a = main_ram(&core);
         let sa = core.create_save_state();
         let sram_a = core.save_sram();
-        core.go_to_replay_frame(target);
+        core.go_to_replay_frame(target).expect("seek");
         let sb = core.create_save_state();
         println!("real replay: seek {target} -> {target} again: {}", if sa == sb { "identical".to_string() } else { describe_diff(&sa, &sb) });
-        core.go_to_replay_frame(target + 300);
-        core.go_to_replay_frame(target);
+        core.go_to_replay_frame(target + 300).expect("seek");
+        core.go_to_replay_frame(target).expect("seek");
         let sc = core.create_save_state();
         let sram_c = core.save_sram();
         println!("real replay: seek {target} -> {} -> {target}: {}", target + 300, if sa == sc { "identical".to_string() } else { describe_diff(&sa, &sc) });
@@ -134,7 +134,7 @@ fn main() {
         let mut player2 = ReplayFilePlayer::new(&bytes2, true).expect("parse replay");
         player2.enable_threading();
         fresh.attach_replay_player(player2, true).expect("attach");
-        fresh.go_to_replay_frame(target);
+        fresh.go_to_replay_frame(target).expect("seek");
         let sd = fresh.create_save_state();
         println!("real replay: fresh core seek {target}: {}", if sa == sd { "identical".to_string() } else { describe_diff(&sa, &sd) });
         assert!(sa == sd, "seeking to the same frame from a fresh core gave a different state");

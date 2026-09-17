@@ -2,22 +2,6 @@
 //!
 //! See [`ReplayFilePlayer`].
 
-#[cfg(not(feature = "std"))]
-use spin::Mutex;
-
-#[cfg(not(feature = "std"))]
-macro_rules! unwrap_mutex_lock {
-    ($e:expr) => {$e};
-}
-
-#[cfg(feature = "std")]
-use std::sync::Mutex;
-
-#[cfg(feature = "std")]
-macro_rules! unwrap_mutex_lock {
-    ($e:expr) => {$e.unwrap()};
-}
-
 use alloc::borrow::Cow;
 use alloc::format;
 use alloc::vec::Vec;
@@ -52,7 +36,8 @@ pub struct ReplayFilePlayer {
     total_frame_count: UnsignedInteger,
     total_millis: TimestampMillis,
 
-    compressed_blobs_decompressing: BTreeMap<usize, Option<Arc<Mutex<PacketDecompressionStatus>>>>,
+    #[cfg(feature = "std")]
+    compressed_blobs_decompressing: BTreeMap<usize, Option<DecompressionWorker>>,
     compressed_blobs_finished: BTreeMap<usize, Option<Arc<Vec<Packet>>>>,
     compressed_blob_uncompressed_packet_indices: Vec<usize>,
     cleanup_enabled: bool,
@@ -325,7 +310,8 @@ impl ReplayFilePlayer {
             };
         }
 
-        let mut compressed_blobs = BTreeMap::new();
+        #[cfg(feature = "std")]
+        let mut compressed_blobs_decompressing = BTreeMap::new();
         let mut compressed_blobs_finished = BTreeMap::new();
         let mut compressed_blob_indices = Vec::new();
 
@@ -344,7 +330,8 @@ impl ReplayFilePlayer {
                         return Err(ReplayFileReadError::Other { explanation: Cow::Borrowed("Replay has a compressed blob that decompressed beyond the current architectural limits") });
                     }
 
-                    compressed_blobs.insert(packet_index, None);
+                    #[cfg(feature = "std")]
+                    compressed_blobs_decompressing.insert(packet_index, None);
                     compressed_blobs_finished.insert(packet_index, None);
                     compressed_blob_indices.push(packet_index);
 
@@ -369,8 +356,10 @@ impl ReplayFilePlayer {
                     add_keyframe!(metadata);
                 },
                 Packet::NextFrame { timestamp_delta } => {
-                    total_frame_count += 1;
-                    total_millis += timestamp_delta.0;
+                    total_frame_count = total_frame_count.checked_add(1)
+                        .ok_or_else(|| ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("frame or time counter overflowed") })?;
+                    total_millis = total_millis.checked_add(timestamp_delta.0)
+                        .ok_or_else(|| ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("frame or time counter overflowed") })?;
                 }
                 Packet::Bookmark { metadata } => {
                     add_bookmark!(metadata);
@@ -420,7 +409,8 @@ impl ReplayFilePlayer {
             next_uncompressed_packet_index: 0usize,
             next_compressed_packet_index: None,
             compressed_blob_uncompressed_packet_indices: compressed_blob_indices,
-            compressed_blobs_decompressing: compressed_blobs,
+            #[cfg(feature = "std")]
+            compressed_blobs_decompressing,
             compressed_blobs_finished,
             total_frame_count,
             total_millis: TimestampMillis(total_millis),
@@ -660,55 +650,73 @@ impl ReplayFilePlayer {
         Ok(())
     }
 
+    /// Ensure the blob at `blob_packet_index` is decompressed and cached, using (and, if
+    /// necessary, waiting for) a background worker if one is in flight for it.
+    ///
+    /// Never spins: a worker still running is waited for with a blocking `recv()`, and a worker
+    /// that died before sending (see [`DecompressionWorker`]) is reaped and the blob is
+    /// decompressed here instead.
+    #[cfg(feature = "std")]
     fn decompress_immediately(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
+        if self.compressed_blobs_finished[&blob_packet_index].is_some() {
+            return Ok(())
+        }
+
+        let worker = self.compressed_blobs_decompressing
+            .get_mut(&blob_packet_index)
+            .expect("compressed blob should be in working cache")
+            .take();
+
+        if let Some(worker) = worker {
+            match worker.result.recv() {
+                Ok(Ok(packets)) => {
+                    *self.compressed_blobs_finished
+                        .get_mut(&blob_packet_index)
+                        .expect("compressed blob should be in finished cache") = Some(packets);
+                    return Ok(());
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(std::sync::mpsc::RecvError) => {
+                    // The worker died before sending (an early exit; a panic would abort the whole
+                    // process under this app's release profile, but not under an unwinding build
+                    // such as `cargo test`). Reap the thread and fall back to decompressing here.
+                    let _ = worker.handle.join();
+                }
+            }
+        }
+
+        self.decompress_on_this_thread(blob_packet_index)
+    }
+
+    /// [`Self::decompress_immediately`] without a background worker: the `no_std` configuration
+    /// never spawns a thread, so this is the only path.
+    #[cfg(not(feature = "std"))]
+    fn decompress_immediately(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
+        if self.compressed_blobs_finished[&blob_packet_index].is_some() {
+            return Ok(())
+        }
+
+        self.decompress_on_this_thread(blob_packet_index)
+    }
+
+    /// Decompress the blob at `blob_packet_index` on the calling thread and cache the result.
+    /// Assumes it is not already cached.
+    fn decompress_on_this_thread(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
         let Some(Packet::CompressedBlob { compressed_data, uncompressed_size, .. }) = self.all_uncompressed_packets.get(blob_packet_index) else {
             panic!("decompress_immediately on {blob_packet_index} failed because it's not a compressed blob packet...")
         };
 
-        let decompressed_packets = self.compressed_blobs_finished
+        let packets = decompress_compressed_blob(
+            &self.header_raw,
+            compressed_data.as_slice(),
+            usize::try_from(*uncompressed_size).expect("we checked uncompressed size converting earlier")
+        )?;
+
+        *self.compressed_blobs_finished
             .get_mut(&blob_packet_index)
-            .expect("compressed blob should be in finished cache");
+            .expect("compressed blob should be in finished cache") = Some(packets);
 
-        let working_blob = self.compressed_blobs_decompressing
-            .get_mut(&blob_packet_index)
-            .expect("compressed blob should be in working cache");
-
-        if decompressed_packets.is_some() {
-            return Ok(())
-        }
-
-        loop {
-            let Some(working_blob_ref) = working_blob.as_ref() else {
-                // we have to decompress on the main thread. sad.
-                let packets = decompress_compressed_blob(
-                    &self.header_raw,
-                    compressed_data.as_slice(),
-                    usize::try_from(*uncompressed_size).expect("we checked uncompressed size converting earlier")
-                )?;
-                *decompressed_packets = Some(packets);
-                return Ok(());
-            };
-
-            let status = unwrap_mutex_lock!(working_blob_ref.lock());
-            match &*status {
-                PacketDecompressionStatus::InProgress => {
-                    continue;
-                }
-                PacketDecompressionStatus::Failed { error } => {
-                    let error = error.clone();
-                    drop(status);
-                    *working_blob = None;
-                    return Err(error)
-                }
-                PacketDecompressionStatus::Decompressed { packets } => {
-                    let packets = packets.clone();
-                    drop(status);
-                    *decompressed_packets = Some(packets);
-                    *working_blob = None;
-                    return Ok(());
-                }
-            }
-        }
+        Ok(())
     }
 
     /// Get the next packet in the stream.
@@ -821,6 +829,7 @@ impl ReplayFilePlayer {
             if let Some(last_compressed_blob_packet_index) = last_compressed_blob {
                 for i in 0..last_compressed_blob_packet_index {
                     self.compressed_blobs_finished.insert(i, None);
+                    #[cfg(feature = "std")]
                     self.compressed_blobs_decompressing.insert(i, None);
                 }
             }
@@ -841,6 +850,8 @@ impl ReplayFilePlayer {
         }
     }
 
+    /// Start (if not already running) or poll (without blocking) the background decompression of
+    /// the blob at `blob_index`.
     #[cfg(feature = "std")]
     fn decompress_blob_threaded(&mut self, blob_index: usize) {
         if !self.threading {
@@ -851,20 +862,17 @@ impl ReplayFilePlayer {
             return;
         }
 
-        let q = self.compressed_blobs_decompressing
+        let slot = self.compressed_blobs_decompressing
             .get_mut(&blob_index)
             .expect("compressed_blobs_decompressing exploded");
 
-        let Some(status) = q else {
-            // Not decompressed; start decompression...
-
-            let status = Arc::new(Mutex::new(PacketDecompressionStatus::InProgress));
-            *q = Some(status.clone());
-            let status_ref = Arc::downgrade(&status);
+        let Some(worker) = slot else {
+            // Not decompressing yet; start it.
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let packets = self.all_uncompressed_packets.clone();
             let header = self.header_raw;
 
-            match std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("ReplayFilePlayer-decompression-thread".to_owned())
                 .spawn(move || {
                     let Packet::CompressedBlob { uncompressed_size, compressed_data, .. } = packets
@@ -872,61 +880,70 @@ impl ReplayFilePlayer {
                         .expect("failed to get packet") else {
                         panic!("compressed blob wasn't a compressed blob NOOOOO")
                     };
-                    let decompressed = decompress_compressed_blob(&header, compressed_data.as_slice(), usize::try_from(*uncompressed_size).expect("we checked this could be a usize!"));
-                    let Some(r) = status_ref.upgrade() else {
-                        return
-                    };
+                    let result = decompress_compressed_blob(&header, compressed_data.as_slice(), usize::try_from(*uncompressed_size).expect("we checked this could be a usize!"));
+                    // If the receiver side was dropped (e.g. a fresh spawn detached us, see the
+                    // `slot.insert`/re-spawn path), the send just fails; there is nothing else to
+                    // clean up here.
+                    let _ = tx.send(result);
+                });
 
-                    let mut r = unwrap_mutex_lock!(r.lock());
-
-                    match decompressed {
-                        Ok(n) => {
-                            *r = PacketDecompressionStatus::Decompressed { packets: n }
-                        },
-                        Err(error) => {
-                            *r = PacketDecompressionStatus::Failed { error }
-                        }
-                    }
-
-                }) {
-                Ok(_) => {
-                    return
-                },
-                Err(_) => {
-                    *q = None;
-                    return
-                }
+            if let Ok(handle) = spawned {
+                *slot = Some(DecompressionWorker { result: rx, handle });
             }
+            // If spawning failed, leave the slot empty; a later hint or a direct
+            // `decompress_immediately` will try again / fall back to the main thread.
+            return;
         };
 
-        // Decompression was at least started at some point?
-
-        let lock;
-        #[cfg(feature = "std")]
-        {
-            lock = status.try_lock().ok();
-        }
-
-        #[cfg(not(feature = "std"))]
-        {
-            lock = status.try_lock();
-        }
-
-        if let Some(f) = lock.as_ref() {
-            match &**f {
-                PacketDecompressionStatus::InProgress => return,
-                PacketDecompressionStatus::Failed { .. } => return,
-                PacketDecompressionStatus::Decompressed { packets } => {
-                    self.compressed_blobs_finished.insert(blob_index, Some(packets.clone()));
+        match worker.result.try_recv() {
+            Ok(Ok(packets)) => {
+                self.compressed_blobs_finished.insert(blob_index, Some(packets));
+                *slot = None;
+            }
+            Ok(Err(_)) => {
+                // Decompression failed; drop the worker so a later demand retries on the main
+                // thread, where the error is returned to the caller instead of silently dropped.
+                *slot = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Still working; nothing to do.
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // The worker died before sending. Reap the thread and clear the slot so the next
+                // hint (or `decompress_immediately`) retries.
+                if let Some(worker) = slot.take() {
+                    let _ = worker.handle.join();
                 }
             }
         }
-        else {
-            return
-        }
+    }
+}
 
-        drop(lock);
-        *q = None;
+/// A background decompression of one compressed blob, started by
+/// [`ReplayFilePlayer::enable_threading`].
+///
+/// `decompress_immediately` never spins on this: it blocks on [`Self::result`] (a blocking
+/// `recv()`) rather than polling, and a worker that dies before sending (`RecvError`/
+/// `TryRecvError::Disconnected`) is reaped with `handle.join()` and the blob is decompressed on
+/// the calling thread instead, so a background failure can never wedge the caller at 100% CPU or
+/// forever.
+///
+/// Note: under this app's release profile (`panic = "abort"`), a panic in the worker thread
+/// aborts the whole process like any other panic, so the fallback below cannot occur from a panic
+/// in a release build; it matters for unwinding builds (`cargo test`, a debug build) and for a
+/// worker that exits early without panicking.
+#[cfg(feature = "std")]
+pub(crate) struct DecompressionWorker {
+    result: std::sync::mpsc::Receiver<Result<Arc<Vec<Packet>>, ReplayFileReadError>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+#[cfg(all(test, feature = "std"))]
+impl ReplayFilePlayer {
+    /// Test-only hook: inject a decompression worker for `blob_index`, replacing any existing one
+    /// (which is simply detached — see [`ReplayFilePlayer::decompress_blob_threaded`]).
+    pub(crate) fn inject_worker(&mut self, blob_index: usize, worker: DecompressionWorker) {
+        self.compressed_blobs_decompressing.insert(blob_index, Some(worker));
     }
 }
 
@@ -1000,19 +1017,10 @@ fn decompress_compressed_blob(header: &ReplayHeaderRaw, blob_data: &[u8], uncomp
     Ok(Arc::new(packets))
 }
 
-#[derive(Clone)]
-#[cfg_attr(not(feature = "std"), expect(dead_code))]
-enum PacketDecompressionStatus {
-    InProgress,
-    Failed { error: ReplayFileReadError },
-    Decompressed { packets: Arc<Vec<Packet>> }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::region_diff;
 
     /// A v3 file (both the crash-safe temp layout with a top-level delta tail and the closed
     /// all-blobs layout) must keep playing back exactly: identical materialised keyframe states,
@@ -1021,26 +1029,6 @@ mod tests {
     fn v3_fixture_plays_back_exactly() {
         check_script_replay(V3_SMALL, "v3-small (temp layout)");
         check_script_replay(V3_SMALL_CLOSED, "v3-small-closed");
-    }
-
-    /// Build a replay from the v3 fixture's header followed by `packets`.
-    fn file_with_packets(packets: &[Packet]) -> Vec<u8> {
-        let mut bytes = V3_SMALL[..size_of::<ReplayHeaderBytes>()].to_vec();
-        for packet in packets {
-            for command in packet.write_packet_instructions() {
-                bytes.extend_from_slice(command.bytes());
-            }
-        }
-        bytes
-    }
-
-    fn metadata_at(frame: u64) -> KeyframeMetadata {
-        KeyframeMetadata { elapsed_frames: frame, elapsed_millis: (frame * 16).into(), ..Default::default() }
-    }
-
-    fn region_delta(frame: u64, prev: &[u8], cur: &[u8]) -> Packet {
-        let d = region_diff(prev, cur).unwrap();
-        Packet::RegionDeltaKeyframe { metadata: metadata_at(frame), state_len: cur.len() as u64, control: bv(&d.control), data: bv(&d.data) }
     }
 
     #[test]
@@ -1093,35 +1081,6 @@ mod tests {
         for frame in [2u64, 2, 1, 4, 0, 3, 4, 2, 4, 1] {
             player.go_to_keyframe(frame).unwrap();
             check(&mut player, frame);
-        }
-    }
-
-    /// A blob holding exactly `packets` (which must start with a full keyframe).
-    fn blob_of(packets: &[Packet]) -> Packet {
-        let mut raw = Vec::new();
-        let mut keyframes = Vec::new();
-        let mut frames = 0;
-        for packet in packets {
-            for command in packet.write_packet_instructions() {
-                raw.extend_from_slice(command.bytes());
-            }
-            if let Some(metadata) = keyframe_metadata(packet) {
-                keyframes.push(metadata.clone());
-                frames = metadata.elapsed_frames;
-            }
-            if matches!(packet, Packet::NextFrame { .. }) {
-                frames += 1;
-            }
-        }
-        Packet::CompressedBlob {
-            elapsed_frames_start: keyframes[0].elapsed_frames,
-            elapsed_frames_end: frames,
-            timestamp_start: keyframes[0].elapsed_millis,
-            timestamp_end: (frames * 16).into(),
-            keyframes,
-            bookmarks: Vec::new(),
-            uncompressed_size: raw.len() as u64,
-            compressed_data: ByteVec::Heap(crate::compress_data(&raw, 1).unwrap()),
         }
     }
 
@@ -1223,5 +1182,63 @@ mod tests {
             player.go_to_keyframe(frame + 1).unwrap();
             assert!(matches!(player.next_packet().unwrap(), Some(Packet::Keyframe { metadata, .. }) if metadata.elapsed_frames == frame + 1));
         }
+    }
+
+    /// Threaded decompression must hand out exactly the same packets as decompressing on the
+    /// calling thread: `enable_threading()` only changes *when* a blob's decompression work
+    /// happens, never its result.
+    #[cfg(feature = "std")]
+    #[test]
+    fn threaded_decompression_hands_out_the_same_packets() {
+        fn walk(player: &mut ReplayFilePlayer) -> Vec<Packet> {
+            player.go_to_keyframe(0).unwrap();
+            let mut out = Vec::new();
+            while let Some(packet) = player.next_packet().unwrap() {
+                out.push(packet.clone());
+            }
+            out
+        }
+
+        let mut plain = ReplayFilePlayer::new(V3_SMALL_CLOSED, false).unwrap();
+        let expected = walk(&mut plain);
+
+        let mut threaded = ReplayFilePlayer::new(V3_SMALL_CLOSED, false).unwrap();
+        threaded.enable_threading();
+        let got = walk(&mut threaded);
+
+        assert_eq!(got.len(), expected.len(), "packet count");
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_packet_eq(g, e, &format!("threaded packet {i}"));
+        }
+    }
+
+    /// A worker whose thread drops the sender without sending (an early exit, or -- in an
+    /// unwinding build -- a panic) must not wedge the reader: the fallback in
+    /// `decompress_immediately` reaps it and decompresses on the calling thread instead.
+    #[cfg(feature = "std")]
+    #[test]
+    fn dead_worker_falls_back_to_main_thread() {
+        let mut player = ReplayFilePlayer::new(V3_SMALL_CLOSED, false).unwrap();
+        player.enable_threading();
+
+        let Packet::CompressedBlob { keyframes, .. } = &player.all_uncompressed_packets()[0] else {
+            panic!("expected the first packet of the closed fixture to be a compressed blob")
+        };
+        let frame = keyframes[0].elapsed_frames;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Arc<Vec<Packet>>, ReplayFileReadError>>(1);
+        // The thread does nothing but drop the sender: the channel disconnects without a value
+        // ever being sent, simulating a worker that exited early (or, in an unwinding build,
+        // panicked).
+        let handle = std::thread::spawn(move || {
+            drop(tx);
+        });
+        player.inject_worker(0, DecompressionWorker { result: rx, handle });
+
+        // Seeking into that blob blocks on the dead worker, observes the disconnect, reaps the
+        // thread, and falls back to decompressing on this thread -- it must still succeed rather
+        // than spin or error out.
+        player.go_to_keyframe(frame).unwrap();
+        assert!(matches!(player.next_packet().unwrap(), Some(Packet::Keyframe { metadata, .. }) if metadata.elapsed_frames == frame));
     }
 }

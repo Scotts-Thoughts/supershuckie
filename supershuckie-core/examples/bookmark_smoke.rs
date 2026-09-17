@@ -32,8 +32,8 @@ const FRAMES_PER_KEYFRAME: u64 = 120;
 fn make_core(console: &str, rom: &[u8]) -> SuperShuckieCore {
     let emulator: Box<dyn EmulatorCore> = match console {
         "--gbc" => Box::new(GameBoyColor::new_from_rom(rom, include_bytes!("../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin"), None, Model::Cgb0)),
-        "--gba" => Box::new(GameBoyAdvance::new_from_rom(rom, None, &[], std_timestamp_provider())),
-        "--nds" => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false)),
+        "--gba" => Box::new(GameBoyAdvance::new_from_rom(rom, None, &[], std_timestamp_provider()).expect("failed to load ROM")),
+        "--nds" => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false).expect("failed to load ROM")),
         other => panic!("unknown console {other}")
     };
     SuperShuckieCore::new(emulator, std_timestamp_provider())
@@ -165,7 +165,7 @@ fn main() {
     // --- 4. Seeking to the keyframe bookmark: no folds, three frames, same state. ---
     let mut seeker = make_core(&console, &rom);
     seeker.attach_replay_player(ReplayFilePlayer::new(&bytes, false).unwrap(), true).unwrap();
-    seeker.go_to_replay_frame(360);
+    seeker.go_to_replay_frame(360).expect("seek to 360");
     let folds = seeker.replay_player().unwrap().chain_folds();
     let started = Instant::now();
     let keyframe = seeker.go_to_replay_keyframe(fast.in_frame - KEYFRAME_BOOKMARK_LEAD_FRAMES).unwrap();
@@ -180,8 +180,8 @@ fn main() {
     let via_keyframe = seeker.create_save_state();
 
     // The ordinary seek path, for comparison.
-    seeker.go_to_replay_frame(360);
-    seeker.go_to_replay_frame(fast.in_frame);
+    seeker.go_to_replay_frame(360).expect("seek to 360");
+    seeker.go_to_replay_frame(fast.in_frame).expect("seek to fast.in_frame");
     assert_eq!(seeker.total_frames(), fast.in_frame);
     let via_seek = seeker.create_save_state();
 
@@ -190,14 +190,14 @@ fn main() {
     assert!(diff_summary(&via_keyframe, &reference).is_none() || diff_summary(&via_seek, &reference).is_some(), "the keyframe bookmark's state differs from sequential playback where an ordinary seek does not");
 
     // An ordinary seek far from a keyframe, for comparison.
-    seeker.go_to_replay_frame(10);
+    seeker.go_to_replay_frame(10).expect("seek to 10");
     let started = Instant::now();
-    seeker.go_to_replay_frame(305);
+    seeker.go_to_replay_frame(305).expect("seek to 305");
     let ordinary_seek = started.elapsed();
     println!("keyframe bookmark seek {:.2} ms; ordinary seek to 305 (115 frames past a keyframe) {:.2} ms", keyframe_seek.as_secs_f64() * 1000.0, ordinary_seek.as_secs_f64() * 1000.0);
 
     // --- 5. During playback a keyframe bookmark snaps to an existing keyframe. ---
-    seeker.go_to_replay_frame(300);
+    seeker.go_to_replay_frame(300).expect("seek to 300");
     let snapped = seeker.bookmark_anchor(true).unwrap();
     assert_eq!((snapped.in_frame, snapped.keyframe), (190 + KEYFRAME_BOOKMARK_LEAD_FRAMES, true), "snaps to the last keyframe at or before 297");
     let plain = seeker.bookmark_anchor(false).unwrap();

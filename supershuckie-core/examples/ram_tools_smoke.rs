@@ -37,8 +37,8 @@ fn make_emulator(console: Console, rom: &[u8]) -> Box<dyn EmulatorCore> {
             let bios = include_bytes!("../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin");
             Box::new(GameBoyColor::new_from_rom(rom, bios, None, Model::Cgb0))
         }
-        Console::Gba => Box::new(GameBoyAdvance::new_from_rom(rom, None, &[], std_timestamp_provider())),
-        Console::Nds => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false))
+        Console::Gba => Box::new(GameBoyAdvance::new_from_rom(rom, None, &[], std_timestamp_provider()).expect("failed to load ROM")),
+        Console::Nds => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false).expect("failed to load ROM"))
     }
 }
 
@@ -297,10 +297,10 @@ fn check_monitor(console: Console, rom: &[u8]) {
         r.traces.push(TraceSpec { id: 2, path: AddressPath::direct(edit_address), len: 2, decode: ValueDecode::default(), pause_when: None });
         r.freezes.push(FreezeSpec::new(3, AddressPath::direct(edit_address), &[1, 2]).unwrap());
     });
-    play.go_to_replay_frame(100);
+    play.go_to_replay_frame(100).expect("seek");
     monitor.service(&mut play, false);
     let before = all_memory(play.get_core());
-    play.go_to_replay_frame(250);
+    play.go_to_replay_frame(250).expect("seek");
     monitor.service(&mut play, false);
     shared.push_edit(MemoryEdit { edit_id: 7, path: AddressPath::direct(edit_address), data: vec![9, 9] });
     monitor.service(&mut play, false);

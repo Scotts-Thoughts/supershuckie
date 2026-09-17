@@ -385,7 +385,8 @@ impl Search {
         let mut regions = Vec::with_capacity(snapshot.layout.len());
         for (index, layout) in snapshot.layout.iter().enumerate() {
             let bytes = snapshot.region_bytes(index);
-            let slots = layout.region.len as usize / alignment;
+            // Round up: the last (possibly partial) slot still needs a bit when `len % alignment != 0`.
+            let slots = (layout.region.len as usize).div_ceil(alignment);
             let mut dense = DenseRegion { words: vec![0u64; slots.div_ceil(64)], count: 0, rank: Vec::new() };
 
             let included = settings.regions.is_empty() || settings.regions.contains(&index);
@@ -972,6 +973,22 @@ mod tests {
                     assert_eq!(page.iter().map(|r| r.address).collect::<Vec<_>>(), expected[middle..middle + 5].iter().map(|e| e.0).collect::<Vec<_>>());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn odd_region_lengths_do_not_overflow_the_bitset() {
+        // A region length that is not a multiple of the alignment leaves a partial last slot; the
+        // bitset must have room for it even when the full-slot count is itself a multiple of 64 (L31).
+        let control = ScanControl::default();
+        for &len in &[129u32, 257, 513] {
+            let r = region("RAM", 0x1000, len);
+            let data = vec![0u8; len as usize];
+            let search = Search::new(settings(ValueType::U8, 1, 2), &Comparison::Unknown, snapshot(0, &[(r, data)]), &control).unwrap();
+            let addrs = addresses(&search);
+            let expected_count = (len as usize).div_ceil(2);
+            assert_eq!(addrs.len(), expected_count, "len {len}");
+            assert_eq!(*addrs.last().unwrap(), 0x1000 + len - 1, "len {len}");
         }
     }
 

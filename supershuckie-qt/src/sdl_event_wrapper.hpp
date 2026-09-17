@@ -7,6 +7,8 @@
 #include <vector>
 #include <cstdint>
 
+struct SDL_Gamepad;
+
 namespace SuperShuckie64 {
 
 enum SDLEventWrapperAction {
@@ -20,6 +22,7 @@ enum SDLEventWrapperAction {
 struct ConnectedController {
     SuperShuckieConnectedControllerIndex mapping;
     std::string name;
+    SDL_Gamepad *gamepad = nullptr;
 };
 
 struct SDLEventWrapperResult {
@@ -46,6 +49,7 @@ class SDLEventWrapper {
     friend MainWindow;
 public:
     SDLEventWrapper();
+    ~SDLEventWrapper();
     SDLEventWrapperResult next();
 private:
     SuperShuckieFrontendRaw *frontend = nullptr;

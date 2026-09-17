@@ -16,3 +16,7 @@ supershuckie-core = { workspace = true }
 supershuckie-memory-tools = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+melonds-rs = { workspace = true, features = ["link-cores"] }
+mgba-rs = { workspace = true, features = ["link-cores"] }

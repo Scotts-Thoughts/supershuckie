@@ -500,7 +500,6 @@ impl MemoryTools {
         }).collect();
         let game = core.console_type().map(|console_type| GameIdentity { console_type, rom_checksum: *core.rom_checksum() });
         let game_changed = game != self.game;
-        self.game = game;
 
         if regions != self.regions || game_changed {
             self.region_names = regions.iter().map(|r| (UTF8CString::from_str(&r.name), UTF8CString::from_str(&r.short_name))).collect();
@@ -513,10 +512,18 @@ impl MemoryTools {
             self.search_visible_rows.clear();
         }
         if game_changed {
+            // M8: save the OUTGOING game's watch list under ITS OWN identity before switching
+            // `self.game` to the new one. `save_watches` (via `watch_file_contents`) stamps the
+            // file with `self.game`'s console/checksum, so reassigning first made the outgoing
+            // ROM's watch file record the new ROM's identity instead of its own.
             self.save_watches();
+            self.game = game;
             self.load_watches(if self.game.is_some() { watch_file } else { None });
             self.undo_stack.clear();
             self.redo_stack.clear();
+        }
+        else {
+            self.game = game;
         }
 
         // The old core took its half of the monitor with it. Edits it had not applied are dropped
@@ -1439,4 +1446,79 @@ impl MemoryTools {
 
 fn blake3_hex(hash: &ReplayHeaderBlake3Hash) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use supershuckie_core::emulator::{EmulatorCore, Input, RunTime, ScreenData};
+
+    /// The bare minimum `EmulatorCore` needed to exercise `core_switched`: a settable console
+    /// type and ROM checksum, everything else stubbed out.
+    struct FakeCore {
+        console_type: ReplayConsoleType,
+        rom_checksum: ReplayHeaderBlake3Hash
+    }
+
+    impl EmulatorCore for FakeCore {
+        fn run(&mut self) -> RunTime { RunTime::NONE }
+        fn run_unlocked(&mut self) -> RunTime { RunTime::NONE }
+        fn read_ram(&self, _address: u32, _into: &mut [u8]) -> Result<(), &'static str> { Err("unsupported") }
+        fn write_ram(&mut self, _address: u32, _from: &[u8]) -> Result<(), &'static str> { Err("unsupported") }
+        fn set_speed(&mut self, _speed: f64) {}
+        fn save_sram(&self) -> Vec<u8> { Vec::new() }
+        fn create_save_state(&self) -> Vec<u8> { Vec::new() }
+        fn load_save_state(&mut self, _state: &[u8]) -> Result<(), String> { Ok(()) }
+        fn encode_input(&self, _input: Input, into: &mut Vec<u8>) { into.clear(); }
+        fn set_input_encoded(&mut self, _input: &[u8]) {}
+        fn get_screens(&self) -> &[ScreenData] { &[] }
+        fn swap_screen_data(&mut self, _screens: &mut [ScreenData]) {}
+        fn hard_reset(&mut self) {}
+        fn replay_console_type(&self) -> Option<ReplayConsoleType> { Some(self.console_type) }
+        fn rom_checksum(&self) -> &ReplayHeaderBlake3Hash { &self.rom_checksum }
+        fn bios_checksum(&self) -> &ReplayHeaderBlake3Hash { &self.rom_checksum }
+        fn core_name(&self) -> &'static str { "Fake" }
+        fn frame_rate(&self) -> (u32, u32) { (60, 1) }
+    }
+
+    fn fake_core(checksum_byte: u8) -> ThreadedSuperShuckieCore {
+        ThreadedSuperShuckieCore::new(Box::new(FakeCore {
+            console_type: ReplayConsoleType::GameBoy,
+            rom_checksum: [checksum_byte; 32]
+        }))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("supershuckie-frontend-memory-tools-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// M8: switching games must save the OUTGOING game's watch file under its OWN identity, not
+    /// the incoming game's -- `core_switched` used to reassign `self.game` before `save_watches`
+    /// ran, so ROM A's watch file ended up stamped with ROM B's checksum.
+    #[test]
+    fn watch_file_is_saved_under_the_outgoing_games_identity() {
+        let dir = temp_dir("watch-identity");
+        let watch_a = dir.join("a-ram-watch.json");
+        let watch_b = dir.join("b-ram-watch.json");
+
+        let mut tools = MemoryTools::new(dir.join("tables"));
+        let core_a = fake_core(0xAA);
+        let core_b = fake_core(0xBB);
+
+        tools.core_switched(&core_a, Some(watch_a.clone()));
+        assert!(tools.watches().is_empty());
+
+        // Switching to a different game must flush a's watch file, stamped with a's own
+        // checksum, before b's watch file is even loaded.
+        tools.core_switched(&core_b, Some(watch_b.clone()));
+
+        let saved = std::fs::read_to_string(&watch_a).expect("a's watch file must have been written");
+        let (file, _) = WatchFile::parse(&saved).unwrap();
+        assert_eq!(file.rom_checksum, blake3_hex(&[0xAA; 32]), "a's watch file must record a's checksum, not b's");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

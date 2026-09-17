@@ -25,8 +25,8 @@ pub struct NintendoDS {
 
 impl NintendoDS {
     /// Instantiate from a ROM.
-    pub fn new_from_rom(rom: &[u8], sram: Option<&[u8]>, clock: Box<dyn MonotonicTimestampProvider>, jit: bool) -> Self {
-        Self {
+    pub fn new_from_rom(rom: &[u8], sram: Option<&[u8]>, clock: Box<dyn MonotonicTimestampProvider>, jit: bool) -> Result<Self, String> {
+        Ok(Self {
             rom_checksum: blake3_hash(rom),
             screens: core::array::from_fn(|_| ScreenData {
                 pixels: alloc::vec![0u32; 256*192],
@@ -34,14 +34,14 @@ impl NintendoDS {
                 height: 192,
                 encoding: ScreenDataEncoding::A8R8G8B8
             }),
-            core: Core::new(rom, sram.unwrap_or(&[]), jit).expect("failed to make a core (TODO: HANDLE THIS ERROR)"),
+            core: Core::new(rom, sram.unwrap_or(&[]), jit).map_err(|e| alloc::format!("melonDS rejected the ROM: {e}"))?,
             last_frame_microseconds: 0,
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
             clock,
             skip_drawing: false,
             audio_enabled: false,
             jit
-        }
+        })
     }
 
     /// Set the date.

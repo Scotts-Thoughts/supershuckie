@@ -8,7 +8,7 @@
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use alloc::format;
@@ -171,11 +171,39 @@ fn source_info(player: &ReplayFilePlayer, size: u64) -> ReplaySourceInfo {
     }
 }
 
+/// Whether `input` and `output` name the same file on disk, robust to a relative path, a `./`
+/// prefix, a case difference (on a case-insensitive filesystem) or a symlink -- not just a lexical
+/// `Path` comparison, which any of those defeats.
+///
+/// `output` is typically about to be created, so a plain `canonicalize` of it usually fails; in
+/// that case its parent directory is canonicalized instead and the file name is appended back, so
+/// e.g. `dir` and `./dir` still resolve to the same place even though `dir/out.replay` does not
+/// exist yet. Falls back to a lexical comparison only if neither path (nor `output`'s parent)
+/// exists at all.
+fn same_file(input: &Path, output: &Path) -> bool {
+    fn resolve(path: &Path) -> Option<PathBuf> {
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            return Some(canon);
+        }
+
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let file_name = path.file_name()?;
+        Some(std::fs::canonicalize(parent).ok()?.join(file_name))
+    }
+
+    match (resolve(input), resolve(output)) {
+        (Some(a), Some(b)) => a == b,
+        _ => input == output,
+    }
+}
+
 /// Re-encode `input` into `output` (which must not exist yet unless `overwrite` is set).
 ///
 /// The header, patch, crop/timer markers, bookmarks, counters and every emulated frame are
-/// carried over unchanged; keyframes are re-encoded with `options.settings`. On any error, or when
-/// the progress callback cancels, a partially written `output` is deleted.
+/// carried over unchanged; keyframes are re-encoded with `options.settings`. The result is first
+/// written to a temporary file next to `output` and only renamed over it once the whole
+/// conversion has succeeded, so a failure (or a cancelled progress callback) never truncates or
+/// deletes `output` -- only ever the temporary file, which is removed on any error.
 pub fn convert_replay_file(
     input: &Path,
     output: &Path,
@@ -183,7 +211,7 @@ pub fn convert_replay_file(
     overwrite: bool,
     progress: ProgressFn<'_>,
 ) -> Result<ConvertReport, ConvertError> {
-    if input == output {
+    if same_file(input, output) {
         return Err(ConvertError::Failed("input and output must be different files".into()));
     }
     if output.exists() && !overwrite {
@@ -192,19 +220,28 @@ pub fn convert_replay_file(
 
     let started = Instant::now();
 
-    // Open and parse the source before touching the output, so a bad source never costs an
+    // Open and parse the source before touching anything else, so a bad source never costs an
     // existing output file.
     let input_map = map_file(input)?;
     let input_size = input_map.len() as u64;
     let mut player = open_player(input, &input_map[..], options.allow_corruption)?;
     let source = source_info(&player, input_size);
 
-    let output_file = File::create(output).map_err(|e| format!("cannot create {}: {e}", output.display()))?;
-    let result = write_reencoded(&mut player, output_file, options, progress);
+    // Written to a temp file in the output directory, never to `output` itself, until it is known
+    // to be complete: `output` is only ever replaced by the rename below, and is never truncated
+    // or deleted by a failure in between.
+    let tmp_path = output.with_extension("replay.tmp");
+    let tmp_file = File::create(&tmp_path).map_err(|e| format!("cannot create {}: {e}", tmp_path.display()))?;
+    let result = write_reencoded(&mut player, tmp_file, options, progress);
     if result.is_err() {
-        let _ = std::fs::remove_file(output);
+        let _ = std::fs::remove_file(&tmp_path);
     }
     let (output_size, frames) = result?;
+
+    if let Err(e) = std::fs::rename(&tmp_path, output) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!("cannot move {} to {}: {e}", tmp_path.display(), output.display()).into());
+    }
 
     Ok(ConvertReport { source, output_size, frames, elapsed: started.elapsed() })
 }
@@ -456,6 +493,32 @@ mod tests {
         let result = convert_replay_file(&input, &cancelled, &options, false, &mut |_, done, _| done < 50);
         assert_eq!(result, Err(ConvertError::Cancelled));
         assert!(!cancelled.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `output` naming the same file as `input` -- even through a path that is lexically different
+    /// (a `./` component) -- is refused, `--force` included, instead of truncating/deleting the
+    /// input (finding M18: the old lexical-only `Path` comparison missed this).
+    #[test]
+    fn converting_onto_the_input_itself_is_refused_even_with_force() {
+        let dir = temp_dir("self-convert");
+        let input = dir.join("v3.replay");
+        std::fs::write(&input, V3_SMALL_CLOSED).unwrap();
+
+        // A case variant of the file name: lexically different from `input` as far as `Path`'s own
+        // `PartialEq` is concerned, but the same file on a case-insensitive filesystem (as Windows
+        // and, commonly, macOS are) once resolved.
+        let file_name = input.file_name().unwrap().to_str().unwrap();
+        let alias = dir.join(file_name.to_uppercase());
+        assert_ne!(alias, input, "the alias must be lexically different for this to test anything");
+
+        let options = ConvertOptions::default();
+        let result = convert_replay_file(&input, &alias, &options, true, &mut |_, _, _| true);
+        assert!(matches!(result, Err(ConvertError::Failed(_))), "{result:?}");
+
+        assert_eq!(std::fs::read(&input).unwrap(), V3_SMALL_CLOSED, "the input must be untouched");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no stray temp file either");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

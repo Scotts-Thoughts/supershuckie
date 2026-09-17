@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use core::mem::transmute;
 use core::ffi::CStr;
 use num_enum::TryFromPrimitive;
-use zstd_sys::{ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2, ZSTD_createCCtx, ZSTD_decompress, ZSTD_freeCCtx, ZSTD_getErrorName, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel};
+use zstd_sys::{ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2, ZSTD_createCCtx, ZSTD_decompress, ZSTD_freeCCtx, ZSTD_getErrorName, ZSTD_getFrameContentSize, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel};
 use crate::replay_file::ReplayHeaderBlake3Hash;
 
 /// Describes an enum that may or may not be valid.
@@ -138,7 +138,31 @@ pub(crate) fn compress_data(data: &[u8], compression_level: i32) -> Result<Vec<u
     Ok(v)
 }
 
+/// zstd's sentinel for "the frame does not record its content size" (`ZSTD_CONTENTSIZE_UNKNOWN`,
+/// `-1` reinterpreted as the `u64` this binding's `ZSTD_getFrameContentSize` returns).
+const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
+
+/// zstd's sentinel for "the frame header is malformed" (`ZSTD_CONTENTSIZE_ERROR`, `-2`
+/// reinterpreted as `u64`).
+const ZSTD_CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
+
 pub(crate) fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>, Cow<'static, str>> {
+    // Check the frame's own claimed content size against what the caller asked for BEFORE
+    // reserving `uncompressed_size` bytes: a corrupt or hostile header claiming e.g. 1 << 40 bytes
+    // must not cause a huge allocation attempt just to find out decompression fails anyway.
+    //
+    // SAFETY: `data` is a valid slice for its length; this function only inspects the frame header.
+    let claimed_size = unsafe { ZSTD_getFrameContentSize(data.as_ptr() as *const c_void, data.len()) };
+    if claimed_size == ZSTD_CONTENTSIZE_UNKNOWN {
+        return Err(Cow::Borrowed("zstd frame does not record its content size"));
+    }
+    if claimed_size == ZSTD_CONTENTSIZE_ERROR {
+        return Err(Cow::Borrowed("zstd frame header is malformed"));
+    }
+    if claimed_size != uncompressed_size as u64 {
+        return Err(Cow::Owned(format!("zstd frame claims {claimed_size} bytes but {uncompressed_size} were expected")));
+    }
+
     let mut decompressed_data: Vec<u8> = Vec::new();
     if decompressed_data.try_reserve_exact(uncompressed_size).is_err() {
         return Err(Cow::Borrowed("failed to allocate RAM to decompress compressed blob"))
@@ -560,6 +584,36 @@ mod tests {
         let compressed = compress_data(&[1, 2, 3], 3).unwrap();
         assert!(decompress_data(&compressed, 4).is_err());
         assert!(decompress_data(&[0xFF; 8], 3).is_err());
+    }
+
+    /// A minimal (header-only, no compressed blocks) zstd frame whose header claims `size` bytes of
+    /// content. Used to check that `decompress_data` rejects a mismatched claim before allocating.
+    fn frame_header_claiming(size: u64) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&0xFD2FB528u32.to_le_bytes()); // zstd magic number
+        frame.push(0b1100_0000); // Frame_Header_Descriptor: Frame_Content_Size_flag = 3 (8-byte field)
+        frame.push(0x00); // Window_Descriptor (unused: we never reach block decoding)
+        frame.extend_from_slice(&size.to_le_bytes()); // Frame_Content_Size (flag 3: no offset)
+        frame
+    }
+
+    #[test]
+    fn decompress_rejects_a_mismatched_claimed_size_before_allocating() {
+        // A genuine, valid small frame, but asked for the wrong size.
+        let data = pseudo_random_bytes(42, 200);
+        let compressed = compress_data(&data, 3).unwrap();
+        assert!(decompress_data(&compressed, data.len() + 1).is_err());
+        assert!(decompress_data(&compressed, data.len() - 1).is_err());
+        assert_eq!(decompress_data(&compressed, data.len()).unwrap(), data);
+
+        // A frame whose header claims an enormous content size must be rejected immediately: if the
+        // mismatch were only caught after reserving, this would try to allocate a TiB.
+        let huge_claim = frame_header_claiming(1u64 << 40);
+        assert!(decompress_data(&huge_claim, 100).is_err());
+
+        // The "unknown size" and "malformed header" sentinels are also rejected, not misread as
+        // literal sizes.
+        assert!(decompress_data(&[0xFFu8; 32], 100).is_err());
     }
 
     const DEFAULT_LEVEL_FOR_TEST: i32 = crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4;

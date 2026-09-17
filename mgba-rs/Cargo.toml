@@ -10,3 +10,9 @@ publish = false
 
 [build-dependencies]
 cc = { workspace = true }
+
+[features]
+# Links mGBA's static library (libmgba.a) and the C++ runtime, so a plain `cargo
+# test`/`cargo build` of this crate's dependents can link without CMake/corrosion or the
+# frame server's build.rs around to supply them. See build.rs.
+link-cores = []

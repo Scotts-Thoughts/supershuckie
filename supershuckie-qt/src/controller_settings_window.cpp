@@ -301,7 +301,7 @@ void ControlsSettingsWindow::update_textboxes() {
             supershuckie_control_settings_get_controls_for_device(
                 this->current_settings,
                 device,
-                false,
+                true,
                 setting->control_type,
                 setting->control_modifier,
                 buffer_axis.data(),

@@ -45,8 +45,8 @@ const fn gba_region(name: &'static str, short_name: &'static str, base_address: 
 
 impl GameBoyAdvance {
     /// Instantiate from a ROM.
-    pub fn new_from_rom(rom: &[u8], sram: Option<&[u8]>, bios: &[u8], clock: Box<dyn MonotonicTimestampProvider>) -> Self {
-        Self {
+    pub fn new_from_rom(rom: &[u8], sram: Option<&[u8]>, bios: &[u8], clock: Box<dyn MonotonicTimestampProvider>) -> Result<Self, String> {
+        Ok(Self {
             rom_checksum: blake3_hash(rom),
             screen: ScreenData {
                 pixels: alloc::vec![0u32; 240*160],
@@ -57,9 +57,9 @@ impl GameBoyAdvance {
             last_frame_microseconds: 0,
             bios_checksum: blake3_hash(bios),
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
-            core: Core::new(rom, sram.unwrap_or(&[]), bios).expect("failed to make a core (TODO: HANDLE THIS ERROR)"),
+            core: Core::new(rom, sram.unwrap_or(&[]), bios).map_err(|e| alloc::format!("mGBA rejected the ROM: {e}"))?,
             clock,
-        }
+        })
     }
 }
 
@@ -170,7 +170,7 @@ impl EmulatorCore for GameBoyAdvance {
 
     #[inline]
     fn save_sram(&self) -> Vec<u8> {
-        self.core.get_sram().to_vec()
+        self.core.get_sram()
     }
 
     #[inline]

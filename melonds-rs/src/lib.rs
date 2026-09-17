@@ -12,7 +12,8 @@ unsafe extern "C" {
         rom_size: usize,
         sram: *const u8,
         sram_size: usize,
-        jit: bool
+        jit: bool,
+        error_out: *mut u32
     ) -> *mut MelonDSCoreHolderRaw;
     fn melonds_rs_core_free(core: *mut MelonDSCoreHolderRaw);
     fn melonds_rs_core_run_frame(core: *mut MelonDSCoreHolderRaw);
@@ -21,7 +22,7 @@ unsafe extern "C" {
     fn melonds_rs_core_get_pixels(core: *const MelonDSCoreHolderRaw, screen: usize) -> *const u32;
     fn melonds_rs_core_set_input(core: *mut MelonDSCoreHolderRaw, input: u32);
     fn melonds_rs_core_get_sram(core: *const MelonDSCoreHolderRaw, size: &mut usize) -> *const u8;
-    fn melonds_rs_core_create_save_state(core: *const MelonDSCoreHolderRaw, data: *mut u8, data_size: usize) -> usize;
+    fn melonds_rs_core_create_save_state(core: *mut MelonDSCoreHolderRaw, data: *mut u8, data_size: usize) -> usize;
     fn melonds_rs_core_load_save_state(core: *mut MelonDSCoreHolderRaw, data: *const u8, data_size: usize) -> bool;
     fn melonds_rs_core_get_ram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x400000];
     fn melonds_rs_core_get_shared_wram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x8000];
@@ -54,15 +55,48 @@ pub enum JitRegion {
 }
 
 unsafe impl Send for Core {}
-unsafe impl Sync for Core {}
+
+/// Why [`Core::new`] failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CoreError {
+    /// The ROM was rejected by melonDS's parser.
+    BadRom,
+    /// Core construction, ROM parsing or save loading threw a C++ exception.
+    Exception,
+    /// An error code the Rust binding does not recognise.
+    Unknown(u32)
+}
+
+impl From<u32> for CoreError {
+    fn from(code: u32) -> Self {
+        match code {
+            1 => CoreError::BadRom,
+            2 => CoreError::Exception,
+            other => CoreError::Unknown(other)
+        }
+    }
+}
+
+impl core::fmt::Display for CoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CoreError::BadRom => f.write_str("the ROM was rejected"),
+            CoreError::Exception => f.write_str("melonDS threw while creating the core"),
+            CoreError::Unknown(code) => write!(f, "unknown melonDS core error ({code})")
+        }
+    }
+}
 
 impl Core {
-    pub fn new(rom: &[u8], sram: &[u8], jit: bool) -> Option<Self> {
-        let inner = unsafe { melonds_rs_core_new(rom.as_ptr(), rom.len(), sram.as_ptr(), sram.len(), jit) };
+    pub fn new(rom: &[u8], sram: &[u8], jit: bool) -> Result<Self, CoreError> {
+        let mut error_code: u32 = 0;
+        let inner = unsafe {
+            melonds_rs_core_new(rom.as_ptr(), rom.len(), sram.as_ptr(), sram.len(), jit, &mut error_code)
+        };
         if inner.is_null() {
-            return None
+            return Err(CoreError::from(error_code))
         }
-        Some(Self { inner })
+        Ok(Self { inner })
     }
     #[inline]
     pub fn reset(&mut self) {
@@ -91,10 +125,16 @@ impl Core {
     pub fn set_input(&mut self, input: u32) {
         unsafe { melonds_rs_core_set_input(self.inner, input) }
     }
+    /// The cartridge's live save memory (not a copy), or an empty slice if this cart has none
+    /// (`GetNDSSave` can return null with a zero length in that case, which is not safe to hand to
+    /// `slice::from_raw_parts` directly).
     #[inline]
     pub fn get_sram(&self) -> &[u8] {
         let mut size = 0;
         let ptr = unsafe { melonds_rs_core_get_sram(self.inner, &mut size) };
+        if ptr.is_null() || size == 0 {
+            return &[]
+        }
         unsafe { core::slice::from_raw_parts(ptr, size) }
     }
     /// Upper bound of a melonDS save state; the writer fails (returns 0) if it does not fit.
@@ -124,8 +164,11 @@ impl Core {
         }
     }
 
+    /// Loads a save state, overwriting all emulated RAM and the running core's state. Takes
+    /// `&mut self` because it invalidates any borrow of the core's memory (e.g. from
+    /// [`get_main_ram`](Self::get_main_ram)) taken before the call.
     #[inline]
-    pub fn load_save_state(&self, state: &[u8]) -> bool {
+    pub fn load_save_state(&mut self, state: &[u8]) -> bool {
         unsafe { melonds_rs_core_load_save_state(self.inner, state.as_ptr(), state.len()) }
     }
 

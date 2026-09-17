@@ -1,7 +1,8 @@
 #include <cstdint>
 #include <cstddef>
-#include <exception>
+#include <cstdlib>
 #include <cstdio>
+#include <exception>
 #include <vector>
 
 #define ENABLE_VFS
@@ -24,15 +25,16 @@ static mLogger logger = {
 
 
 struct MGBACoreRaw {
-    mCore *core;
+    mCore *core = nullptr;
 
-    VFile *rom_vf;
+    // The save VFile is not kept here: once handed to loadSave() it is owned by mGBA (as
+    // savedata.realVf) and closed by GBAUnloadROM when the core is unloaded/deinited. Its backing
+    // memory is a private copy VFileMemChunk makes internally, so we don't need to keep a vector
+    // of our own alive for it either.
+    VFile *rom_vf = nullptr;
     std::vector<std::byte> rom;
 
-    VFile *sram_vf;
-    std::vector<std::byte> sram;
-
-    VFile *bios_vf;
+    VFile *bios_vf = nullptr;
     std::vector<std::byte> bios;
 
     std::vector<std::uint32_t> pixels;
@@ -51,13 +53,43 @@ struct MGBACoreRaw {
 static constexpr std::size_t RESAMPLED_CAPACITY_FRAMES = 8192;
 static constexpr double OUTPUT_SAMPLE_RATE = 48000.0;
 
+// Error codes handed back through `error_out` by mgba_rs_core_new on failure (see below).
+enum MGBACoreNewError : std::uint32_t {
+    MGBA_CORE_NEW_ERROR_CREATE_FAILED = 1,
+    MGBA_CORE_NEW_ERROR_INIT_FAILED = 2,
+    MGBA_CORE_NEW_ERROR_BAD_ROM = 3,
+    MGBA_CORE_NEW_ERROR_MISSING_MEMORY_BLOCKS = 4,
+    MGBA_CORE_NEW_ERROR_BAD_BIOS = 5,
+};
+
+// Tear down whatever mgba_rs_core_new got through before failing and report `code` through
+// `error_out`. `core->core->init` is only ever called once, right after creation and before
+// anything else touches the core, so by the time this can be reached with core->core non-null,
+// either init succeeded (deinit is safe) or the caller already reset core->core to nullptr after
+// freeing a half-initialised one by hand (see the init failure path below, which must NOT call
+// deinit(): a failed init() never populates core->cpu/board, and mCore's own deinit
+// unconditionally dereferences them).
+static MGBACoreRaw *fail(MGBACoreRaw *core, std::uint32_t *error_out, std::uint32_t code) {
+    if(error_out != nullptr) {
+        *error_out = code;
+    }
+    if(core != nullptr) {
+        if(core->core != nullptr) {
+            core->core->deinit(core->core);
+        }
+        delete core;
+    }
+    return nullptr;
+}
+
 extern "C" MGBACoreRaw *mgba_rs_core_new(
     const std::byte *rom,
     std::size_t rom_size,
     const std::byte *sram,
     std::size_t sram_size,
     const std::byte *bios,
-    std::size_t bios_size
+    std::size_t bios_size,
+    std::uint32_t *error_out
 ) {
     mLogSetDefaultLogger(&logger);
 
@@ -65,8 +97,7 @@ extern "C" MGBACoreRaw *mgba_rs_core_new(
     core->core = mCoreCreate(mPLATFORM_GBA);
 
     if(core->core == nullptr) {
-        std::printf("Failed to create mGBA instance\n");
-        std::terminate();
+        return fail(core, error_out, MGBA_CORE_NEW_ERROR_CREATE_FAILED);
     }
 
 	mCoreInitConfig(core->core, nullptr);
@@ -74,18 +105,50 @@ extern "C" MGBACoreRaw *mgba_rs_core_new(
 	core->core->opts.skipBios = true;
 
     if(!core->core->init(core->core)) {
-        std::printf("Failed to init mGBA\n");
-        std::terminate();
+        // core->cpu/board were never populated (GBACoreCreate leaves them null and init() only
+        // sets them on success), so core->deinit() would crash; free the mCore shell directly.
+        // struct GBACore has struct mCore as its first member, so freeing through the base
+        // pointer mCoreCreate handed back is the same as freeing the allocation mgba made.
+        std::free(core->core);
+        core->core = nullptr;
+        return fail(core, error_out, MGBA_CORE_NEW_ERROR_INIT_FAILED);
     }
 
     core->rom = std::vector(rom, rom + rom_size);
-    core->rom_vf = VFileFromMemory(core->rom.data(), core->rom.size());
-    core->core->loadROM(core->core, core->rom_vf);
+    core->rom_vf = VFileFromConstMemory(core->rom.data(), core->rom.size());
+    if(core->rom_vf == nullptr || !core->core->loadROM(core->core, core->rom_vf)) {
+        // On every current loadROM failure path mGBA has already given up ownership of the vf
+        // (or never took it), so closing it ourselves here cannot double-free.
+        if(core->rom_vf != nullptr) {
+            core->rom_vf->close(core->rom_vf);
+            core->rom_vf = nullptr;
+        }
+        return fail(core, error_out, MGBA_CORE_NEW_ERROR_BAD_ROM);
+    }
 
     if(sram_size > 0) {
-        core->sram = std::vector(sram, sram + sram_size);
-        core->sram_vf = VFileFromMemory(core->sram.data(), core->sram.size());
-        core->core->loadSave(core->core, core->sram_vf);
+        // VFileMemChunk copies `sram` into its own growable buffer and its truncate() can expand
+        // (unlike VFileFromMemory's, which cannot grow past `sram_size`). That matters because an
+        // undersized .sav (e.g. a 64 KiB FLASH512 save for a FLASH1M game) needs to grow when
+        // GBASavedataInitFlash upgrades it; VFileFromMemory would hand back a NULL map() and the
+        // subsequent memset would segfault. mGBA takes ownership of this vf via loadSave() and
+        // closes it itself in GBAUnloadROM, so we don't keep a copy of the pointer or the bytes.
+        VFile *sram_vf = VFileMemChunk(sram, sram_size);
+        core->core->loadSave(core->core, sram_vf);
+    }
+
+    if(bios_size > 0) {
+        core->bios = std::vector(bios, bios + bios_size);
+        core->bios_vf = VFileFromConstMemory(core->bios.data(), core->bios.size());
+        if(core->bios_vf == nullptr || !core->core->loadBIOS(core->core, core->bios_vf, 0)) {
+            // loadBIOS only takes ownership (sets gba->biosVf) once GBAIsBIOS() has accepted the
+            // file; on rejection the vf is still ours to close.
+            if(core->bios_vf != nullptr) {
+                core->bios_vf->close(core->bios_vf);
+                core->bios_vf = nullptr;
+            }
+            return fail(core, error_out, MGBA_CORE_NEW_ERROR_BAD_BIOS);
+        }
     }
 
     const mCoreMemoryBlock *blocks;
@@ -100,31 +163,18 @@ extern "C" MGBACoreRaw *mgba_rs_core_new(
         }
     }
 
-    if(core->ewram == ~0) {
-        std::printf("Failed to find ewram\n");
-        std::terminate();
-    }
-
-    if(core->iwram == ~0) {
-        std::printf("Failed to find iwram\n");
-        std::terminate();
+    if(core->ewram == ~0 || core->iwram == ~0) {
+        return fail(core, error_out, MGBA_CORE_NEW_ERROR_MISSING_MEMORY_BLOCKS);
     }
 
     core->pixels.resize(240 * 160);
     core->core->setVideoBuffer(core->core, core->pixels.data(), 240);
 
+    // Initialised last (after every fallible step above) so no failure path ever needs to tear
+    // these back down.
     mAudioBufferInit(&core->resampled, RESAMPLED_CAPACITY_FRAMES, 2);
     mAudioResamplerInit(&core->resampler, mINTERPOLATOR_SINC);
     mAudioResamplerSetDestination(&core->resampler, &core->resampled, OUTPUT_SAMPLE_RATE);
-
-    if(bios_size > 0) {
-        core->bios = std::vector(bios, bios + bios_size);
-        core->bios_vf = VFileFromMemory(core->bios.data(), core->bios.size());
-        if(!core->core->loadBIOS(core->core, core->bios_vf, 0)) {
-            std::printf("Bad BIOS\n");
-            std::terminate();
-        }
-    }
 
 	core->core->rtc.override = RTC_FAKE_EPOCH;
 	core->core->rtc.value = 0;
@@ -185,28 +235,45 @@ extern "C" void mgba_rs_core_set_input(MGBACoreRaw *core, std::uint16_t input) {
     core->core->setKeys(core->core, input);
 }
 
+// mGBA malloc()s a fresh copy of the save data on every call (see _GBACoreSavedataClone); the
+// caller must free it back through mgba_rs_core_free_sram_clone once it has copied what it needs.
+// NULL/0 whenever the save size is not yet known (e.g. the game was closed before mGBA detected
+// its save type), not an error.
 extern "C" const void *mgba_rs_core_get_sram(const MGBACoreRaw *core, std::size_t &size) {
     void *sram = nullptr;
     size = core->core->savedataClone(core->core, &sram);
     return sram;
 }
 
+// Frees a clone handed back by mgba_rs_core_get_sram. Must go through this shim (not the caller's
+// own allocator) since mGBA's _GBACoreSavedataClone allocates it with this binary's malloc().
+extern "C" void mgba_rs_core_free_sram_clone(void *p) {
+    std::free(p);
+}
+
 #define SAVE_STATE_FLAGS (SAVESTATE_SAVEDATA | SAVESTATE_RTC)
 
 extern "C" std::size_t mgba_rs_core_create_save_state(const MGBACoreRaw *core, std::byte *data, std::size_t data_size) {
 	auto *vf = VFileMemChunk(NULL, 0);
-    bool read_successfully = mCoreSaveStateNamed(core->core, vf, SAVE_STATE_FLAGS);
-	size_t size = vf->size(vf);
-	if(size <= data_size && read_successfully) {
+    bool ok = mCoreSaveStateNamed(core->core, vf, SAVE_STATE_FLAGS);
+	std::size_t size = static_cast<std::size_t>(vf->size(vf));
+	ok = ok && size <= data_size;
+	if(ok) {
 	    vf->seek(vf, 0, SEEK_SET);
-        vf->read(vf, data, size);
+	    ok = vf->read(vf, data, size) == static_cast<ssize_t>(size);
 	}
 	vf->close(vf);
-    return size;
+    return ok ? size : 0;
 }
 
 extern "C" bool mgba_rs_core_load_save_state(MGBACoreRaw *core, const std::byte *data, std::size_t data_size) {
-    auto *vf = VFileFromMemory(const_cast<std::byte *>(data), data_size);
+    if(data_size == 0) {
+        return false;
+    }
+    auto *vf = VFileFromConstMemory(data, data_size);
+    if(vf == nullptr) {
+        return false;
+    }
     auto success = mCoreLoadStateNamed(core->core, vf, SAVE_STATE_FLAGS);
     vf->close(vf);
     return success;

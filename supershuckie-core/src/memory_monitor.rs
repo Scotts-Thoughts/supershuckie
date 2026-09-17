@@ -722,7 +722,12 @@ fn copy_mapped_prefix(core: &dyn EmulatorCore, address: u32, out: &mut [u8]) -> 
         };
         let available = data.len().min(region.len as usize).saturating_sub(offset);
         let n = available.min(out.len());
-        out[..n].copy_from_slice(&data[offset..offset + n]);
+        // `offset` may be past the end of a shorter-than-declared backing store (e.g. a GBA save
+        // region before the save type is detected); `data[offset..offset + n]` would panic on that
+        // even with `n == 0`, since slicing requires `offset <= data.len()`. `get` returns `None`
+        // instead, which is exactly the "nothing mapped there" case this function already reports.
+        let Some(src) = data.get(offset..offset + n) else { return 0 };
+        out[..n].copy_from_slice(src);
         return n as u32
     }
     0
@@ -1278,6 +1283,29 @@ mod tests {
         assert_eq!(path.resolve(&core.emulator), Some(0x1084));
         let broken = AddressPath::with_derefs(0x1020, &[0, 0]).unwrap();
         assert_eq!(broken.resolve(&core.emulator), None, "a null pointer is unmapped");
+    }
+
+    #[test]
+    fn copy_mapped_prefix_past_short_backing_returns_zero_without_panicking() {
+        let emulator = FakeEmulator { ram: alloc::vec![0; 0x100], io: alloc::vec![0; 0x10], save: alloc::vec![0; 0x20] };
+        let mut out = [0xAAu8; 4];
+        // The SAVE region is declared 0x3000..0x3040 but only the first 0x20 bytes are backed;
+        // 0x3030 is inside the declared region but past the actual backing store (regressed a
+        // panic: `data[offset..offset + n]` requires `offset <= data.len()` even for `n == 0`).
+        let n = copy_mapped_prefix(&emulator, 0x3030, &mut out);
+        assert_eq!(n, 0);
+        assert_eq!(out, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn copy_mapped_prefix_straddling_the_end_returns_partial_count() {
+        let mut emulator = FakeEmulator { ram: alloc::vec![0; 0x100], io: alloc::vec![0; 0x10], save: alloc::vec![0; 0x20] };
+        emulator.save[0x1F] = 0xCD;
+        let mut out = [0xAAu8; 0x10];
+        // 0x3010 is inside the backing store; the 0x10-byte window runs right up to its end (0x20).
+        let n = copy_mapped_prefix(&emulator, 0x3010, &mut out);
+        assert_eq!(n, 0x10);
+        assert_eq!(out[0xF], 0xCD);
     }
 
     #[test]

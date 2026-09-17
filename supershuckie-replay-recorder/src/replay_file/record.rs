@@ -76,8 +76,6 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
     /// A table change arrived while the in-progress blob had no keyframe yet (a blob must start
     /// with one), so the snapshot is written after the next keyframe instead.
     bookmark_snapshot_pending: bool,
-
-    poisoned: bool
 }
 
 /// How [`ReplayFileRecorder::insert_keyframe_with`] stores a keyframe.
@@ -93,7 +91,18 @@ pub enum KeyframeEncoding {
 
 struct SinkTuple<Final: ReplayFileSink, Temp: ReplayFileSink> {
     final_sink: Final,
-    temp_sink: Temp
+    temp_sink: Temp,
+
+    /// Set when the final sink (the actual output file) fails a write; the failing operation
+    /// propagates the error, and the in-memory data it was writing is retained so the SAME
+    /// operation (a later `next_blob`, or `close`) can retry it. Cleared the next time a final-sink
+    /// write succeeds.
+    final_failed: bool,
+
+    /// Set the first time the temp sink (the crash-safety scratch copy) fails a write. That first
+    /// failure is surfaced once as [`ReplayFileWriteError::TempSink`]; afterwards temp writes are
+    /// skipped silently (the recording itself is unaffected -- the temp file is disposable).
+    temp_failed: Option<ReplayFileWriteError>
 }
 
 /// Settings for [`ReplayFileRecorder`]
@@ -209,10 +218,26 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         let metadata_bytes = metadata.as_bytes();
         let current_blob_offset = metadata_bytes.len() + patch_data.len();
 
-        temp_sink.write_bytes(metadata_bytes.as_slice())?;
+        // The header/patch write is final-sink-first, temp-sink-second, same as every other write
+        // (see `SinkTuple`): a final-sink failure here fails construction outright (there is no
+        // recorder yet to retry through), while a temp-sink failure is only recorded -- the
+        // recording can still proceed from a working final sink alone. There is no recorder to
+        // return the one-time `TempSink` notice through yet, so it first surfaces (if it hasn't
+        // already been superseded) on the first write after construction.
+        let mut temp_failed = None;
+        fn try_temp<T: ReplayFileSink>(sink: &mut T, failed: &mut Option<ReplayFileWriteError>, bytes: &[u8]) {
+            if failed.is_some() {
+                return;
+            }
+            if let Err(e) = sink.write_bytes(bytes) {
+                *failed = Some(e);
+            }
+        }
+
+        try_temp(&mut temp_sink, &mut temp_failed, metadata_bytes.as_slice());
         final_sink.write_bytes(metadata_bytes.as_slice())?;
 
-        temp_sink.write_bytes(patch_data.as_slice())?;
+        try_temp(&mut temp_sink, &mut temp_failed, patch_data.as_slice());
         final_sink.write_bytes(patch_data.as_slice())?;
 
         Ok(ReplayFileRecorder {
@@ -225,7 +250,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             current_blob: Vec::new(),
             current_blob_keyframes: Vec::new(),
             current_blob_offset: u64::try_from(current_blob_offset).expect("failed to read"),
-            poisoned: false,
             header: metadata,
             last_state_to_diff: None,
             recycled_state: None,
@@ -234,7 +258,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             bookmarks_written: false,
             bookmark_snapshot_pending: false,
             sink: Some(SinkTuple {
-                final_sink, temp_sink
+                final_sink, temp_sink, final_failed: false, temp_failed
             })
         })
     }
@@ -253,22 +277,27 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         debug_assert!(matches!(blob, Packet::CompressedBlob { .. }), "append_compressed_blob_verbatim given a non-blob packet");
         debug_assert!(self.current_blob.is_empty(), "append_compressed_blob_verbatim called with a non-empty in-progress blob");
 
-        self.do_with_poison(|this| {
-            let write_instructions = blob.write_packet_instructions();
-            let offset = this.current_blob_offset;
+        self.assert_not_closed()?;
+        self.refuse_if_final_failed()?;
 
-            let (final_sink, temp_sink) = this.get_sinks();
+        let write_instructions = blob.write_packet_instructions();
+        let offset = self.current_blob_offset;
 
+        // Keep the temp file identical to the final file during the verbatim-copy phase: there is
+        // no in-progress region yet, so truncating to the current offset is a no-op that simply
+        // guards against any stray trailing bytes before we re-append the blob.
+        let written = self.final_write(|final_sink| {
+            final_sink.truncate(offset)?;
             let written = final_sink.write_packet_data(&write_instructions)?;
-            let written = u64::try_from(written).expect("failing to convert written blob size from usize to u64");
+            final_sink.flush()?;
+            Ok(written)
+        })?;
+        let written = u64::try_from(written).expect("failing to convert written blob size from usize to u64");
+        self.current_blob_offset = offset.checked_add(written).expect("overflowed adding current_blob_offset");
 
-            // Keep the temp file identical to the final file during the verbatim-copy phase: there
-            // is no in-progress region yet, so truncating to the current offset is a no-op that
-            // simply guards against any stray trailing bytes before we re-append the blob.
+        self.temp_write(|temp_sink| {
             temp_sink.truncate(offset)?;
             temp_sink.write_packet_data(&write_instructions)?;
-
-            this.current_blob_offset = offset.checked_add(written).expect("overflowed adding current_blob_offset");
             Ok(())
         })
     }
@@ -325,37 +354,115 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         // Flush the final in-progress blob (now a no-op if nothing is buffered). Capture the result
         // BEFORE taking the sinks; calling next_blob() again after the take would just fail
         // assert_not_closed and spuriously report the close as failed.
-        let flush_result = self.next_blob().and_then(|()| self.write_bookmark_section());
+        //
+        // A temp-sink-only failure (`TempSink`) must not stop the bookmark section from being
+        // written -- the final file is unaffected by it, and the temp file is disposable scratch.
+        // Only a genuine final-sink failure skips straight to returning the sinks.
+        let blob_result = self.next_blob();
+        let section_result = if matches!(blob_result, Err(ref e) if !is_temp_sink_error(e)) {
+            Ok(())
+        }
+        else {
+            self.write_bookmark_section()
+        };
 
-        let Some(SinkTuple { final_sink, temp_sink }) = self.sink.take() else {
+        let Some(SinkTuple { final_sink, temp_sink, .. }) = self.sink.take() else {
             unreachable!();
         };
 
-        self.poisoned = true;
+        // The first genuine (non-`TempSink`) error from either step is what makes close() fail; a
+        // `TempSink` notice (already delivered to the caller once, from whichever call produced it)
+        // does not.
+        let final_error = [blob_result, section_result].into_iter().find_map(|r| match r {
+            Err(e) if !is_temp_sink_error(&e) => Some(e),
+            _ => None,
+        });
 
-        match flush_result {
-            Ok(()) => Ok((final_sink, temp_sink)),
-            Err(e) => Err((final_sink, temp_sink, e)),
+        match final_error {
+            None => Ok((final_sink, temp_sink)),
+            Some(e) => Err((final_sink, temp_sink, e)),
         }
     }
 
-    /// Returns true if an unrecoverable error occurred.
-    pub const fn is_poisoned(&self) -> bool {
-        self.poisoned
+    /// Returns true if an unrecoverable error occurred: the final sink failed and has not since
+    /// succeeded, or the recorder is closed. A temp-sink-only failure does not count (see
+    /// [`Self::temp_sink_failed`]).
+    pub fn is_poisoned(&self) -> bool {
+        self.sink.as_ref().map(|s| s.final_failed).unwrap_or(true)
+    }
+
+    /// The temp sink's own error, if it has ever failed a write. `None` once the recorder is
+    /// closed (the temp sink, and its failure state, no longer exist).
+    pub fn temp_sink_failed(&self) -> Option<&ReplayFileWriteError> {
+        self.sink.as_ref().and_then(|s| s.temp_failed.as_ref())
+    }
+
+    /// Refuse to attempt a final-sink write when a previous one is still unresolved. Used by
+    /// everything except [`Self::next_blob`], which is the operation that retries (and clears) a
+    /// stale failure; gating it too would make that retry impossible.
+    fn refuse_if_final_failed(&self) -> Result<(), ReplayFileWriteError> {
+        if self.sink.as_ref().is_some_and(|s| s.final_failed) {
+            Err(ReplayFileWriteError::Poisoned)
+        }
+        else {
+            Ok(())
+        }
+    }
+
+    /// Attempt a write to the final sink. Clears the sink's `final_failed` flag on success, sets it
+    /// on failure (the caller's in-memory data is left for the caller to decide whether to retry).
+    fn final_write<T, F: FnOnce(&mut Final) -> Result<T, ReplayFileWriteError>>(&mut self, f: F) -> Result<T, ReplayFileWriteError> {
+        self.assert_not_closed()?;
+        let sink = self.sink.as_mut().expect("checked by assert_not_closed");
+        match f(&mut sink.final_sink) {
+            Ok(v) => {
+                sink.final_failed = false;
+                Ok(v)
+            }
+            Err(e) => {
+                sink.final_failed = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempt a write to the temp sink. Once the temp sink has failed, every later call here is a
+    /// silent no-op (`Ok(())`): the first failure is the only one ever surfaced, as
+    /// [`ReplayFileWriteError::TempSink`], and the recording continues regardless (the temp file is
+    /// a disposable scratch copy).
+    fn temp_write<F: FnOnce(&mut Temp) -> Result<(), ReplayFileWriteError>>(&mut self, f: F) -> Result<(), ReplayFileWriteError> {
+        self.assert_not_closed()?;
+        let sink = self.sink.as_mut().expect("checked by assert_not_closed");
+        if sink.temp_failed.is_some() {
+            return Ok(());
+        }
+        match f(&mut sink.temp_sink) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let explanation = Cow::Owned(format!("Temp file error: {e}"));
+                sink.temp_failed = Some(e);
+                Err(ReplayFileWriteError::TempSink { explanation })
+            }
+        }
     }
 
     /// End the packet stream: record its end in the header, then append the bookmark section.
     fn write_bookmark_section(&mut self) -> Result<(), ReplayFileWriteError> {
         self.header.packet_stream_end = self.current_blob_offset;
-        self.sync_header()?;
+        let header_result = self.sync_header();
+        if let Err(e) = &header_result {
+            if !is_temp_sink_error(e) {
+                return header_result;
+            }
+        }
 
         let section = encode_bookmark_section(&self.bookmarks);
-        self.do_with_poison(|this| {
-            let (final_sink, temp_sink) = this.get_sinks();
-            final_sink.write_bytes(&section)?;
-            temp_sink.write_bytes(&section)?;
-            Ok(())
-        })
+        self.final_write(|final_sink| final_sink.write_bytes(&section))?;
+        let section_result = self.temp_write(|temp_sink| temp_sink.write_bytes(&section));
+
+        // At most one of these is ever `Err` here: `temp_write` only reports a temp failure once,
+        // and whichever of the two calls hit it first is the one that gets to report it.
+        header_result.and(section_result)
     }
 
     /// The replay's bookmarks as last set.
@@ -423,8 +530,10 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     ///
     /// Returns the frame index the keyframe is on.
     pub fn insert_keyframe_with(&mut self, state: ByteVec, elapsed_millis: TimestampMillis, encoding: KeyframeEncoding) -> Result<u64, ReplayFileWriteError> {
-        assert!(self.elapsed_millis <= elapsed_millis, "Bad timestamp given (time went backwards!!!); expected {} (current) <= {elapsed_millis} (last)", self.elapsed_millis);
         self.assert_not_closed()?;
+        if elapsed_millis < self.elapsed_millis {
+            return Err(ReplayFileWriteError::BadInput { explanation: Cow::Owned(format!("keyframe timestamp went backwards ({} -> {elapsed_millis})", self.elapsed_millis)) })
+        }
 
         self.elapsed_millis = elapsed_millis;
         self.last_keyframe_frames = self.elapsed_frames;
@@ -449,10 +558,11 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.current_blob_keyframes.push(metadata.clone());
 
         let mut state = state;
+        let mut masked = Vec::new();
         let delta = match self.last_state_to_diff.as_ref() {
             Some(previous) if previous.len() == state.len() && encoding == KeyframeEncoding::Auto => {
                 if self.settings.mask_transient_buffers {
-                    apply_masks(self.header.console_type.get_or_default(), previous.as_slice(), state.as_mut_slice());
+                    masked = apply_masks(self.header.console_type.get_or_default(), previous.as_slice(), state.as_mut_slice());
                 }
                 let diff = region_diff(previous.as_slice(), state.as_slice()).expect("lengths were checked");
                 (diff.encoded_len() < state.len()).then_some(diff)
@@ -469,6 +579,15 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             })?;
         }
         else {
+            // Falling back to a full keyframe: restore whatever `apply_masks` overwrote above, so
+            // the stored (and, below, diffed-against) state is exact -- full keyframes are
+            // documented to reconstruct bit-exactly, and masking must never leak into one.
+            if !masked.is_empty() {
+                let state = state.as_mut_slice();
+                for (range, original) in &masked {
+                    state[range.clone()].copy_from_slice(original);
+                }
+            }
             self.write_packet_data(&Packet::Keyframe {
                 metadata,
                 state: state.clone()
@@ -518,52 +637,71 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             || self.current_blob.len() >= self.settings.minimum_uncompressed_bytes_per_blob
     }
 
+    /// Compress and flush the in-progress blob to both sinks, if it holds any keyframes.
+    ///
+    /// The final sink is written (and flushed) FIRST; only once that has actually succeeded are
+    /// `current_blob` / `current_blob_keyframes` cleared and `current_blob_offset` advanced. If the
+    /// final write fails, this returns `Err` with the blob left exactly as it was: the next call
+    /// that reaches `next_blob` (the next keyframe that hits the blob limit, or [`Self::close`])
+    /// retries the identical bytes. A stale final-sink failure never blocks this retry (unlike
+    /// every other final-sink operation, which refuses to attempt while one is unresolved) --
+    /// `next_blob` is what resolves it.
     fn next_blob(&mut self) -> Result<(), ReplayFileWriteError> {
-        self.do_with_poison(|this| {
-            // Nothing buffered (e.g. closing immediately after a blob split): a blob with no
-            // keyframes is invalid and would panic below, so there is simply nothing to flush.
-            if this.current_blob_keyframes.is_empty() {
-                return Ok(());
-            }
+        self.assert_not_closed()?;
 
-            let uncompressed_size = this.current_blob.len();
-            let compressed = crate::compress_data(this.current_blob.as_slice(), this.settings.compression_level)
-                .map_err(|e| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("next_blob failed to compress: {e}")) })?;
+        // Nothing buffered (e.g. closing immediately after a blob split): a blob with no keyframes
+        // is invalid and would panic below, so there is simply nothing to flush.
+        if self.current_blob_keyframes.is_empty() {
+            return Ok(());
+        }
 
-            this.current_blob.clear();
+        let uncompressed_size = self.current_blob.len();
+        let compressed = crate::compress_data(self.current_blob.as_slice(), self.settings.compression_level)
+            .map_err(|e| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("next_blob failed to compress: {e}")) })?;
 
-            let keyframes_len = this.current_blob_keyframes.len();
+        let (first_frames, first_millis) = {
+            let first_keyframe = self.current_blob_keyframes.first().expect("no keyframes in blob?");
+            (first_keyframe.elapsed_frames, first_keyframe.elapsed_millis)
+        };
 
-            let first_keyframe =  this.current_blob_keyframes.first().expect("no keyframes in blob?");
+        let compressed_blob = Packet::CompressedBlob {
+            elapsed_frames_start: first_frames,
+            elapsed_frames_end: self.elapsed_frames,
+            timestamp_start: first_millis,
+            timestamp_end: self.elapsed_millis,
 
-            let compressed_blob = Packet::CompressedBlob {
-                elapsed_frames_start: first_keyframe.elapsed_frames,
-                elapsed_frames_end: this.elapsed_frames,
-                timestamp_start: first_keyframe.elapsed_millis,
-                timestamp_end: this.elapsed_millis,
+            // Cloned, not taken: if the final-sink write below fails, `current_blob_keyframes` must
+            // still hold the whole blob so a later call can retry it (see the doc comment above).
+            keyframes: self.current_blob_keyframes.clone(),
+            // Format v5 keeps bookmarks in `BookmarkTable` packets and the bookmark section.
+            bookmarks: Vec::new(),
+            compressed_data: ByteVec::Heap(compressed),
+            uncompressed_size: u64::try_from(uncompressed_size).expect("failed to convert uncompressed_size from usize to u64"),
+        };
 
-                keyframes: core::mem::take(&mut this.current_blob_keyframes),
-                // Format v5 keeps bookmarks in `BookmarkTable` packets and the bookmark section.
-                bookmarks: Vec::new(),
-                compressed_data: ByteVec::Heap(compressed),
-                uncompressed_size: u64::try_from(uncompressed_size).expect("failed to convert uncompressed_size from usize to u64"),
-            };
+        let write_instructions = compressed_blob.write_packet_instructions();
+        let offset = self.current_blob_offset;
 
-            this.current_blob_keyframes.reserve(keyframes_len + 1024);
-
-            let write_instructions = compressed_blob.write_packet_instructions();
-
-            let current_blob_offset_old = this.current_blob_offset;
-
-            let (final_sink, temporary_sink) = this.get_sinks();
-
+        let written = self.final_write(|final_sink| {
+            // Undo any bytes a previous failed attempt at this same blob left behind, so a retry
+            // does not duplicate them.
+            final_sink.truncate(offset)?;
             let written = final_sink.write_packet_data(&write_instructions)?;
-            let written = u64::try_from(written).expect("failing to convert written packet data from usize to u64");
-            temporary_sink.truncate(current_blob_offset_old)?;
-            temporary_sink.write_packet_data(&write_instructions)?;
+            final_sink.flush()?;
+            Ok(written)
+        })?;
+        let written = u64::try_from(written).expect("failing to convert written packet data from usize to u64");
 
-            this.current_blob_offset = current_blob_offset_old.checked_add(written).expect("overflowed adding current_blob_offset");
+        // Only now that the final sink safely holds the blob do we clear it and advance past it.
+        self.current_blob.clear();
+        let keyframes_len = self.current_blob_keyframes.len();
+        self.current_blob_keyframes.clear();
+        self.current_blob_keyframes.reserve(keyframes_len + 1024);
+        self.current_blob_offset = offset.checked_add(written).expect("overflowed adding current_blob_offset");
 
+        self.temp_write(|temp_sink| {
+            temp_sink.truncate(offset)?;
+            temp_sink.write_packet_data(&write_instructions)?;
             Ok(())
         })
     }
@@ -600,34 +738,22 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     }
 
     fn write_packet_data<'a, P: PacketIO<'a>>(&mut self, what: &'a P) -> Result<(), ReplayFileWriteError> {
-        self.do_with_poison(|this| {
-            this.write_packet_unchecked(what)?;
-            Ok(())
-        })
+        self.write_packet_unchecked(what)
     }
 
+    /// Write a packet to the in-memory in-progress blob, then mirror it to the temp sink.
+    ///
+    /// Never touches the final sink: per-packet data only ever reaches the final sink as part of a
+    /// whole compressed blob (see [`Self::next_blob`]). A temp-sink failure here is recorded and
+    /// surfaced once (as [`ReplayFileWriteError::TempSink`]) but never stops the recording.
     fn write_packet_unchecked<'a, P: PacketIO<'a>>(&mut self, what: &'a P) -> Result<(), ReplayFileWriteError> {
+        self.assert_not_closed()?;
         let instructions = what.write_packet_instructions();
         self.current_blob.write_packet_data(&instructions)?;
-        self.sink.as_mut().expect("write_packet_data on None sink").temp_sink.write_packet_data(&instructions)?;
-        Ok(())
-    }
-
-    fn get_sinks(&mut self) -> (&mut Final, &mut Temp) {
-        let sink = self.sink.as_mut().expect("can't get sinks (already closed?)");
-
-        (&mut sink.final_sink, &mut sink.temp_sink)
-    }
-
-    fn do_with_poison<T, F: FnOnce(&mut Self) -> Result<T, ReplayFileWriteError>>(&mut self, f: F) -> Result<T, ReplayFileWriteError> {
-        self.assert_not_closed()?;
-        if self.poisoned {
-            return Err(ReplayFileWriteError::Poisoned)
-        }
-        self.poisoned = true;
-        let result = f(self)?;
-        self.poisoned = false;
-        Ok(result)
+        self.temp_write(|temp_sink| {
+            temp_sink.write_packet_data(&instructions)?;
+            Ok(())
+        })
     }
 
     fn assert_not_closed(&self) -> Result<(), ReplayFileWriteError> {
@@ -643,7 +769,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     pub fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(), ReplayFileWriteError> {
         self.header.crop_start_frame = self.elapsed_frames;
         self.header.crop_start_millis = self.elapsed_millis;
-        self.header.crop_start = true;
+        self.header.crop_start = 1;
         self.header.crop_timer_offset = timer_offset;
         self.sync_header()
     }
@@ -652,34 +778,39 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     pub fn mark_end(&mut self) -> Result<(), ReplayFileWriteError> {
         self.header.crop_end_frame = self.elapsed_frames;
         self.header.crop_end_millis = self.elapsed_millis;
-        self.header.crop_end = true;
+        self.header.crop_end = 1;
         self.sync_header()
     }
 
+    /// Rewrite the header in place (final sink first, then temp). Refuses to attempt this while a
+    /// previous final-sink failure is unresolved (see [`Self::refuse_if_final_failed`]).
     fn sync_header(&mut self) -> Result<(), ReplayFileWriteError> {
+        self.assert_not_closed()?;
+        self.refuse_if_final_failed()?;
+
         let header_bytes = *self.header.as_bytes();
-        self.do_with_poison(|f| {
-            let (final_sink, temp_sink) = f.get_sinks();
-            temp_sink.overwrite_header(&header_bytes)?;
-            final_sink.overwrite_header(&header_bytes)?;
-            Ok(())
-        })
+        self.final_write(|final_sink| final_sink.overwrite_header(&header_bytes))?;
+        self.temp_write(|temp_sink| temp_sink.overwrite_header(&header_bytes))
     }
 
     /// Modify the counter.
     pub fn change_counter(&mut self, name: String, delta: SignedInteger) -> Result<(), ReplayFileWriteError> {
-        self.do_with_poison(|f| {
-            if let Some(v) = f.counters.get_mut(&name) {
-                *v = v.wrapping_add(delta);
-            }
-            else {
-                f.counters.insert(name.clone(), delta);
-            }
+        self.assert_not_closed()?;
+        if let Some(v) = self.counters.get_mut(&name) {
+            *v = v.wrapping_add(delta);
+        }
+        else {
+            self.counters.insert(name.clone(), delta);
+        }
 
-            f.write_packet_unchecked(&Packet::IncrementCounter { name, delta })?;
-            Ok(())
-        })
+        self.write_packet_unchecked(&Packet::IncrementCounter { name, delta })
     }
+}
+
+/// Whether `error` is the one-time notice from a temp-sink-only failure (see
+/// [`ReplayFileRecorder::temp_write`]) rather than a genuine (final-sink or otherwise fatal) error.
+fn is_temp_sink_error(error: &ReplayFileWriteError) -> bool {
+    matches!(error, ReplayFileWriteError::TempSink { .. })
 }
 
 impl Default for ReplayFileRecorderSettings {
@@ -713,6 +844,14 @@ pub trait ReplayFileSink {
             written += bytes.len();
         }
         Ok(written)
+    }
+
+    /// Flush any buffered writes so they are actually visible to whatever will read this sink back
+    /// (e.g. a later [`Self::truncate`]/[`Self::overwrite_header`], or another process). The default
+    /// is a no-op, for sinks with nothing to flush (an in-memory buffer, or a raw unbuffered file);
+    /// a buffered file sink overrides this.
+    fn flush(&mut self) -> Result<(), ReplayFileWriteError> {
+        Ok(())
     }
 }
 
@@ -770,7 +909,7 @@ impl ReplayFileSink for File {
         self.seek(SeekFrom::Start(0))?;
         self.write_all(header_data.as_slice())?;
         self.seek(SeekFrom::End(0))?;
-        self.flush()?;
+        Write::flush(self)?;
         Ok(())
     }
 }
@@ -783,7 +922,7 @@ impl ReplayFileSink for std::io::BufWriter<File> {
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), ReplayFileWriteError> {
-        let _ = self.flush();
+        Write::flush(self)?;
 
         let this = self.get_mut();
         this.set_len(size)?;
@@ -792,9 +931,14 @@ impl ReplayFileSink for std::io::BufWriter<File> {
     }
 
     fn overwrite_header(&mut self, header_data: &ReplayHeaderBytes) -> Result<(), ReplayFileWriteError> {
-        let _ = self.flush();
+        Write::flush(self)?;
         let this = self.get_mut();
         this.overwrite_header(header_data)
+    }
+
+    fn flush(&mut self) -> Result<(), ReplayFileWriteError> {
+        Write::flush(self)?;
+        Ok(())
     }
 }
 
@@ -815,8 +959,18 @@ pub enum ReplayFileWriteError {
     /// The stream has closed. The stream is no longer functional.
     StreamClosed,
 
-    /// The stream was broken by a previous error. The stream is no longer functional.
+    /// A previous write to the final sink failed and has not since succeeded, so this operation
+    /// was refused without being attempted. Unlike the other variants, this is not necessarily
+    /// permanent: a later call to [`ReplayFileRecorder::close`] (or the keyframe that next closes a
+    /// blob) retries the failed write, and once that succeeds the stream is usable again.
     Poisoned,
+
+    /// The temp sink (the non-final, crash-safety copy) failed a write. The recording is
+    /// unaffected: temp writes are skipped silently from here on, and the final file is written
+    /// normally. Surfaced only once, the first time it happens; see
+    /// [`ReplayFileRecorder::temp_sink_failed`].
+    #[allow(missing_docs)]
+    TempSink { explanation: Cow<'static, str> },
 
     /// Some other error occurred. The stream is no longer functional.
     #[allow(missing_docs)]
@@ -829,6 +983,7 @@ impl Display for ReplayFileWriteError {
             ReplayFileWriteError::BadInput { explanation } => f.write_fmt(format_args!("Bad input: {explanation}")),
             ReplayFileWriteError::StreamClosed => f.write_str("The stream has closed"),
             ReplayFileWriteError::Poisoned => f.write_str("Failed to write due to being in an error state"),
+            ReplayFileWriteError::TempSink { explanation } => f.write_str(explanation),
             ReplayFileWriteError::Other { explanation } => f.write_str(explanation)
         }
     }
@@ -979,6 +1134,7 @@ fn _ensure_replay_file_recorder_fns_is_dyn_compatible(_fns: &dyn ReplayFileRecor
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use std::sync::{Arc, Mutex};
 
     fn settings(max_frames_per_blob: u64, minimum_uncompressed_bytes_per_blob: usize) -> ReplayFileRecorderSettings {
         ReplayFileRecorderSettings {
@@ -986,6 +1142,78 @@ mod tests {
             max_frames_per_blob,
             compression_level: DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
             mask_transient_buffers: true,
+        }
+    }
+
+    /// Wraps a [`SharedSink`], injecting controllable failures for the B3 (per-sink failure
+    /// handling) tests: the `n`-th call (1-based, counting `write_bytes`/`write_packet_data` calls
+    /// together) fails exactly once with an injected error, and/or `flush` fails for as long as
+    /// `set_fail_flush(true)` is in effect. `truncate`/`overwrite_header` always pass straight
+    /// through to the wrapped sink.
+    #[derive(Clone, Default, Debug)]
+    struct FailingSink {
+        inner: SharedSink,
+        fail_write_at: Arc<Mutex<usize>>,
+        write_calls: Arc<Mutex<usize>>,
+        fail_flush: Arc<Mutex<bool>>,
+    }
+
+    impl FailingSink {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        /// The `n`-th write call (1-based) fails; `0` (the default) never fails a write.
+        fn fail_write_at(self, n: usize) -> Self {
+            *self.fail_write_at.lock().unwrap() = n;
+            self
+        }
+
+        fn set_fail_flush(&self, fail: bool) {
+            *self.fail_flush.lock().unwrap() = fail;
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.inner.snapshot()
+        }
+
+        fn injected_error() -> ReplayFileWriteError {
+            ReplayFileWriteError::Other { explanation: Cow::Borrowed("injected write failure") }
+        }
+
+        /// Bumps the call counter and reports whether THIS call is the one that should fail.
+        fn bump_and_check(&self) -> bool {
+            let mut calls = self.write_calls.lock().unwrap();
+            *calls += 1;
+            let at = *self.fail_write_at.lock().unwrap();
+            at != 0 && *calls == at
+        }
+    }
+
+    impl ReplayFileSink for FailingSink {
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), ReplayFileWriteError> {
+            if self.bump_and_check() {
+                return Err(Self::injected_error());
+            }
+            self.inner.write_bytes(bytes)
+        }
+        fn truncate(&mut self, size: u64) -> Result<(), ReplayFileWriteError> {
+            self.inner.truncate(size)
+        }
+        fn overwrite_header(&mut self, header_data: &ReplayHeaderBytes) -> Result<(), ReplayFileWriteError> {
+            self.inner.overwrite_header(header_data)
+        }
+        fn write_packet_data(&mut self, instructions: &[PacketWriteCommand<'_>]) -> Result<usize, ReplayFileWriteError> {
+            if self.bump_and_check() {
+                return Err(Self::injected_error());
+            }
+            self.inner.write_packet_data(instructions)
+        }
+        fn flush(&mut self) -> Result<(), ReplayFileWriteError> {
+            if *self.fail_flush.lock().unwrap() {
+                return Err(ReplayFileWriteError::Other { explanation: Cow::Borrowed("injected flush failure") });
+            }
+            Ok(())
         }
     }
 
@@ -1362,5 +1590,198 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    /// A keyframe timestamp going backwards is bad input, not a crash: `insert_keyframe` must
+    /// return `Err(BadInput)` and leave the recorder fully usable afterwards.
+    #[test]
+    fn keyframe_timestamp_backwards_is_bad_input_not_a_panic() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+
+        recorder.next_frame(16u64.into()).unwrap();
+        let err = recorder.insert_keyframe(bv(&state_for(1)), 8u64.into()).unwrap_err();
+        assert!(matches!(err, ReplayFileWriteError::BadInput { .. }), "{err:?}");
+        assert!(!recorder.is_closed(), "a bad-input error must not close or poison the recorder");
+
+        // The recorder keeps working: a later (non-backwards) keyframe and close() still succeed.
+        recorder.next_frame(32u64.into()).unwrap();
+        recorder.insert_keyframe(bv(&state_for(2)), 32u64.into()).unwrap();
+        let (closed, _) = recorder.close().unwrap();
+
+        let player = ReplayFilePlayer::new(&closed, false).unwrap();
+        assert_eq!(player.get_total_frames(), 2);
+    }
+
+    /// `apply_masks` overwrites the transient (masked) ranges of a state in place; when
+    /// `insert_keyframe_with` falls back to storing a full (undiffed) keyframe after having
+    /// masked, it must restore exactly what was there before -- full keyframes are documented to
+    /// reconstruct bit-exactly, so masking must never leak into one. This verifies that guarantee
+    /// directly: restoring what `apply_masks` returns must exactly undo its effect, for a
+    /// wholesale-rewritten frame (so masking has a real, non-trivial effect: the two states'
+    /// masked ranges genuinely differ).
+    ///
+    /// This does not go through `ReplayFileRecorder`/`insert_keyframe`, because doing so cannot
+    /// actually reach the full-keyframe-fallback branch while masking has a real effect: masking
+    /// only ever removes bytes from the region-diff's consideration, so it can only ever shrink
+    /// the encoded delta, never make it larger than the full state -- and the masked range is a
+    /// small, fixed-size fraction of a real GBA or NDS state either way, so no amount of
+    /// "everything else differs" content can make up for what masking saves. (Confirmed
+    /// empirically too: driving this exact before/after pair through the recorder stores it as a
+    /// `RegionDeltaKeyframe`, not a full one.) The normal, always-happens-in-practice case --
+    /// masking applied, a delta chosen -- is covered by `transient_buffer_masks_are_applied_per_chain`.
+    #[test]
+    fn fallback_full_keyframes_are_exact_when_masked() {
+        use crate::replay_file::ReplayConsoleType;
+
+        let base = pseudo_random_bytes(0x6BA, 0x61000 + 1024);
+        let sound_info = 0x19000 + 0x6380;
+
+        let mut prev = base.clone();
+        prev[0..4].copy_from_slice(&0x0100_000Au32.to_le_bytes());
+        prev[0x19000 + 0x7FF0..0x19000 + 0x7FF4].copy_from_slice(&0x0300_6380u32.to_le_bytes());
+        prev[sound_info..sound_info + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
+        prev[sound_info + 0x350..sound_info + 0x350 + 0xC60].copy_from_slice(&pseudo_random_bytes(1, 0xC60));
+
+        // A wholesale rewrite, except for the bytes that make it recognisable as the same layout
+        // (magic, the m4a SoundInfo pointer, its ident) -- so the masked (PCM buffer) range is the
+        // same range as `prev`'s, and its content genuinely differs (so masking has a real effect).
+        let mut cur = prev.clone();
+        for b in cur.iter_mut() {
+            *b = b.wrapping_add(1);
+        }
+        cur[0..4].copy_from_slice(&prev[0..4]);
+        cur[0x19000 + 0x7FF0..0x19000 + 0x7FF4].copy_from_slice(&prev[0x19000 + 0x7FF0..0x19000 + 0x7FF4]);
+        cur[sound_info..sound_info + 4].copy_from_slice(&prev[sound_info..sound_info + 4]);
+
+        let original = cur.clone();
+        let masked = crate::keyframe_masks::apply_masks(ReplayConsoleType::GameBoyAdvance, &prev, &mut cur);
+        assert!(!masked.is_empty(), "the PCM buffer must have actually been recognised and masked");
+        assert_ne!(cur, original, "masking must have had a real effect (the PCM buffers genuinely differ)");
+
+        // Exactly what insert_keyframe_with's full-keyframe fallback does with `masked`.
+        for (range, original_bytes) in &masked {
+            cur[range.clone()].copy_from_slice(original_bytes);
+        }
+        assert_eq!(cur, original, "restoring what apply_masks overwrote must exactly undo it");
+    }
+
+    /// If the final sink's blob write fails, the blob (and its keyframes) is retained rather than
+    /// lost: the failing call returns `Err`, but a later call that reaches `next_blob` again (here,
+    /// simply retrying the same keyframe) succeeds once the sink stops failing, and `close()`
+    /// produces a file that plays back exactly.
+    #[test]
+    fn final_sink_failure_keeps_the_blob_and_retries() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+
+        // max_frames_per_blob = 1: inserting keyframe #2 (frame 1) forces blob #1 (holding just
+        // keyframe #1, frame 0) to flush. That flush is the final sink's 3rd write (after the
+        // header and the empty patch), which is where the one injected failure lands.
+        let final_sink = FailingSink::new().fail_write_at(3);
+        let temp = SharedSink::default();
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(1, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), final_sink.clone(), temp.clone()
+        ).unwrap();
+
+        recorder.next_frame(16u64.into()).unwrap();
+        let err = recorder.insert_keyframe(bv(&state_for(1)), 16u64.into()).unwrap_err();
+        assert!(matches!(err, ReplayFileWriteError::Other { .. }), "{err:?}");
+        assert!(!recorder.is_closed());
+        assert!(recorder.is_poisoned(), "the final sink failed and has not yet retried successfully");
+
+        // Retry: current_blob_keyframes still holds keyframe #1 untouched (it was never cleared,
+        // since the failed next_blob() returned before insert_keyframe_with got that far), so
+        // re-inserting the exact same keyframe flushes the SAME blob -- and this time the sink's
+        // one injected failure has already been consumed, so it succeeds.
+        recorder.insert_keyframe(bv(&state_for(1)), 16u64.into()).unwrap();
+        assert!(!recorder.is_poisoned());
+
+        recorder.next_frame(32u64.into()).unwrap();
+        recorder.insert_keyframe(bv(&state_for(2)), 32u64.into()).unwrap();
+
+        let (final_sink, _temp) = recorder.close().unwrap();
+        let closed = final_sink.snapshot();
+
+        let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+        assert_eq!(player.get_total_frames(), 2);
+        for frame in [0u64, 1, 2] {
+            player.go_to_keyframe(frame).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { state, metadata }) => {
+                    assert_eq!(metadata.elapsed_frames, frame);
+                    assert_eq!(state.as_slice(), state_for(frame).as_slice(), "frame {frame}");
+                }
+                other => panic!("expected keyframe {frame}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A temp-sink failure is surfaced exactly once (as `TempSink`), recorded on the recorder, and
+    /// otherwise has no effect: the recording continues normally and the final file is unaffected.
+    #[test]
+    fn temp_sink_failure_does_not_stop_the_recording() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+
+        // Temp write calls so far once construction finishes: #1 header, #2 (empty) patch, #3 the
+        // frame-0 keyframe. #4 is the first `next_frame`, which is where the one injected failure
+        // lands.
+        let final_sink = SharedSink::default();
+        let temp = FailingSink::new().fail_write_at(4);
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), final_sink.clone(), temp.clone()
+        ).unwrap();
+        assert!(recorder.temp_sink_failed().is_none());
+
+        let err = recorder.next_frame(16u64.into()).unwrap_err();
+        assert!(matches!(err, ReplayFileWriteError::TempSink { .. }), "{err:?}");
+        assert!(recorder.temp_sink_failed().is_some());
+        assert!(!recorder.is_poisoned(), "a temp failure must not poison the final sink");
+
+        // Later operations succeed normally: the temp mirror is silently abandoned, but the
+        // recording (backed by the final sink) is unaffected.
+        recorder.insert_keyframe(bv(&state_for(1)), 16u64.into()).unwrap();
+        recorder.next_frame(32u64.into()).unwrap();
+        recorder.insert_keyframe(bv(&state_for(2)), 32u64.into()).unwrap();
+        assert!(recorder.temp_sink_failed().is_some());
+
+        let (closed, _temp) = recorder.close().unwrap();
+        let closed = closed.snapshot();
+
+        let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+        assert_eq!(player.get_total_frames(), 2);
+        for frame in [0u64, 1, 2] {
+            player.go_to_keyframe(frame).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { state, metadata }) => {
+                    assert_eq!(metadata.elapsed_frames, frame);
+                    assert_eq!(state.as_slice(), state_for(frame).as_slice(), "frame {frame}");
+                }
+                other => panic!("expected keyframe {frame}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A flush error (previously silently swallowed for a buffered file sink) must reach the
+    /// caller instead of being treated as success.
+    #[test]
+    fn flush_errors_reach_close() {
+        let final_sink = FailingSink::new();
+        final_sink.set_fail_flush(true);
+        let temp = SharedSink::default();
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            make_metadata(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), final_sink.clone(), temp.clone()
+        ).unwrap();
+
+        recorder.next_frame(16u64.into()).unwrap();
+        recorder.insert_keyframe(bv(&state_for(1)), 16u64.into()).unwrap();
+
+        // No blob-size/frame cap is reached yet, so close() is what first flushes the in-progress
+        // blob: the write itself succeeds, but the sink's flush() fails, and that must abort the
+        // close (not be swallowed as `let _ = self.flush()` used to).
+        let (_final_sink, _temp, error) = recorder.close().unwrap_err();
+        assert!(matches!(error, ReplayFileWriteError::Other { .. }), "{error:?}");
     }
 }

@@ -19,9 +19,9 @@ use supershuckie_memory_tools::{DisplayBase, Number, ValueFormat, ValueType};
 fn make_core(path: &str) -> ThreadedSuperShuckieCore {
     let rom = std::fs::read(path).expect("read rom");
     let core: Box<dyn EmulatorCore> = if path.ends_with(".nds") {
-        Box::new(NintendoDS::new_from_rom(&rom, None, std_timestamp_provider(), false))
+        Box::new(NintendoDS::new_from_rom(&rom, None, std_timestamp_provider(), false).expect("load nds rom"))
     } else {
-        Box::new(GameBoyAdvance::new_from_rom(&rom, None, &[], std_timestamp_provider()))
+        Box::new(GameBoyAdvance::new_from_rom(&rom, None, &[], std_timestamp_provider()).expect("load gba rom"))
     };
     ThreadedSuperShuckieCore::new(core)
 }

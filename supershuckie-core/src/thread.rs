@@ -4,14 +4,15 @@ use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink}
 use crate::{std_timestamp_provider, AudioOutput, BookmarkAnchor, BookmarkAnchorError, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
 use spin::RwLock;
-use std::borrow::ToOwned;
+use std::borrow::{Cow, ToOwned};
 use std::boxed::Box;
 use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::format;
 use std::fs::File;
-use std::string::String;
+use std::string::{String, ToString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
 use std::vec::Vec;
@@ -19,15 +20,34 @@ use supershuckie_pokeabyte_integration::PokeAByteEmulatorCommand;
 #[cfg(feature = "pokeabyte")]
 use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
-use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ResumeCropPolicy};
+use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 use supershuckie_replay_recorder::{BookmarkTable, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
+
+/// The core thread has exited (its command channel is disconnected, or a reply channel was
+/// dropped without an answer). No further command reaches it; reload the ROM to get a working
+/// core again. See [`ThreadedSuperShuckieCore::is_alive`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct CoreThreadDead;
+
+impl Display for CoreThreadDead {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The emulator thread has stopped; reload the ROM.")
+    }
+}
+
+impl std::error::Error for CoreThreadDead {}
 
 /// A (mostly) non-blocking, threaded wrapper for [`SuperShuckieCore`].
 pub struct ThreadedSuperShuckieCore {
     screens: Arc<Mutex<Vec<ScreenData>>>,
     sender: Sender<ThreadCommand>,
     receiver_close: Receiver<()>,
+
+    /// Whether the core thread is (as far as this wrapper knows) still alive. Set to `false` the
+    /// first time a send or a reply receive finds the channel disconnected; every method that
+    /// talks to the thread checks/updates it instead of panicking. See [`Self::is_alive`].
+    alive: AtomicBool,
 
     desired_replay_frame: Arc<AtomicU32>,
     delta_replay_frames: Arc<AtomicI32>,
@@ -37,11 +57,24 @@ pub struct ThreadedSuperShuckieCore {
     playback_paused: Arc<AtomicBool>,
     replay_stalled: Arc<AtomicBool>,
 
+    /// Whether a replay is attached (playing or stopped).
     playback: bool,
+    /// Whether the attached replay is stopped (see [`Self::stop_replay_playback`]).
+    playback_stopped: bool,
     playback_total_frames: UnsignedInteger,
     playback_total_milliseconds: TimestampMillis,
     replay_errors: Arc<Mutex<Vec<ReplayFileWriteError>>>,
     replay_counters: Arc<Mutex<BTreeMap<String, SignedInteger>>>,
+
+    /// Errors from the atomics-driven seek path (`go_to_replay_frame`/`advance_playback_frames`
+    /// are fire-and-forget, so a failed seek has nowhere else to report to) and from unstalling on
+    /// `start()`; see [`Self::take_playback_errors`].
+    playback_errors: Arc<Mutex<Vec<String>>>,
+
+    /// The cancel flag of the currently running video export, if any, so [`Drop`] can abort it
+    /// instead of the thread running the export to completion (or hanging) with nobody left to
+    /// read the result.
+    current_export_cancel: Mutex<Option<Arc<AtomicBool>>>,
 
     /// The core thread, to wake it early from a paused wait.
     thread: Option<std::thread::Thread>,
@@ -59,6 +92,11 @@ pub struct ElapsedTimeStats {
     pub milliseconds: u32,
     pub frames: u32,
     pub speed: Speed,
+
+    /// The attached replay's position: the frame being played back (`frames`), or, while the
+    /// replay is stopped, the frame playback resumes from while `frames` keeps counting the live
+    /// play (see `SuperShuckieCore::replay_position`). 0 without a replay.
+    pub replay_frame: u32,
 
     /// Incremented every time a newly drawn frame is published to `read_screens`. Frames that
     /// were emulated but not drawn (fast-forward) do not change it, so compare this rather than
@@ -125,6 +163,7 @@ impl ThreadedSuperShuckieCore {
         let replay_counters = Arc::new(Mutex::new(BTreeMap::new()));
         let playback_paused = Arc::new(AtomicBool::new(false));
         let replay_stalled = Arc::new(AtomicBool::new(false));
+        let playback_errors = Arc::new(Mutex::new(Vec::new()));
 
         let elapsed_time = Arc::new(RwLock::new(ElapsedTimeStats::default()));
         let frame_times = Arc::new(RwLock::new(FrameTimeStats::default()));
@@ -141,6 +180,7 @@ impl ThreadedSuperShuckieCore {
             let replay_counters = replay_counters.clone();
             let playback_paused = playback_paused.clone();
             let replay_stalled = replay_stalled.clone();
+            let playback_errors = playback_errors.clone();
             std::thread::Builder::new().name("ThreadedSuperShuckieCore".to_owned()).spawn(move || {
                 mark_thread_latency_sensitive();
                 ThreadedSuperShuckieCoreThread {
@@ -162,9 +202,11 @@ impl ThreadedSuperShuckieCore {
                     replay_errors,
                     replay_counters,
                     replay_stalled,
+                    playback_errors,
                     playback_frozen: false,
                     freezes: BTreeMap::new(),
                     last_pokeabyte_freeze: None,
+                    last_pokeabyte_read: None,
                     memory_monitor: None,
                     playback_paused
                 }.run_thread();
@@ -175,6 +217,7 @@ impl ThreadedSuperShuckieCore {
             sender,
             screens,
             receiver_close,
+            alive: AtomicBool::new(true),
             playback_total_frames,
             playback_total_milliseconds,
             replay_errors,
@@ -182,7 +225,10 @@ impl ThreadedSuperShuckieCore {
             frame_times,
             emulated_frames,
             replay_counters,
+            playback_errors,
+            current_export_cancel: Mutex::new(None),
             playback: false,
+            playback_stopped: false,
             desired_replay_frame,
             delta_replay_frames,
             playback_paused,
@@ -212,10 +258,51 @@ impl ThreadedSuperShuckieCore {
         &self.rom_checksum
     }
 
+    /// Whether the core thread is still running, as far as this wrapper has observed. Once this
+    /// is `false` it never becomes `true` again; every method that talks to the thread degrades
+    /// gracefully instead of panicking (see [`CoreThreadDead`]).
+    #[inline]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Send `c` to the core thread without waiting for a reply. `Err(CoreThreadDead)` (and
+    /// [`Self::is_alive`] flipping to `false`) means the thread has exited; `c` is dropped
+    /// unsent.
+    fn send(&self, c: ThreadCommand) -> Result<(), CoreThreadDead> {
+        if self.sender.send(c).is_err() {
+            self.alive.store(false, Ordering::Relaxed);
+            return Err(CoreThreadDead)
+        }
+        Ok(())
+    }
+
+    /// Send a command built from a fresh reply channel (via `make`) and block for the answer.
+    /// `Err(CoreThreadDead)` if the thread has exited, either before the command could be sent or
+    /// while it was being processed (the reply channel closes when the thread's copy of the
+    /// sender half is dropped without ever calling `send`).
+    fn call<T>(&self, make: impl FnOnce(Sender<T>) -> ThreadCommand) -> Result<T, CoreThreadDead> {
+        let (sender, receiver) = channel();
+        self.send(make(sender))?;
+        receiver.recv().map_err(|_| {
+            self.alive.store(false, Ordering::Relaxed);
+            CoreThreadDead
+        })
+    }
+
+    /// Take (clearing) the errors accumulated from the atomics-driven seek path
+    /// (`go_to_replay_frame`/`advance_playback_frames`) and from unstalling playback on
+    /// [`Self::start`]. Those commands are fire-and-forget, so this is the only way to observe a
+    /// failed seek.
+    pub fn take_playback_errors(&self) -> Vec<String> {
+        let mut errors = self.playback_errors.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *errors)
+    }
+
     /// Attach (or with `None`, detach) the RAM tools' memory monitor. The core thread services it
     /// between frames (see [`crate::memory_monitor`]).
     pub fn set_memory_monitor(&self, monitor: Option<Arc<MemoryMonitorShared>>) {
-        let _ = self.sender.send(ThreadCommand::SetMemoryMonitor(monitor));
+        let _ = self.send(ThreadCommand::SetMemoryMonitor(monitor));
         self.wake();
     }
 
@@ -249,66 +336,67 @@ impl ThreadedSuperShuckieCore {
     /// Note that while this function is running, the screen buffer will be blocked from being
     /// updated and may not be immediately updated until later.
     pub fn read_screens<T, F: FnOnce(&[ScreenData]) -> T>(&self, reader: F) -> T {
-        let lock = self.screens.lock().expect("screen mutex is poisoned");
+        let lock = self.screens.lock().unwrap_or_else(|p| p.into_inner());
         reader(lock.as_slice())
     }
 
     /// Start running continuously.
     ///
-    /// NOTE: This is blocking.
+    /// NOTE: This is blocking (as long as the core thread is alive; returns immediately if it is
+    /// not).
     pub fn start(&self) {
         if !self.playback_paused.load(Ordering::Relaxed) {
             return
         }
 
         let (sender, receiver) = channel();
-        self.sender.send(ThreadCommand::Start(sender))
-            .expect("Start - the core thread has crashed");
-        let _ = receiver.recv();
+        if self.send(ThreadCommand::Start(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
     }
 
     /// Pause running.
     ///
-    /// NOTE: This is blocking.
+    /// NOTE: This is blocking (as long as the core thread is alive; returns immediately if it is
+    /// not).
     pub fn pause(&self) {
         if self.playback_paused.load(Ordering::Relaxed) {
             return
         }
 
         let (sender, receiver) = channel();
-        self.sender.send(ThreadCommand::Pause(sender))
-            .expect("Pause - the core thread has crashed");
-        let _ = receiver.recv();
+        if self.send(ThreadCommand::Pause(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
     }
 
     /// Block until this command is reached.
     pub fn rendezvous(&self) {
         let (sender, receiver) = channel();
-        self.sender.send(ThreadCommand::Rendezvous(sender))
-            .expect("Pause - the core thread has crashed");
-        let _ = receiver.recv();
+        if self.send(ThreadCommand::Rendezvous(sender)).is_ok() {
+            let _ = receiver.recv();
+        }
     }
 
     /// Pause running temporarily.
     pub fn set_playback_frozen(&self, paused: bool) {
-        self.sender.send(ThreadCommand::SetPlaybackFrozen(paused))
-            .expect("SetPlaybackFrozen - the core thread has crashed");
+        let _ = self.send(ThreadCommand::SetPlaybackFrozen(paused));
     }
 
     /// Attach/detach a Poke-A-Byte integration server.
     pub fn set_pokeabyte_enabled(&self, enabled: bool) -> Result<(), String> {
-        let (sender, receiver) = channel();
-
-        self.sender.send(ThreadCommand::SetPokeAByteEnabled(enabled, sender))
-            .expect("SetPokeAByteEnabled - the core thread has crashed");
-
-        receiver.recv().ok().unwrap_or(Ok(()))
+        match self.call(|sender| ThreadCommand::SetPokeAByteEnabled(enabled, sender)) {
+            Ok(r) => r,
+            Err(dead) => Err(dead.to_string()),
+        }
     }
 
-    /// Stop recording replay.
-    pub fn start_recording_replay(&self, metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>) {
-        self.sender.send(ThreadCommand::StartRecordingReplay(metadata))
-            .expect("StopRecordingReplay - the core thread has crashed");
+    /// Start recording a replay.
+    pub fn start_recording_replay(&self, metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>) -> Result<(), ReplayFileWriteError> {
+        match self.call(|reply| ThreadCommand::StartRecordingReplay(metadata, reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(ReplayFileWriteError::Other { explanation: Cow::Owned(dead.to_string()) }),
+        }
     }
 
     /// Resume recording from an existing replay.
@@ -316,34 +404,44 @@ impl ThreadedSuperShuckieCore {
     /// The source replay must already be attached for playback (e.g. via `attach_replay_player`);
     /// the core thread consumes that attached player to build the new file's prefix.
     /// `resume_at_frame == None` resumes from the final frame.
+    ///
+    /// The wrapper's cached playback state (see [`Self::is_playing_back`]) is only cleared on
+    /// success; a failed resume leaves the source player attached and playing back on the core
+    /// thread (see `SuperShuckieCore::resume_recording_replay`), so the wrapper's view of it stays
+    /// accurate too.
     pub fn resume_recording_replay(
         &mut self,
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
         bookmarks: Option<BookmarkTable>,
-    ) {
-        // The source replay was attached for positioning; resuming transitions us out of playback
-        // and into live recording, so clear the wrapper's playback state (mirrors detach).
-        self.playback_total_frames = 0;
-        self.playback_total_milliseconds = 0.into();
-        self.playback = false;
-        self.sender.send(ThreadCommand::ResumeRecordingReplay {
+    ) -> Result<(), ReplayResumeError> {
+        let result = match self.call(|reply| ThreadCommand::ResumeRecordingReplay {
             resume_at_frame,
             metadata,
             crop_policy,
             bookmarks,
-        }).expect("ResumeRecordingReplay - the core thread has crashed");
+            reply,
+        }) {
+            Ok(r) => r,
+            Err(dead) => Err(ReplayResumeError::BadSource { explanation: Cow::Owned(dead.to_string()) }),
+        };
+
+        if result.is_ok() {
+            // Resuming transitions us out of playback and into live recording, so clear the
+            // wrapper's playback state (mirrors detach).
+            self.playback_total_frames = 0;
+            self.playback_total_milliseconds = 0.into();
+            self.playback = false;
+            self.playback_stopped = false;
+        }
+
+        result
     }
 
     /// Stop recording replay.
     pub fn stop_recording_replay(&self) -> bool {
-        let (sender, receiver) = channel();
-
-        self.sender.send(ThreadCommand::StopRecordingReplay(sender))
-            .expect("StopRecordingReplay - the core thread has crashed");
-
-        receiver.recv().ok().unwrap_or(false)
+        self.call(|sender| ThreadCommand::StopRecordingReplay(sender)).unwrap_or(false)
     }
 
     /// Begin a blocking video export on the core thread.
@@ -351,6 +449,9 @@ impl ThreadedSuperShuckieCore {
     /// A replay must already be attached for playback (the export reuses the attached player).
     /// While the export runs, normal playback/stepping on the core thread is paused. Returns a
     /// [`VideoExportHandle`] to poll progress, cancel, and retrieve the result.
+    ///
+    /// If the core thread has already exited, the returned handle observes that immediately (see
+    /// [`VideoExportHandle::poll_done`]).
     pub fn export_replay(
         &self,
         sink: Box<dyn VideoFrameSink>,
@@ -361,14 +462,18 @@ impl ThreadedSuperShuckieCore {
         let progress = Arc::new(RwLock::new((0u64, 0u64)));
         let (done_sender, done_receiver) = channel();
 
-        self.sender.send(ThreadCommand::ExportVideo {
+        // So `Drop` can abort this export instead of waiting for it (or the whole thread) to run
+        // to completion with nobody left to read the result.
+        *self.current_export_cancel.lock().unwrap_or_else(|p| p.into_inner()) = Some(cancel.clone());
+
+        let _ = self.send(ThreadCommand::ExportVideo {
             sink,
             range,
             layout,
             cancel: cancel.clone(),
             progress: progress.clone(),
             done: done_sender,
-        }).expect("ExportVideo - the core thread has crashed");
+        });
 
         VideoExportHandle {
             cancel,
@@ -379,14 +484,12 @@ impl ThreadedSuperShuckieCore {
 
     /// Enqueue an input.
     pub fn enqueue_input(&self, input: Input) {
-        self.sender.send(ThreadCommand::EnqueueInput(input))
-            .expect("EnqueueInput - the core thread has crashed");
+        let _ = self.send(ThreadCommand::EnqueueInput(input));
     }
 
     /// Set the speed.
     pub fn set_speed(&self, speed: Speed) {
-        self.sender.send(ThreadCommand::SetSpeed(speed))
-            .expect("SetSpeed - the core thread has crashed");
+        let _ = self.send(ThreadCommand::SetSpeed(speed));
     }
 
     /// Reset the frame-time diagnostics (max, over-budget and measured counts).
@@ -396,56 +499,103 @@ impl ThreadedSuperShuckieCore {
 
     /// Set the speed.
     pub fn hard_reset(&self) {
-        self.sender.send(ThreadCommand::HardReset)
-            .expect("HardReset - the core thread has crashed");
+        let _ = self.send(ThreadCommand::HardReset);
     }
 
     /// Set the rapid fire input.
     pub fn set_rapid_fire_input(&self, input: Option<SuperShuckieRapidFire>) {
-        self.sender.send(ThreadCommand::SetRapidFireInput(input))
-            .expect("SetRapidFireInput - the core thread has crashed");
+        let _ = self.send(ThreadCommand::SetRapidFireInput(input));
     }
 
     /// Set the toggle input.
     pub fn set_toggled_input(&self, input: Option<Input>) {
-        self.sender.send(ThreadCommand::SetToggledInput(input))
-            .expect("SetToggledInput - the core thread has crashed");
+        let _ = self.send(ThreadCommand::SetToggledInput(input));
     }
 
     /// Create a save state.
     ///
-    /// Returns `None` if no save state could be created for some unknown reason.
+    /// Returns `None` if no save state could be created for some unknown reason (including the
+    /// core thread having exited).
     ///
     /// NOTE: This is blocking.
     pub fn create_save_state(&self) -> Option<Vec<u8>> {
-        let (sender, receiver) = channel();
-        self.sender.send(ThreadCommand::CreateSaveState(sender))
-            .expect("CreateSaveState - the core thread has crashed");
-        receiver.recv().ok()
+        self.call(|sender| ThreadCommand::CreateSaveState(sender)).ok()
     }
 
     /// Load a save state.
     pub fn load_save_state(&self, state: Vec<u8>) {
-        self.sender.send(ThreadCommand::LoadSaveState(state))
-            .expect("LoadSaveState - the core thread has crashed");
+        let _ = self.send(ThreadCommand::LoadSaveState(state));
     }
 
     /// Get SRAM.
     ///
-    /// Returns `None` if SRAM could not be read for some unknown reason.
+    /// Returns `None` if SRAM could not be read for some unknown reason (including the core
+    /// thread having exited).
     ///
     /// NOTE: This is blocking.
     pub fn get_sram(&self) -> Option<Vec<u8>> {
-        let (sender, receiver) = channel();
-        self.sender.send(ThreadCommand::SaveSRAM(sender))
-            .expect("SaveSRAM - the core thread has crashed");
-        receiver.recv().ok()
+        self.call(|sender| ThreadCommand::SaveSRAM(sender)).ok()
     }
 
-    /// Get whether or not a replay is being played back.
+    /// Get whether or not a replay is being played back (attached and not stopped).
     #[inline]
     pub fn is_playing_back(&self) -> bool {
+        self.playback && !self.playback_stopped
+    }
+
+    /// Get whether a replay is attached, playing or stopped.
+    #[inline]
+    pub fn has_replay_attached(&self) -> bool {
         self.playback
+    }
+
+    /// Get whether the attached replay is stopped (see [`Self::stop_replay_playback`]).
+    #[inline]
+    pub fn is_replay_playback_stopped(&self) -> bool {
+        self.playback && self.playback_stopped
+    }
+
+    /// Stop the attached replay from driving the emulator without detaching it; the game runs
+    /// on live under the user's input from the current frame, and the replay can still be seeked
+    /// in ([`Self::go_to_replay_frame`]) and resumed ([`Self::resume_replay_playback`]). See
+    /// `SuperShuckieCore::stop_replay_playback`.
+    ///
+    /// NOTE: This is blocking (as long as the core thread is alive).
+    pub fn stop_replay_playback(&mut self) {
+        if !self.is_playing_back() {
+            return
+        }
+        let _ = self.call(|reply| ThreadCommand::StopReplayPlayback(reply));
+        self.playback_stopped = true;
+    }
+
+    /// Resume playing back a stopped replay from where it was stopped or last seeked to (see
+    /// `SuperShuckieCore::resume_replay_playback`). Does nothing unless stopped.
+    ///
+    /// NOTE: This is blocking (as long as the core thread is alive): the emulator has to be put
+    /// back at the resume point first.
+    pub fn resume_replay_playback(&mut self) -> Result<(), String> {
+        if !self.is_replay_playback_stopped() {
+            return Ok(())
+        }
+        // Playing back again either way: a failed seek leaves the core stalled in the replay,
+        // which is how any other failed seek ends up too.
+        self.playback_stopped = false;
+        match self.call(|reply| ThreadCommand::ResumeReplayPlayback(reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(dead.to_string()),
+        }
+    }
+
+    /// Put a stopped replay's emulator back at its resume point without resuming playback (see
+    /// `SuperShuckieCore::go_to_replay_resume_point`). Does nothing unless stopped. Like
+    /// [`Self::go_to_replay_frame`] this is fire-and-forget; a failure surfaces through
+    /// [`Self::take_playback_errors`].
+    pub fn go_to_replay_resume_point(&self) {
+        if !self.is_replay_playback_stopped() {
+            return
+        }
+        let _ = self.send(ThreadCommand::GoToReplayResumePoint);
     }
 
     /// Get the total number of frames in the current playback.
@@ -461,29 +611,45 @@ impl ThreadedSuperShuckieCore {
     }
 
     /// Load the replay.
+    ///
+    /// On `Err(ReplayPlayerAttachError::Failed { .. })` the core detached itself (see
+    /// `SuperShuckieCore::attach_replay_player`), so the wrapper's cached playback state is
+    /// cleared to match. On any other error (including a dead core thread, which maps to
+    /// `Failed`) or on success, the wrapper's playback state is updated/left as documented below.
     pub fn attach_replay_player(&mut self, mut player: ReplayFilePlayer, allow_mismatch: bool) -> Result<(), ReplayPlayerAttachError> {
         player.enable_threading();
 
         let total_milliseconds = player.get_total_milliseconds();
         let total_frames = player.get_total_frames();
 
-        let (sender, receiver) = channel();
-
-        self.sender.send(ThreadCommand::AttachReplayPlayer {
+        let result = match self.call(|reply| ThreadCommand::AttachReplayPlayer {
             player,
             allow_mismatched: allow_mismatch,
-            errors: sender
-        }).expect("AttachReplayPlayer - the core thread has crashed");
+            reply
+        }) {
+            Ok(r) => r,
+            Err(dead) => Err(ReplayPlayerAttachError::Failed { description: dead.to_string() }),
+        };
 
-        match receiver.recv() {
-            Err(_) => {
+        match &result {
+            Ok(()) => {
                 self.playback_total_frames = total_frames;
                 self.playback_total_milliseconds = total_milliseconds;
                 self.playback = true;
-                Ok(())
-            },
-            Ok(n) => Err(n)
+                self.playback_stopped = false;
+            }
+            Err(ReplayPlayerAttachError::Failed { .. }) => {
+                self.playback_total_frames = 0;
+                self.playback_total_milliseconds = 0.into();
+                self.playback = false;
+                self.playback_stopped = false;
+            }
+            // Incompatible / MismatchedMetadata: the core rejected the attach before touching
+            // anything, so whatever was already attached (or not) is unchanged.
+            Err(_) => {}
         }
+
+        result
     }
 
     /// Detach a replay
@@ -491,8 +657,8 @@ impl ThreadedSuperShuckieCore {
         self.playback_total_frames = 0;
         self.playback_total_milliseconds = 0.into();
         self.playback = false;
-        self.sender.send(ThreadCommand::DetachReplayPlayer)
-            .expect("DetachReplayPlayer - the core thread has crashed")
+        self.playback_stopped = false;
+        let _ = self.send(ThreadCommand::DetachReplayPlayer);
     }
 
     /// Go to the desired frame.
@@ -512,22 +678,18 @@ impl ThreadedSuperShuckieCore {
 
     /// Get any replay recording errors.
     pub fn get_replay_recording_errors(&mut self) -> Vec<ReplayFileWriteError> {
-        self.replay_errors.clear_poison();
-        core::mem::take(&mut *self.replay_errors.lock().expect("get_replay_recording_errors fainted due to poison"))
+        let mut errors = self.replay_errors.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *errors)
     }
 
     /// Mark the start of the replay.
     pub fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(UnsignedInteger, TimestampMillis), ()> {
-        let (sender, receiver) = channel();
-        let _ = self.sender.send(ThreadCommand::MarkReplayStart(sender, timer_offset));
-        receiver.recv().map_err(|_| ())
+        self.call(|sender| ThreadCommand::MarkReplayStart(sender, timer_offset)).map_err(|_| ())
     }
 
     /// Mark the end of the replay.
     pub fn mark_end(&mut self) -> Result<(UnsignedInteger, TimestampMillis), ()> {
-        let (sender, receiver) = channel();
-        let _ = self.sender.send(ThreadCommand::MarkReplayEnd(sender));
-        receiver.recv().map_err(|_| ())
+        self.call(|sender| ThreadCommand::MarkReplayEnd(sender)).map_err(|_| ())
     }
 
     /// Longest a caller waits for the core thread to place a bookmark.
@@ -538,7 +700,12 @@ impl ThreadedSuperShuckieCore {
     /// NOTE: This is blocking (for at most half a second).
     pub fn bookmark_anchor(&self, keyframe: bool) -> Result<BookmarkAnchor, BookmarkAnchorError> {
         let (sender, receiver) = channel();
-        let _ = self.sender.send(ThreadCommand::BookmarkAnchor(sender, keyframe));
+        // The core thread must not write a bookmark (or the keyframe a keyframe bookmark forces)
+        // after we have given up waiting for it; hand it the deadline so it can skip a late one.
+        let deadline = Instant::now() + Self::BOOKMARK_TIMEOUT;
+        if self.send(ThreadCommand::BookmarkAnchor(sender, keyframe, deadline)).is_err() {
+            return Err(BookmarkAnchorError::Busy)
+        }
         self.wake();
         receiver.recv_timeout(Self::BOOKMARK_TIMEOUT).unwrap_or(Err(BookmarkAnchorError::Busy))
     }
@@ -548,7 +715,9 @@ impl ThreadedSuperShuckieCore {
     /// NOTE: This is blocking (for at most half a second).
     pub fn estimate_millis_at(&self, frame: UnsignedInteger) -> Result<Option<TimestampMillis>, BookmarkAnchorError> {
         let (sender, receiver) = channel();
-        let _ = self.sender.send(ThreadCommand::EstimateMillisAt(sender, frame));
+        if self.send(ThreadCommand::EstimateMillisAt(sender, frame)).is_err() {
+            return Err(BookmarkAnchorError::Busy)
+        }
         self.wake();
         receiver.recv_timeout(Self::BOOKMARK_TIMEOUT).map_err(|_| BookmarkAnchorError::Busy)
     }
@@ -556,58 +725,56 @@ impl ThreadedSuperShuckieCore {
     /// Replace the bookmarks of the replay being recorded (see
     /// [`SuperShuckieCore::set_replay_bookmarks`]).
     pub fn set_replay_bookmarks(&self, table: BookmarkTable) {
-        let _ = self.sender.send(ThreadCommand::SetReplayBookmarks(table));
+        let _ = self.send(ThreadCommand::SetReplayBookmarks(table));
     }
 
     /// Get the counters.
     #[inline]
     pub fn get_replay_counters(&self) -> BTreeMap<String, SignedInteger> {
-        self.replay_counters.lock().expect("couldn't get replay counters (thread crash?)").clone()
+        self.replay_counters.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Add an amount to a counter.
     #[inline]
     pub fn change_replay_counter(&mut self, name: String, delta: SignedInteger) {
-        let _ = self.sender.send(ThreadCommand::ChangeReplayCounter { name, delta });
+        let _ = self.send(ThreadCommand::ChangeReplayCounter { name, delta });
     }
 
     /// Set whether or not speed changes from replays are ignored.
     #[inline]
     pub fn set_ignore_speed_changes_in_replay(&self, ignored: bool) {
-        let _ = self.sender.send(ThreadCommand::IgnoreSpeedChangesInReplay(ignored));
+        let _ = self.send(ThreadCommand::IgnoreSpeedChangesInReplay(ignored));
     }
 
     /// Set whether or not to resync keyframes in replay playback.
     #[inline]
     pub fn set_auto_resync_keyframes_in_replay(&self, resync: bool) {
-        let _ = self.sender.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
+        let _ = self.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
     /// Route the audio of audible frames to `output` (`None` to stop).
     #[inline]
     pub fn set_audio_output(&self, output: Option<Arc<AudioOutput>>) {
-        let _ = self.sender.send(ThreadCommand::SetAudioOutput(output));
+        let _ = self.send(ThreadCommand::SetAudioOutput(output));
     }
 
     /// Turn audio rendering in the core on or off.
     #[inline]
     pub fn set_audio_enabled(&self, enabled: bool) {
-        let _ = self.sender.send(ThreadCommand::SetAudioEnabled(enabled));
+        let _ = self.send(ThreadCommand::SetAudioEnabled(enabled));
     }
 
     /// Discard audio while the game runs at any speed other than 1x.
     #[inline]
     pub fn set_audio_mute_when_sped_up(&self, mute: bool) {
-        let _ = self.sender.send(ThreadCommand::SetAudioMuteWhenSpedUp(mute));
+        let _ = self.send(ThreadCommand::SetAudioMuteWhenSpedUp(mute));
     }
 
     /// Transfer the given Poke-A-Byte integration if it is compatible.
     ///
     /// NOTE: This is blocking.
     pub fn transfer_pokeabyte_integration(&self, to: &ThreadedSuperShuckieCore) -> bool {
-        let (sender, receiver) = channel();
-        let _ = self.sender.send(ThreadCommand::TransferPokeAByteIntegrationExternal(sender, to.sender.clone()));
-        receiver.recv().unwrap_or(false)
+        self.call(|sender| ThreadCommand::TransferPokeAByteIntegrationExternal(sender, to.sender.clone())).unwrap_or(false)
     }
 
     /// Get whether or not playback is currently paused.
@@ -641,8 +808,17 @@ impl VideoExportHandle {
     }
 
     /// Non-blocking check for completion. `None` while still running.
+    ///
+    /// If the core thread closes (or crashes) before sending a result, this reports it as a sink
+    /// error rather than leaving the export looking perpetually in progress.
     pub fn poll_done(&self) -> Option<Result<(), VideoExportError>> {
-        self.done.try_recv().ok()
+        match self.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(VideoExportError::Sink {
+                explanation: std::borrow::Cow::Borrowed("the emulator thread closed before the export finished"),
+            })),
+        }
     }
 
     /// Block until the export completes and return its result.
@@ -655,6 +831,14 @@ impl VideoExportHandle {
 
 impl Drop for ThreadedSuperShuckieCore {
     fn drop(&mut self) {
+        // If a video export is running, the core thread will not even look at its command queue
+        // (let alone `Close`) until the export's blocking loop returns; flip its cancel flag
+        // first so it aborts at the next frame instead of running to completion (or hanging)
+        // while dropping us blocks on `receiver_close.recv()` below.
+        if let Some(cancel) = self.current_export_cancel.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+
         // we couldn't really care less if these succeed or fail; we just want to ensure that
         // the replay file is closed, and it should be (if it didn't error)
         let _ = self.sender.send(ThreadCommand::Close);
@@ -669,12 +853,13 @@ enum ThreadCommand {
     Pause(Sender<()>),
     SetPlaybackFrozen(bool),
     SetPokeAByteEnabled(bool, Sender<Result<(), String>>),
-    StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>),
+    StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, Sender<Result<(), ReplayFileWriteError>>),
     ResumeRecordingReplay {
         resume_at_frame: Option<UnsignedInteger>,
         metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>,
         crop_policy: ResumeCropPolicy,
         bookmarks: Option<BookmarkTable>,
+        reply: Sender<Result<(), ReplayResumeError>>,
     },
     ExportVideo {
         sink: Box<dyn VideoFrameSink>,
@@ -688,9 +873,12 @@ enum ThreadCommand {
     AttachReplayPlayer {
         player: ReplayFilePlayer,
         allow_mismatched: bool,
-        errors: Sender<ReplayPlayerAttachError>
+        reply: Sender<Result<(), ReplayPlayerAttachError>>
     },
     DetachReplayPlayer,
+    StopReplayPlayback(Sender<()>),
+    ResumeReplayPlayback(Sender<Result<(), String>>),
+    GoToReplayResumePoint,
     EnqueueInput(Input),
     SetRapidFireInput(Option<SuperShuckieRapidFire>),
     SetToggledInput(Option<Input>),
@@ -701,7 +889,11 @@ enum ThreadCommand {
     SaveSRAM(Sender<Vec<u8>>),
     MarkReplayStart(Sender<(UnsignedInteger, TimestampMillis)>, TimestampMillis),
     MarkReplayEnd(Sender<(UnsignedInteger, TimestampMillis)>),
-    BookmarkAnchor(Sender<Result<BookmarkAnchor, BookmarkAnchorError>>, bool),
+    /// `Instant` is the deadline the wrapper is willing to wait until; the handler skips placing
+    /// the bookmark (and, for a keyframe bookmark, writing its keyframe) if it is reached, so a
+    /// caller that gave up waiting never gets an orphan keyframe written later (see
+    /// [`ThreadedSuperShuckieCoreThread::handle_command`]).
+    BookmarkAnchor(Sender<Result<BookmarkAnchor, BookmarkAnchorError>>, bool, Instant),
     EstimateMillisAt(Sender<Option<TimestampMillis>>, UnsignedInteger),
     SetReplayBookmarks(BookmarkTable),
     Close,
@@ -744,6 +936,7 @@ struct ThreadedSuperShuckieCoreThread {
     delta_replay_frames: Arc<AtomicI32>,
     replay_errors: Arc<Mutex<Vec<ReplayFileWriteError>>>,
     replay_counters: Arc<Mutex<BTreeMap<String, SignedInteger>>>,
+    playback_errors: Arc<Mutex<Vec<String>>>,
     playback_paused: Arc<AtomicBool>,
     playback_frozen: bool,
 
@@ -760,6 +953,10 @@ struct ThreadedSuperShuckieCoreThread {
     freezes: BTreeMap<u64, ByteVec>,
     /// `(frame, state epoch)` the Poke-A-Byte freezes were last applied at.
     last_pokeabyte_freeze: Option<(u64, u64)>,
+    /// `(frame, state epoch)` the Poke-A-Byte shared-memory reads were last taken at (see
+    /// [`Self::handle_pokeabyte_integration`]: paced cores no longer report "mid-frame" on a
+    /// pacing miss, so this is what keeps the reads to once per emulated frame while running).
+    last_pokeabyte_read: Option<(u64, u64)>,
     replay_stalled: Arc<AtomicBool>,
 
     memory_monitor: Option<MemoryMonitorLocal>,
@@ -831,15 +1028,22 @@ impl ThreadedSuperShuckieCoreThread {
             return;
         }
 
-        if self.core.replay_stalled || self.core.mid_frame && self.core.core.frame_period_microseconds().is_none() {
+        if self.core.is_replay_stalled() || self.core.is_mid_frame() {
             // Not a pacing wait (Game Boy mid-frame stepping, or nothing to run): keep going.
             return;
         }
 
-        if let Some(until) = self.core.core.microseconds_until_next_frame() {
-            let until = Duration::from_micros(until);
-            if until > Self::WAKE_EARLY {
-                std::thread::sleep((until - Self::WAKE_EARLY).min(Self::MAX_FRAME_WAIT));
+        match self.core.core.microseconds_until_next_frame() {
+            Some(until) => {
+                let until = Duration::from_micros(until);
+                if until > Self::WAKE_EARLY {
+                    std::thread::sleep((until - Self::WAKE_EARLY).min(Self::MAX_FRAME_WAIT));
+                }
+            }
+            None => {
+                // No pacing information at all (e.g. a null core, if it ever got here despite
+                // `is_running` excluding it): sleep a bounded amount rather than spinning.
+                std::thread::sleep(Self::MAX_FRAME_WAIT);
             }
         }
     }
@@ -854,14 +1058,36 @@ impl ThreadedSuperShuckieCoreThread {
     fn go_to_desired_frame(&mut self) {
         let delta = self.delta_replay_frames.swap(0, Ordering::Relaxed);
         let frame = self.desired_replay_frame.swap(u32::MAX, Ordering::Relaxed);
+
+        let mut seeked = false;
+
+        // An absolute seek (if any) applies first, THEN the delta relative to the resulting
+        // frame -- both may be set in the same loop iteration (an app frame that both jumps and
+        // steps), and applying only one used to silently drop the other.
         if frame != u32::MAX {
-            self.core.go_to_replay_frame(frame as UnsignedInteger);
+            if let Err(e) = self.core.go_to_replay_frame(frame as UnsignedInteger) {
+                self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+            }
+            seeked = true;
         }
-        else if delta != 0 {
-            self.core.go_to_replay_frame(self.core.total_frames.saturating_add_signed(delta as i64));
+
+        if delta != 0 {
+            let target = self.core.total_frames.saturating_add_signed(delta as i64);
+            if let Err(e) = self.core.go_to_replay_frame(target) {
+                self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+            }
+            seeked = true;
         }
-        else {
+
+        if !seeked {
             return
+        }
+
+        // A seek in a stopped replay hands the emulator back live at the new frame, which restarts
+        // the wall-clock timer; keep it in step with the pause state (harmless while playing back,
+        // where the timer is not consulted).
+        if !self.is_running() {
+            self.core.pause_timer();
         }
 
         // We aren't really too focused on smooth playback as opposed to updating the buffer now!
@@ -907,6 +1133,7 @@ impl ThreadedSuperShuckieCoreThread {
             milliseconds: self.core.get_recording_milliseconds().0 as u32,
             frames: self.core.total_frames as u32,
             speed: self.core.game_speed,
+            replay_frame: self.core.replay_position().0 as u32,
             screen_generation: self.screen_generation
         };
     }
@@ -919,7 +1146,7 @@ impl ThreadedSuperShuckieCoreThread {
     /// holds the buffer right now). Frames that were emulated but not drawn only update the
     /// elapsed-time stats.
     fn refresh_screen_data(&mut self) {
-        if self.is_running() && self.core.mid_frame {
+        if self.is_running() && self.core.is_mid_frame() {
             return
         }
 
@@ -966,7 +1193,12 @@ impl ThreadedSuperShuckieCoreThread {
             return;
         }
 
-        self.core.force_stop_recording_replay();
+        // A `TempSink` error means only the crash-safe temp copy failed; the final file (and thus
+        // the recording) is still fine, so it is reported but does not stop the recording. Any
+        // other error means the final file itself is in trouble.
+        if errors.iter().any(|e| !matches!(e, ReplayFileWriteError::TempSink { .. })) {
+            self.core.force_stop_recording_replay();
+        }
         self.replay_errors.lock().expect("could not get replay errors mutex").extend(errors.into_iter());
     }
 
@@ -989,6 +1221,11 @@ impl ThreadedSuperShuckieCoreThread {
         }
     }
 
+    /// Freeze entries held at once; a Poke-A-Byte client that asks for more than this just stops
+    /// gaining new freezes (existing ones, and the one-shot write that came with a refused
+    /// request, are unaffected).
+    const MAX_POKEABYTE_FREEZES: usize = 256;
+
     /// Update RAM read/writes
     fn handle_pokeabyte_integration(&mut self) {
         let Some(integration) = self.pokeabyte_integration.as_ref() else {
@@ -1003,11 +1240,17 @@ impl ThreadedSuperShuckieCoreThread {
         for write in &mut session.writes {
             match write {
                 PokeAByteEmulatorCommand::Write { address, data } => {
-                    self.core.enqueue_write(address as u32, data);
+                    // A replay's `WriteMemory` packets are u32-addressed; an address that does not
+                    // fit is simply not something this core can write.
+                    let Ok(narrow_address) = u32::try_from(address) else { continue };
+                    self.core.enqueue_write(narrow_address, data);
                 },
                 PokeAByteEmulatorCommand::Freeze { address, data } => {
-                    self.core.enqueue_write(address as u32, data.clone());
-                    self.freezes.insert(address, data);
+                    let Ok(narrow_address) = u32::try_from(address) else { continue };
+                    self.core.enqueue_write(narrow_address, data.clone());
+                    if self.freezes.contains_key(&address) || self.freezes.len() < Self::MAX_POKEABYTE_FREEZES {
+                        self.freezes.insert(address, data);
+                    }
                 },
                 PokeAByteEmulatorCommand::Unfreeze { address } => {
                     self.freezes.remove(&address);
@@ -1020,18 +1263,30 @@ impl ThreadedSuperShuckieCoreThread {
 
         // don't update reads or apply freezes mid-frame; it's too slow
         let is_running = self.is_running();
-        if self.core.mid_frame && is_running {
+        if self.core.is_mid_frame() && is_running {
             return;
         }
 
+        let frame_key = (self.core.total_frames(), self.core.state_epoch());
+
         // apply freezes once per emulated frame regardless of frame skipping setting, and only when
         // the game changed the value (every write is recorded into a replay being recorded)
-        let freeze_key = (self.core.total_frames(), self.core.state_epoch());
-        if is_running && self.last_pokeabyte_freeze != Some(freeze_key) {
-            self.last_pokeabyte_freeze = Some(freeze_key);
+        if is_running && self.last_pokeabyte_freeze != Some(frame_key) {
+            self.last_pokeabyte_freeze = Some(frame_key);
             for (address, data) in &self.freezes {
                 self.core.write_if_changed(*address as u32, data.as_slice());
             }
+        }
+
+        // Reads are cheap to poll every loop while paused, but a paced core's thread loop calls
+        // this many times per emulated frame while running (it no longer reports "mid-frame" on a
+        // pacing miss -- see `EmulatorCore::is_mid_frame`); keep them to once per emulated frame,
+        // the same way the freeze restore above already does.
+        if is_running {
+            if self.last_pokeabyte_read == Some(frame_key) {
+                return;
+            }
+            self.last_pokeabyte_read = Some(frame_key);
         }
 
         // handle frame skipping unless we're paused (or we haven't set up yet)
@@ -1066,7 +1321,9 @@ impl ThreadedSuperShuckieCoreThread {
             ThreadCommand::Start(sender) => {
                 if self.playback_paused.swap(false, Ordering::Relaxed) {
                     if self.core.replay_stalled {
-                        self.core.go_to_replay_frame(0);
+                        if let Err(e) = self.core.go_to_replay_frame(0) {
+                            self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                        }
                     }
                     self.core.unpause_timer();
                 }
@@ -1099,23 +1356,23 @@ impl ThreadedSuperShuckieCoreThread {
                     let _ = err.send(Ok(()));
                 }
             }
-            ThreadCommand::StartRecordingReplay(metadata) => {
-                self.replay_errors.lock().expect("start recording replay failed to get replay errors").clear();
+            ThreadCommand::StartRecordingReplay(metadata, reply) => {
+                self.replay_errors.lock().unwrap_or_else(|p| p.into_inner()).clear();
 
-                // FIXME: error if this fails
-                self.core.start_recording_replay(metadata).expect("FAILED TO START RECORDING REPLAY OH NO");
-                if !self.is_running() {
+                let r = self.core.start_recording_replay(metadata);
+                if r.is_ok() && !self.is_running() {
                     self.core.pause_timer();
                 }
+                let _ = reply.send(r);
             }
-            ThreadCommand::ResumeRecordingReplay { resume_at_frame, metadata, crop_policy, bookmarks } => {
-                self.replay_errors.lock().expect("resume recording replay failed to get replay errors").clear();
+            ThreadCommand::ResumeRecordingReplay { resume_at_frame, metadata, crop_policy, bookmarks, reply } => {
+                self.replay_errors.lock().unwrap_or_else(|p| p.into_inner()).clear();
 
-                // FIXME: error if this fails
-                self.core.resume_recording_replay(resume_at_frame, metadata, crop_policy, bookmarks).expect("FAILED TO RESUME RECORDING REPLAY OH NO");
-                if !self.is_running() {
+                let r = self.core.resume_recording_replay(resume_at_frame, metadata, crop_policy, bookmarks);
+                if r.is_ok() && !self.is_running() {
                     self.core.pause_timer();
                 }
+                let _ = reply.send(r);
             }
             ThreadCommand::StopRecordingReplay(sender) => {
                 let _ = sender.send(self.core.stop_recording_replay() == Some(true));
@@ -1158,16 +1415,44 @@ impl ThreadedSuperShuckieCoreThread {
             ThreadCommand::Close => {
                 unreachable!("handle_command(ThreadCommand::Close) should not happen")
             },
-            ThreadCommand::AttachReplayPlayer { player, allow_mismatched, errors } => {
-                if let Err(e) = self.core.attach_replay_player(player, allow_mismatched) {
-                    let _ = errors.send(e);
+            ThreadCommand::AttachReplayPlayer { player, allow_mismatched, reply } => {
+                let r = self.core.attach_replay_player(player, allow_mismatched);
+                if r.is_ok() && !self.is_running() {
+                    self.core.pause_timer();
+                }
+                let _ = reply.send(r);
+            }
+            ThreadCommand::DetachReplayPlayer => {
+                self.core.detach_replay_player();
+            }
+            ThreadCommand::StopReplayPlayback(reply) => {
+                self.core.stop_replay_playback();
+                // Live from here on, so the wall-clock timer matters again: keep it in step with
+                // the pause state (stop resumes it from the replay's time).
+                if !self.is_running() {
+                    self.core.pause_timer();
+                }
+                self.update_elapsed_time();
+                let _ = reply.send(());
+            }
+            ThreadCommand::ResumeReplayPlayback(reply) => {
+                let r = self.core.resume_replay_playback();
+                // Whatever was played live since stopping is gone; show the resume point now.
+                self.force_refresh_screen_data();
+                self.update_counters();
+                let _ = reply.send(r);
+            }
+            ThreadCommand::GoToReplayResumePoint => {
+                // A seek in a stopped replay (see go_to_desired_frame): fire-and-forget, so a
+                // failure is reported the same way.
+                if let Err(e) = self.core.go_to_replay_resume_point() {
+                    self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
                 }
                 if !self.is_running() {
                     self.core.pause_timer();
                 }
-            }
-            ThreadCommand::DetachReplayPlayer => {
-                self.core.detach_replay_player();
+                self.force_refresh_screen_data();
+                self.update_counters();
             }
             ThreadCommand::MarkReplayStart(timestamp, timer_offset) => {
                 if let Some(n) = self.core.mark_start(timer_offset) {
@@ -1182,8 +1467,13 @@ impl ThreadedSuperShuckieCoreThread {
             ThreadCommand::ChangeReplayCounter { name, delta } => {
                 self.core.change_replay_counter(name, delta);
             }
-            ThreadCommand::BookmarkAnchor(sender, keyframe) => {
-                let _ = sender.send(self.core.bookmark_anchor(keyframe));
+            ThreadCommand::BookmarkAnchor(sender, keyframe, deadline) => {
+                // The caller has already given up waiting past `deadline`; placing the bookmark
+                // (and, for a keyframe bookmark, writing its keyframe) now would only leave an
+                // orphan nobody asked for any more.
+                if Instant::now() <= deadline {
+                    let _ = sender.send(self.core.bookmark_anchor(keyframe));
+                }
             }
             ThreadCommand::EstimateMillisAt(sender, frame) => {
                 let _ = sender.send(self.core.estimate_millis_at(frame));
@@ -1284,3 +1574,52 @@ fn mark_thread_latency_sensitive() {
 
 #[cfg(not(windows))]
 fn mark_thread_latency_sensitive() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::num::NonZeroU64;
+    use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
+    use supershuckie_replay_recorder::replay_file::ReplayPatchFormat;
+
+    /// (g) Once the core thread has exited, the wrapper must report errors instead of panicking,
+    /// and `is_alive()` must reflect that once a call has observed the disconnected channel.
+    ///
+    /// The thread is made to exit by sending it `Close` directly (bypassing `Drop`) and waiting
+    /// for its close acknowledgment, which is a deterministic stand-in for a genuine crash: by the
+    /// time the acknowledgment is sent, the thread is committed to returning (and dropping its
+    /// receiver) with nothing left to race against a subsequent send from this test.
+    #[test]
+    fn dead_core_thread_reports_errors_instead_of_panicking() {
+        let core = ThreadedSuperShuckieCore::new(Box::new(crate::emulator::NullEmulatorCore));
+        assert!(core.is_alive(), "a freshly constructed core should be alive");
+
+        let _ = core.sender.send(ThreadCommand::Close);
+        let _ = core.receiver_close.recv();
+
+        let dir = std::env::temp_dir().join("supershuckie-core-thread-dead-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let final_file = File::create(dir.join("final.replay")).expect("create temp final file");
+        let temp_file = File::create(dir.join("temp.replay")).expect("create temp temp file");
+
+        let metadata = PartialReplayRecordMetadata {
+            rom_name: "dead".into(),
+            rom_filename: "dead".into(),
+            settings: ReplayFileRecorderSettings::default(),
+            patch_format: ReplayPatchFormat::Unpatched,
+            patch_target_checksum: Default::default(),
+            patch_data: ByteVec::new(),
+            frames_per_keyframe: NonZeroU64::new(1000).unwrap(),
+            final_file: std::io::BufWriter::new(final_file),
+            temp_file: std::io::BufWriter::new(temp_file),
+        };
+
+        let result = core.start_recording_replay(metadata);
+        assert!(result.is_err(), "start_recording_replay should report an error on a dead core thread, not panic");
+        assert!(!core.is_alive(), "the wrapper should now know the thread is dead");
+
+        assert_eq!(core.create_save_state(), None, "create_save_state should return None on a dead core thread, not panic");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

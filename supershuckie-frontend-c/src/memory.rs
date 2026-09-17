@@ -1,11 +1,11 @@
 //! C API for the RAM tools (see `include/supershuckie/memory.h`).
 
-use crate::frontend::write_str_to_data;
+use crate::frontend::{write_error, write_str_to_data};
 use std::ffi::{c_char, CStr};
 use std::ptr::null;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
 use supershuckie_frontend::SuperShuckieFrontend;
-use supershuckie_memory_tools::{format_address, format_region_address, format_value, parse_address, parse_hex_bytes, parse_value, DisplayBase, ValueFormat, ValueType};
+use supershuckie_memory_tools::{format_address, format_region_address, format_value, parse_address, parse_hex_bytes, parse_value, DisplayBase, ValueFormat, ValueType, MAX_VALUE_SIZE};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -32,12 +32,6 @@ unsafe fn c_str<'a>(text: *const c_char) -> &'a str {
         return ""
     }
     unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("")
-}
-
-unsafe fn write_error(message: &str, error: *mut u8, error_len: usize) {
-    if !error.is_null() && error_len > 0 {
-        write_str_to_data(message, unsafe { from_raw_parts_mut(error, error_len) });
-    }
 }
 
 pub(crate) fn value_type_from_c(value_type: u32) -> ValueType {
@@ -422,6 +416,9 @@ pub unsafe extern "C" fn supershuckie_frontend_search_new(
             };
             if len == 0 {
                 return Err("enter something to search for".to_owned())
+            }
+            if len > MAX_VALUE_SIZE {
+                return Err(format!("patterns are limited to {MAX_VALUE_SIZE} bytes (got {len})"))
             }
             format = ValueFormat::new(format.ty, len as u8, false);
         }

@@ -13,7 +13,8 @@ unsafe extern "C" {
         sram: *const u8,
         sram_size: usize,
         bios: *const u8,
-        bios_size: usize
+        bios_size: usize,
+        error_out: *mut u32
     ) -> *mut MGBACoreRaw;
     fn mgba_rs_core_free(core: *mut MGBACoreRaw);
     fn mgba_rs_core_run_frame(core: *mut MGBACoreRaw);
@@ -21,6 +22,7 @@ unsafe extern "C" {
     fn mgba_rs_core_get_pixels(core: *const MGBACoreRaw) -> *const u32;
     fn mgba_rs_core_set_input(core: *mut MGBACoreRaw, input: u16);
     fn mgba_rs_core_get_sram(core: *const MGBACoreRaw, size: &mut usize) -> *const u8;
+    fn mgba_rs_core_free_sram_clone(sram: *mut u8);
     fn mgba_rs_core_create_save_state(core: *const MGBACoreRaw, data: *mut u8, data_size: usize) -> usize;
     fn mgba_rs_core_load_save_state(core: *mut MGBACoreRaw, data: *const u8, data_size: usize) -> bool;
     fn mgba_rs_core_get_ewram(core: *mut MGBACoreRaw) -> *mut [u8; 0x40000];
@@ -47,16 +49,66 @@ pub enum Region {
     SaveData = 3
 }
 
-unsafe impl Sync for Core {}
 unsafe impl Send for Core {}
 
-impl Core {
-    pub fn new(rom: &[u8], sram: &[u8], bios: &[u8]) -> Option<Self> {
-        let inner = unsafe { mgba_rs_core_new(rom.as_ptr(), rom.len(), sram.as_ptr(), sram.len(), bios.as_ptr(), bios.len()) };
-        if inner.is_null() {
-            return None
+/// Why [`Core::new`] failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CoreError {
+    /// mGBA failed to allocate/create its core object.
+    CreateFailed,
+    /// The created core failed to initialise.
+    InitFailed,
+    /// The ROM was rejected (including an empty one).
+    BadRom,
+    /// mGBA did not expose EWRAM/IWRAM as memory blocks.
+    MissingMemoryBlocks,
+    /// The BIOS image was rejected.
+    BadBios,
+    /// An error code the Rust binding does not recognise.
+    Unknown(u32)
+}
+
+impl From<u32> for CoreError {
+    fn from(code: u32) -> Self {
+        match code {
+            1 => CoreError::CreateFailed,
+            2 => CoreError::InitFailed,
+            3 => CoreError::BadRom,
+            4 => CoreError::MissingMemoryBlocks,
+            5 => CoreError::BadBios,
+            other => CoreError::Unknown(other)
         }
-        Some(Self { inner })
+    }
+}
+
+impl core::fmt::Display for CoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CoreError::CreateFailed => f.write_str("failed to create the mGBA core"),
+            CoreError::InitFailed => f.write_str("failed to initialize the mGBA core"),
+            CoreError::BadRom => f.write_str("the ROM was rejected"),
+            CoreError::MissingMemoryBlocks => f.write_str("mGBA did not expose EWRAM/IWRAM"),
+            CoreError::BadBios => f.write_str("the BIOS image was rejected"),
+            CoreError::Unknown(code) => write!(f, "unknown mGBA core error ({code})")
+        }
+    }
+}
+
+impl Core {
+    pub fn new(rom: &[u8], sram: &[u8], bios: &[u8]) -> Result<Self, CoreError> {
+        let mut error_code: u32 = 0;
+        let inner = unsafe {
+            mgba_rs_core_new(
+                rom.as_ptr(), rom.len(),
+                sram.as_ptr(), sram.len(),
+                bios.as_ptr(), bios.len(),
+                &mut error_code
+            )
+        };
+        if inner.is_null() {
+            return Err(CoreError::from(error_code))
+        }
+        Ok(Self { inner })
     }
 
     #[inline]
@@ -80,13 +132,29 @@ impl Core {
         unsafe { mgba_rs_core_set_input(self.inner, input) }
     }
 
+    /// A copy of the cartridge's save memory, or an empty `Vec` if mGBA does not know the save
+    /// type yet (the game was closed before it touched its save). mGBA hands back a fresh
+    /// `malloc`'d clone on every call; this copies it into a `Vec` and frees the clone itself.
     #[inline]
-    pub fn get_sram(&self) -> &[u8] {
+    pub fn get_sram(&self) -> Vec<u8> {
         let mut size = 0;
         let ptr = unsafe { mgba_rs_core_get_sram(self.inner, &mut size) };
-        unsafe { core::slice::from_raw_parts(ptr, size) }
+        if ptr.is_null() || size == 0 {
+            return Vec::new()
+        }
+        let mut v = Vec::with_capacity(size);
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, v.as_mut_ptr(), size);
+            v.set_len(size);
+            mgba_rs_core_free_sram_clone(ptr as *mut u8);
+        }
+        v
     }
 
+    /// Serialises the core's state. Takes `&self`: mGBA's serializer does touch some internal
+    /// bookkeeping (e.g. flushing the current flash/EEPROM command) while writing the state out,
+    /// but that is treated as an implementation detail of what is logically a read, not a
+    /// mutation callers need to synchronise against the way [`load_save_state`](Self::load_save_state) is.
     #[inline]
     pub fn create_save_state(&self) -> Option<Vec<u8>> {
         let mut v = Vec::new();
@@ -99,17 +167,22 @@ impl Core {
         into.clear();
         into.reserve(32 * 1024 * 1024);
 
-        match unsafe { mgba_rs_core_create_save_state(self.inner, into.as_mut_ptr(), into.capacity()) } {
-            0 => false,
-            n => {
-                unsafe { into.set_len(n); }
-                true
-            }
+        let capacity = into.capacity();
+        let n = unsafe { mgba_rs_core_create_save_state(self.inner, into.as_mut_ptr(), capacity) };
+        // The shim already guarantees n <= capacity when n != 0; re-checked here so a bug on the
+        // C++ side can never make us set_len past what was actually allocated/written.
+        if n == 0 || n > capacity {
+            return false
         }
+        unsafe { into.set_len(n); }
+        true
     }
 
+    /// Loads a save state, overwriting all emulated RAM and the running core's state. Treated as a
+    /// mutation (not merely a read of `state`) because it invalidates any borrow of the core's
+    /// memory (e.g. from [`get_ewram`](Self::get_ewram)) taken before the call.
     #[inline]
-    pub fn load_save_state(&self, state: &[u8]) -> bool {
+    pub fn load_save_state(&mut self, state: &[u8]) -> bool {
         unsafe { mgba_rs_core_load_save_state(self.inner, state.as_ptr(), state.len()) }
     }
 

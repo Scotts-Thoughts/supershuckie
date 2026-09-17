@@ -28,50 +28,72 @@ struct MelonDSCoreHolder {
     std::unique_ptr<NDS> nds;
 };
 
+// Error codes handed back through `error_out` by melonds_rs_core_new on failure.
+enum MelonDSCoreNewError : std::uint32_t {
+    MELONDS_CORE_NEW_ERROR_BAD_ROM = 1,
+    MELONDS_CORE_NEW_ERROR_EXCEPTION = 2,
+};
+
 extern "C" MelonDSCoreHolder *melonds_rs_core_new(
     const u8 *rom,
     std::size_t rom_size,
     const u8 *sram,
     std::size_t sram_size,
-    bool jit
+    bool jit,
+    std::uint32_t *error_out
 ) {
-    NDSCart::NDSCartArgs cartargs;
+    // NDS construction, ROM parsing and save loading can all throw (e.g. std::bad_alloc, or
+    // melonDS's own parsing exceptions), which is UB unwinding across this extern "C" boundary if
+    // left uncaught.
+    MelonDSCoreHolder *holder = nullptr;
+    try {
+        NDSCart::NDSCartArgs cartargs;
 
-    auto file_data = std::make_unique<u8[]>(rom_size);
-    std::memcpy(file_data.get(), rom, rom_size);
+        auto file_data = std::make_unique<u8[]>(rom_size);
+        std::memcpy(file_data.get(), rom, rom_size);
 
-    auto *holder = new MelonDSCoreHolder();
+        holder = new MelonDSCoreHolder();
 
-    NDSArgs nds_args;
-    if(!jit) {
-        nds_args.JIT = std::nullopt;
-    }
-    // Every core hands the frontend 48 kHz stereo (supershuckie_core::emulator::AUDIO_SAMPLE_RATE);
-    // melonDS resamples the SPU's 32.7 kHz mix to this with blip_buf.
-    nds_args.OutputSampleRate = 48000.0;
+        NDSArgs nds_args;
+        if(!jit) {
+            nds_args.JIT = std::nullopt;
+        }
+        // Every core hands the frontend 48 kHz stereo (supershuckie_core::emulator::AUDIO_SAMPLE_RATE);
+        // melonDS resamples the SPU's 32.7 kHz mix to this with blip_buf.
+        nds_args.OutputSampleRate = 48000.0;
 
-    holder->nds = std::make_unique<NDS>(std::move(nds_args));
+        holder->nds = std::make_unique<NDS>(std::move(nds_args));
 
-    static_cast<SoftRenderer &>(holder->nds->GetRenderer3D()).SetThreaded(true, holder->nds->GPU);
-    auto cart = NDSCart::ParseROM(std::move(file_data), rom_size, holder, std::move(cartargs));
-    if(!cart) {
+        static_cast<SoftRenderer &>(holder->nds->GetRenderer3D()).SetThreaded(true, holder->nds->GPU);
+        auto cart = NDSCart::ParseROM(std::move(file_data), rom_size, holder, std::move(cartargs));
+        if(!cart) {
+            delete holder;
+            if(error_out != nullptr) {
+                *error_out = MELONDS_CORE_NEW_ERROR_BAD_ROM;
+            }
+            return nullptr;
+        }
+
+        holder->nds->SetNDSCart(std::move(cart));
+
+        if(sram_size > 0) {
+            holder->nds->SetNDSSave(sram, sram_size);
+        }
+
+        holder->nds->SetARM7BIOS(bios_arm7_bin);
+        holder->nds->SetARM9BIOS(bios_arm9_bin);
+        holder->nds->LoadBIOS();
+        holder->nds->SetupDirectBoot("nds.rom");
+        holder->nds->Start();
+
+        return holder;
+    } catch(...) {
         delete holder;
+        if(error_out != nullptr) {
+            *error_out = MELONDS_CORE_NEW_ERROR_EXCEPTION;
+        }
         return nullptr;
     }
-
-    holder->nds->SetNDSCart(std::move(cart));
-
-    if(sram_size > 0) {
-        holder->nds->SetNDSSave(sram, sram_size);
-    }
-
-    holder->nds->SetARM7BIOS(bios_arm7_bin);
-    holder->nds->SetARM9BIOS(bios_arm9_bin);
-    holder->nds->LoadBIOS();
-    holder->nds->SetupDirectBoot("nds.rom");
-    holder->nds->Start();
-
-    return holder;
 }
 
 extern "C" void melonds_rs_core_free(MelonDSCoreHolder *core) {
@@ -106,7 +128,7 @@ extern "C" u8 *melonds_rs_core_get_sram(const MelonDSCoreHolder *core, size_t &s
     return core->nds->GetNDSSave();
 }
 
-extern "C" std::size_t melonds_rs_core_create_save_state(const MelonDSCoreHolder *core, void *data, std::size_t data_size) {
+extern "C" std::size_t melonds_rs_core_create_save_state(MelonDSCoreHolder *core, void *data, std::size_t data_size) {
     Savestate state(data, data_size, true);
     bool success = core->nds->DoSavestate(&state);
     state.Finish();
@@ -118,7 +140,7 @@ extern "C" std::size_t melonds_rs_core_create_save_state(const MelonDSCoreHolder
     return state.Length();
 }
 
-extern "C" bool melonds_rs_core_load_save_state(const MelonDSCoreHolder *core, void *data, std::size_t data_size) {
+extern "C" bool melonds_rs_core_load_save_state(MelonDSCoreHolder *core, void *data, std::size_t data_size) {
     Savestate state(data, data_size, false);
     return core->nds->DoSavestate(&state);
 }

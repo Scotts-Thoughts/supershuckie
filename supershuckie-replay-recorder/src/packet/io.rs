@@ -195,7 +195,10 @@ impl<'a, T: PacketIO<'a>> PacketIO<'a> for Vec<T> {
     }
     fn read_all(what: &mut &'a [u8], version: u32) -> Result<Self, PacketReadError> {
         let len = usize::read_all(what, version)?;
-        let mut s = Self::with_capacity(len);
+        // `len` comes straight from the file; every element consumes at least one byte, so the
+        // remaining slice bounds how many can possibly be read. Without this, a corrupt or hostile
+        // count (e.g. 2^63) would try to allocate immediately, before any of the elements are read.
+        let mut s = Self::with_capacity(len.min(what.len()));
         for _ in 0..len {
             s.push(T::read_all(what, version)?);
         }
@@ -734,5 +737,27 @@ mod tests {
     fn unknown_discriminator_is_a_parse_failure() {
         let mut slice: &[u8] = &[0xF9, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
+    }
+
+    #[test]
+    fn oversized_vec_length_is_rejected_without_a_huge_allocation() {
+        // `Packet::CompressedBlob`'s first field is `keyframes: Vec<KeyframeMetadata>`, whose
+        // read_all starts with a length prefix (this crate's varint: one length byte, then that many
+        // raw little-endian bytes -- not LEB128). A corrupt or hostile file can claim any count; with
+        // only the discriminator and the (corrupted) prefix present, there is nowhere near enough
+        // data left for that many elements, so this must fail cleanly instead of trying to allocate
+        // for the claimed count up front.
+        for (len_byte, len_bytes) in [
+            (8u8, [0u8, 0, 0, 0, 0, 0, 0, 0x80].to_vec()), // 2^63
+            (5u8, [0u8, 0, 0, 0, 1].to_vec()),             // 2^32
+        ] {
+            let mut bytes = vec![PacketDiscriminator::CompressedBlob as u8, len_byte];
+            bytes.extend_from_slice(&len_bytes);
+            let mut slice = bytes.as_slice();
+            assert!(
+                matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::NotEnoughData)),
+                "len_byte {len_byte}"
+            );
+        }
     }
 }

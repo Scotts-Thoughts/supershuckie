@@ -184,14 +184,24 @@ mod file {
 
     /// Replace the bookmark section of the replay at `path` with `table`.
     ///
-    /// When `expected_header` is given, the write is refused unless the file's header is exactly
-    /// that one (the header captured when the replay was loaded, or returned by the previous write),
-    /// so a replay replaced on disk is never modified.
+    /// When `expected_header` is given, the write is refused unless the file's header describes the
+    /// same replay as that one (the header captured when the replay was loaded, or returned by the
+    /// previous write) per [`ReplayHeaderRaw::same_replay_as`], which ignores `replay_version` and
+    /// `packet_stream_end` (the two fields a bookmark edit itself rewrites) — so a replay replaced
+    /// on disk is never modified, without spuriously refusing the write this check exists to allow.
     ///
     /// A v3/v4 file, or a v5 file whose recording was never closed, first gets a v5 header whose
     /// `packet_stream_end` is the current file length. The header is written before the section,
     /// and the file is synced afterwards; if the process dies in between, the section is invalid
     /// and players fall back to the bookmarks in the packet stream.
+    ///
+    /// This function cannot cheaply verify that the packet stream it is about to seal actually
+    /// parses cleanly up to `packet_stream_end` (doing so would mean decoding the whole stream on
+    /// every write); a v3/v4 file with a partial trailing packet would have that corruption folded
+    /// silently into the new `packet_stream_end`. The **caller** must not call this on a replay
+    /// whose player reported `stream_truncated() == true`
+    /// ([`crate::replay_file::playback::ReplayFilePlayer::stream_truncated`]); the frontend already
+    /// enforces this before offering bookmark edits.
     pub fn write_bookmark_section(path: &Path, expected_header: Option<&ReplayHeaderBytes>, table: &BookmarkTable) -> Result<BookmarkSectionWriteOutcome, BookmarkSectionWriteError> {
         let mut file = OpenOptions::new().read(true).write(true).open(path).map_err(|e| io("open the replay for writing", e))?;
 
@@ -201,11 +211,16 @@ mod file {
             _ => io("read the replay header", e)
         })?;
 
-        if let Some(expected) = expected_header && *expected != header_bytes {
+        let header = ReplayHeaderRaw::from_bytes(&header_bytes);
+
+        // Ignore `replay_version` and `packet_stream_end`: a bookmark edit rewrites exactly those
+        // two fields (an upgrade bumps the version; every write updates the section boundary), so
+        // comparing them byte-exactly would spuriously refuse the very writes this check exists to
+        // allow through.
+        if let Some(expected) = expected_header && !header.same_replay_as(ReplayHeaderRaw::from_bytes(expected)) {
             return Err(BookmarkSectionWriteError::HeaderChanged)
         }
 
-        let header = ReplayHeaderRaw::from_bytes(&header_bytes);
         header.parse().map_err(|explanation| BookmarkSectionWriteError::InvalidReplay { explanation })?;
 
         let version = header.replay_version;
@@ -214,7 +229,8 @@ mod file {
         }
 
         let file_len = file.metadata().map_err(|e| io("read the replay's size", e))?.len();
-        let packets_start = size_of::<ReplayHeaderBytes>() as u64 + header.patch_data_length;
+        let packets_start = (size_of::<ReplayHeaderBytes>() as u64).checked_add(header.patch_data_length)
+            .ok_or_else(|| BookmarkSectionWriteError::InvalidReplay { explanation: String::from("the header's patch data length overflows") })?;
 
         let (stream_end, new_header) = match header.packet_stream_end() {
             Some(end) => {
@@ -325,6 +341,25 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
 
+        /// `expected_header` need not match `packet_stream_end` byte-exactly: a caller that captured
+        /// the header before a previous bookmark write (or before the replay was closed) still
+        /// passes the "is this the same replay" check, because that field is exactly what every
+        /// write rewrites.
+        #[test]
+        fn header_compare_ignores_packet_stream_end() {
+            let (_, closed) = record_script(ReplayFileRecorderSettings { max_frames_per_blob: 45, ..Default::default() });
+            let path = temp_file("psend.replay", &closed);
+
+            let mut stale = header_of(&closed);
+            // Flip a byte inside `packet_stream_end` (offset 0x3A8, 8 bytes long).
+            stale[0x3A8] ^= 0xFF;
+            assert_ne!(stale, header_of(&closed), "the byte-exact headers must actually differ for this test to mean anything");
+
+            write_bookmark_section(&path, Some(&stale), &table()).unwrap();
+
+            let _ = std::fs::remove_file(&path);
+        }
+
         #[test]
         fn v3_replays_are_upgraded_in_place() {
             for (name, fixture) in [("v3-small.replay", V3_SMALL), ("v3-small-closed.replay", V3_SMALL_CLOSED)] {
@@ -346,9 +381,10 @@ mod tests {
                 check_script_replay_with(&bytes, name, BookmarkExpectation::Fixed(&table()));
                 assert_eq!(ReplayFilePlayer::new(&bytes, false).unwrap().legacy_bookmarks().len(), 2, "{name}");
 
-                // A second write needs the upgraded header, not the one loaded before the upgrade.
-                assert_eq!(write_bookmark_section(&path, Some(&header_of(fixture)), &BookmarkTable::new()).unwrap_err(), BookmarkSectionWriteError::HeaderChanged, "{name}");
-                write_bookmark_section(&path, Some(&outcome.header), &BookmarkTable::new()).unwrap();
+                // A second write accepts either the header captured before the upgrade or the one
+                // the first write returned: `same_replay_as` ignores exactly the two fields the
+                // upgrade changed (`replay_version`, `packet_stream_end`), as asserted above.
+                write_bookmark_section(&path, Some(&header_of(fixture)), &BookmarkTable::new()).unwrap();
                 assert_eq!(std::fs::read(&path).unwrap().len(), fixture.len() + super::super::encode_bookmark_section(&BookmarkTable::new()).len(), "{name}");
 
                 let _ = std::fs::remove_file(&path);

@@ -252,10 +252,13 @@ void WatchEditDialog::on_type_changed() {
 }
 
 void WatchEditDialog::on_region_chosen(int index) {
-    if(index <= 0) {
+    auto &regions = this->controller->regions();
+    // An external command can switch ROMs (and so shrink the region list) while this modal dialog
+    // is open; `index` was captured against the combo box as it was filled and may now be stale.
+    if(index <= 0 || static_cast<std::size_t>(index) > regions.size()) {
+        this->region_combo->setCurrentIndex(0);
         return;
     }
-    auto &regions = this->controller->regions();
     auto &region = regions[index - 1];
     QString error;
     auto address = this->controller->parse_address(this->address_edit->text(), &error);

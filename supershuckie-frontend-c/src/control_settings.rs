@@ -46,7 +46,7 @@ pub unsafe extern "C" fn supershuckie_control_settings_clear_controls_for_device
         settings.0.keyboard_controls.retain(retain_fn);
     }
     else {
-        let device_name = unsafe { CStr::from_ptr(device_name).to_str().expect("device name not UTF-8") };
+        let Ok(device_name) = unsafe { CStr::from_ptr(device_name) }.to_str() else { return };
         let Some(s) = settings.0.controller_controls.get_mut(device_name) else {
             return
         };
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn supershuckie_control_settings_get_controls_for_device(
     let key_codes = if input_codes_count == 0 { &mut [] } else { unsafe { from_raw_parts_mut(input_codes, input_codes_count) } };
 
     let map = if device_name.is_null() { &settings.0.keyboard_controls } else {
-        let device_name = unsafe { CStr::from_ptr(device_name).to_str().expect("device name not UTF-8") };
+        let Ok(device_name) = unsafe { CStr::from_ptr(device_name) }.to_str() else { return 0 };
         match settings.0.controller_controls.get(device_name) {
             Some(n) => if is_axis { &n.axis } else { &n.buttons },
             None => return 0
@@ -110,19 +110,19 @@ pub unsafe extern "C" fn supershuckie_control_settings_set_control_for_device(
     modifier: u32,
 ) {
     if device_name.is_null() && is_axis {
-        panic!("No axis support for keyboards");
+        return;
     }
 
-    let Ok(control) = Control::try_from(control) else { panic!("Unknown control {control}") };
-    let Ok(modifier) = ControlModifier::try_from(modifier) else { panic!("Unknown modifier {modifier}") };
+    let Ok(control) = Control::try_from(control) else { return };
+    let Ok(modifier) = ControlModifier::try_from(modifier) else { return };
 
     if !control.is_button() && modifier != ControlModifier::Normal {
-        panic!("{control:?} cannot have non-normal modifiers (not a button)")
+        return;
     }
 
     let map = loop {
         let map = if device_name.is_null() { &mut settings.0.keyboard_controls } else {
-            let device_name = unsafe { CStr::from_ptr(device_name).to_str().expect("device name not UTF-8") };
+            let Ok(device_name) = unsafe { CStr::from_ptr(device_name) }.to_str() else { return };
             match settings.0.controller_controls.get_mut(device_name) {
                 Some(n) => if is_axis { &mut n.axis } else { &mut n.buttons },
                 None => {
@@ -142,8 +142,8 @@ pub extern "C" fn supershuckie_control_settings_is_control_available_for_emulato
     control: u32,
     emulator_type: u8
 ) -> bool {
-    let Ok(control) = Control::try_from(control) else { panic!("Unknown control {control}") };
-    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { panic!("Unknown emulator_type {emulator_type}") };
+    let Ok(control) = Control::try_from(control) else { return false };
+    let Ok(emulator_type) = SuperShuckieEmulatorType::try_from(emulator_type) else { return false };
     control.is_available_for_emulator_type(emulator_type)
 }
 
