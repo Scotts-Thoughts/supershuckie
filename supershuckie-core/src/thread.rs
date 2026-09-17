@@ -12,7 +12,7 @@ use std::format;
 use std::fs::File;
 use std::string::{String, ToString};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, SendError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, TryLockError, Weak};
 use std::time::{Duration, Instant};
 use std::vec::Vec;
@@ -682,14 +682,16 @@ impl ThreadedSuperShuckieCore {
         core::mem::take(&mut *errors)
     }
 
-    /// Mark the start of the replay.
+    /// Mark the start of the replay. `Err` when no replay is being recorded (or the thread has
+    /// died).
     pub fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(UnsignedInteger, TimestampMillis), ()> {
-        self.call(|sender| ThreadCommand::MarkReplayStart(sender, timer_offset)).map_err(|_| ())
+        self.call(|sender| ThreadCommand::MarkReplayStart(sender, timer_offset)).ok().flatten().ok_or(())
     }
 
-    /// Mark the end of the replay.
+    /// Mark the end of the replay. `Err` when no replay is being recorded (or the thread has
+    /// died).
     pub fn mark_end(&mut self) -> Result<(UnsignedInteger, TimestampMillis), ()> {
-        self.call(|sender| ThreadCommand::MarkReplayEnd(sender)).map_err(|_| ())
+        self.call(|sender| ThreadCommand::MarkReplayEnd(sender)).ok().flatten().ok_or(())
     }
 
     /// Longest a caller waits for the core thread to place a bookmark.
@@ -887,8 +889,10 @@ enum ThreadCommand {
     CreateSaveState(Sender<Vec<u8>>),
     LoadSaveState(Vec<u8>),
     SaveSRAM(Sender<Vec<u8>>),
-    MarkReplayStart(Sender<(UnsignedInteger, TimestampMillis)>, TimestampMillis),
-    MarkReplayEnd(Sender<(UnsignedInteger, TimestampMillis)>),
+    /// Answered with `None` when no replay is being recorded.
+    MarkReplayStart(Sender<Option<(UnsignedInteger, TimestampMillis)>>, TimestampMillis),
+    /// Answered with `None` when no replay is being recorded.
+    MarkReplayEnd(Sender<Option<(UnsignedInteger, TimestampMillis)>>),
     /// `Instant` is the deadline the wrapper is willing to wait until; the handler skips placing
     /// the bookmark (and, for a keyframe bookmark, writing its keyframe) if it is reached, so a
     /// caller that gave up waiting never gets an orphan keyframe written later (see
@@ -1454,15 +1458,13 @@ impl ThreadedSuperShuckieCoreThread {
                 self.force_refresh_screen_data();
                 self.update_counters();
             }
+            // Always answered, with `None` when not recording: `call` reads a dropped reply
+            // sender as the thread having died, so "no answer" must never be used to mean "no".
             ThreadCommand::MarkReplayStart(timestamp, timer_offset) => {
-                if let Some(n) = self.core.mark_start(timer_offset) {
-                    let _ = timestamp.send(n);
-                }
+                let _ = timestamp.send(self.core.mark_start(timer_offset));
             }
             ThreadCommand::MarkReplayEnd(timestamp) => {
-                if let Some(n) = self.core.mark_end() {
-                    let _ = timestamp.send(n);
-                }
+                let _ = timestamp.send(self.core.mark_end());
             }
             ThreadCommand::ChangeReplayCounter { name, delta } => {
                 self.core.change_replay_counter(name, delta);
@@ -1506,7 +1508,11 @@ impl ThreadedSuperShuckieCoreThread {
                     return;
                 };
                 let rom_checksum = *self.core.core.rom_checksum();
-                let _ = core_sender.send(ThreadCommand::TransferPokeAByteIntegrationInternal(sender, server, replay_console_type, rom_checksum));
+                // The other core's thread answers; if it is gone, answer here rather than drop the
+                // reply sender, which `call` would take to mean *this* thread has died.
+                if let Err(SendError(ThreadCommand::TransferPokeAByteIntegrationInternal(sender, ..))) = core_sender.send(ThreadCommand::TransferPokeAByteIntegrationInternal(sender, server, replay_console_type, rom_checksum)) {
+                    let _ = sender.send(false);
+                }
             },
             ThreadCommand::TransferPokeAByteIntegrationInternal(sender, server, replay_console_type, rom_checksum) => {
                 if self.core.core.rom_checksum() != &rom_checksum || self.core.core.replay_console_type() != Some(replay_console_type) {
@@ -1621,5 +1627,25 @@ mod tests {
         assert_eq!(core.create_save_state(), None, "create_save_state should return None on a dead core thread, not panic");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused request must not look like a dead thread: `/mark-start` and `/mark-end` while a
+    /// replay is playing back (not recording) used to make the handler drop its reply sender,
+    /// which `call` reads as the thread having exited -- the frontend then reported "The emulator
+    /// thread has stopped" and unloaded the ROM the moment the overlay marked the run's start or
+    /// end.
+    #[test]
+    fn refused_mark_start_and_end_do_not_declare_the_thread_dead() {
+        let mut core = ThreadedSuperShuckieCore::new(Box::new(crate::emulator::NullEmulatorCore));
+
+        assert_eq!(core.mark_start(TimestampMillis(0)), Err(()), "not recording, so the mark is refused");
+        assert!(core.is_alive(), "a refused mark_start must not be mistaken for a dead thread");
+
+        assert_eq!(core.mark_end(), Err(()), "not recording, so the mark is refused");
+        assert!(core.is_alive(), "a refused mark_end must not be mistaken for a dead thread");
+
+        // The thread really is still there: a round trip still gets answered.
+        assert!(core.create_save_state().is_some(), "the thread should still answer after refused marks");
+        assert!(core.is_alive());
     }
 }
