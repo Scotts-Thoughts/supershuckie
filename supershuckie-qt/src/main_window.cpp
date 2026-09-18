@@ -41,6 +41,7 @@
 #include "memory_tools_controller.hpp"
 #include "bookmark_window.hpp"
 #include "landing_widget.hpp"
+#include "play_together_controller.hpp"
 
 #include <QProgressDialog>
 #include <QToolButton>
@@ -59,6 +60,7 @@ using namespace SuperShuckie64;
 static const char *USE_NUMBER_KEYS_FOR_QUICK_SLOTS = "qt__number_keys_for_quick_slots";
 static const char *WINDOW_XY = "qt__window_xy";
 static const char *DISPLAY_STATUS_BAR = "qt__display_status_bar";
+static const char *SYNC_DISPLAY_TO_REFRESH = "qt__sync_display_to_refresh";
 static const char *KEYBOARD_REPLAY_CONTROLS_DISABLED = "qt__replay_controls_disabled";
 static const char *HORIZONTAL_NDS = "qt__horizontal_nds";
 static const char *BOOKMARK_WINDOW_STATE = "qt__bookmark_window";
@@ -196,6 +198,8 @@ MainWindow::MainWindow(): QMainWindow() {
     callbacks.user_data = this;
     callbacks.refresh_screens = MainWindow::on_refresh_screens;
     callbacks.change_video_mode = MainWindow::on_change_video_mode;
+    callbacks.peer_refresh_screens = PlayTogetherController::on_peer_refresh_screens;
+    callbacks.peer_change_video_mode = PlayTogetherController::on_peer_change_video_mode;
 
     QString config_path;
 
@@ -219,6 +223,11 @@ MainWindow::MainWindow(): QMainWindow() {
     bool status_bar_visible = status_bar_visible_setting != nullptr && *status_bar_visible_setting == '1';
     this->status_bar->setVisible(status_bar_visible);
     this->show_status_bar->setChecked(status_bar_visible);
+
+    const char *sync_display_setting = supershuckie_frontend_get_custom_setting(this->frontend, SYNC_DISPLAY_TO_REFRESH);
+    bool sync_display = sync_display_setting != nullptr && *sync_display_setting == '1';
+    this->sync_display_to_refresh->setChecked(sync_display);
+    this->apply_display_sync(sync_display);
 
     char buf[256];
     if(supershuckie_frontend_is_pokeabyte_enabled(this->frontend, buf, sizeof(buf))) {
@@ -299,6 +308,10 @@ MainWindow::MainWindow(): QMainWindow() {
 
     this->memory_tools = new MemoryToolsController(this);
     this->memory_tools->restore_windows();
+
+    this->play_together = new PlayTogetherController(this);
+    this->pt_save_replays->setChecked(supershuckie_frontend_play_together_get_save_peer_replays(this->frontend));
+    this->refresh_play_together_actions();
 
     const char *bookmark_window_state = supershuckie_frontend_get_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE);
     if(bookmark_window_state != nullptr) {
@@ -453,6 +466,10 @@ void MainWindow::tick() {
         this->start_timer();
     }
 
+    if(this->play_together != nullptr) {
+        this->play_together->tick();
+    }
+
     this->pause->setChecked(supershuckie_frontend_is_paused(this->frontend));
 
     // Keep the menu checkbox in sync with the setting, which may be toggled via a bound hotkey.
@@ -551,6 +568,7 @@ void MainWindow::set_up_menu() {
     this->set_up_replays_menu();
     this->set_up_audio_menu();
     this->set_up_tools_menu();
+    this->set_up_play_together_menu();
     this->set_up_settings_menu();
 
     this->refresh_action_states();
@@ -1202,6 +1220,12 @@ void MainWindow::set_up_settings_menu() {
     this->show_status_bar->setObjectName("show-status-bar");
     this->show_status_bar->setCheckable(true);
     connect(this->show_status_bar, SIGNAL(triggered()), this, SLOT(do_toggle_status_bar()));
+
+    this->sync_display_to_refresh = this->settings_menu->addAction("Sync display to monitor refresh");
+    this->sync_display_to_refresh->setObjectName("sync-display-to-refresh");
+    this->sync_display_to_refresh->setCheckable(true);
+    this->sync_display_to_refresh->setToolTip("Show one emulated frame per display refresh instead of each frame as it arrives; evens out periodic judder");
+    connect(this->sync_display_to_refresh, SIGNAL(triggered()), this, SLOT(do_toggle_sync_display()));
 }
 
 void MainWindow::refresh_action_states() {
@@ -1333,6 +1357,8 @@ void MainWindow::refresh_action_states() {
             break;
     }
 
+    this->refresh_play_together_actions();
+
     this->last_known_replay_state = replay_state;
     this->last_known_replay_stopped = replay_stopped;
 }
@@ -1365,6 +1391,10 @@ void MainWindow::do_open_rom() {
 void MainWindow::load_rom(const std::filesystem::path &path) {
     char error[256] = "";
 
+    if(this->play_together != nullptr && !this->play_together->confirm_leave("Opening another ROM")) {
+        return;
+    }
+
     // path.string() converts to the narrow "native" encoding and throws for characters that
     // encoding can't represent; u8string() always succeeds and is what the Rust side expects.
     auto path_utf8 = path.u8string();
@@ -1383,11 +1413,17 @@ void MainWindow::load_rom(const char *path) {
 }
 
 void MainWindow::do_close_rom() {
+    if(this->play_together != nullptr && !this->play_together->confirm_leave("Closing the ROM")) {
+        return;
+    }
     supershuckie_frontend_close_rom(this->frontend);
     supershuckie_frontend_set_paused(this->frontend, false);
 }
 
 void MainWindow::do_unload_rom() {
+    if(this->play_together != nullptr && !this->play_together->confirm_leave("Unloading the ROM")) {
+        return;
+    }
     supershuckie_frontend_unload_rom(this->frontend);
     supershuckie_frontend_set_paused(this->frontend, false);
 }
@@ -1676,6 +1712,10 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         if(this->memory_tools != nullptr) {
             this->memory_tools->save_windows();
         }
+        if(this->play_together != nullptr) {
+            this->play_together->save_windows();
+            supershuckie_frontend_play_together_leave(this->frontend);
+        }
         if(this->bookmark_window != nullptr) {
             supershuckie_frontend_set_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE, this->bookmark_window->save_state().toUtf8().constData());
         }
@@ -1700,6 +1740,8 @@ void MainWindow::closeEvent(QCloseEvent *event) {
 }
 
 MainWindow::~MainWindow() {
+    // Stop asking for frames before the frontend goes away.
+    this->display_sync.reset();
     // The device callback reads the ring, never the frontend, but stop it before the frontend
     // goes anyway.
     this->audio.reset();
@@ -2157,6 +2199,35 @@ void MainWindow::do_toggle_status_bar() {
     this->refresh_title();
 }
 
+void MainWindow::do_toggle_sync_display() {
+    bool on = this->sync_display_to_refresh->isChecked();
+    supershuckie_frontend_set_custom_setting(this->frontend, SYNC_DISPLAY_TO_REFRESH, on ? "1" : "0");
+    this->apply_display_sync(on);
+}
+
+void MainWindow::apply_display_sync(bool on) {
+    supershuckie_frontend_set_present_on_demand(this->frontend, on);
+    if(on) {
+        if(!this->display_sync) {
+            this->display_sync = std::make_unique<DisplaySyncThread>();
+            connect(this->display_sync.get(), &DisplaySyncThread::vblank, this, &MainWindow::present_frame, Qt::QueuedConnection);
+            this->display_sync->start(QThread::HighestPriority);
+        }
+    }
+    else {
+        this->display_sync.reset();
+    }
+}
+
+void MainWindow::present_frame() {
+    if(this->display_sync) {
+        this->display_sync->acknowledge();
+    }
+    if(this->frontend != nullptr) {
+        supershuckie_frontend_present_latest_frame(this->frontend);
+    }
+}
+
 void MainWindow::do_toggle_pokeabyte() {
     char err[256];
 
@@ -2390,4 +2461,101 @@ void MainWindow::do_toggle_disable_save_states_when_recording() {
 
 void MainWindow::do_toggle_disable_speed_changes_when_recording() {
     supershuckie_frontend_set_disable_speed_changes_when_recording(this->frontend, this->disable_speed_changes_when_recording->isChecked());
+}
+
+void MainWindow::set_up_play_together_menu() {
+    this->play_together_menu = this->menu_bar->addMenu("Play Together");
+
+    this->pt_open = this->play_together_menu->addAction("Host or join a session...");
+    this->pt_open->setObjectName("play-together-session");
+    this->pt_open->setShortcut(QKeyCombination(Qt::ControlModifier | Qt::ShiftModifier, Qt::Key_P));
+    connect(this->pt_open, SIGNAL(triggered()), this, SLOT(do_play_together_open()));
+
+    this->pt_leave = this->play_together_menu->addAction("Leave session");
+    this->pt_leave->setObjectName("play-together-leave");
+    connect(this->pt_leave, SIGNAL(triggered()), this, SLOT(do_play_together_leave()));
+
+    this->play_together_menu->addSeparator();
+
+    this->pt_reset_all = this->play_together_menu->addAction("Reset everyone (race start)");
+    this->pt_reset_all->setObjectName("play-together-reset-all");
+    this->pt_reset_all->setToolTip("Every player's console resets after a 3 second countdown (host only)");
+    connect(this->pt_reset_all, SIGNAL(triggered()), this, SLOT(do_play_together_reset_all()));
+
+    this->pt_show_windows = this->play_together_menu->addAction("Show friends' windows");
+    this->pt_show_windows->setObjectName("play-together-show-windows");
+    connect(this->pt_show_windows, SIGNAL(triggered()), this, SLOT(do_play_together_show_windows()));
+
+    auto *scale_menu = this->play_together_menu->addMenu("Friends' view scale");
+    for(std::size_t i = 0; i < MainWindow::PEER_SCALE_COUNT; i++) {
+        char text[16];
+        std::snprintf(text, sizeof(text), "%zux", i + 1);
+        auto *action = new NumberedAction(this, text, static_cast<std::uint8_t>(i + 1), &MainWindow::set_peer_video_scale);
+        action->setObjectName(QString("play-together-scale-%1").arg(i + 1));
+        action->setCheckable(true);
+        scale_menu->addAction(action);
+        this->pt_scale[i] = action;
+    }
+
+    this->play_together_menu->addSeparator();
+
+    this->pt_save_replays = this->play_together_menu->addAction("Save friends' games as replays");
+    this->pt_save_replays->setObjectName("play-together-save-replays");
+    this->pt_save_replays->setCheckable(true);
+    connect(this->pt_save_replays, SIGNAL(triggered()), this, SLOT(do_toggle_save_peer_replays()));
+}
+
+void MainWindow::refresh_play_together_actions() {
+    if(this->frontend == nullptr || this->play_together == nullptr) {
+        return;
+    }
+    bool game_loaded = this->is_game_running();
+    bool active = this->play_together->is_active();
+    bool host = this->play_together->is_host();
+    auto emulator_type = supershuckie_frontend_get_emulator_type(this->frontend);
+    bool supported = game_loaded && emulator_type != SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
+
+    this->pt_open->setEnabled(active || supported);
+    this->pt_leave->setEnabled(active);
+    this->pt_leave->setText(host ? "Stop hosting" : "Leave session");
+    this->pt_reset_all->setEnabled(active && host);
+    this->pt_show_windows->setEnabled(active);
+
+    auto scale = supershuckie_frontend_play_together_get_video_scale(this->frontend);
+    for(auto *action : this->pt_scale) {
+        action->setChecked(action->number == scale);
+    }
+
+    // The game being played together cannot be swapped for a replay or another Game Boy model.
+    if(active) {
+        this->play_replay->setEnabled(false);
+        this->continue_last_replay->setEnabled(false);
+        this->game_boy_settings->setEnabled(false);
+    }
+}
+
+void MainWindow::set_peer_video_scale(std::uint8_t scale) {
+    this->play_together->set_scale(scale);
+    this->refresh_play_together_actions();
+}
+
+void MainWindow::do_play_together_open() {
+    this->play_together->open_dialog();
+}
+
+void MainWindow::do_play_together_leave() {
+    this->play_together->leave();
+    this->refresh_action_states();
+}
+
+void MainWindow::do_play_together_reset_all() {
+    this->play_together->reset_all();
+}
+
+void MainWindow::do_play_together_show_windows() {
+    this->play_together->show_windows();
+}
+
+void MainWindow::do_toggle_save_peer_replays() {
+    supershuckie_frontend_play_together_set_save_peer_replays(this->frontend, this->pt_save_replays->isChecked());
 }

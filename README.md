@@ -129,6 +129,17 @@ deletes and seeks to bookmarks as well (see [docs/external_commands.md](docs/ext
 Bookmarks are saved inside the replay file (format v5). Adding one to a replay made by an older
 version upgrades that file in place, after asking; older versions cannot open it afterwards.
 
+## Play Together
+
+Play alongside friends (or race them) with every player's game on your screen. One player hosts
+from **Play Together → Host or join a session…** and shares a code; the others load their own
+game and join. What travels over the network is only what a replay holds (inputs, memory edits,
+resets) and each friend's game is emulated locally from it, in a window of its own, at a few
+kilobytes a second; your own game keeps its priority and its frame rate. Friends' games are also
+saved as replays. Game Boy, Game Boy Color and Game Boy Advance for now. See
+[docs/play_together.md](docs/play_together.md) and
+[docs/play-together-protocol.md](docs/play-together-protocol.md).
+
 ## Converting old replays
 
 Replays recorded before format v4 (September 2026) can be re-encoded offline into the current

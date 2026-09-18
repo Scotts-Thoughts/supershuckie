@@ -112,9 +112,110 @@ pub struct Settings {
     #[serde(default = "BookmarkSettings::default")]
     pub bookmarks: BookmarkSettings,
 
+    #[serde(default = "PlayTogetherSettings::default")]
+    pub play_together: PlayTogetherSettings,
+
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub custom: BTreeMap<String, UTF8CString>
+}
+
+/// Play Together: playing alongside other players over the network.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct PlayTogetherSettings {
+    /// The name other players see.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_DISPLAY_NAME")]
+    pub display_name: String,
+
+    /// The TCP port to host on.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_HOST_PORT")]
+    pub host_port: u16,
+
+    /// The address to host on: `0.0.0.0` (reachable from the network) unless changed.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_BIND_ADDRESS")]
+    pub bind_address: String,
+
+    /// The last code joined with, to prefill the dialog.
+    #[serde(default = "String::new")]
+    pub last_join_code: String,
+
+    /// Write every other player's game to a replay file of its own.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_SAVE_PEER_REPLAYS")]
+    pub save_peer_replays: bool,
+
+    /// Display scale of the other players' windows.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_PEER_VIDEO_SCALE")]
+    pub peer_video_scale: NonZeroU8,
+
+    /// Let Nintendo DS games into sessions (unsupported for now: a state is 20 MB).
+    #[serde(default = "PlayTogetherSettings::DEFAULT_ALLOW_NINTENDO_DS")]
+    pub allow_nintendo_ds: bool,
+
+    /// ROMs by blake3 hash (lowercase hex), so another player's ROM can be found on this
+    /// machine without asking. Learned from every ROM loaded or located.
+    #[serde(default = "BTreeMap::default")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub known_roms: BTreeMap<String, UTF8CString>
+}
+
+impl PlayTogetherSettings {
+    const DEFAULT_DISPLAY_NAME: fn() -> String = || String::from("Player");
+    const DEFAULT_HOST_PORT: fn() -> u16 = || 30170;
+    const DEFAULT_BIND_ADDRESS: fn() -> String = || String::from("0.0.0.0");
+    const DEFAULT_SAVE_PEER_REPLAYS: fn() -> bool = || true;
+    const DEFAULT_PEER_VIDEO_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(2) };
+    const DEFAULT_ALLOW_NINTENDO_DS: fn() -> bool = || false;
+
+    /// Longest display name kept.
+    pub const MAX_DISPLAY_NAME_BYTES: usize = 32;
+
+    /// Largest scale the other players' windows get.
+    pub const MAX_PEER_VIDEO_SCALE: u8 = 12;
+
+    /// Most ROM paths remembered by hash.
+    pub const MAX_KNOWN_ROMS: usize = 64;
+
+    /// Bring out-of-range values from the config file back into range.
+    pub(crate) fn clamp(&mut self) {
+        let mut name = self.display_name.trim().to_owned();
+        name.retain(|c| !c.is_control());
+        while name.len() > Self::MAX_DISPLAY_NAME_BYTES {
+            name.pop();
+        }
+        self.display_name = if name.is_empty() { Self::DEFAULT_DISPLAY_NAME() } else { name };
+
+        if self.host_port == 0 {
+            self.host_port = Self::DEFAULT_HOST_PORT();
+        }
+        if self.bind_address.trim().parse::<std::net::IpAddr>().is_err() {
+            self.bind_address = Self::DEFAULT_BIND_ADDRESS();
+        }
+        else {
+            self.bind_address = self.bind_address.trim().to_owned();
+        }
+        if self.peer_video_scale.get() > Self::MAX_PEER_VIDEO_SCALE {
+            self.peer_video_scale = NonZeroU8::new(Self::MAX_PEER_VIDEO_SCALE).unwrap();
+        }
+        while self.known_roms.len() > Self::MAX_KNOWN_ROMS {
+            let first = self.known_roms.keys().next().cloned().expect("non-empty");
+            self.known_roms.remove(&first);
+        }
+    }
+}
+
+impl Default for PlayTogetherSettings {
+    fn default() -> Self {
+        Self {
+            display_name: Self::DEFAULT_DISPLAY_NAME(),
+            host_port: Self::DEFAULT_HOST_PORT(),
+            bind_address: Self::DEFAULT_BIND_ADDRESS(),
+            last_join_code: String::new(),
+            save_peer_replays: Self::DEFAULT_SAVE_PEER_REPLAYS(),
+            peer_video_scale: Self::DEFAULT_PEER_VIDEO_SCALE(),
+            allow_nintendo_ds: Self::DEFAULT_ALLOW_NINTENDO_DS(),
+            known_roms: BTreeMap::new()
+        }
+    }
 }
 
 /// Audio playback. Off by default: a fresh install plays nothing until the user turns it on.
@@ -193,6 +294,7 @@ impl Settings {
         self.export.default_crf = self.export.default_crf.min(51);
 
         self.recent_roms.clamp();
+        self.play_together.clamp();
     }
 }
 

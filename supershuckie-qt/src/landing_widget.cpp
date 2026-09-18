@@ -92,6 +92,14 @@ LandingWidget::LandingWidget(MainWindow *window, QWidget *parent): QWidget(paren
     this->reload();
 }
 
+QStringList LandingWidget::favorite_paths() const {
+    QStringList paths;
+    for(const auto &favorite : this->favorites) {
+        paths.append(favorite.path);
+    }
+    return paths;
+}
+
 void LandingWidget::reload() {
     bool dismissed = false;
     if(this->main_window->frontend != nullptr) {

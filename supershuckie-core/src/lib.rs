@@ -19,9 +19,15 @@ use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
 use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
-use supershuckie_replay_recorder::{BookmarkTable, ByteVec, Packet, SignedInteger, TimestampMillis, UnsignedInteger, KEYFRAME_BOOKMARK_LEAD_FRAMES};
+use supershuckie_replay_recorder::{blake3_hash_slices, BookmarkTable, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, SignedInteger, TimestampMillis, UnsignedInteger, KEYFRAME_BOOKMARK_LEAD_FRAMES};
+use crate::stream::{StreamPublisherFns, SYNC_HASH_INTERVAL_FRAMES};
 
 pub mod emulator;
+
+pub mod stream;
+
+#[cfg(feature = "std")]
+pub mod live_replay;
 
 pub mod export;
 pub use export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
@@ -52,6 +58,29 @@ pub struct SuperShuckieCore {
     timestamp_provider: Box<dyn MonotonicTimestampProvider>,
 
     replay_player: Option<ReplayFilePlayer>,
+
+    /// A live replay arriving from another player (Play Together); see [`live_replay`].
+    #[cfg(feature = "std")]
+    follower: Option<live_replay::FollowerState>,
+
+    /// Where the running session is mirrored to, if it is being published (see [`stream`]).
+    stream_publisher: Option<Box<dyn StreamPublisherFns>>,
+
+    /// A snapshot was asked for; it goes out after the next completed frame (or from the idle
+    /// path while paused), so that it sits at a frame boundary in the stream.
+    stream_snapshot_pending: bool,
+
+    /// Frames since the last sync hash was published.
+    stream_frames_since_hash: u64,
+
+    /// Whether a live replay (see [`live_replay`]) has nothing to run yet: unlike
+    /// [`Self::replay_stalled`] this is transient (the publisher is paused or the network is
+    /// behind) and is re-checked on every run.
+    replay_waiting: bool,
+
+    /// The replay time a follower's own recording started at: its file counts time from zero
+    /// while [`Self::total_milliseconds`] is the publisher's. Zero for anything else.
+    stream_time_origin: TimestampMillis,
 
     /// The current user-defined input.
     base_input: Input,
@@ -247,6 +276,13 @@ impl SuperShuckieCore {
             total_frames: 0,
             full_keyframe_pending: false,
             replay_player: None,
+            #[cfg(feature = "std")]
+            follower: None,
+            stream_publisher: None,
+            stream_snapshot_pending: false,
+            stream_frames_since_hash: 0,
+            replay_waiting: false,
+            stream_time_origin: 0.into(),
             replay_stalled: false,
             replay_frame_pending: false,
             input_latched: false,
@@ -344,7 +380,28 @@ impl SuperShuckieCore {
     /// attached, but the emulator is the user's again.
     #[inline]
     pub fn is_playing_back(&self) -> bool {
-        self.replay_player.is_some() && !self.replay_playback_stopped
+        (self.replay_player.is_some() || self.is_following()) && !self.replay_playback_stopped
+    }
+
+    /// Whether a live replay from another player is attached (see [`live_replay`]).
+    #[inline]
+    #[cfg(feature = "std")]
+    pub fn is_following(&self) -> bool {
+        self.follower.is_some()
+    }
+
+    /// Whether a live replay from another player is attached (never, without `std`).
+    #[inline]
+    #[cfg(not(feature = "std"))]
+    pub fn is_following(&self) -> bool {
+        false
+    }
+
+    /// Whether the attached live replay has nothing to run yet (see [`Self::is_replay_stalled`]
+    /// for the permanent case).
+    #[inline]
+    pub fn is_replay_waiting(&self) -> bool {
+        self.replay_waiting
     }
 
     /// Whether a replay is attached, playing or stopped.
@@ -491,6 +548,15 @@ impl SuperShuckieCore {
         self.do_run_fn(EmulatorCore::run_unlocked, true);
     }
 
+    /// Run unlocked for the shortest amount of time, drawing the frame only if `draw`, with its
+    /// samples reaching the audio output (a follower of another player's game paces itself on
+    /// what arrives rather than on a clock, so it never uses [`Self::run`]).
+    #[cfg(feature = "std")]
+    pub fn run_unlocked_presenting(&mut self, draw: bool) {
+        self.core.set_skip_drawing(!draw);
+        self.do_run_fn(EmulatorCore::run_unlocked, true);
+    }
+
     /// Get the current replay counters.
     pub fn get_replay_counters(&self) -> Option<&BTreeMap<String, SignedInteger>> {
         self.replay_counters.as_ref()
@@ -506,7 +572,9 @@ impl SuperShuckieCore {
             self.before_run();
         }
 
-        if !self.replay_stalled {
+        // A live replay that has nothing to run yet holds position, like a stalled one, but is
+        // asked again on the next run.
+        if !self.replay_stalled && !self.replay_waiting {
             let time = run_fn(Box::as_mut(&mut self.core));
             self.after_run(&time);
             self.drain_audio(audible);
@@ -795,6 +863,12 @@ impl SuperShuckieCore {
             return
         }
 
+        #[cfg(feature = "std")]
+        if self.follower.is_some() {
+            self.handle_live_replay();
+            return
+        }
+
         let Some(mut player) = self.replay_player.take() else {
             return
         };
@@ -806,53 +880,20 @@ impl SuperShuckieCore {
                     break;
                 },
                 Ok(Some(n)) => {
-                    match n {
-                        Packet::NoOp => {}
-                        Packet::NextFrame { timestamp_delta } => {
-                            self.total_milliseconds = self.total_milliseconds.0.wrapping_add(timestamp_delta.0).into();
-                            // Nothing more is read from the replay until this frame has run.
-                            self.replay_frame_pending = true;
-                            break;
+                    let next_frame = matches!(n, Packet::NextFrame { .. });
+                    if matches!(n, Packet::Keyframe { .. }) {
+                        // The player is told not to copy states into packets (see
+                        // `attach_replay_player`); read the reconstructed state directly.
+                        if self.auto_resync_keyframes_in_replays {
+                            let state = player.current_keyframe_state();
+                            self.resync_from_keyframe(state);
                         }
-                        Packet::WriteMemory { address, data } => {
-                            // Skipped rather than fatal: a replay may write to memory this version
-                            // does not map (including an address that no longer fits in u32).
-                            let wrote = u32::try_from(*address).is_ok_and(|address| self.core.write_ram(address, data.as_slice()).is_ok());
-                            if !wrote {
-                                self.replay_write_failures += 1;
-                            }
-                        }
-                        Packet::ChangeInput { data } => {
-                            self.core.set_input_encoded(data.as_slice());
-                        }
-                        Packet::ChangeSpeed { speed } => {
-                            self.replay_playback_speed = *speed;
-                            self.match_replay_playback_speed();
-                        }
-                        Packet::ResetConsole => {
-                            self.core.hard_reset();
-                            self.bump_state_epoch();
-                        }
-                        Packet::LoadSaveState { state } => {
-                            let _ = self.core.load_save_state(state.as_slice());
-                            self.bump_state_epoch();
-                        },
-                        Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => {}
-                        Packet::Keyframe { .. } => {
-                            if self.auto_resync_keyframes_in_replays {
-                                // The player is told not to copy states into packets (see
-                                // `attach_replay_player`); read the reconstructed state directly.
-                                let state = self.splice_live_transient_buffers(player.current_keyframe_state());
-                                let _ = self.core.load_save_state(&state);
-                            }
-                        }
-                        // The player materialises every delta variant into a Keyframe before
-                        // handing it out; these arms are unreachable in practice.
-                        Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } => {},
-                        Packet::CompressedBlob { .. } => unreachable!("compressed blob"),
-                        Packet::IncrementCounter { name, delta } => {
-                            self.change_replay_counter_map(&name, *delta);
-                        }
+                    }
+                    else {
+                        self.apply_playback_packet(n, None);
+                    }
+                    if next_frame {
+                        break;
                     }
                 }
                 Err(_) => {
@@ -863,6 +904,68 @@ impl SuperShuckieCore {
         }
 
         self.replay_player = Some(player);
+    }
+
+    /// Apply one packet of a replay being played back (from a file or live). `keyframe_state` is
+    /// the reconstructed state of a file's `Keyframe` packet, used for an auto-resync; a live
+    /// replay's snapshots are applied before they get here (see `apply_stream_snapshot`).
+    fn apply_playback_packet(&mut self, packet: &Packet, keyframe_state: Option<&[u8]>) {
+        let mut wrote = false;
+        match packet {
+            Packet::NoOp => {}
+            Packet::NextFrame { timestamp_delta } => {
+                self.total_milliseconds = self.total_milliseconds.0.wrapping_add(timestamp_delta.0).into();
+                // Nothing more is read from the replay until this frame has run.
+                self.replay_frame_pending = true;
+            }
+            Packet::WriteMemory { address, data } => {
+                // Skipped rather than fatal: a replay may write to memory this version does not
+                // map (including an address that no longer fits in u32).
+                wrote = u32::try_from(*address).is_ok_and(|address| self.core.write_ram(address, data.as_slice()).is_ok());
+                if !wrote {
+                    self.replay_write_failures += 1;
+                }
+            }
+            Packet::ChangeInput { data } => {
+                self.core.set_input_encoded(data.as_slice());
+            }
+            Packet::ChangeSpeed { speed } => {
+                self.replay_playback_speed = *speed;
+                self.match_replay_playback_speed();
+            }
+            Packet::ResetConsole => {
+                self.core.hard_reset();
+                self.bump_state_epoch();
+            }
+            Packet::LoadSaveState { state } => {
+                let _ = self.core.load_save_state(state.as_slice());
+                self.bump_state_epoch();
+            },
+            Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => {}
+            Packet::Keyframe { .. } => {
+                if self.auto_resync_keyframes_in_replays && let Some(state) = keyframe_state {
+                    self.resync_from_keyframe(state);
+                }
+            }
+            // The player materialises every delta variant into a Keyframe before handing it out;
+            // these arms are unreachable in practice.
+            Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } => {},
+            Packet::CompressedBlob { .. } => unreachable!("compressed blob"),
+            Packet::IncrementCounter { name, delta } => {
+                self.change_replay_counter_map(name, *delta);
+            }
+        }
+
+        #[cfg(feature = "std")]
+        self.follower_mirror(packet, wrote);
+        #[cfg(not(feature = "std"))]
+        let _ = wrote;
+    }
+
+    /// Put the console back on a file replay's keyframe it has just reached (an auto-resync).
+    fn resync_from_keyframe(&mut self, state: &[u8]) {
+        let state = self.splice_live_transient_buffers(state);
+        let _ = self.core.load_save_state(&state);
     }
 
     /// Copy the emulator's own regenerated output buffers (melonDS 3D vertex/polygon banks, mGBA
@@ -906,6 +1009,7 @@ impl SuperShuckieCore {
         self.run_serial = self.run_serial.wrapping_add(1);
         self.do_frame_timekeeping(time);
         self.push_keyframe_if_needed(time);
+        self.service_stream(time);
     }
 
     fn flush_writes(&mut self) {
@@ -923,6 +1027,10 @@ impl SuperShuckieCore {
             // Only record what was actually written: a replay must not carry a write it cannot
             // apply on playback.
             if self.core.write_ram(write.address, write.data.as_slice()).is_ok() {
+                if self.stream_publisher.is_some() {
+                    let data = write.data.clone();
+                    self.with_publisher(|publisher| publisher.write_memory(write.address as UnsignedInteger, data));
+                }
                 self.with_recorder(|recorder| recorder.write_memory(write.address as UnsignedInteger, write.data));
             }
         }
@@ -947,6 +1055,7 @@ impl SuperShuckieCore {
         self.bump_state_epoch();
         self.clear_audio();
         self.with_recorder(|r| r.reset_console());
+        self.with_publisher(|p| p.reset_console());
         // The console's own input state was just replaced; apply ours again on the next run.
         self.input_latched = false;
     }
@@ -1000,8 +1109,9 @@ impl SuperShuckieCore {
         self.bump_state_epoch();
         self.clear_audio();
 
-        if self.replay_file_recorder.is_some() {
+        if self.is_capturing() {
             self.with_recorder(|r| r.load_save_state(state.into()));
+            self.with_publisher(|p| p.load_save_state(state.into()));
         }
         else {
             // Draw one frame from the loaded state (so the screens show something), then reload it
@@ -1025,10 +1135,14 @@ impl SuperShuckieCore {
 
     /// Modify a counter, adding `delta`.
     pub fn change_replay_counter(&mut self, name: String, delta: SignedInteger) {
-        if self.replay_file_recorder.is_none() {
+        if !self.is_capturing() {
             return
         }
         self.change_replay_counter_map(&name, delta);
+        if self.stream_publisher.is_some() {
+            let name = name.clone();
+            self.with_publisher(|p| p.change_counter(name, delta));
+        }
         self.with_recorder(|r| r.change_counter(name, delta))
     }
 
@@ -1104,6 +1218,10 @@ impl SuperShuckieCore {
         self.replay_counters = Some(BTreeMap::new());
         // Record the input with the first frame rather than rely on the header's initial input.
         self.input_latched = false;
+        // The counters started over; anyone following this session picks that up from a snapshot.
+        if self.stream_publisher.is_some() {
+            self.stream_snapshot_pending = true;
+        }
 
         Ok(())
     }
@@ -1230,7 +1348,9 @@ impl SuperShuckieCore {
     /// Returns None if no replay was being recorded. Otherwise, returns Some(true) if successfully closed, or Some(false) if not.
     pub fn stop_recording_replay(&mut self) -> Option<bool> {
         if let Some(mut old_recorder) = self.replay_file_recorder.take() {
-            self.replay_counters = None;
+            if self.stream_publisher.is_none() && !self.is_following() {
+                self.replay_counters = None;
+            }
             return if !old_recorder.is_closed() {
                 Some(old_recorder.close().is_ok())
             }
@@ -1251,6 +1371,161 @@ impl SuperShuckieCore {
         if let Some(n) = self.replay_file_recorder.as_mut() {
             let _ = what(Box::as_mut(n));
         }
+    }
+
+    fn with_publisher<F: FnOnce(&mut dyn StreamPublisherFns)>(&mut self, what: F) {
+        if let Some(p) = self.stream_publisher.as_mut() {
+            what(Box::as_mut(p));
+        }
+    }
+
+    /// Whether anything is capturing the session: a replay being recorded or a stream being
+    /// published.
+    #[inline]
+    fn is_capturing(&self) -> bool {
+        self.replay_file_recorder.is_some() || self.stream_publisher.is_some()
+    }
+
+    /// Start mirroring the session into `publisher` (see [`stream`]). Refused without a console
+    /// or while a replay (from a file or another player) is attached: a replay's console is not
+    /// this player's to publish.
+    ///
+    /// The publisher gets a snapshot of the current state right away. The timer is not touched
+    /// (a recording may be running): snapshots carry absolute times and the publisher derives
+    /// deltas.
+    pub fn start_stream_publishing(&mut self, publisher: Box<dyn StreamPublisherFns>) -> Result<(), String> {
+        if self.core.replay_console_type().is_none() {
+            return Err(String::from("this core cannot be published (no console type)"))
+        }
+        if self.has_replay_attached() || self.is_following() {
+            return Err(String::from("a replay is attached; close it before publishing"))
+        }
+        self.stop_stream_publishing();
+        self.finish_current_frame();
+        self.stream_publisher = Some(publisher);
+        if self.replay_counters.is_none() {
+            self.replay_counters = Some(BTreeMap::new());
+        }
+        self.stream_frames_since_hash = 0;
+        self.stream_snapshot_pending = false;
+        self.publish_snapshot_now();
+        Ok(())
+    }
+
+    /// Stop publishing the session (see [`Self::start_stream_publishing`]).
+    pub fn stop_stream_publishing(&mut self) {
+        if let Some(mut publisher) = self.stream_publisher.take() {
+            publisher.end();
+        }
+        self.stream_snapshot_pending = false;
+        if self.replay_file_recorder.is_none() && !self.is_following() {
+            self.replay_counters = None;
+        }
+    }
+
+    /// Whether the session is being published.
+    #[inline]
+    pub fn is_stream_publishing(&self) -> bool {
+        self.stream_publisher.is_some()
+    }
+
+    /// Publish a snapshot after the next completed frame (requests made before then are merged
+    /// into that one). Does nothing when not publishing.
+    pub fn request_stream_snapshot(&mut self) {
+        if self.stream_publisher.is_some() {
+            self.stream_snapshot_pending = true;
+        }
+    }
+
+    /// Whether a requested snapshot has not gone out yet.
+    #[inline]
+    pub fn stream_snapshot_pending(&self) -> bool {
+        self.stream_snapshot_pending
+    }
+
+    /// Publish the requested snapshot now, if one is pending and the console sits at a frame
+    /// boundary: for when the game is paused and no frame will complete to carry it.
+    pub fn publish_pending_stream_snapshot(&mut self) {
+        if !self.stream_snapshot_pending || self.core.is_mid_frame() {
+            return
+        }
+        self.stream_snapshot_pending = false;
+        self.publish_snapshot_now();
+    }
+
+    /// Problems the publisher reported since the last call.
+    pub fn poll_stream_errors(&mut self) -> Vec<String> {
+        self.stream_publisher.as_mut().map(|p| p.poll_errors()).unwrap_or_default()
+    }
+
+    /// Everything a snapshot of this moment needs besides the state itself.
+    fn current_keyframe_metadata(&mut self) -> KeyframeMetadata {
+        self.input_scratch_buffer.clear();
+        self.core.encode_input(self.current_input, &mut self.input_scratch_buffer);
+        let mut input = InputBuffer::new();
+        input.extend_from_slice(self.input_scratch_buffer.as_slice());
+        KeyframeMetadata {
+            input,
+            speed: self.game_speed,
+            elapsed_frames: self.total_frames,
+            elapsed_millis: self.total_milliseconds,
+            counters: self.replay_counters.iter().flatten().map(|(name, value)| Counter { name: name.clone(), value: *value }).collect()
+        }
+    }
+
+    fn publish_snapshot_now(&mut self) {
+        if self.stream_publisher.is_none() {
+            return
+        }
+        let metadata = self.current_keyframe_metadata();
+        let mut buffer = self.take_state_buffer();
+        self.core.create_save_state_into(&mut buffer);
+        self.with_publisher(|p| p.snapshot(metadata, buffer));
+    }
+
+    /// After a completed frame: the periodic sync hash, then any pending snapshot, in that order
+    /// and after the frame's own `next_frame`, so a follower sees `NextFrame(N)`, the hash of
+    /// frame `N`, then a snapshot at `N`, then frame `N + 1`'s packets.
+    fn service_stream(&mut self, time: &RunTime) {
+        if self.stream_publisher.is_none() || time.frames == 0 || self.core.is_mid_frame() {
+            return
+        }
+        self.stream_frames_since_hash += time.frames;
+        if self.stream_frames_since_hash >= SYNC_HASH_INTERVAL_FRAMES {
+            self.stream_frames_since_hash = 0;
+            if let Some(hash) = self.sync_hash() {
+                let frame = self.total_frames;
+                self.with_publisher(|p| p.sync_hash(frame, hash));
+            }
+        }
+        if core::mem::take(&mut self.stream_snapshot_pending) {
+            self.publish_snapshot_now();
+        }
+    }
+
+    /// Short names of the regions whose contents decide whether two instances of a game are in
+    /// step: the work RAM the game computes in, not video memory or save data (whose mapped
+    /// length can change on the Game Boy Advance as the save type is detected).
+    fn sync_hash_regions(&self) -> &'static [&'static str] {
+        match self.core.replay_console_type() {
+            Some(ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor) => &["WRAM", "WRAMX", "HRAM"],
+            Some(ReplayConsoleType::GameBoyAdvance) => &["EWRAM", "IWRAM"],
+            Some(ReplayConsoleType::NintendoDS) => &["MAIN", "SWRAM", "WRAM7"],
+            _ => &[]
+        }
+    }
+
+    /// blake3 of the console's work RAM (see [`stream::SYNC_HASH_INTERVAL_FRAMES`]), or `None`
+    /// when the core exposes no such region.
+    pub fn sync_hash(&self) -> Option<[u8; 32]> {
+        let wanted = self.sync_hash_regions();
+        let regions = self.core.memory_regions();
+        let parts = regions.iter().enumerate()
+            .filter(|(_, r)| wanted.contains(&r.short_name))
+            .filter_map(|(i, _)| self.core.memory_region_data(i));
+        let mut any = false;
+        let hash = blake3_hash_slices(parts.inspect(|_| any = true));
+        any.then_some(hash)
     }
 
     fn update_input(&mut self) {
@@ -1288,6 +1563,12 @@ impl SuperShuckieCore {
         self.core.encode_input(self.current_input, &mut self.input_scratch_buffer);
         self.core.set_input_encoded(self.input_scratch_buffer.as_slice());
 
+        if self.stream_publisher.is_some() {
+            let mut data = ByteVec::with_capacity(self.input_scratch_buffer.len());
+            data.extend_from_slice(self.input_scratch_buffer.as_slice());
+            self.with_publisher(|p| p.set_input(data));
+        }
+
         if self.replay_file_recorder.is_some() {
             let mut data = ByteVec::with_capacity(self.input_scratch_buffer.len());
             data.extend_from_slice(self.input_scratch_buffer.as_slice());
@@ -1314,6 +1595,7 @@ impl SuperShuckieCore {
                 self.total_milliseconds = ms;
                 for _ in 0..time.frames {
                     self.with_recorder(|f| f.next_frame(ms));
+                    self.with_publisher(|p| p.next_frame(ms));
                 }
             }
         }
@@ -1333,7 +1615,7 @@ impl SuperShuckieCore {
     /// Write a keyframe of the current state into the recording (always stored in full if `full`)
     /// and restart the keyframe interval.
     fn write_keyframe(&mut self, full: bool) {
-        let ms = self.total_milliseconds;
+        let ms = self.recording_millis();
 
         let mut buffer = self.take_state_buffer();
         self.core.create_save_state_into(&mut buffer);
@@ -1353,11 +1635,23 @@ impl SuperShuckieCore {
         }
     }
 
+    /// The time the replay being recorded is at: the session's time, less the origin of a
+    /// follower's own file (see [`Self::stream_time_origin`]).
+    #[inline]
+    fn recording_millis(&self) -> TimestampMillis {
+        self.total_milliseconds.0.saturating_sub(self.stream_time_origin.0).into()
+    }
+
     /// A buffer to create a keyframe state into: a recycled one when available, since a fresh
     /// multi-megabyte allocation costs milliseconds of page faults and a reused one is a plain copy.
     fn take_state_buffer(&mut self) -> Vec<u8> {
         while self.state_buffers.len() < Self::STATE_BUFFER_POOL
             && let Some(buffer) = self.replay_file_recorder.as_mut().and_then(|r| r.take_free_state_buffer())
+        {
+            self.state_buffers.push(buffer);
+        }
+        while self.state_buffers.len() < Self::STATE_BUFFER_POOL
+            && let Some(buffer) = self.stream_publisher.as_mut().and_then(|p| p.take_free_state_buffer())
         {
             self.state_buffers.push(buffer);
         }
@@ -1371,41 +1665,20 @@ impl SuperShuckieCore {
     /// (see [`ReplayPlayerAttachError`]). Only after those checks pass is the current recording
     /// stopped and any previously attached player detached.
     pub fn attach_replay_player(&mut self, mut player: ReplayFilePlayer, allow_mismatched: bool) -> Result<(), ReplayPlayerAttachError> {
-        let metadata = player.get_replay_metadata();
-        let core_console_type = self.core.replay_console_type();
-
-        if Some(metadata.console_type) != core_console_type {
-            return Err(ReplayPlayerAttachError::Incompatible {
-                description: format!("Console types don't match! (replay: {:?}, rom: {core_console_type:?})", metadata.console_type)
-            })
+        {
+            let metadata = player.get_replay_metadata();
+            self.check_replay_compat(metadata.console_type, &metadata.rom_checksum, &metadata.bios_checksum, &metadata.emulator_core_name, allow_mismatched)?;
         }
-
-        if !allow_mismatched {
-            let mut mismatched_list = Vec::new();
-
-            let rom_checksum = *self.core.rom_checksum();
-            let bios_checksum = *self.core.bios_checksum();
-            let core_name = self.core.core_name();
-
-            if metadata.rom_checksum != rom_checksum {
-                mismatched_list.push(ReplayPlayerMetadataMismatchKind::ROMChecksumMismatch { replay: metadata.rom_checksum, loaded: rom_checksum })
-            }
-
-            if metadata.bios_checksum != bios_checksum {
-                mismatched_list.push(ReplayPlayerMetadataMismatchKind::BIOSChecksumMismatch { replay: metadata.bios_checksum, loaded: bios_checksum })
-            }
-
-            if metadata.emulator_core_name != core_name {
-                mismatched_list.push(ReplayPlayerMetadataMismatchKind::CoreMismatch { replay: metadata.emulator_core_name.clone(), loaded: core_name.to_owned() })
-            }
-
-            if !mismatched_list.is_empty() {
-                return Err(ReplayPlayerAttachError::MismatchedMetadata { issues: mismatched_list })
-            }
+        if self.stream_publisher.is_some() {
+            return Err(ReplayPlayerAttachError::Incompatible {
+                description: String::from("This console is being published to other players; leave the Play Together session first.")
+            })
         }
 
         self.stop_recording_replay();
         self.detach_replay_player();
+        #[cfg(feature = "std")]
+        self.detach_live_source();
 
         if let Err(e) = player.go_to_keyframe(0) {
             // Nothing was attached yet (the detach above already cleared any previous player), but
@@ -1433,6 +1706,51 @@ impl SuperShuckieCore {
         if let Err(e) = self.go_to_replay_frame_inner(0, 0) {
             self.detach_replay_player();
             return Err(ReplayPlayerAttachError::Failed { description: e })
+        }
+
+        Ok(())
+    }
+
+    /// Whether a replay (from a file or another player) can be played on this core: the console
+    /// type must match, and unless `allow_mismatched`, so must the ROM, BIOS and core name.
+    fn check_replay_compat(
+        &self,
+        console_type: ReplayConsoleType,
+        rom_checksum: &ReplayHeaderBlake3Hash,
+        bios_checksum: &ReplayHeaderBlake3Hash,
+        emulator_core_name: &str,
+        allow_mismatched: bool
+    ) -> Result<(), ReplayPlayerAttachError> {
+        let core_console_type = self.core.replay_console_type();
+
+        if Some(console_type) != core_console_type {
+            return Err(ReplayPlayerAttachError::Incompatible {
+                description: format!("Console types don't match! (replay: {console_type:?}, rom: {core_console_type:?})")
+            })
+        }
+
+        if !allow_mismatched {
+            let mut mismatched_list = Vec::new();
+
+            let loaded_rom = *self.core.rom_checksum();
+            let loaded_bios = *self.core.bios_checksum();
+            let core_name = self.core.core_name();
+
+            if *rom_checksum != loaded_rom {
+                mismatched_list.push(ReplayPlayerMetadataMismatchKind::ROMChecksumMismatch { replay: *rom_checksum, loaded: loaded_rom })
+            }
+
+            if *bios_checksum != loaded_bios {
+                mismatched_list.push(ReplayPlayerMetadataMismatchKind::BIOSChecksumMismatch { replay: *bios_checksum, loaded: loaded_bios })
+            }
+
+            if emulator_core_name != core_name {
+                mismatched_list.push(ReplayPlayerMetadataMismatchKind::CoreMismatch { replay: emulator_core_name.to_owned(), loaded: core_name.to_owned() })
+            }
+
+            if !mismatched_list.is_empty() {
+                return Err(ReplayPlayerAttachError::MismatchedMetadata { issues: mismatched_list })
+            }
         }
 
         Ok(())
@@ -1884,6 +2202,8 @@ mod tests {
         period_micros: u64,
         last_frame_micros: u64,
         counter: u32,
+        /// `counter` as bytes, exposed as a memory region (so sync hashes see something).
+        counter_bytes: [u8; 4],
         input_byte: u8,
         /// The input byte active on every frame that actually advanced, oldest first.
         frame_inputs: Arc<Mutex<Vec<u8>>>,
@@ -1901,6 +2221,7 @@ mod tests {
                 period_micros,
                 last_frame_micros: 0,
                 counter: 0,
+                counter_bytes: [0; 4],
                 input_byte: 0,
                 frame_inputs: Arc::new(Mutex::new(Vec::new())),
                 rom_checksum: [0; 32],
@@ -1915,7 +2236,19 @@ mod tests {
         }
     }
 
+    static FAKE_REGIONS: [crate::emulator::MemoryRegionInfo; 1] = [crate::emulator::MemoryRegionInfo {
+        name: "EWRAM", short_name: "EWRAM", base_address: 0x0200_0000, len: 4, default_big_endian: false, writable: true
+    }];
+
     impl EmulatorCore for FakePacedCore {
+        fn memory_regions(&self) -> &[crate::emulator::MemoryRegionInfo] {
+            &FAKE_REGIONS
+        }
+
+        fn memory_region_data(&self, index: usize) -> Option<&[u8]> {
+            (index == 0).then_some(&self.counter_bytes[..])
+        }
+
         fn run(&mut self) -> RunTime {
             let now = self.clock.now();
             let expected_next = self.last_frame_micros + self.period_micros;
@@ -1928,6 +2261,7 @@ mod tests {
 
         fn run_unlocked(&mut self) -> RunTime {
             self.counter = self.counter.wrapping_add(1);
+            self.counter_bytes = self.counter.to_le_bytes();
             self.frame_inputs.lock().unwrap().push(self.input_byte);
             RunTime::ONE_FRAME
         }
@@ -1961,6 +2295,7 @@ mod tests {
         fn load_save_state(&mut self, state: &[u8]) -> Result<(), String> {
             let bytes: [u8; 4] = state.try_into().map_err(|_| String::from("bad state"))?;
             self.counter = u32::from_le_bytes(bytes);
+            self.counter_bytes = bytes;
             Ok(())
         }
 
@@ -1980,6 +2315,7 @@ mod tests {
 
         fn hard_reset(&mut self) {
             self.counter = 0;
+            self.counter_bytes = [0; 4];
         }
 
         fn replay_console_type(&self) -> Option<ReplayConsoleType> {
@@ -2718,5 +3054,461 @@ mod tests {
         assert!(!core.is_replay_playback_stopped());
         assert!(!core.is_playing_back());
         assert_eq!(core.replay_position(), (0, 0.into()));
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Play Together: the publisher tee and the follower.
+    // ------------------------------------------------------------------------------------------
+
+    use crate::live_replay::{live_replay_channel, FollowerStats};
+    use crate::stream::{SnapshotRequestReason, StreamPublisherFns, SYNC_HASH_INTERVAL_FRAMES};
+    use supershuckie_replay_recorder::{InputBuffer, KeyframeMetadata};
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum StreamEvent {
+        Snapshot { frame: u64, input: Vec<u8>, state: Vec<u8> },
+        NextFrame(u64),
+        SetInput(Vec<u8>),
+        WriteMemory(u64, Vec<u8>),
+        Reset,
+        LoadState(Vec<u8>),
+        Counter(String, i64),
+        SyncHash(u64, [u8; 32]),
+        End
+    }
+
+    /// A publisher that keeps every event, in order, where the test can read it.
+    #[derive(Clone, Default)]
+    struct VecStreamPublisher(Arc<Mutex<Vec<StreamEvent>>>);
+
+    impl VecStreamPublisher {
+        fn events(&self) -> Vec<StreamEvent> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn count(&self, matcher: impl Fn(&StreamEvent) -> bool) -> usize {
+            self.events().iter().filter(|e| matcher(e)).count()
+        }
+    }
+
+    impl StreamPublisherFns for VecStreamPublisher {
+        fn snapshot(&mut self, metadata: KeyframeMetadata, state: Vec<u8>) {
+            self.0.lock().unwrap().push(StreamEvent::Snapshot { frame: metadata.elapsed_frames, input: metadata.input.to_vec(), state });
+        }
+        fn next_frame(&mut self, timestamp_millis: TimestampMillis) {
+            self.0.lock().unwrap().push(StreamEvent::NextFrame(timestamp_millis.0));
+        }
+        fn set_input(&mut self, input: InputBuffer) {
+            self.0.lock().unwrap().push(StreamEvent::SetInput(input.to_vec()));
+        }
+        fn write_memory(&mut self, address: UnsignedInteger, data: ByteVec) {
+            self.0.lock().unwrap().push(StreamEvent::WriteMemory(address, data.to_vec()));
+        }
+        fn reset_console(&mut self) {
+            self.0.lock().unwrap().push(StreamEvent::Reset);
+        }
+        fn load_save_state(&mut self, state: ByteVec) {
+            self.0.lock().unwrap().push(StreamEvent::LoadState(state.to_vec()));
+        }
+        fn change_counter(&mut self, name: String, delta: SignedInteger) {
+            self.0.lock().unwrap().push(StreamEvent::Counter(name, delta));
+        }
+        fn sync_hash(&mut self, frame: UnsignedInteger, hash: [u8; 32]) {
+            self.0.lock().unwrap().push(StreamEvent::SyncHash(frame, hash));
+        }
+        fn end(&mut self) {
+            self.0.lock().unwrap().push(StreamEvent::End);
+        }
+        fn poll_errors(&mut self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    fn fake_gba_metadata() -> ReplayFileMetadata {
+        ReplayFileMetadata {
+            console_type: ReplayConsoleType::GameBoyAdvance,
+            rom_name: "fake".into(),
+            rom_filename: "fake".into(),
+            rom_checksum: [0; 32],
+            bios_checksum: [0; 32],
+            emulator_core_name: "fake-paced".into(),
+            patch_format: ReplayPatchFormat::Unpatched,
+            patch_target_checksum: [0; 32],
+            crop_start: None,
+            crop_end: None,
+            timer_offset: None
+        }
+    }
+
+    fn keyframe_packet(frame: u64, counter: u32, input: u8) -> Packet {
+        let mut input_buffer = InputBuffer::new();
+        input_buffer.push(input);
+        Packet::Keyframe {
+            metadata: KeyframeMetadata { input: input_buffer, elapsed_frames: frame, elapsed_millis: TimestampMillis(frame * 16), ..Default::default() },
+            state: ByteVec::from(&counter.to_le_bytes()[..])
+        }
+    }
+
+    fn input_packet(input: u8) -> Packet {
+        let mut data = InputBuffer::new();
+        data.push(input);
+        Packet::ChangeInput { data }
+    }
+
+    fn next_frame_packet() -> Packet {
+        Packet::NextFrame { timestamp_delta: TimestampMillis(16) }
+    }
+
+    /// The thread loop polls a paced core's `run` many times per emulated frame; the publisher
+    /// must see the input once per emulated frame (the same guarantee the file recorder has),
+    /// never once per poll.
+    #[test]
+    fn publisher_emits_one_change_input_per_emulated_frame_on_a_paced_core() {
+        const FRAMES: u64 = 20;
+        const POLLS_PER_FRAME: u64 = 50;
+
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let publisher = VecStreamPublisher::default();
+        core.start_stream_publishing(Box::new(publisher.clone())).expect("start publishing");
+        assert!(matches!(publisher.events().first(), Some(StreamEvent::Snapshot { frame: 0, .. })), "publishing starts with a snapshot");
+
+        for frame in 0..FRAMES {
+            for poll in 0..POLLS_PER_FRAME {
+                if poll == POLLS_PER_FRAME / 2 {
+                    core.enqueue_input(Input { a: frame % 2 == 0, ..Input::default() });
+                }
+                core.run();
+                assert_eq!(core.last_run_time().frames, 0);
+            }
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+
+        let seen = log.lock().unwrap().clone();
+        let expected: Vec<u8> = (0..FRAMES).map(|frame| u8::from(frame % 2 == 0)).collect();
+        assert_eq!(seen, expected);
+
+        assert_eq!(publisher.count(|e| matches!(e, StreamEvent::NextFrame(_))) as u64, FRAMES);
+        let inputs = publisher.count(|e| matches!(e, StreamEvent::SetInput(_))) as u64;
+        assert!(inputs <= 2 * FRAMES, "{inputs} input events for {FRAMES} frames: the input is being published on every pacing poll");
+        assert!(core.poll_stream_errors().is_empty());
+
+        core.stop_stream_publishing();
+        assert_eq!(publisher.events().last(), Some(&StreamEvent::End));
+    }
+
+    /// Publishing is independent of file recording: starting and stopping a recording (which
+    /// restarts the timer and the frame counter) must not break the stream, and the followers
+    /// get a snapshot so they pick up the new frame numbering.
+    #[test]
+    fn publisher_tee_survives_starting_and_stopping_a_file_recording() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let publisher = VecStreamPublisher::default();
+        core.start_stream_publishing(Box::new(publisher.clone())).expect("start publishing");
+        for _ in 0..5 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+
+        let final_buf = SharedSink::default();
+        core.start_recording_replay(metadata(final_buf.clone(), SharedSink::default())).expect("start recording");
+        let snapshots_before = publisher.count(|e| matches!(e, StreamEvent::Snapshot { .. }));
+        for _ in 0..5 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert!(publisher.count(|e| matches!(e, StreamEvent::Snapshot { .. })) > snapshots_before, "a recording start re-snapshots the followers");
+        assert_eq!(core.stop_recording_replay(), Some(true));
+        for _ in 0..5 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+
+        assert_eq!(publisher.count(|e| matches!(e, StreamEvent::NextFrame(_))), 15);
+        assert!(core.poll_stream_errors().is_empty());
+        assert!(core.is_stream_publishing(), "the stream outlives the recording");
+
+        let bytes = final_buf.0.lock().unwrap().clone();
+        let player = ReplayFilePlayer::new(&bytes, false).expect("parse the recording");
+        assert_eq!(player.get_total_frames(), 5);
+    }
+
+    /// The wire order after frame N is `NextFrame(N)`, the hash of frame N, then a snapshot at N.
+    #[test]
+    fn publisher_sync_hash_and_snapshot_land_after_next_frame_in_order() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let publisher = VecStreamPublisher::default();
+        core.start_stream_publishing(Box::new(publisher.clone())).expect("start publishing");
+        for _ in 0..SYNC_HASH_INTERVAL_FRAMES - 1 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(publisher.count(|e| matches!(e, StreamEvent::SyncHash(..))), 0);
+        core.request_stream_snapshot();
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+
+        let events = publisher.events();
+        let n = SYNC_HASH_INTERVAL_FRAMES;
+        let tail = &events[events.len() - 3..];
+        assert!(matches!(tail[0], StreamEvent::NextFrame(_)), "{tail:?}");
+        assert!(matches!(tail[1], StreamEvent::SyncHash(frame, _) if frame == n), "{tail:?}");
+        assert!(matches!(tail[2], StreamEvent::Snapshot { frame, .. } if frame == n), "{tail:?}");
+        assert_eq!(core.sync_hash(), match tail[1] { StreamEvent::SyncHash(_, hash) => Some(hash), _ => None }, "the hash is of the state after frame N");
+    }
+
+    /// A publisher that is paused still answers a snapshot request from the idle path.
+    #[test]
+    fn pending_snapshot_is_published_without_a_frame_when_asked() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let publisher = VecStreamPublisher::default();
+        core.start_stream_publishing(Box::new(publisher.clone())).expect("start publishing");
+        core.request_stream_snapshot();
+        assert!(core.stream_snapshot_pending());
+        core.publish_pending_stream_snapshot();
+        assert!(!core.stream_snapshot_pending());
+        assert_eq!(publisher.count(|e| matches!(e, StreamEvent::Snapshot { .. })), 2);
+    }
+
+    /// A follower runs exactly one frame per `NextFrame` received, with the inputs that came
+    /// with it, waits (not stalls) when the queue is empty, and stalls when the stream ends.
+    #[test]
+    fn follower_consumes_one_frame_per_emulated_frame_and_waits_for_more() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats.clone(), tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+        assert!(core.is_playing_back(), "a follower is a replay driving the console");
+        assert!(core.is_following());
+
+        // Nothing yet: waiting, not stalled, no frame.
+        core.run_unlocked_presenting(true);
+        assert_eq!(core.last_run_time().frames, 0);
+        assert!(core.is_replay_waiting());
+        assert!(!core.is_replay_stalled());
+
+        feeder.push_packet(keyframe_packet(10, 7, 1));
+        feeder.push_packet(input_packet(1));
+        feeder.push_packet(next_frame_packet());
+        feeder.push_packet(input_packet(0));
+        feeder.push_packet(next_frame_packet());
+        feeder.push_packet(next_frame_packet());
+        assert_eq!(core.live_frames_available(), 3);
+        assert_eq!(core.live_newest_publisher_frame(), 13);
+
+        for _ in 0..3 {
+            core.run_unlocked_presenting(true);
+            assert_eq!(core.last_run_time().frames, 1);
+        }
+        assert_eq!(core.total_frames(), 13, "frame numbers are the publisher's");
+        assert_eq!(log.lock().unwrap().clone(), alloc::vec![1, 0, 0]);
+        assert_eq!(stats.snapshots_applied.load(Ordering::Relaxed), 1);
+        assert!(!core.is_replay_waiting());
+
+        core.run_unlocked_presenting(true);
+        assert_eq!(core.last_run_time().frames, 0);
+        assert!(core.is_replay_waiting());
+        assert!(!core.is_replay_stalled());
+
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        assert_eq!(core.last_run_time().frames, 1);
+        assert_eq!(core.total_frames(), 14);
+
+        feeder.end();
+        core.run_unlocked_presenting(true);
+        assert_eq!(core.last_run_time().frames, 0);
+        assert!(core.is_replay_stalled());
+        assert!(!core.is_replay_waiting());
+
+        core.detach_live_source();
+        assert!(!core.is_following());
+        assert!(!core.is_playing_back());
+    }
+
+    /// A snapshot that arrives while frames are still queued replaces them: the follower jumps.
+    #[test]
+    fn follower_snapshot_supersedes_the_backlog() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats.clone(), tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+
+        feeder.push_packet(keyframe_packet(0, 0, 0));
+        for _ in 0..10 {
+            feeder.push_packet(next_frame_packet());
+        }
+        feeder.push_packet(keyframe_packet(50, 99, 0));
+        assert_eq!(core.live_frames_available(), 0);
+
+        core.run_unlocked_presenting(true);
+        assert_eq!(core.last_run_time().frames, 0, "the snapshot leaves nothing to run yet");
+        assert_eq!(core.total_frames(), 50);
+        assert_eq!(core.create_save_state(), 99u32.to_le_bytes().to_vec());
+        assert_eq!(stats.snapshots_applied.load(Ordering::Relaxed), 1, "only the newest snapshot was applied");
+        assert!(core.is_replay_waiting());
+    }
+
+    /// A sync hash that differs asks for a snapshot once (rate-limited); one within the
+    /// post-load window is ignored; one that matches is silent.
+    #[test]
+    fn follower_hash_mismatch_requests_a_snapshot_once() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats.clone(), tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+
+        feeder.push_packet(keyframe_packet(0, 0, 0));
+        // Within POST_LOAD_FRAMES of the snapshot: ignored even though it is wrong.
+        feeder.push_sync_hash(0, [0xAB; 32]);
+        for _ in 0..4 {
+            feeder.push_packet(next_frame_packet());
+        }
+        for _ in 0..4 {
+            core.run_unlocked_presenting(true);
+        }
+        assert_eq!(core.total_frames(), 4);
+        assert_eq!(stats.hash_mismatches.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_err());
+
+        // The right hash for frame 4 is silent.
+        let right = core.sync_hash().expect("the fake core exposes a region");
+        feeder.push_sync_hash(4, right);
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        assert_eq!(stats.hash_mismatches.load(Ordering::Relaxed), 0);
+        assert!(rx.try_recv().is_err());
+
+        // A wrong hash for frame 5 asks for a snapshot; a second wrong one is held back.
+        feeder.push_sync_hash(5, [0xAB; 32]);
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        feeder.push_sync_hash(6, [0xCD; 32]);
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        assert_eq!(stats.hash_mismatches.load(Ordering::Relaxed), 2);
+        assert_eq!(rx.try_recv(), Ok(SnapshotRequestReason::HashMismatch));
+        assert!(rx.try_recv().is_err(), "one request per interval");
+        assert_eq!(stats.snapshot_requests.load(Ordering::Relaxed), 1);
+    }
+
+    /// A sliced (Game Boy) follower only ever waits at a frame boundary.
+    #[test]
+    fn sliced_core_follower_only_waits_at_frame_boundaries() {
+        let mut core = SuperShuckieCore::new(Box::new(FakeSlicedCore::new(2)), Box::new(FakeClock::new()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats, tx);
+        let metadata = ReplayFileMetadata { console_type: ReplayConsoleType::GameBoy, emulator_core_name: "fake-sliced".into(), ..fake_gba_metadata() };
+        core.attach_live_replay_source(source, &metadata, false).expect("attach");
+
+        feeder.push_packet(Packet::Keyframe { metadata: KeyframeMetadata::default(), state: ByteVec::new() });
+        feeder.push_packet(next_frame_packet());
+        // Two slices then the frame: no wait in between.
+        for _ in 0..3 {
+            core.run_unlocked_presenting(true);
+            assert!(!core.is_replay_waiting());
+        }
+        assert_eq!(core.total_frames(), 1);
+        assert!(!core.is_mid_frame());
+        // Now the queue is empty: waiting, at a frame boundary.
+        core.run_unlocked_presenting(true);
+        assert!(core.is_replay_waiting());
+        assert!(!core.is_mid_frame());
+    }
+
+    /// The follower's own file starts at its first snapshot and replays exactly what it ran,
+    /// with a full keyframe wherever a later snapshot jumped it.
+    #[test]
+    fn follower_disk_recording_plays_back_identically() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let followed_log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats, tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+
+        let final_buf = SharedSink::default();
+        core.start_recording_follower_replay(metadata(final_buf.clone(), SharedSink::default()), fake_gba_metadata()).expect("start the file");
+        assert!(core.is_recording_follower_replay());
+
+        feeder.push_packet(keyframe_packet(100, 5, 0));
+        for i in 0..12u8 {
+            feeder.push_packet(input_packet(i % 3));
+            feeder.push_packet(next_frame_packet());
+        }
+        for _ in 0..12 {
+            core.run_unlocked_presenting(true);
+        }
+        assert_eq!(core.total_frames(), 112);
+
+        // A resync mid-file: a full keyframe goes in and the file jumps with the console.
+        feeder.push_packet(keyframe_packet(200, 77, 2));
+        for _ in 0..6 {
+            feeder.push_packet(input_packet(2));
+            feeder.push_packet(next_frame_packet());
+        }
+        for _ in 0..7 {
+            core.run_unlocked_presenting(true);
+        }
+        assert_eq!(core.total_frames(), 206);
+        assert!(core.poll_replay_recording_errors().is_empty());
+
+        core.detach_live_source();
+        let followed = followed_log.lock().unwrap().clone();
+        assert_eq!(followed.len(), 18);
+
+        let bytes = final_buf.0.lock().unwrap().clone();
+        let player = ReplayFilePlayer::new(&bytes, false).expect("parse the follower's file");
+        assert_eq!(player.get_total_frames(), 18, "the file counts frames from the first snapshot");
+
+        let clock2 = FakeClock::new();
+        let fake2 = FakePacedCore::new(clock2.clone(), PERIOD_MICROS);
+        let played_log = fake2.frame_inputs.clone();
+        let mut playback = SuperShuckieCore::new(Box::new(fake2), Box::new(clock2.clone()));
+        playback.attach_replay_player(player, false).expect("attach the file");
+        while playback.total_frames() < 18 && !playback.is_replay_stalled() {
+            run_one_frame(&mut playback, &clock2, PERIOD_MICROS);
+        }
+        assert_eq!(played_log.lock().unwrap().clone(), followed, "the file replays what the follower ran");
+        assert_eq!(playback.create_save_state(), 83u32.to_le_bytes().to_vec(), "77 from the mid-file snapshot plus 6 frames");
+    }
+
+    /// Publishing and following are exclusive with each other and with a file replay.
+    #[test]
+    fn publishing_following_and_file_replays_are_exclusive() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let (bytes, _) = record_alternating_replay(4);
+
+        core.start_stream_publishing(Box::new(VecStreamPublisher::default())).expect("publish");
+        let player = ReplayFilePlayer::new(&bytes, false).expect("parse");
+        assert!(matches!(core.attach_replay_player(player, false), Err(ReplayPlayerAttachError::Incompatible { .. })), "no file replay while publishing");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (_feeder, source) = live_replay_channel(Arc::new(FollowerStats::default()), tx);
+        assert!(core.attach_live_replay_source(source, &fake_gba_metadata(), false).is_err(), "no following while publishing");
+        assert!(core.is_stream_publishing());
+
+        core.stop_stream_publishing();
+        let player = ReplayFilePlayer::new(&bytes, false).expect("parse");
+        core.attach_replay_player(player, false).expect("attach");
+        assert!(core.start_stream_publishing(Box::new(VecStreamPublisher::default())).is_err(), "a replay's console is not the player's to publish");
+        assert!(core.has_replay_attached());
     }
 }

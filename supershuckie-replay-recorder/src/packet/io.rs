@@ -19,7 +19,8 @@ pub enum PacketWriteCommand<'a> {
 }
 
 impl PacketWriteCommand<'_> {
-    pub(crate) fn bytes(&self) -> &[u8] {
+    /// The bytes this instruction writes.
+    pub fn bytes(&self) -> &[u8] {
         match self {
             Self::WriteByte { byte } => core::slice::from_ref(byte),
             Self::WriteSlice { bytes } => *bytes,
@@ -31,6 +32,14 @@ impl PacketWriteCommand<'_> {
 impl Default for PacketWriteCommand<'_> {
     fn default() -> Self {
         Self::WriteByte { byte: 0 }
+    }
+}
+
+/// Serialize `what` (a packet or any other [`PacketIO`] value) onto the end of `into`, exactly as
+/// a replay file sink would write it.
+pub fn append_packet<'a, P: PacketIO<'a>>(what: &'a P, into: &mut Vec<u8>) {
+    for instruction in what.write_packet_instructions() {
+        into.extend_from_slice(instruction.bytes());
     }
 }
 

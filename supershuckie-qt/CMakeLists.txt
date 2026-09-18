@@ -19,6 +19,11 @@ add_library(supershuckie-cpp-static STATIC
     src/main.cpp
     src/main_window.cpp
     src/render_widget.cpp
+    src/screen_canvas.cpp
+    src/peer_window.cpp
+    src/play_together_controller.cpp
+    src/play_together_dialog.cpp
+    src/display_sync.cpp
     src/game_speed_dialog.cpp
     src/ask_for_text_dialog.cpp
     src/select_item_dialog.cpp

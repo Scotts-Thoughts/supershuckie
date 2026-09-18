@@ -988,6 +988,7 @@ dependencies = [
  "supershuckie-core",
  "supershuckie-frontend-webserver",
  "supershuckie-memory-tools",
+ "supershuckie-play-together",
  "supershuckie-replay-recorder",
 ]
 
@@ -1018,6 +1019,15 @@ version = "0.4.14"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "supershuckie-play-together"
+version = "0.4.14"
+dependencies = [
+ "blake3",
+ "serde",
+ "supershuckie-replay-recorder",
 ]
 
 [[package]]

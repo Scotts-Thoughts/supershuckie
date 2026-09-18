@@ -18,6 +18,8 @@ fn main() {
 
     let bytes = std::fs::read(&path).expect("read");
     let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse");
+    // Do not reconstruct and keep every keyframe state (20 MB each on NDS): a 40 MB file ate 26 GB.
+    player.set_keyframe_states_wanted(false);
     println!("{path}: v{}, {} frames, {} keyframes", player.get_replay_version(), player.get_total_frames(), player.all_keyframes().len());
 
     let mut counts: BTreeMap<&'static str, u64> = BTreeMap::new();

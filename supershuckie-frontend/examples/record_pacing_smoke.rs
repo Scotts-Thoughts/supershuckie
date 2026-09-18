@@ -51,6 +51,9 @@ struct Phase {
     budget_ms: f64,
     over_budget: u64,
     measured: u64,
+    /// Wall-clock gaps between consecutive emulated frames that exceeded 2.5x the budget:
+    /// (frame index the gap ended on, gap in ms, the core's own time for that frame in ms).
+    stalls: Vec<(u64, f64, f64)>,
 }
 
 impl Phase {
@@ -67,6 +70,20 @@ impl Phase {
             "{:<12} {:>8.1} fps  {:>6} frames in {:>5.1} s  avg {:>6.2} ms  max {:>7.2} ms  budget {:>5.2} ms  over budget {:>5.2}% ({}/{})",
             self.name, self.fps(), self.frames, self.seconds, self.average_ms, self.max_ms, self.budget_ms, self.over_budget_percent(), self.over_budget, self.measured
         );
+        if !self.stalls.is_empty() {
+            println!("    {} stalls (> 2.5x budget between frames); first 40 as frame/gap ms/core ms, delta to previous stall in frames:", self.stalls.len());
+            let mut previous: Option<u64> = None;
+            for (frame, gap, core) in self.stalls.iter().take(40) {
+                let delta = previous.map(|p| format!("{:>+6}", *frame as i64 - p as i64)).unwrap_or_else(|| "      ".into());
+                println!("      {frame:>8}  {gap:>7.2} ms  core {core:>6.2} ms  {delta}");
+                previous = Some(*frame);
+            }
+            let mut modulo: BTreeMap<u64, usize> = BTreeMap::new();
+            for (frame, _, _) in &self.stalls {
+                *modulo.entry(frame % 120).or_default() += 1;
+            }
+            println!("    stall frame mod 120 histogram (keyframe interval): {modulo:?}");
+        }
     }
 }
 
@@ -77,12 +94,34 @@ fn measure(frontend: &mut SuperShuckieFrontend, name: &'static str, seconds: f64
     let start_frames = frontend.get_elapsed_frames() as u64;
     let started = Instant::now();
     let mut max_ms = 0.0f64;
+    let mut stalls = Vec::new();
+    let budget_us = start_stats.budget_micros as f64;
+    let mut last_frames = frontend.get_elapsed_frames() as u64;
+    let mut last_advance = Instant::now();
+    let mut since_check = Instant::now();
     while started.elapsed().as_secs_f64() < seconds {
-        tick_for(frontend, Duration::from_millis(100));
-        max_ms = max_ms.max(frontend.get_frame_time_stats().max_frame_micros as f64 / 1000.0);
-        if done(frontend) {
-            break;
+        if let Err(e) = frontend.tick() {
+            println!("tick error: {e}");
         }
+        let now = Instant::now();
+        let frames = frontend.get_elapsed_frames() as u64;
+        if frames != last_frames {
+            let gap = now.duration_since(last_advance).as_secs_f64() * 1000.0;
+            let stats = frontend.get_frame_time_stats();
+            max_ms = max_ms.max(stats.max_frame_micros as f64 / 1000.0);
+            if budget_us > 0.0 && gap * 1000.0 > budget_us * 2.5 * (frames - last_frames) as f64 {
+                stalls.push((frames, gap, stats.last_frame_micros as f64 / 1000.0));
+            }
+            last_frames = frames;
+            last_advance = now;
+        }
+        if since_check.elapsed() > Duration::from_millis(100) {
+            since_check = now;
+            if done(frontend) {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
     let seconds = started.elapsed().as_secs_f64();
     let stats = frontend.get_frame_time_stats();
@@ -95,12 +134,14 @@ fn measure(frontend: &mut SuperShuckieFrontend, name: &'static str, seconds: f64
         budget_ms: stats.budget_micros as f64 / 1000.0,
         over_budget: stats.frames_over_budget.wrapping_sub(start_stats.frames_over_budget),
         measured: stats.frames_measured.wrapping_sub(start_stats.frames_measured),
+        stalls,
     }
 }
 
 fn count_packets(path: &std::path::Path) -> (u64, BTreeMap<&'static str, u64>, f64, u64) {
     let bytes = std::fs::read(path).expect("read the recording");
     let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse the recording");
+    player.set_keyframe_states_wanted(false);
     let total = player.get_total_frames();
     println!("{}: v{}, {} frames, {} keyframes, {} bytes", path.display(), player.get_replay_version(), total, player.all_keyframes().len(), bytes.len());
 
@@ -158,19 +199,25 @@ fn request_fine_timer_resolution() {
 fn request_fine_timer_resolution() {}
 
 fn main() {
-    request_fine_timer_resolution();
     let mut args = std::env::args().skip(1);
-    let rom = std::path::absolute(args.next().expect("usage: record_pacing_smoke <rom> [--speed n] [--seconds n]")).unwrap();
+    let rom = std::path::absolute(args.next().expect("usage: record_pacing_smoke <rom> [--speed n] [--seconds n] [--coarse-timer]")).unwrap();
     let mut speed = 4.0f64;
     let mut seconds = 20.0f64;
+    let mut coarse_timer = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--speed" => speed = args.next().unwrap().parse().unwrap(),
             "--seconds" => seconds = args.next().unwrap().parse().unwrap(),
+            // Leave Windows at its default 15.6 ms timer granularity, to see what the pacing does
+            // in a process that never asked for 1 ms.
+            "--coarse-timer" => coarse_timer = true,
             other => panic!("unexpected {other}"),
         }
     }
 
+    if !coarse_timer {
+        request_fine_timer_resolution();
+    }
     let dir = std::env::temp_dir().join("supershuckie-record-pacing-smoke");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

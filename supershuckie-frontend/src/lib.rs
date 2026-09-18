@@ -3,6 +3,7 @@ pub mod settings;
 pub mod replay_convert;
 pub mod memory_tools;
 pub mod bookmarks;
+pub mod play_together;
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -111,6 +112,18 @@ pub enum UserInput {
     Axis { controller: ConnectedControllerIndex, axis: i32 }
 }
 
+/// Frame pacing state for [`SuperShuckieFrontend::present_latest_frame`].
+#[derive(Default)]
+struct PresentPacer {
+    window_start: Option<Instant>,
+    window_refreshes: u32,
+    window_start_generation: u32,
+    /// Display refreshes each drawn frame should be shown for: the measured ratio when it is
+    /// close to a whole number of at least 2, else 1 (present as soon as a frame is available).
+    refreshes_per_frame: u32,
+    refreshes_since_present: u32,
+}
+
 pub struct SuperShuckieFrontend {
     core: ThreadedSuperShuckieCore,
     emulator_type: Option<SuperShuckieEmulatorType>,
@@ -149,6 +162,12 @@ pub struct SuperShuckieFrontend {
 
     /// `(when, emulated frame count then)` for [`Self::get_emulation_fps`].
     fps_window: Option<(Instant, u64)>,
+    /// When set, `tick` no longer hands new frames to the UI as they arrive; the UI asks for the
+    /// latest one with `present_latest_frame` (once per display refresh, to keep a steady cadence).
+    present_on_demand: bool,
+    /// `screen_generation` of the last frame handed to the UI.
+    last_presented_screen_generation: u32,
+    present_pacer: PresentPacer,
     last_emulation_fps: f64,
     last_read_replay_stats: Option<LastReadReplayCropData>,
 
@@ -190,6 +209,13 @@ pub struct SuperShuckieFrontend {
     /// of changes into a single write (M10). See [`Self::mark_settings_dirty`].
     settings_dirty: bool,
 
+    /// The Play Together session, if any (see [`play_together`]).
+    play_together: Option<play_together::PlayTogetherSession>,
+
+    /// Extra paths that may hold another player's ROM (see
+    /// [`Self::play_together_add_rom_candidates`]).
+    play_together_rom_candidates: Vec<PathBuf>,
+
     settings: Settings
 }
 
@@ -221,6 +247,9 @@ impl SuperShuckieFrontend {
             current_save_state_history: Vec::new(),
             last_read_elapsed_time_stats: ElapsedTimeStats::default(),
             fps_window: None,
+            present_on_demand: false,
+            last_presented_screen_generation: 0,
+            present_pacer: PresentPacer::default(),
             last_emulation_fps: 0.0,
             current_save_state_history_position: 0,
             recording_replay_file: None,
@@ -243,7 +272,9 @@ impl SuperShuckieFrontend {
             bookmark_types_generation: 0,
             deferred_errors: Vec::new(),
             core_death_reported: false,
-            settings_dirty: false
+            settings_dirty: false,
+            play_together: None,
+            play_together_rom_candidates: Vec::new()
         };
 
         // C4: startup never aborts on a bad/unreadable settings file; surface what happened
@@ -439,6 +470,9 @@ impl SuperShuckieFrontend {
     /// If it does not exist, `Ok(false)` is returned.
     pub fn load_replay_if_exists(&mut self, name: &str, override_errors: bool) -> Result<bool, UTF8CString> {
         self.refuse_if_exporting()?;
+        if self.play_together.is_some() {
+            return Err("Leave the Play Together session first: the game being played together cannot be replaced by a replay.".into())
+        }
         check_user_file_name(name)?;
         self.assert_replays_available()?;
 
@@ -935,6 +969,9 @@ impl SuperShuckieFrontend {
         // L12: keep the list capped at the configured maximum.
         self.settings.recent_roms.clamp();
         self.last_replay_and_frame = None;
+        // So another player's copy of this ROM can be found here by hash (Play Together).
+        let rom_checksum = *self.core.rom_checksum();
+        self.remember_rom(rom_checksum, &path);
 
         Ok(())
     }
@@ -1087,7 +1124,12 @@ impl SuperShuckieFrontend {
 
     fn make_new_core(&self, rom_data: &[u8], save_file: Option<Vec<u8>>, emulator_type: SuperShuckieEmulatorType) -> Result<Box<dyn EmulatorCore>, UTF8CString> {
         let bios = self.get_bios_for_core(emulator_type);
+        self.make_new_core_with_bios(rom_data, save_file, emulator_type, bios, self.settings.nintendo_ds_settings.jit)
+    }
 
+    /// Build a core for `emulator_type` with an explicit BIOS (and, for the Nintendo DS, JIT
+    /// setting), e.g. one following another player's game with their BIOS.
+    pub(crate) fn make_new_core_with_bios(&self, rom_data: &[u8], save_file: Option<Vec<u8>>, emulator_type: SuperShuckieEmulatorType, bios: Vec<u8>, nds_jit: bool) -> Result<Box<dyn EmulatorCore>, UTF8CString> {
         let sram = save_file.as_ref().map(|i| i.as_slice());
 
         let core: Box<dyn EmulatorCore> = match emulator_type {
@@ -1104,7 +1146,7 @@ impl SuperShuckieFrontend {
                         rom_data,
                         sram,
                         std_timestamp_provider(),
-                        self.settings.nintendo_ds_settings.jit
+                        nds_jit
                     ).map_err(|e| format!("melonDS rejected the ROM: {e}"))?
                 );
 
@@ -1146,8 +1188,11 @@ impl SuperShuckieFrontend {
         if let Some(s) = self.bios_override.clone() {
             return s;
         }
+        self.default_bios_for(emulator_kind)
+    }
 
-        // Defaults
+    /// The BIOS/boot ROM a fresh core of `emulator_kind` gets when no replay overrides it.
+    pub(crate) fn default_bios_for(&self, emulator_kind: SuperShuckieEmulatorType) -> Vec<u8> {
         match emulator_kind {
             SuperShuckieEmulatorType::GameBoy | SuperShuckieEmulatorType::GameBoySGB2 => include_bytes!("../../bootrom/dmg/dmg.bin").to_vec(),
             SuperShuckieEmulatorType::GameBoyColor => include_bytes!("../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin").to_vec(),
@@ -1165,8 +1210,10 @@ impl SuperShuckieFrontend {
         self.unload_rom();
     }
 
-    /// Unload the ROM without saving.
+    /// Unload the ROM without saving. Leaves any Play Together session: the game being
+    /// published is going away.
     pub fn unload_rom(&mut self) {
+        self.play_together_leave();
         self.abort_export_and_wait();
         self.before_unload_or_reload_rom();
         self.assign_core(ThreadedSuperShuckieCore::new(Box::new(NullEmulatorCore)));
@@ -1439,7 +1486,14 @@ impl SuperShuckieFrontend {
             self.unload_rom();
         }
 
-        self.refresh_screen(false);
+        if self.present_on_demand {
+            // Keep the cached elapsed-time stats fresh; the frame itself waits for the UI's call.
+            self.last_read_elapsed_time_stats = self.core.get_elapsed_time();
+        }
+        else {
+            self.refresh_screen(false);
+        }
+        self.tick_play_together(&mut errors);
 
         let playing_back = self.core.is_playing_back();
         let recording = self.recording_replay_file.is_some();
@@ -1671,7 +1725,7 @@ impl SuperShuckieFrontend {
 
     fn refresh_screen(&mut self, force: bool) {
         let current_stats = self.core.get_elapsed_time();
-        let new_frame_drawn = current_stats.screen_generation != self.last_read_elapsed_time_stats.screen_generation;
+        let new_frame_drawn = current_stats.screen_generation != self.last_presented_screen_generation;
         self.last_read_elapsed_time_stats = current_stats;
 
         // Frames that were emulated but not drawn (fast-forward) leave the screens untouched, so
@@ -1680,9 +1734,74 @@ impl SuperShuckieFrontend {
             return
         }
 
+        self.last_presented_screen_generation = current_stats.screen_generation;
         self.core.read_screens(|screens| {
             self.callbacks.refresh_screens(screens);
         })
+    }
+
+    /// Choose whether new frames reach the UI from `tick` as they arrive (`false`, the default) or
+    /// only when the UI calls [`Self::present_latest_frame`] (`true`). A UI that calls it once per
+    /// display refresh shows exactly one frame per refresh, instead of a cadence that drifts
+    /// against the display and periodically doubles and skips frames.
+    pub fn set_present_on_demand(&mut self, on_demand: bool) {
+        self.present_on_demand = on_demand;
+        self.present_pacer = PresentPacer::default();
+    }
+
+    /// Whether frames wait for [`Self::present_latest_frame`]; see [`Self::set_present_on_demand`].
+    pub fn present_on_demand(&self) -> bool {
+        self.present_on_demand
+    }
+
+    /// Hand the UI the newest drawn frame, if one arrived since the last one it was given. Meant
+    /// to be called once per display refresh with [`Self::set_present_on_demand`] on; harmless
+    /// (and redundant) otherwise.
+    ///
+    /// When the display refreshes an integer number of times per drawn frame (a 120 Hz display
+    /// showing 60 frames per second), a frame that arrives a little early is held for the next
+    /// refresh so that every frame is shown for the same number of refreshes. Otherwise the drift
+    /// between the two clocks periodically puts frame arrival right at the refresh boundary, where
+    /// timing jitter alone decides whether a frame shows for one refresh or three, for as long as
+    /// the drift takes to move past it. A frame is never held while a newer one is already waiting.
+    pub fn present_latest_frame(&mut self) {
+        let now = Instant::now();
+        let stats = self.core.get_elapsed_time();
+        let pacer = &mut self.present_pacer;
+        pacer.refreshes_since_present = pacer.refreshes_since_present.saturating_add(1);
+
+        // Measure display refreshes per drawn frame over the last second or so.
+        match pacer.window_start {
+            Some(start) if now.duration_since(start) >= Duration::from_secs(1) => {
+                let refreshes = pacer.window_refreshes as f64;
+                let drawn = stats.screen_generation.wrapping_sub(pacer.window_start_generation) as f64;
+                let ratio = if drawn > 0.0 { refreshes / drawn } else { 0.0 };
+                let rounded = ratio.round();
+                pacer.refreshes_per_frame = if rounded >= 2.0 && (ratio - rounded).abs() < 0.15 { rounded as u32 } else { 1 };
+                pacer.window_start = Some(now);
+                pacer.window_refreshes = 0;
+                pacer.window_start_generation = stats.screen_generation;
+            }
+            Some(_) => pacer.window_refreshes += 1,
+            None => {
+                pacer.window_start = Some(now);
+                pacer.window_refreshes = 0;
+                pacer.window_start_generation = stats.screen_generation;
+            }
+        }
+
+        let pending = stats.screen_generation.wrapping_sub(self.last_presented_screen_generation);
+        if pending == 0 {
+            self.last_read_elapsed_time_stats = stats;
+            return
+        }
+        if pending == 1 && pacer.refreshes_since_present < pacer.refreshes_per_frame {
+            // Arrived early for our cadence: show it on the next refresh instead.
+            self.last_read_elapsed_time_stats = stats;
+            return
+        }
+        pacer.refreshes_since_present = 0;
+        self.refresh_screen(false);
     }
 
     /// Emulated frames per second, averaged over the last second or so (drawn or not). This is
@@ -2595,6 +2714,8 @@ impl SuperShuckieFrontend {
         self.core.set_audio_enabled(self.settings.audio.enabled);
 
         self.update_video_mode();
+        // A reloaded game is still the one being played together; the followers get a snapshot.
+        self.republish_after_core_switch();
     }
 
     /// The ring the audio device reads from. Stable for the life of the frontend.
@@ -2835,6 +2956,10 @@ impl SuperShuckieFrontend {
         let expected = self.choose_for_game_boy(rom.as_slice());
 
         if expected != current {
+            if self.play_together.is_some() {
+                self.report_later(String::from("The Game Boy model cannot change during a Play Together session; the setting applies after you leave."));
+                return
+            }
             self.emulator_type = Some(expected);
             if let Err(e) = self.reload_core() {
                 self.report_later(e.to_string());
@@ -3023,6 +3148,20 @@ pub trait SuperShuckieFrontendCallbacks {
     /// call back into the frontend — but only through its read-only getters; nothing that would
     /// try to lock the screens or otherwise reenter the core.
     fn change_video_mode(&mut self, screens: &[ScreenInfo], screen_scaling: NonZeroU8);
+
+    /// Like [`Self::refresh_screens`], for another player's game in a Play Together session
+    /// (that game's screens mutex is held; do not call back in). Default: ignored.
+    fn peer_refresh_screens(&mut self, peer: play_together::PeerId, screens: &[ScreenData]) {
+        let _ = (peer, screens);
+    }
+
+    /// Like [`Self::change_video_mode`], for another player's game: called when their game
+    /// starts here and whenever its display scale changes (no lock is held; read-only getters
+    /// may be called). A player who leaves is noticed through
+    /// [`SuperShuckieFrontend::play_together_generation`], not a callback. Default: ignored.
+    fn peer_change_video_mode(&mut self, peer: play_together::PeerId, screens: &[ScreenInfo], screen_scaling: NonZeroU8) {
+        let _ = (peer, screens, screen_scaling);
+    }
 }
 
 fn _ensure_callbacks_are_object_safe(_: Box<dyn SuperShuckieFrontendCallbacks>) {}

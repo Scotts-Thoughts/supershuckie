@@ -1,0 +1,18 @@
+[package]
+name = "supershuckie-play-together"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Network protocol and session layer for Play Together: every participant publishes its emulator session as replay packets, the host relays every stream to everyone else"
+
+[features]
+default = []
+# `serde::Serialize`/`Deserialize` on the public info, event-reason and stats types.
+serde = ["dep:serde"]
+
+[dependencies]
+supershuckie-replay-recorder = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true, optional = true }

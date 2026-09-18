@@ -26,6 +26,8 @@ pub struct SuperShuckieFrontendCallbacksC {
 
     pub refresh_screens: Option<unsafe extern "C" fn(userdata: *mut c_void, screen_count: usize, screen_data: *const *const u32)>,
     pub change_video_mode: Option<unsafe extern "C" fn(userdata: *mut c_void, screen_count: usize, screen_data: *const SuperShuckieScreenDataC, screen_scale: NonZeroU8)>,
+    pub peer_refresh_screens: Option<unsafe extern "C" fn(userdata: *mut c_void, peer: u16, screen_count: usize, screen_data: *const *const u32)>,
+    pub peer_change_video_mode: Option<unsafe extern "C" fn(userdata: *mut c_void, peer: u16, screen_count: usize, screen_data: *const SuperShuckieScreenDataC, screen_scale: NonZeroU8)>,
 }
 
 impl SuperShuckieFrontendCallbacks for SuperShuckieFrontendCallbacksC {
@@ -54,6 +56,32 @@ impl SuperShuckieFrontendCallbacks for SuperShuckieFrontendCallbacksC {
         }
 
         unsafe { s(self.userdata, screens.len(), screens_buf.as_ptr(), scaling) };
+    }
+
+    fn peer_refresh_screens(&mut self, peer: supershuckie_frontend::play_together::PeerId, screens: &[ScreenData]) {
+        let Some(s) = self.peer_refresh_screens else { return };
+
+        let mut screens_buf = [null(); 4];
+        for (index, screen) in screens.iter().enumerate().take(4) {
+            screens_buf[index] = screen.pixels.as_ptr();
+        }
+
+        unsafe { s(self.userdata, peer, screens.len().min(4), screens_buf.as_ptr()) };
+    }
+
+    fn peer_change_video_mode(&mut self, peer: supershuckie_frontend::play_together::PeerId, screens: &[ScreenInfo], scaling: NonZeroU8) {
+        let Some(s) = self.peer_change_video_mode else { return };
+
+        let mut screens_buf = [SuperShuckieScreenDataC { width: 0, height: 0, screen_data_encoding: ScreenDataEncoding::A8R8G8B8 }; 4];
+        for (index, screen) in screens.iter().enumerate().take(4) {
+            screens_buf[index] = SuperShuckieScreenDataC {
+                width: screen.width as u32,
+                height: screen.height as u32,
+                screen_data_encoding: screen.encoding
+            };
+        }
+
+        unsafe { s(self.userdata, peer, screens.len().min(4), screens_buf.as_ptr(), scaling) };
     }
 }
 
@@ -123,6 +151,21 @@ pub unsafe extern "C" fn supershuckie_frontend_tick(
             false
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_set_present_on_demand(
+    frontend: &mut SuperShuckieFrontend,
+    on_demand: bool
+) {
+    frontend.set_present_on_demand(on_demand);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_present_latest_frame(
+    frontend: &mut SuperShuckieFrontend
+) {
+    frontend.present_latest_frame();
 }
 
 #[unsafe(no_mangle)]

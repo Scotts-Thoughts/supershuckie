@@ -8,6 +8,7 @@
 #include <chrono>
 #include <supershuckie/supershuckie.h>
 #include "sdl_event_wrapper.hpp"
+#include "display_sync.hpp"
 #include "shortcuts_settings_window.hpp"
 
 class QMenu;
@@ -36,6 +37,9 @@ class BookmarkWindow;
 class BookmarkTypesDialog;
 class AddBookmarkDialog;
 class LandingWidget;
+class PlayTogetherController;
+class PeerWindow;
+class PlayTogetherDialog;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -63,6 +67,9 @@ class MainWindow: public QMainWindow {
     friend BookmarkTypesDialog;
     friend AddBookmarkDialog;
     friend LandingWidget;
+    friend PlayTogetherController;
+    friend PeerWindow;
+    friend PlayTogetherDialog;
     
 public:
     MainWindow();
@@ -196,6 +203,10 @@ private:
 
     QAction *use_number_row_for_quick_slots;
     QAction *show_status_bar;
+    QAction *sync_display_to_refresh;
+    // Runs while "Sync display to monitor refresh" is on; see DisplaySyncThread.
+    std::unique_ptr<DisplaySyncThread> display_sync;
+    void apply_display_sync(bool on);
     QAction *enable_pokeabyte_integration;
     QAction *enable_external_commands;
 
@@ -241,6 +252,20 @@ private:
     void set_up_settings_menu();
 
     MemoryToolsController *memory_tools = nullptr;
+
+    // Play Together (playing alongside other players over the network); see play_together_controller.hpp.
+    PlayTogetherController *play_together = nullptr;
+    QMenu *play_together_menu;
+    QAction *pt_open;
+    QAction *pt_leave;
+    QAction *pt_reset_all;
+    QAction *pt_show_windows;
+    QAction *pt_save_replays;
+    static const std::size_t PEER_SCALE_COUNT = 6;
+    NumberedAction *pt_scale[PEER_SCALE_COUNT];
+    void set_up_play_together_menu();
+    void set_peer_video_scale(std::uint8_t scale);
+    void refresh_play_together_actions();
 
     void apply_audio_gain();
     void set_audio_volume(std::uint8_t percent);
@@ -311,6 +336,8 @@ private slots:
     void do_undo_load_save_state();
     void do_redo_load_save_state();
     void do_toggle_status_bar();
+    void do_toggle_sync_display();
+    void present_frame();
     void do_toggle_pokeabyte();
     void do_toggle_stop_replay_on_input();
     void do_open_controls_settings_dialog() noexcept;
@@ -349,6 +376,11 @@ private slots:
     void do_toggle_range_bookmark();
     void do_add_bookmark_at_frame();
     void do_open_bookmarks();
+    void do_play_together_open();
+    void do_play_together_leave();
+    void do_play_together_reset_all();
+    void do_play_together_show_windows();
+    void do_toggle_save_peer_replays();
 };
 
 class NumberedAction: public QAction {

@@ -36,6 +36,9 @@ public:
     /** Re-read the list from the frontend's settings and rebuild the tiles. */
     void reload();
 
+    /** The favourite ROMs' paths, in tile order. */
+    QStringList favorite_paths() const;
+
 private:
     struct Favorite {
         QString path;

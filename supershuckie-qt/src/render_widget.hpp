@@ -2,46 +2,24 @@
 #define __SUPERSHUCKIE_RENDER_VIEW_HPP__
 
 #include <QWidget>
-#include <QGraphicsView>
-#include <QPixmap>
-#include <vector>
+#include "screen_canvas.hpp"
 
-class QGraphicsScene;
 struct SuperShuckieScreenData;
 
 namespace SuperShuckie64 {
 
 class MainWindow;
-class SuperShuckieGraphicsView;
 
-class GameRenderWidget: public QGraphicsView {
+/** The player's own game: a ScreenCanvas that also takes the keyboard, drops and the touch screen. */
+class GameRenderWidget: public ScreenCanvas {
     friend MainWindow;
 public:
+    /** Lay the screens out as the main window's NDS orientation and screen-swap settings say. */
     void set_dimensions(unsigned screen_count, const SuperShuckieScreenData *screen_data, unsigned scale) noexcept;
-
-    // Composite the current frame into a native-resolution image (screens positioned exactly as
-    // displayed, including swap/horizontal layout). Returns a null QImage if no frame is available.
-    QImage capture() const;
 
 private:
     GameRenderWidget(MainWindow *window, QWidget *parent);
     MainWindow *main_window;
-
-    struct ScreenData {
-        unsigned width;
-        unsigned height;
-        QPixmap pixmap;
-        QGraphicsPixmapItem *pixmap_item = nullptr;
-        unsigned x = 0;
-        unsigned y = 0;
-    };
-
-    unsigned total_width = 1, total_height = 1, current_scale = 1;
-
-    std::vector<ScreenData> screens;
-    QGraphicsScene *scene = nullptr;
-
-    void refresh_screen(unsigned screen_count, const uint32_t *const *pixels);
 
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;

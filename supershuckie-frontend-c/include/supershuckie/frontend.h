@@ -77,6 +77,21 @@ struct SuperShuckieFrontendCallbacks {
      * getters; nothing that could reenter the core or the screens lock.
      */
     SuperShuckieChangeVideoModeCallback change_video_mode;
+
+    /**
+     * Play Together: like refresh_screens, for another player's game (identified by its peer id;
+     * see play_together.h). The same rule applies: that game's screens mutex is held, so this
+     * must NOT call back into the frontend. May be NULL.
+     */
+    void (*peer_refresh_screens)(void *user_data, uint16_t peer, size_t screen_count, const uint32_t *const *pixels);
+
+    /**
+     * Play Together: like change_video_mode, for another player's game: called when their game
+     * starts here and whenever its display scale changes (no lock held; read-only getters may be
+     * called). A player leaving is noticed through supershuckie_frontend_play_together_generation(),
+     * not a callback. May be NULL.
+     */
+    void (*peer_change_video_mode)(void *user_data, uint16_t peer, size_t screen_count, const struct SuperShuckieScreenData *screen_data, uint8_t scaling);
 };
 
 /**
@@ -730,6 +745,22 @@ void supershuckie_frontend_hard_reset_console(struct SuperShuckieFrontendRaw *fr
  * - error must point to a buffer of at least `error_len` bytes
  */
 bool supershuckie_frontend_tick(struct SuperShuckieFrontendRaw *frontend, char *error, size_t error_len);
+
+/**
+ * Choose whether new frames reach the refresh_screens callback from supershuckie_frontend_tick as
+ * they arrive (false, the default) or only from supershuckie_frontend_present_latest_frame (true).
+ *
+ * A UI that calls the latter once per display refresh shows exactly one frame per refresh instead
+ * of a cadence that drifts against the display and periodically doubles and skips frames.
+ */
+void supershuckie_frontend_set_present_on_demand(struct SuperShuckieFrontendRaw *frontend, bool on_demand);
+
+/**
+ * Hand the UI the newest drawn frame (through the refresh_screens callback) if one arrived since
+ * the last one it was given. Meant to be called once per display refresh with on-demand
+ * presenting on; harmless otherwise.
+ */
+void supershuckie_frontend_present_latest_frame(struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * Get all replays for the given rom, or the currently loaded ROM if no ROM passed in.

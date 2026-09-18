@@ -6,5 +6,6 @@
 #include "control_settings.h"
 #include "memory.h"
 #include "bookmarks.h"
+#include "play_together.h"
 
 #endif

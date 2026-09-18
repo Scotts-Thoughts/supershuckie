@@ -69,7 +69,7 @@ fn zstd_error(code: usize) -> Cow<'static, str> {
 }
 
 /// Compress `data` as a single zstd frame (readable by [`decompress_data`]).
-pub(crate) fn compress_data(data: &[u8], compression_level: i32) -> Result<Vec<u8>, Cow<'static, str>> {
+pub fn compress_data(data: &[u8], compression_level: i32) -> Result<Vec<u8>, Cow<'static, str>> {
     // SAFETY: This function is safe.
     let bound = unsafe { zstd_sys::ZSTD_compressBound(data.len()) };
 
@@ -146,7 +146,13 @@ const ZSTD_CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 /// reinterpreted as `u64`).
 const ZSTD_CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
 
-pub(crate) fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>, Cow<'static, str>> {
+/// Decompress a single zstd frame made by [`compress_data`] into exactly `uncompressed_size`
+/// bytes.
+///
+/// The frame's own claimed content size is checked against `uncompressed_size` before any memory
+/// is reserved, so a corrupt or hostile frame claiming a huge size fails without a huge
+/// allocation.
+pub fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>, Cow<'static, str>> {
     // Check the frame's own claimed content size against what the caller asked for BEFORE
     // reserving `uncompressed_size` bytes: a corrupt or hostile header claiming e.g. 1 << 40 bytes
     // must not cause a huge allocation attempt just to find out decompression fails anyway.
@@ -284,6 +290,15 @@ impl Drop for BlobDecoder {
 /// Hash the given data.
 pub fn blake3_hash(data: &[u8]) -> ReplayHeaderBlake3Hash {
     *blake3::hash(data).as_bytes()
+}
+
+/// Hash the concatenation of `parts` without concatenating them.
+pub fn blake3_hash_slices<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> ReplayHeaderBlake3Hash {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 pub(crate) unsafe fn launder_reference<T>(what: &T) -> &'static T {

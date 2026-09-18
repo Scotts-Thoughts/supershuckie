@@ -9,7 +9,8 @@ members = [
     "mgba-rs",
     "supershuckie-frontend-webserver",
     "supershuckie-memory-tools",
-    "supershuckie-frame-server"
+    "supershuckie-frame-server",
+    "supershuckie-play-together"
 ]
 
 resolver = "3"
@@ -31,6 +32,7 @@ melonds-rs = { version = "0.4.14", path = "melonds-rs" }
 mgba-rs = { version = "0.4.14", path = "mgba-rs" }
 supershuckie-memory-tools = { version = "0.4.14", path = "supershuckie-memory-tools" }
 supershuckie-frame-server = { version = "0.4.14", path = "supershuckie-frame-server" }
+supershuckie-play-together = { version = "0.4.14", path = "supershuckie-play-together" }
 
 num_enum = "0.7.5"
 tinyvec = { version = "1.10.0", features = ["alloc"], default-features = false }

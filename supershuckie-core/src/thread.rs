@@ -1,5 +1,7 @@
 use crate::emulator::{EmulatorCore, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
+use crate::live_replay::{FollowerStats, FollowerStatsSnapshot, LiveReplaySource};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
+use crate::stream::{SnapshotRequestReason, StreamPublisherFns};
 use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 use crate::{std_timestamp_provider, AudioOutput, BookmarkAnchor, BookmarkAnchorError, ReplayPlayerAttachError, Speed};
 use crate::{SuperShuckieCore, SuperShuckieRapidFire};
@@ -21,8 +23,21 @@ use supershuckie_pokeabyte_integration::PokeAByteEmulatorCommand;
 use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
-use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
+use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash};
 use supershuckie_replay_recorder::{BookmarkTable, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
+
+/// What a core thread is for, which decides how it competes for the CPU.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum CoreThreadRole {
+    /// The player's own game: the thread the user is waiting on (raised priority, exempt from
+    /// power throttling on Windows).
+    #[default]
+    Primary,
+
+    /// Another player's game being followed (Play Together): may lag a little, must never take
+    /// the CPU from the primary thread (lowered priority).
+    Follower
+}
 
 /// The core thread has exited (its command channel is disconnected, or a reply channel was
 /// dropped without an answer). No further command reaches it; reload the ROM to get a working
@@ -79,10 +94,14 @@ pub struct ThreadedSuperShuckieCore {
     /// The core thread, to wake it early from a paused wait.
     thread: Option<std::thread::Thread>,
 
+    /// The followed game's counters while following (see [`Self::attach_live_replay_source`]).
+    follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>>,
+
     /// Facts about the wrapped core that never change for its life.
     memory_regions: Vec<MemoryRegionInfo>,
     console_type: Option<ReplayConsoleType>,
-    rom_checksum: ReplayHeaderBlake3Hash
+    rom_checksum: ReplayHeaderBlake3Hash,
+    core_name: String
 }
 
 /// Current elapsed time, retrieved atomically (the frame count corresponds to milliseconds and vice versa).
@@ -146,12 +165,18 @@ impl FrameTimeStats {
 }
 
 impl ThreadedSuperShuckieCore {
-    /// Wrap the given `core`.
+    /// Wrap the given `core` as the player's own game (see [`CoreThreadRole::Primary`]).
     pub fn new(emulator_core: Box<dyn EmulatorCore>) -> Self {
+        Self::new_with_role(emulator_core, CoreThreadRole::Primary)
+    }
+
+    /// Wrap the given `core`, with its thread scheduled for `role`.
+    pub fn new_with_role(emulator_core: Box<dyn EmulatorCore>, role: CoreThreadRole) -> Self {
         let screens = Arc::new(Mutex::new(emulator_core.get_screens().to_vec()));
         let memory_regions = emulator_core.memory_regions().to_vec();
         let console_type = emulator_core.replay_console_type();
         let rom_checksum = *emulator_core.rom_checksum();
+        let core_name = emulator_core.core_name().to_owned();
         let (sender, receiver) = channel();
         let (sender_close, receiver_close) = channel();
 
@@ -164,6 +189,7 @@ impl ThreadedSuperShuckieCore {
         let playback_paused = Arc::new(AtomicBool::new(false));
         let replay_stalled = Arc::new(AtomicBool::new(false));
         let playback_errors = Arc::new(Mutex::new(Vec::new()));
+        let follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>> = Arc::new(Mutex::new(None));
 
         let elapsed_time = Arc::new(RwLock::new(ElapsedTimeStats::default()));
         let frame_times = Arc::new(RwLock::new(FrameTimeStats::default()));
@@ -181,8 +207,13 @@ impl ThreadedSuperShuckieCore {
             let playback_paused = playback_paused.clone();
             let replay_stalled = replay_stalled.clone();
             let playback_errors = playback_errors.clone();
-            std::thread::Builder::new().name("ThreadedSuperShuckieCore".to_owned()).spawn(move || {
-                mark_thread_latency_sensitive();
+            let follower_stats_thread = follower_stats.clone();
+            let name = match role {
+                CoreThreadRole::Primary => "ThreadedSuperShuckieCore",
+                CoreThreadRole::Follower => "ThreadedSuperShuckieCore/follower"
+            };
+            std::thread::Builder::new().name(name.to_owned()).spawn(move || {
+                mark_thread_role(role);
                 ThreadedSuperShuckieCoreThread {
                     screens,
                     is_null: emulator_core.is_null(),
@@ -210,6 +241,9 @@ impl ThreadedSuperShuckieCore {
                     last_pokeabyte_freeze: None,
                     last_pokeabyte_read: None,
                     memory_monitor: None,
+                    follower: None,
+                    follower_stats: follower_stats_thread,
+                    stream_errors: Vec::new(),
                     playback_paused
                 }.run_thread();
             }).ok().map(|handle| handle.thread().clone())
@@ -236,9 +270,11 @@ impl ThreadedSuperShuckieCore {
             playback_paused,
             replay_stalled,
             thread,
+            follower_stats,
             memory_regions,
             console_type,
-            rom_checksum
+            rom_checksum,
+            core_name
         }
     }
 
@@ -258,6 +294,12 @@ impl ThreadedSuperShuckieCore {
     #[inline]
     pub fn rom_checksum(&self) -> &ReplayHeaderBlake3Hash {
         &self.rom_checksum
+    }
+
+    /// The wrapped core's name, including its version (see `EmulatorCore::core_name`).
+    #[inline]
+    pub fn core_name(&self) -> &str {
+        &self.core_name
     }
 
     /// Whether the core thread is still running, as far as this wrapper has observed. Once this
@@ -756,6 +798,82 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
+    /// Start mirroring the session into `publisher` (see [`SuperShuckieCore::start_stream_publishing`]).
+    ///
+    /// NOTE: This is blocking.
+    pub fn start_stream_publishing(&self, publisher: Box<dyn StreamPublisherFns>) -> Result<(), String> {
+        match self.call(|reply| ThreadCommand::StartStreamPublishing(publisher, reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(dead.to_string())
+        }
+    }
+
+    /// Stop publishing the session (see [`SuperShuckieCore::stop_stream_publishing`]).
+    ///
+    /// NOTE: This is blocking, so that the publisher's `end` has been sent when it returns.
+    pub fn stop_stream_publishing(&self) {
+        let _ = self.call(|reply| ThreadCommand::StopStreamPublishing(reply));
+    }
+
+    /// Publish a snapshot at the next frame boundary (see
+    /// [`SuperShuckieCore::request_stream_snapshot`]); served right away while paused.
+    pub fn request_stream_snapshot(&self) {
+        let _ = self.send(ThreadCommand::RequestStreamSnapshot);
+        self.wake();
+    }
+
+    /// Problems the stream publisher reported since the last call.
+    pub fn get_stream_errors(&self) -> Vec<String> {
+        self.call(|reply| ThreadCommand::TakeStreamErrors(reply)).unwrap_or_default()
+    }
+
+    /// Follow another player's game (see [`SuperShuckieCore::attach_live_replay_source`]). The
+    /// thread paces itself on what arrives from then on (see [`CoreThreadRole::Follower`] for
+    /// how to schedule it).
+    ///
+    /// NOTE: This is blocking.
+    pub fn attach_live_replay_source(&mut self, source: LiveReplaySource, metadata: ReplayFileMetadata, allow_mismatched: bool) -> Result<(), ReplayPlayerAttachError> {
+        let result = match self.call(|reply| ThreadCommand::AttachLiveSource { source, metadata, allow_mismatched, reply }) {
+            Ok(r) => r,
+            Err(dead) => Err(ReplayPlayerAttachError::Failed { description: dead.to_string() })
+        };
+        if result.is_ok() {
+            self.playback_total_frames = 0;
+            self.playback_total_milliseconds = 0.into();
+            self.playback = false;
+            self.playback_stopped = false;
+        }
+        result
+    }
+
+    /// Stop following (see [`SuperShuckieCore::detach_live_source`]).
+    ///
+    /// NOTE: This is blocking, so that the follower's file is closed when it returns.
+    pub fn detach_live_replay_source(&self) {
+        let _ = self.call(|reply| ThreadCommand::DetachLiveSource(reply));
+    }
+
+    /// The followed game's counters, if following (see [`FollowerStats`]).
+    pub fn follower_stats(&self) -> Option<FollowerStatsSnapshot> {
+        self.follower_stats.lock().unwrap_or_else(|p| p.into_inner()).as_ref().map(|s| s.snapshot())
+    }
+
+    /// Also write the followed game to a replay file (see
+    /// [`SuperShuckieCore::start_recording_follower_replay`]).
+    ///
+    /// NOTE: This is blocking.
+    pub fn start_recording_follower_replay(&self, metadata: PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, publisher: ReplayFileMetadata) -> Result<(), ReplayFileWriteError> {
+        match self.call(|reply| ThreadCommand::StartRecordingFollowerReplay(metadata, publisher, reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(ReplayFileWriteError::Other { explanation: Cow::Owned(dead.to_string()) })
+        }
+    }
+
+    /// Problems following reported since the last call (a state that would not load).
+    pub fn get_follower_errors(&self) -> Vec<String> {
+        self.call(|reply| ThreadCommand::TakeFollowerErrors(reply)).unwrap_or_default()
+    }
+
     /// Set whether seeks requested while playback is frozen (a timeline drag) land on the nearest
     /// keyframe instead of the exact frame, which is then sought when the freeze ends. See
     /// [`SuperShuckieCore::coarse_replay_frame`]. On by default.
@@ -922,6 +1040,25 @@ enum ThreadCommand {
     TransferPokeAByteIntegrationInternal(Sender<bool>, PokeAByteIntegrationServer, ReplayConsoleType, ReplayHeaderBlake3Hash),
     Rendezvous(Sender<()>),
     SetMemoryMonitor(Option<Arc<MemoryMonitorShared>>),
+    StartStreamPublishing(Box<dyn StreamPublisherFns>, Sender<Result<(), String>>),
+    StopStreamPublishing(Sender<()>),
+    RequestStreamSnapshot,
+    TakeStreamErrors(Sender<Vec<String>>),
+    AttachLiveSource {
+        source: LiveReplaySource,
+        metadata: ReplayFileMetadata,
+        allow_mismatched: bool,
+        reply: Sender<Result<(), ReplayPlayerAttachError>>
+    },
+    DetachLiveSource(Sender<()>),
+    StartRecordingFollowerReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, ReplayFileMetadata, Sender<Result<(), ReplayFileWriteError>>),
+    TakeFollowerErrors(Sender<Vec<String>>),
+}
+
+/// What the thread keeps while its core follows another player's game.
+struct FollowerLoopState {
+    stats: Arc<FollowerStats>,
+    last_draw: Instant
 }
 
 fn extend_counter_map(from: &BTreeMap<String, SignedInteger>, into: &mut BTreeMap<String, SignedInteger>) {
@@ -979,6 +1116,14 @@ struct ThreadedSuperShuckieCoreThread {
     replay_stalled: Arc<AtomicBool>,
 
     memory_monitor: Option<MemoryMonitorLocal>,
+
+    /// Set while the core follows another player's game; `run_one_follower` runs instead of
+    /// `run_one`.
+    follower: Option<FollowerLoopState>,
+    follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>>,
+
+    /// Problems the stream publisher reported, until the wrapper takes them.
+    stream_errors: Vec<String>,
 }
 
 impl ThreadedSuperShuckieCoreThread {
@@ -996,6 +1141,7 @@ impl ThreadedSuperShuckieCoreThread {
             }
 
             self.handle_replay_recording_errors();
+            self.handle_stream_errors();
             self.go_to_desired_frame();
             self.refresh_screen_data();
             self.update_queued_screens();
@@ -1005,8 +1151,17 @@ impl ThreadedSuperShuckieCoreThread {
 
             if self.is_running() {
                 if !self.playback_frozen {
-                    self.run_one();
+                    if self.follower.is_some() {
+                        self.run_one_follower();
+                    }
+                    else {
+                        self.run_one();
+                    }
                 }
+            }
+            else if self.core.stream_snapshot_pending() {
+                // Paused, so no frame will complete to carry the snapshot somebody asked for.
+                self.core.publish_pending_stream_snapshot();
             }
             else if self.core.replay_player.is_none() {
                 // unfortunately we can't just block until we're running again because we still need
@@ -1019,11 +1174,96 @@ impl ThreadedSuperShuckieCoreThread {
             }
         }
 
+        self.core.stop_stream_publishing();
+        self.core.detach_live_source();
         self.core.stop_recording_replay();
         self.pokeabyte_integration = None;
         self.memory_monitor = None;
 
         let _ = self.sender_close.send(());
+    }
+
+    /// Frames a follower sits behind the newest one received, to absorb network jitter.
+    const FOLLOWER_TARGET_LAG_FRAMES: u64 = 2;
+
+    /// Most frames a follower runs in one pass before the loop looks at commands again.
+    const FOLLOWER_MAX_FRAMES_PER_PASS: u64 = 8;
+
+    /// Longest one catch-up pass may take.
+    const FOLLOWER_MAX_PASS: Duration = Duration::from_millis(4);
+
+    /// A follower this far behind asks for a snapshot instead of emulating the backlog (5 s of
+    /// the publisher's output at 60 fps).
+    const FOLLOWER_RESYNC_BEHIND_FRAMES: u64 = 300;
+
+    /// A follower draws at most this often; frames in between run hidden.
+    const FOLLOWER_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+
+    /// Longest a follower parks when nothing has arrived (a push unparks it sooner).
+    const FOLLOWER_WAIT: Duration = Duration::from_millis(4);
+
+    /// Run a follower: paced by what has arrived from the publisher, never by a clock. Runs up to
+    /// a bounded pass of frames when behind, parks briefly when caught up, and asks for a
+    /// snapshot when hopelessly behind.
+    fn run_one_follower(&mut self) {
+        let Some(follower) = self.follower.as_ref() else {
+            return
+        };
+        let stats = follower.stats.clone();
+        let last_draw = follower.last_draw;
+
+        let newest = self.core.live_newest_publisher_frame();
+        let behind = newest.saturating_sub(self.core.total_frames());
+        stats.frames_behind.store(behind, Ordering::Relaxed);
+        if behind > Self::FOLLOWER_RESYNC_BEHIND_FRAMES {
+            self.core.live_request_snapshot(SnapshotRequestReason::TooFarBehind);
+        }
+
+        let want = behind.saturating_sub(Self::FOLLOWER_TARGET_LAG_FRAMES).min(Self::FOLLOWER_MAX_FRAMES_PER_PASS);
+        let stalled = self.core.is_replay_stalled();
+        if stalled || want == 0 || self.core.live_frames_available() == 0 {
+            if !stalled {
+                stats.waiting.store(true, Ordering::Relaxed);
+            }
+            std::thread::park_timeout(Self::FOLLOWER_WAIT);
+            return
+        }
+
+        let pass_started = Instant::now();
+        let mut ran = 0;
+        let mut drew = false;
+        while ran < want && pass_started.elapsed() < Self::FOLLOWER_MAX_PASS {
+            // Draw the last frame of the pass, at most every FOLLOWER_DRAW_INTERVAL.
+            let draw = !drew && ran + 1 >= want && last_draw.elapsed() >= Self::FOLLOWER_DRAW_INTERVAL;
+            let started = Instant::now();
+            self.core.run_unlocked_presenting(draw);
+            let frames = self.core.last_run_time().frames;
+            if frames > 0 {
+                ran += frames;
+                self.emulated_frames.fetch_add(frames, Ordering::Relaxed);
+                stats.emulated_frames.fetch_add(frames, Ordering::Relaxed);
+                self.frame_times.write().record(started.elapsed(), None);
+                if self.core.last_frame_presented() {
+                    drew = true;
+                    stats.drawn_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                self.update_counters();
+            }
+            if self.core.is_replay_waiting() || self.core.is_replay_stalled() {
+                break
+            }
+            // A sliced (Game Boy) core returns without a frame many times per frame; keep going.
+        }
+        if drew && let Some(follower) = self.follower.as_mut() {
+            follower.last_draw = Instant::now();
+        }
+    }
+
+    fn handle_stream_errors(&mut self) {
+        let errors = self.core.poll_stream_errors();
+        if !errors.is_empty() {
+            self.stream_errors.extend(errors);
+        }
     }
 
     /// Longest single wait before the next frame; keeps commands and Poke-A-Byte reads responsive.
@@ -1055,8 +1295,12 @@ impl ThreadedSuperShuckieCoreThread {
         match self.core.core.microseconds_until_next_frame() {
             Some(until) => {
                 let until = Duration::from_micros(until);
+                // A frame still waiting to be handed over (the UI held the screen buffers when
+                // `update_queued_screens` tried) must not sit through a whole wait: at 1x that is
+                // up to 8 ms, half a refresh of a 120 Hz display. Retry every millisecond instead.
+                let max_wait = if self.screen_ready_for_copy { Duration::from_millis(1) } else { Self::MAX_FRAME_WAIT };
                 if until > Self::WAKE_EARLY {
-                    std::thread::sleep((until - Self::WAKE_EARLY).min(Self::MAX_FRAME_WAIT));
+                    std::thread::sleep((until - Self::WAKE_EARLY).min(max_wait));
                 }
             }
             None => {
@@ -1565,6 +1809,50 @@ impl ThreadedSuperShuckieCoreThread {
             ThreadCommand::SetMemoryMonitor(monitor) => {
                 self.memory_monitor = monitor.map(MemoryMonitorLocal::new);
             }
+            ThreadCommand::StartStreamPublishing(publisher, reply) => {
+                let _ = reply.send(self.core.start_stream_publishing(publisher));
+            }
+            ThreadCommand::StopStreamPublishing(reply) => {
+                self.core.stop_stream_publishing();
+                let _ = reply.send(());
+            }
+            ThreadCommand::RequestStreamSnapshot => {
+                self.core.request_stream_snapshot();
+                if !self.is_running() {
+                    self.core.publish_pending_stream_snapshot();
+                }
+            }
+            ThreadCommand::TakeStreamErrors(reply) => {
+                let _ = reply.send(core::mem::take(&mut self.stream_errors));
+            }
+            ThreadCommand::AttachLiveSource { source, metadata, allow_mismatched, reply } => {
+                let stats = source.stats().clone();
+                let r = self.core.attach_live_replay_source(source, &metadata, allow_mismatched);
+                if r.is_ok() {
+                    self.core.set_live_waker(std::thread::current());
+                    *self.follower_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(stats.clone());
+                    self.follower = Some(FollowerLoopState { stats, last_draw: Instant::now() - Self::FOLLOWER_DRAW_INTERVAL });
+                    self.pending_exact_frame = None;
+                    *self.frame_times.write() = FrameTimeStats::default();
+                }
+                let _ = reply.send(r);
+            }
+            ThreadCommand::DetachLiveSource(reply) => {
+                self.core.detach_live_source();
+                self.follower = None;
+                *self.follower_stats.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                if !self.is_running() {
+                    self.core.pause_timer();
+                }
+                let _ = reply.send(());
+            }
+            ThreadCommand::StartRecordingFollowerReplay(metadata, publisher, reply) => {
+                self.replay_errors.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                let _ = reply.send(self.core.start_recording_follower_replay(metadata, publisher));
+            }
+            ThreadCommand::TakeFollowerErrors(reply) => {
+                let _ = reply.send(self.core.poll_follower_errors());
+            }
         }
     }
 }
@@ -1575,6 +1863,35 @@ impl ThreadedSuperShuckieCoreThread {
 /// is fair game for the efficiency cores and for EcoQoS clock limits, which is a 30-40 % loss
 /// that shows up as lost speed. Opting the thread out of power throttling and raising its
 /// priority slightly keeps it on a performance core at full clock. No-op elsewhere.
+#[cfg(windows)]
+fn mark_thread_role(role: CoreThreadRole) {
+    match role {
+        CoreThreadRole::Primary => mark_thread_latency_sensitive(),
+        CoreThreadRole::Follower => mark_thread_background()
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_thread_role(_role: CoreThreadRole) {}
+
+/// The opposite of [`mark_thread_latency_sensitive`]: a follower of another player's game may
+/// run on an efficiency core and yields to the player's own game whenever both want the CPU.
+#[cfg(windows)]
+fn mark_thread_background() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+
+    // SAFETY: plain Win32 calls on the current thread.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
 #[cfg(windows)]
 fn mark_thread_latency_sensitive() {
     #[repr(C)]

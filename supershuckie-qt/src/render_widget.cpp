@@ -8,97 +8,15 @@
 
 using namespace SuperShuckie64;
 
-GameRenderWidget::GameRenderWidget(MainWindow *window, QWidget *parent): QGraphicsView(parent), main_window(window) {
-    this->setFrameStyle(0);
-    this->setHorizontalScrollBarPolicy(Qt::ScrollBarPolicy::ScrollBarAlwaysOff);
-    this->setVerticalScrollBarPolicy(Qt::ScrollBarPolicy::ScrollBarAlwaysOff);
-    this->setSizePolicy(QSizePolicy::Policy::Fixed, QSizePolicy::Policy::Fixed);
+GameRenderWidget::GameRenderWidget(MainWindow *window, QWidget *parent): ScreenCanvas(parent), main_window(window) {
     this->setFocusPolicy(Qt::ClickFocus);
 }
 
 void GameRenderWidget::set_dimensions(unsigned screen_count, const SuperShuckieScreenData *screen_data, unsigned scale) noexcept {
-    if(scale == 0) {
-        scale = 1;
-    }
-
-    this->current_scale = scale;
-    this->scale(scale, scale);
-    this->setTransform(QTransform::fromScale(scale, scale));
-
-    delete this->scene;
-    this->scene = nullptr;
-
-    this->screens.clear();
-
-    this->scene = new QGraphicsScene(this);
-
-    this->total_width = 0;
-    this->total_height = 0;
-
     bool horizontal_nds = this->main_window->horizontal_nds->isChecked();
     bool swap_screens = this->main_window->frontend != nullptr &&
         supershuckie_frontend_get_swap_nds_screens(this->main_window->frontend);
-
-    // Create the screen objects in data order so screens[i] stays bound to pixels[i] in
-    // refresh_screen(), and so touch input keeps targeting the bottom screen (screens[1]).
-    for(unsigned i = 0; i < screen_count; i++) {
-        ScreenData screen;
-        screen.width = screen_data[i].width;
-        screen.height = screen_data[i].height;
-        screen.pixmap_item = this->scene->addPixmap(screen.pixmap);
-        this->screens.emplace_back(screen);
-    }
-
-    // Assign on-screen positions in visual order. When swapping, place the two screens in
-    // reverse so the bottom screen comes first; this works for both orientations and the
-    // stored x/y offsets keep touch mapping correct.
-    for(unsigned visual = 0; visual < screen_count; visual++) {
-        unsigned i = (swap_screens && screen_count == 2) ? (screen_count - 1 - visual) : visual;
-        auto &screen = this->screens[i];
-
-        if(horizontal_nds) {
-            screen.x = this->total_width;
-            this->total_width += screen.width;
-            this->total_height = this->total_height > screen.height ? this->total_height : screen.height;
-        }
-        else {
-            screen.y = this->total_height;
-            this->total_height += screen.height;
-            this->total_width = this->total_width > screen.width ? this->total_width : screen.width;
-        }
-
-        screen.pixmap_item->setOffset(screen.x, screen.y);
-    }
-    
-    this->setFixedSize(this->total_width * scale, this->total_height * scale);
-    this->setScene(this->scene);
-}
-
-QImage GameRenderWidget::capture() const {
-    if(this->screens.empty() || this->total_width == 0 || this->total_height == 0) {
-        return QImage();
-    }
-
-    // Paint each screen's current pixmap at its on-screen offset. The offsets already encode the
-    // vertical/horizontal arrangement and the screen-swap setting, so the result matches the view.
-    QImage image(this->total_width, this->total_height, QImage::Format_ARGB32);
-    image.fill(Qt::black);
-
-    QPainter painter(&image);
-    for(const auto &screen : this->screens) {
-        painter.drawPixmap(static_cast<int>(screen.x), static_cast<int>(screen.y), screen.pixmap);
-    }
-    painter.end();
-
-    return image;
-}
-
-void GameRenderWidget::refresh_screen(unsigned screen_count, const uint32_t *const *pixels) {
-    for(unsigned i = 0; i < this->screens.size() && i < screen_count; i++) {
-        auto &screen = this->screens[i];
-        screen.pixmap.convertFromImage(QImage(reinterpret_cast<const uchar *>(pixels[i]), screen.width, screen.height, QImage::Format::Format_ARGB32));
-        screen.pixmap_item->setPixmap(screen.pixmap);
-    }
+    this->set_layout(screen_count, screen_data, scale, horizontal_nds, swap_screens);
 }
 
 void GameRenderWidget::keyPressEvent(QKeyEvent *event) {
