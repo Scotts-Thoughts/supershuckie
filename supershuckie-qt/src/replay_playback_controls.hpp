@@ -1,4 +1,5 @@
 #include <QWidget>
+#include <QElapsedTimer>
 
 #include <cstdint>
 
@@ -45,11 +46,25 @@ private:
 
     void tick();
 
+    /** Remember a seek the bar just asked for, so the bar keeps showing it until it lands. */
+    void note_seek_requested(std::uint32_t frame);
+    /** Whether the frontend's reported frame means the pending seek has landed (or timed out). */
+    bool pending_seek_settled(std::uint32_t reported_frame, std::uint32_t total_frames);
+
     bool is_paused = false;
     /** The loaded replay is stopped (see the class comment); mirrors the frontend. */
     bool is_stopped = false;
     bool is_clicking_on_bar = false;
 
     double playback_progress = 0.0;
+
+    /**
+     * A seek the bar asked for that the core has not reported yet. Seeks run on the core thread,
+     * so for a few frames after a click the frontend still reports the old position; without this
+     * the bar would snap back there and then jump forward again once the seek lands.
+     */
+    bool seek_pending = false;
+    std::uint32_t seek_requested_frame = 0;
+    QElapsedTimer seek_requested_at;
 };
 }

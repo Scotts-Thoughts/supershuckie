@@ -2565,6 +2565,20 @@ impl SuperShuckieFrontend {
         self.settings.replay.disable_speed_changes_when_recording
     }
 
+    /// Set whether a dragged timeline shows the nearest keyframe rather than the exact frame
+    /// until the drag ends (see `ReplaySettings::snap_timeline_drag_to_keyframes`).
+    #[inline]
+    pub fn set_snap_timeline_drag_to_keyframes(&mut self, snap: bool) {
+        self.settings.replay.snap_timeline_drag_to_keyframes = snap;
+        self.core.set_coarse_seek_while_frozen(snap);
+    }
+
+    /// See [`Self::set_snap_timeline_drag_to_keyframes`].
+    #[inline]
+    pub fn get_snap_timeline_drag_to_keyframes(&self) -> bool {
+        self.settings.replay.snap_timeline_drag_to_keyframes
+    }
+
     fn after_switch_core(&mut self) {
         if self.settings.replay.ignore_speed_changes_in_replays {
             self.core.set_ignore_speed_changes_in_replay(true);
@@ -2572,6 +2586,7 @@ impl SuperShuckieFrontend {
         if self.settings.replay.auto_resync_keyframes_in_replays {
             self.core.set_auto_resync_keyframes_in_replay(true);
         }
+        self.core.set_coarse_seek_while_frozen(self.settings.replay.snap_timeline_drag_to_keyframes);
 
         // A new core is a new timeline; nothing the old one queued should be heard.
         self.audio_output.clear();

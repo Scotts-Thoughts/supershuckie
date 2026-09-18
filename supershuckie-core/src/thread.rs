@@ -204,6 +204,8 @@ impl ThreadedSuperShuckieCore {
                     replay_stalled,
                     playback_errors,
                     playback_frozen: false,
+                    coarse_seek_while_frozen: true,
+                    pending_exact_frame: None,
                     freezes: BTreeMap::new(),
                     last_pokeabyte_freeze: None,
                     last_pokeabyte_read: None,
@@ -754,6 +756,14 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
+    /// Set whether seeks requested while playback is frozen (a timeline drag) land on the nearest
+    /// keyframe instead of the exact frame, which is then sought when the freeze ends. See
+    /// [`SuperShuckieCore::coarse_replay_frame`]. On by default.
+    #[inline]
+    pub fn set_coarse_seek_while_frozen(&self, coarse: bool) {
+        let _ = self.send(ThreadCommand::SetCoarseSeekWhileFrozen(coarse));
+    }
+
     /// Route the audio of audible frames to `output` (`None` to stop).
     #[inline]
     pub fn set_audio_output(&self, output: Option<Arc<AudioOutput>>) {
@@ -854,6 +864,7 @@ enum ThreadCommand {
     Start(Sender<()>),
     Pause(Sender<()>),
     SetPlaybackFrozen(bool),
+    SetCoarseSeekWhileFrozen(bool),
     SetPokeAByteEnabled(bool, Sender<Result<(), String>>),
     StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, Sender<Result<(), ReplayFileWriteError>>),
     ResumeRecordingReplay {
@@ -943,6 +954,10 @@ struct ThreadedSuperShuckieCoreThread {
     playback_errors: Arc<Mutex<Vec<String>>>,
     playback_paused: Arc<AtomicBool>,
     playback_frozen: bool,
+    /// See [`ThreadedSuperShuckieCore::set_coarse_seek_while_frozen`].
+    coarse_seek_while_frozen: bool,
+    /// The exact frame the last coarse seek stood in for, sought once playback is unfrozen.
+    pending_exact_frame: Option<u32>,
 
     core: SuperShuckieCore,
     receiver: Receiver<ThreadCommand>,
@@ -1069,7 +1084,18 @@ impl ThreadedSuperShuckieCoreThread {
         // frame -- both may be set in the same loop iteration (an app frame that both jumps and
         // steps), and applying only one used to silently drop the other.
         if frame != u32::MAX {
-            if let Err(e) = self.core.go_to_replay_frame(frame as UnsignedInteger) {
+            // While frozen (the timeline is being dragged) land on the nearest keyframe and
+            // remember the exact frame for when the drag ends; see `coarse_replay_frame`.
+            let target = if self.playback_frozen && self.coarse_seek_while_frozen {
+                let coarse = u32::try_from(self.core.coarse_replay_frame(frame as UnsignedInteger)).unwrap_or(frame);
+                self.pending_exact_frame = (coarse != frame).then_some(frame);
+                coarse
+            }
+            else {
+                self.pending_exact_frame = None;
+                frame
+            };
+            if let Err(e) = self.core.go_to_replay_frame(target as UnsignedInteger) {
                 self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
             }
             seeked = true;
@@ -1412,6 +1438,16 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::SetPlaybackFrozen(paused) => {
                 self.playback_frozen = paused;
+                if !paused {
+                    if let Some(frame) = self.pending_exact_frame.take() {
+                        // Settle on the frame the drag ended at, unless a newer request is
+                        // already waiting (it wins, as always).
+                        let _ = self.desired_replay_frame.compare_exchange(u32::MAX, frame, Ordering::Relaxed, Ordering::Relaxed);
+                    }
+                }
+            }
+            ThreadCommand::SetCoarseSeekWhileFrozen(coarse) => {
+                self.coarse_seek_while_frozen = coarse;
             }
             ThreadCommand::SaveSRAM(sender) => {
                 let _ = sender.send(self.core.save_sram());
@@ -1428,6 +1464,7 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::DetachReplayPlayer => {
                 self.core.detach_replay_player();
+                self.pending_exact_frame = None;
             }
             ThreadCommand::StopReplayPlayback(reply) => {
                 self.core.stop_replay_playback();

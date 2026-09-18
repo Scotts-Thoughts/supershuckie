@@ -1,14 +1,16 @@
 //! `supershuckie-replay-convert`: re-encode a Super Shuckie replay file into the current format.
 //!
-//! Every keyframe of the source (v2, v3 or v4) is re-fed through the recorder, so the output is a
-//! format-v4 file with region-diffed keyframes, long delta chains and zstd level 9 — typically 3-6x
-//! smaller than a v3 file — while the header, patch, crop/timer markers, bookmarks, counters and
-//! every emulated frame are carried over unchanged. `--verify` re-opens both files afterwards and
+//! Every keyframe of the source (v2 to v6) is re-fed through the recorder, so the output is a
+//! current-format file with region-diffed keyframes, long delta chains carrying a keyframe offset
+//! table (format v6) and zstd level 9 — typically 3-6x smaller than a v3 file — while the header,
+//! patch, crop/timer markers, bookmarks, counters and every emulated frame are carried over
+//! unchanged. Re-encoding a v4/v5 file gains the offset table (faster seeks) and, with a longer
+//! `--chain-frames` than it was recorded with, a smaller file. `--verify` re-opens both files afterwards and
 //! checks them packet by packet (keyframe states must reconstruct bit-exactly).
 //!
 //! ```text
 //! supershuckie-replay-convert <in.replay> <out.replay>
-//!     [--level 9] [--chain-frames 54000] [--blob-mb 1024] [--no-masks] [--verify]
+//!     [--level 9] [--chain-frames 108000] [--blob-mb 1024] [--no-masks] [--verify]
 //!     [--allow-corruption] [--force]
 //! ```
 //!
@@ -35,11 +37,11 @@ use supershuckie_replay_recorder::replay_file::record::{
 const USAGE: &str = "\
 usage: supershuckie-replay-convert <in.replay> <out.replay> [options]
 
-Re-encodes a replay (format v2/v3/v4) into the current format (v4).
+Re-encodes a replay (format v2 to v6) into the current format (v6).
 
 options:
   --level <n>          zstd compression level (default 9)
-  --chain-frames <n>   frames per delta chain / compressed blob, 0 = unlimited (default 54000 = 15 min)
+  --chain-frames <n>   frames per delta chain / compressed blob, 0 = unlimited (default 108000 = 30 min)
   --blob-mb <n>        hard cap on buffered uncompressed bytes per blob in MiB (default 1024)
   --no-masks           keep regenerated output buffers (3D geometry banks, mixed PCM) in delta
                        keyframes, i.e. every keyframe reconstructs bit-exactly

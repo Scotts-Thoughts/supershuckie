@@ -5,7 +5,7 @@ use core::ffi::c_void;
 use core::mem::transmute;
 use core::ffi::CStr;
 use num_enum::TryFromPrimitive;
-use zstd_sys::{ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2, ZSTD_createCCtx, ZSTD_decompress, ZSTD_freeCCtx, ZSTD_getErrorName, ZSTD_getFrameContentSize, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel};
+use zstd_sys::{ZSTD_CCtx_setParameter, ZSTD_cParameter, ZSTD_compress2, ZSTD_createCCtx, ZSTD_createDCtx, ZSTD_DCtx, ZSTD_DCtx_setParameter, ZSTD_dParameter, ZSTD_decompress, ZSTD_decompressStream, ZSTD_freeCCtx, ZSTD_freeDCtx, ZSTD_getErrorName, ZSTD_getFrameContentSize, ZSTD_inBuffer, ZSTD_isError, ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_outBuffer};
 use crate::replay_file::ReplayHeaderBlake3Hash;
 
 /// Describes an enum that may or may not be valid.
@@ -191,6 +191,94 @@ pub(crate) fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<V
     // SAFETY: It's been initialized.
     unsafe { decompressed_data.set_len(uncompressed_size) };
     Ok(decompressed_data)
+}
+
+/// Incremental decompression of one zstd frame (a compressed blob) straight into a caller-owned
+/// buffer, so a reader can stop once it has the bytes it needs.
+///
+/// The output `Vec` must be created with capacity for the whole frame and never reallocated: zstd
+/// is told the buffer is stable (`ZSTD_d_stableOutBuffer`), which lets it decode in place without
+/// its own window copy, and it verifies the pointer and size on every call.
+pub(crate) struct BlobDecoder {
+    dctx: *mut ZSTD_DCtx,
+    input_pos: usize,
+}
+
+// The context is only ever driven from one thread at a time; moving it between threads is fine.
+unsafe impl Send for BlobDecoder {}
+
+impl BlobDecoder {
+    /// `ZSTD_d_stableOutBuffer`, spelled as the public header spells it.
+    const STABLE_OUT_BUFFER: ZSTD_dParameter = ZSTD_dParameter::ZSTD_d_experimentalParam2;
+
+    /// Prepare to decode `data`, a frame that must decompress to exactly `uncompressed_size` bytes.
+    pub(crate) fn new(data: &[u8], uncompressed_size: usize) -> Result<Self, Cow<'static, str>> {
+        // SAFETY: `data` is a valid slice for its length; this function only inspects the frame header.
+        let claimed_size = unsafe { ZSTD_getFrameContentSize(data.as_ptr() as *const c_void, data.len()) };
+        if claimed_size == ZSTD_CONTENTSIZE_UNKNOWN {
+            return Err(Cow::Borrowed("zstd frame does not record its content size"));
+        }
+        if claimed_size == ZSTD_CONTENTSIZE_ERROR {
+            return Err(Cow::Borrowed("zstd frame header is malformed"));
+        }
+        if claimed_size != uncompressed_size as u64 {
+            return Err(Cow::Owned(format!("zstd frame claims {claimed_size} bytes but {uncompressed_size} were expected")));
+        }
+
+        // SAFETY: creating a context is safe; a null result means allocation failed.
+        let dctx = unsafe { ZSTD_createDCtx() };
+        if dctx.is_null() {
+            return Err(Cow::Borrowed("could not allocate a zstd decompression context"));
+        }
+        let decoder = Self { dctx, input_pos: 0 };
+
+        // SAFETY: dctx is a valid context and the parameter is validated by zstd.
+        let result = unsafe { ZSTD_DCtx_setParameter(dctx, Self::STABLE_OUT_BUFFER, 1) };
+        if unsafe { ZSTD_isError(result) } != 0 {
+            return Err(zstd_error(result));
+        }
+
+        Ok(decoder)
+    }
+
+    /// Feed up to `input_chunk` more compressed bytes of `data` (the same slice every call) and
+    /// append whatever they decode to `out`, whose capacity must be at least `uncompressed_size`
+    /// (the same every call) and which must not have been reallocated since the first call.
+    ///
+    /// Returns `true` once the frame is complete; `out` then holds `uncompressed_size` bytes.
+    pub(crate) fn step(&mut self, data: &[u8], out: &mut Vec<u8>, uncompressed_size: usize, input_chunk: usize) -> Result<bool, Cow<'static, str>> {
+        if self.input_pos >= data.len() {
+            return Err(Cow::Borrowed("zstd frame ended before producing its declared content"));
+        }
+        if out.capacity() < uncompressed_size || out.len() > uncompressed_size {
+            return Err(Cow::Borrowed("blob decode buffer is the wrong size"));
+        }
+
+        let end = self.input_pos.saturating_add(input_chunk).min(data.len());
+        let mut input = ZSTD_inBuffer { src: data.as_ptr() as *const c_void, size: end, pos: self.input_pos };
+        let mut output = ZSTD_outBuffer { dst: out.as_mut_ptr() as *mut c_void, size: uncompressed_size, pos: out.len() };
+
+        // SAFETY: `input` covers a valid prefix of `data`; `output` covers the reserved capacity
+        // of `out`, whose pointer and size are the same on every call as the stable-buffer
+        // contract requires (the caller never reallocates it).
+        let result = unsafe { ZSTD_decompressStream(self.dctx, &mut output, &mut input) };
+        if unsafe { ZSTD_isError(result) } != 0 {
+            return Err(zstd_error(result));
+        }
+
+        // SAFETY: zstd initialised `out` up to `output.pos`, which is within its capacity.
+        unsafe { out.set_len(output.pos) };
+        self.input_pos = input.pos;
+
+        Ok(result == 0)
+    }
+}
+
+impl Drop for BlobDecoder {
+    fn drop(&mut self) {
+        // SAFETY: dctx was created by ZSTD_createDCtx and is not used after this.
+        unsafe { ZSTD_freeDCtx(self.dctx) };
+    }
 }
 
 /// Hash the given data.

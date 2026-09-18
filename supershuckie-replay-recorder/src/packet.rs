@@ -131,9 +131,17 @@ pub enum Packet {
     },
 
     /// Describes a compressed blob of memory.
+    ///
+    /// `keyframe_offsets`, when not empty, is parallel to `keyframes`: the byte offset in the
+    /// decompressed blob of each keyframe-class packet (format v6, written with the
+    /// `IndexedCompressedBlob` discriminator). It lets a reader decompress a blob only as far as
+    /// the keyframe it seeks and parse just the keyframe packets on the way there. Empty for blobs
+    /// written before v6 (or copied verbatim from such a file); the reader then scans the whole
+    /// decompressed blob once to build the same table.
     #[allow(missing_docs)]
     CompressedBlob {
         keyframes: Vec<KeyframeMetadata>,
+        keyframe_offsets: Vec<UnsignedInteger>,
         bookmarks: Vec<BookmarkMetadata>,
         compressed_data: ByteVec,
         uncompressed_size: UnsignedInteger,

@@ -5,6 +5,8 @@
 #include <QGuiApplication>
 #include <QStyleHints>
 
+#include <algorithm>
+
 #include "replay_playback_controls.hpp"
 #include "main_window.hpp"
 
@@ -213,8 +215,14 @@ void ReplayPlaybackControls::tick() {
     // frame counter itself keeps counting the live play).
     std::uint32_t replay_frame = supershuckie_frontend_get_replay_frame(frontend);
 
+    // Keep showing where the user asked to go until the core has actually got there (or
+    // playback is stopped mid-drag); the reported position lags the request by a seek.
+    if(this->seek_pending && !this->is_clicking_on_bar && this->pending_seek_settled(replay_frame, total_frames)) {
+        this->seek_pending = false;
+    }
+
     double calculated_progress = total_frames == 0 ? 1.0 : static_cast<double>(replay_frame) / static_cast<double>(total_frames);
-    if(!this->is_clicking_on_bar && this->playback_progress != calculated_progress) {
+    if(!this->is_clicking_on_bar && !this->seek_pending && this->playback_progress != calculated_progress) {
         this->playback_progress = calculated_progress;
         needs_repaint = true;
     }
@@ -261,10 +269,36 @@ void ReplayPlaybackControls::mousePressEvent(QMouseEvent *event) {
 
     this->playback_progress = progress_requested;
 
+    auto frame = this->progress_to_frame(progress_requested);
     supershuckie_frontend_set_playback_frozen(this->main_window->frontend, true);
-    supershuckie_frontend_set_playback_frame(this->main_window->frontend, this->progress_to_frame(progress_requested));
+    supershuckie_frontend_set_playback_frame(this->main_window->frontend, frame);
+    this->note_seek_requested(frame);
     this->is_clicking_on_bar = true;
     this->repaint();
+}
+
+void ReplayPlaybackControls::note_seek_requested(std::uint32_t frame) {
+    this->seek_pending = true;
+    this->seek_requested_frame = frame;
+    this->seek_requested_at.start();
+}
+
+bool ReplayPlaybackControls::pending_seek_settled(std::uint32_t reported_frame, std::uint32_t total_frames) {
+    // Landed: the core reports (about) the requested frame. "About" covers the frames that live
+    // playback runs between the seek and this tick, and, on a short replay, anything within a
+    // pixel of the bar. Give up after a second so a seek that failed cannot pin the bar forever.
+    constexpr std::uint32_t MIN_SLACK_FRAMES = 30;
+    constexpr qint64 TIMEOUT_MS = 1000;
+
+    auto bar_width = this->playback_bar_bounds().width();
+    std::uint32_t frames_per_pixel = bar_width > 0.0 ? static_cast<std::uint32_t>(total_frames / bar_width) : 0;
+    std::uint32_t slack = std::max(MIN_SLACK_FRAMES, frames_per_pixel);
+
+    std::uint32_t distance = reported_frame > this->seek_requested_frame
+        ? reported_frame - this->seek_requested_frame
+        : this->seek_requested_frame - reported_frame;
+
+    return distance <= slack || this->seek_requested_at.elapsed() >= TIMEOUT_MS;
 }
 
 void ReplayPlaybackControls::mouseReleaseEvent(QMouseEvent *event) {
@@ -344,10 +378,9 @@ void ReplayPlaybackControls::mouseMoveEvent(QMouseEvent *event) {
     double progress = this->progress_on_bar(event->position().x());
     this->playback_progress = progress;
 
-    supershuckie_frontend_set_playback_frame(
-        this->main_window->frontend,
-        this->progress_to_frame(progress)
-    );
+    auto frame = this->progress_to_frame(progress);
+    supershuckie_frontend_set_playback_frame(this->main_window->frontend, frame);
+    this->note_seek_requested(frame);
 
     this->repaint();
 }

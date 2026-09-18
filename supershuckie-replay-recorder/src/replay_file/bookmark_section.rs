@@ -124,7 +124,7 @@ pub use file::*;
 mod file {
     use super::encode_bookmark_section;
     use crate::bookmarks::BookmarkTable;
-    use crate::replay_file::{ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION, REPLAY_VERSION_BOOKMARK_SECTION};
+    use crate::replay_file::{ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
     use alloc::format;
     use alloc::string::String;
     use std::fmt::{Display, Formatter};
@@ -244,7 +244,9 @@ mod file {
                     return Err(BookmarkSectionWriteError::InvalidReplay { explanation: String::from("the file ends inside its patch data") })
                 }
                 let mut upgraded = *header;
-                upgraded.replay_version = REPLAY_VERSION.max(REPLAY_VERSION_BOOKMARK_SECTION);
+                // The lowest version that has a bookmark section: the packets are untouched, so an older
+                // build that reads that version still opens the file.
+                upgraded.replay_version = REPLAY_VERSION_BOOKMARK_SECTION;
                 upgraded.packet_stream_end = file_len;
                 (file_len, Some(upgraded))
             }
@@ -294,7 +296,7 @@ mod tests {
         use crate::replay_file::bookmark_section::{write_bookmark_section, BookmarkSectionWriteError};
         use crate::replay_file::playback::{BookmarkTableSource, ReplayFilePlayer};
         use crate::replay_file::record::ReplayFileRecorderSettings;
-        use crate::replay_file::{ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION};
+        use crate::replay_file::{ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
         use crate::test_support::*;
         use alloc::format;
         use std::path::PathBuf;
@@ -372,7 +374,7 @@ mod tests {
                 let header_bytes = header_of(&bytes);
                 let header = ReplayHeaderRaw::from_bytes(&header_bytes);
                 let version = header.replay_version;
-                assert_eq!(version, REPLAY_VERSION, "{name}");
+                assert_eq!(version, REPLAY_VERSION_BOOKMARK_SECTION, "{name}");
                 assert_eq!(header.packet_stream_end(), Some(fixture.len() as u64), "{name}");
                 assert_eq!(outcome.header, header_of(&bytes), "{name}");
                 assert!(header.same_replay_as(ReplayHeaderRaw::from_bytes(&header_of(fixture))), "{name}");

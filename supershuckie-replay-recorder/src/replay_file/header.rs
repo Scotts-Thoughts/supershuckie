@@ -29,14 +29,21 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 ///   (see [`bookmark_section`](crate::replay_file::bookmark_section)), and the stream carries
 ///   `BookmarkTable` snapshots instead of `Bookmark` packets. A v3/v4 file is upgraded in place the
 ///   first time its bookmarks are edited; its packets parse identically under a v5 header.
-pub const REPLAY_VERSION: u32 = 5;
+/// * v6: compressed blobs carry a per-keyframe byte-offset table (`IndexedCompressedBlob`,
+///   discriminator 0xF9), so a seek decompresses a blob only up to its target keyframe and parses
+///   only the keyframe packets before it. Blobs without the table (v4/v5 files, or blobs copied
+///   verbatim from them on resume) still read; they are scanned once after a full decompression.
+pub const REPLAY_VERSION: u32 = 6;
 
 /// First format version with [`ReplayHeaderRaw::packet_stream_end`] and a bookmark section.
 pub const REPLAY_VERSION_BOOKMARK_SECTION: u32 = 5;
 
-/// Oldest format version whose packets are encoded the way this build writes them. Re-encoding a
-/// file of this version or newer gains nothing (v5 only added bookmark storage, which a v4 file
-/// gets in place on its first bookmark edit).
+/// Oldest format version whose keyframes are encoded the way this build writes them (region
+/// deltas, long chains). The app's batch converter skips files of this version or newer: v5 only
+/// added bookmark storage (which a v4 file gets in place on its first bookmark edit) and v6 only
+/// added the blob offset table, which speeds up seeks but does not shrink the file. Re-encoding a
+/// v4/v5 file with the command-line converter is still worthwhile for the table and for a longer
+/// chain length than it was recorded with.
 pub const REPLAY_VERSION_CURRENT_ENCODING: u32 = 4;
 
 // Resume support: see replay_file::record::resume (build_resumed_recorder). A resumed file is an

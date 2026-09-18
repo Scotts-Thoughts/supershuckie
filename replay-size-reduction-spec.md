@@ -451,3 +451,57 @@ Not verified in the app (the production instance was running and owns the REST p
 instance was driven): §9.9's manual checks — scrub across blob boundaries, play through a keyframe
 with resync on, resume from the middle, export a short video, and step frame-by-frame after a seek
 on a masked NDS file looking for 3D artefacts.
+
+## 14. Format v6 and the timeline (implemented 2026-09-17, branch `replay-bookmarks`)
+
+Measured first (tools: `supershuckie-replay-recorder/examples/blob_bench.rs`, per-blob zstd /
+parse / fold breakdown plus level and split experiments; `supershuckie-core/examples/seek_e2e.rs`,
+the real `go_to_replay_frame` on the ROM). HeartGold `h-ampharos-line-1-21318` re-converted with
+masks at several chain lengths, v5 player:
+
+| Chain | File | Cold keyframe seek (core) | Random scrub step (core) |
+|---|---|---|---|
+| 5 min | 358.9 MiB | 60 ms | 172 ms |
+| 10 min | 236.7 MiB | 74 ms | 185 ms |
+| 15 min | 191.6 MiB | 97 ms | 205 ms |
+| 30 min | 142.8 MiB | 153 ms | 238 ms |
+| 60 min | 116.8 MiB | 240 ms | 283 ms |
+
+Shorter chains are no longer a win: each blob's full keyframe (~1.75 MiB compressed) is a third of
+a masked 15-minute blob, and splitting zstd's context costs +20% on its own. A cold seek into a
+15-minute blob was ~55 ms zstd + ~40 ms parsing 162k packets into a `Vec` + <= 22 ms of folds; a
+scrub to an arbitrary frame then emulates up to 119 frames at ~2.2 ms each, which is half of an
+average drag step.
+
+What changed:
+
+1. **Format v6** — `Packet::CompressedBlob` gained `keyframe_offsets` (byte offset of every
+   keyframe-class packet in the decompressed blob), written with the new `IndexedCompressedBlob`
+   discriminator 0xF9; table-less blobs keep 0xFE and still read. `ReplayFilePlayer` no longer
+   parses a blob into a packet list: `DecodedBlob` holds the decompressed bytes, decoded on
+   demand by a streaming `BlobDecoder` (`ZSTD_d_stableOutBuffer`, so no extra window copy), and
+   packets are parsed straight out of it as the cursor passes them. A seek decodes only up to its
+   keyframe and parses only the keyframe packets before it. A blob without a table is decoded in
+   full and scanned once (still cheaper than the old parse). Bookmark upgrades of v3/v4 files
+   write version 5, not 6, since they leave the packets alone.
+2. **Timeline snap** — `ThreadedSuperShuckieCore` seeks to `coarse_replay_frame` (nearest
+   keyframe + `POST_LOAD_FRAMES`) while playback is frozen (the slider is held) and seeks the
+   exact frame when it is released. Setting `replay.snap_timeline_drag_to_keyframes`, default
+   true.
+3. **Default chain 30 minutes** (`DEFAULT_MAX_FRAMES_PER_BLOB` = 108,000). Existing settings
+   files keep their persisted value.
+
+Same replay, v6 files, new player (cold keyframe seek in the core; warm = 19 ms throughout):
+
+| Chain | File | Cold seek v6 | Cold seek before (v5, old player) |
+|---|---|---|---|
+| 15 min | 191.7 MiB | 53 ms | 97 ms |
+| 30 min | 142.9 MiB | 68 ms | 153 ms |
+| 60 min | 116.9 MiB | 101 ms | 240 ms |
+
+A v5 file read by the new player (scan fallback): 79 ms. With snapping, a drag step costs the
+cold or warm seek alone instead of seek + emulation.
+
+Not verified in the app: dragging the timeline across blob boundaries and releasing on an exact
+frame, and a recording session through a 30-minute blob rollover (see §9.9).
+

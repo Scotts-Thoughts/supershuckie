@@ -236,8 +236,13 @@ pub struct ReplaySettings {
 
     /// Close a compressed blob (= one delta-keyframe chain) after this many minutes of recording.
     ///
-    /// Longer chains save a few MiB per hour on Nintendo DS replays but make a cold seek into the
-    /// chain proportionally slower (15 minutes is roughly 50-100 ms). Default 15.
+    /// Every blob starts with a full keyframe, so longer chains make Nintendo DS replays smaller
+    /// (on a 2h14 HeartGold replay: 15 min = 192 MiB, 30 min = 143 MiB, 60 min = 117 MiB) at the
+    /// cost of a slower cold seek into the chain, which since format v6 decodes only up to the
+    /// keyframe it wants (measured 2026-09-17 in the core: 15 min = 53 ms, 30 min = 68 ms,
+    /// 60 min = 101 ms; a 15-minute v5 chain was 97 ms). A decoded chain also occupies about
+    /// 3.3 MiB of RAM per minute. Default 30 (a settings file written by an older build keeps its
+    /// own value, typically 15).
     #[serde(default = "ReplaySettings::MAX_RECORDING_BLOB_MINUTES")]
     pub max_recording_blob_minutes: NonZeroU32,
 
@@ -284,6 +289,13 @@ pub struct ReplaySettings {
 
     #[serde(default = "ReplaySettings::DISABLE_SPEED_CHANGES_WHEN_RECORDING")]
     pub disable_speed_changes_when_recording: bool,
+
+    /// While the timeline is being dragged, show the nearest keyframe (at most one keyframe
+    /// interval, normally 2 seconds, before the pointer) instead of emulating up to the exact
+    /// frame on every mouse move; the exact frame is sought when the drag ends. Keeps a Nintendo
+    /// DS drag at about 20 ms per step instead of up to 300 ms. Default true.
+    #[serde(default = "ReplaySettings::SNAP_TIMELINE_DRAG_TO_KEYFRAMES")]
+    pub snap_timeline_drag_to_keyframes: bool,
 }
 
 impl Default for ReplaySettings {
@@ -301,7 +313,8 @@ impl Default for ReplaySettings {
             ignore_speed_changes_in_replays: Self::IGNORE_SPEED_CHANGES_IN_REPLAYS(),
             auto_resync_keyframes_in_replays: Self::AUTO_RESYNC_KEYFRAMES_IN_REPLAYS(),
             disable_save_states_when_recording: Self::DISABLE_SAVE_STATES_WHEN_RECORDING(),
-            disable_speed_changes_when_recording: Self::DISABLE_SPEED_CHANGES_WHEN_RECORDING()
+            disable_speed_changes_when_recording: Self::DISABLE_SPEED_CHANGES_WHEN_RECORDING(),
+            snap_timeline_drag_to_keyframes: Self::SNAP_TIMELINE_DRAG_TO_KEYFRAMES()
         }
     }
 }
@@ -324,6 +337,7 @@ impl ReplaySettings {
     const AUTO_RESYNC_KEYFRAMES_IN_REPLAYS: fn() -> bool = || false;
     const DISABLE_SAVE_STATES_WHEN_RECORDING: fn() -> bool = || false;
     const DISABLE_SPEED_CHANGES_WHEN_RECORDING: fn() -> bool = || false;
+    const SNAP_TIMELINE_DRAG_TO_KEYFRAMES: fn() -> bool = || true;
 
     /// `max_recording_blob_minutes` as a frame count. The cap is coarse by design, so a nominal
     /// 60 fps is used for every console.

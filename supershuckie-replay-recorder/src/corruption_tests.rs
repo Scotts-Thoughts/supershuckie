@@ -198,6 +198,7 @@ fn corruption_inside_blobs() {
         compressed_data,
         uncompressed_size,
         keyframes,
+        keyframe_offsets,
         bookmarks,
         timestamp_start,
         timestamp_end,
@@ -222,6 +223,7 @@ fn corruption_inside_blobs() {
 
             let corrupted_blob = Packet::CompressedBlob {
                 keyframes: keyframes.clone(),
+                keyframe_offsets: keyframe_offsets.clone(),
                 bookmarks: bookmarks.clone(),
                 compressed_data: ByteVec::Heap(recompressed),
                 uncompressed_size: patched.len() as u64,

@@ -186,8 +186,12 @@ pub fn blob_of(packets: &[Packet]) -> Packet {
 
     let mut raw = Vec::new();
     let mut keyframes = Vec::new();
+    let mut keyframe_offsets = Vec::new();
     let mut frames = 0;
     for packet in packets {
+        if keyframe_metadata_of(packet).is_some() {
+            keyframe_offsets.push(raw.len() as u64);
+        }
         for command in packet.write_packet_instructions() {
             raw.extend_from_slice(command.bytes());
         }
@@ -205,6 +209,7 @@ pub fn blob_of(packets: &[Packet]) -> Packet {
         timestamp_start: keyframes[0].elapsed_millis,
         timestamp_end: (frames * 16).into(),
         keyframes,
+        keyframe_offsets,
         bookmarks: Vec::new(),
         uncompressed_size: raw.len() as u64,
         compressed_data: ByteVec::Heap(crate::compress_data(&raw, 1).unwrap()),

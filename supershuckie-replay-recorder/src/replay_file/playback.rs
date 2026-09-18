@@ -13,8 +13,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use crate::replay_file::bookmark_section::{decode_bookmark_section, BookmarkSectionError};
 use crate::replay_file::{ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
-use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, BookmarkTable, ByteVec, KeyframeMetadata, Packet, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
-use crate::util::{decompress_data, launder_reference};
+use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, BookmarkTable, ByteVec, KeyframeMetadata, Packet, PacketDiscriminator, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
+use crate::util::{decompress_data, launder_reference, BlobDecoder};
 
 type KeyframeMap<'a> = BTreeMap<UnsignedInteger, Vec<&'a KeyframeMetadata>>;
 type BookmarkMap<'a> = BTreeMap<String, Vec<&'a BookmarkMetadata>>;
@@ -38,22 +38,23 @@ pub struct ReplayFilePlayer {
 
     #[cfg(feature = "std")]
     compressed_blobs_decompressing: BTreeMap<usize, Option<DecompressionWorker>>,
-    compressed_blobs_finished: BTreeMap<usize, Option<Arc<Vec<Packet>>>>,
+    /// Every blob's decoded bytes, keyed by top-level packet index; `None` until first needed (or
+    /// after cleanup dropped it). See [`DecodedBlob`].
+    decoded_blobs: BTreeMap<usize, Option<DecodedBlob>>,
     compressed_blob_uncompressed_packet_indices: Vec<usize>,
     cleanup_enabled: bool,
 
     next_uncompressed_packet_index: usize,
-    next_compressed_packet_index: Option<usize>,
+    /// While the cursor is inside the blob at `next_uncompressed_packet_index`: the byte offset
+    /// (in the decompressed blob) of the next packet to hand out.
+    next_blob_offset: Option<usize>,
 
     /// The keyframe chain the cursor is currently on; see [`ChainState`].
     chain: ChainState,
-
-    /// The most recently materialised delta keyframe, handed out by [`Self::next_packet`] as a
-    /// [`Packet::Keyframe`]. Overwritten by the next delta the cursor passes.
-    materialized: Option<Packet>,
-
-    /// Whether [`Packet::Keyframe`]s handed out for delta keyframes carry a copy of the state
-    /// (see [`Self::set_keyframe_states_wanted`]).
+    /// The packet most recently handed out by [`Self::next_packet`] when it was not a reference
+    /// into the top-level list: a packet parsed out of a blob, or a materialised keyframe.
+    scratch: Option<Packet>,
+    /// See [`Self::set_keyframe_states_wanted`].
     keyframe_states_wanted: bool,
 
     #[cfg(feature = "std")]
@@ -75,26 +76,30 @@ pub enum BookmarkTableSource {
 }
 
 /// Which packet list a chain position refers to.
+///
+/// A position in the top-level list is a packet index; a position in a blob is a byte offset into
+/// the blob's decompressed bytes (blobs are parsed on demand, never into a packet list).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum ListId {
     /// The top-level (uncompressed) packet list.
     TopLevel,
-    /// The decompressed packet list of the blob at this top-level index.
+    /// The decompressed bytes of the blob at this top-level index.
     Blob(usize),
 }
 
 /// The state of the keyframe most recently passed by the cursor, and where it came from.
 ///
 /// Delta keyframes ([`Packet::DeltaKeyframe`], [`Packet::RegionDeltaKeyframe`]) stay compact in
-/// the packet lists and are materialised on demand by folding them into this running state.
+/// the file and are materialised on demand by folding them into this running state.
 ///
 /// Invariant: whenever the cursor sits just after a keyframe-class packet, `state` equals that
 /// keyframe's full state. Both [`ReplayFilePlayer::next_packet`] and
 /// [`ReplayFilePlayer::go_to_keyframe`] maintain it.
 struct ChainState {
-    /// The list `last_applied` indexes into.
+    /// The list `last_applied` refers to.
     list: Option<ListId>,
-    /// Index within that list of the last keyframe-class packet folded into `state`.
+    /// Position within that list (see [`ListId`]) of the last keyframe-class packet folded into
+    /// `state`.
     last_applied: Option<usize>,
     state: Vec<u8>,
     /// Delta keyframes applied so far (see [`ReplayFilePlayer::chain_folds`]).
@@ -120,58 +125,56 @@ impl ChainState {
         Self { list: None, last_applied: None, state: Vec::new(), folds: 0 }
     }
 
-    fn is_at(&self, list: ListId, index: usize) -> bool {
-        self.list == Some(list) && self.last_applied == Some(index)
+    fn is_at(&self, list: ListId, position: usize) -> bool {
+        self.list == Some(list) && self.last_applied == Some(position)
     }
 
-    fn set_full(&mut self, list: ListId, index: usize, state: &[u8]) {
+    fn set_full(&mut self, list: ListId, position: usize, state: &[u8]) {
         self.state.clear();
         self.state.extend_from_slice(state);
         self.list = Some(list);
-        self.last_applied = Some(index);
+        self.last_applied = Some(position);
     }
 
-    /// Check that the chain currently holds the state of the keyframe-class packet immediately
-    /// preceding `index` in `list`.
-    fn check_predecessor(&self, list: ListId, packets: &[Packet], index: usize) -> Result<(), ReplayFileReadError> {
-        let valid = self.list == Some(list)
-            && self.last_applied.is_some_and(|last| {
-                last < index && !packets[last + 1..index].iter().any(is_keyframe_class)
-            });
-
-        if valid {
-            Ok(())
-        }
-        else {
-            Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe is not preceded by a keyframe in its chain") })
-        }
+    /// Whether the chain currently holds the state of the keyframe-class packet immediately
+    /// preceding `position` in `list`. `keyframe_between(a, b)` tells whether any keyframe-class
+    /// packet lies strictly between positions `a` and `b` of that list.
+    fn holds_predecessor_of(&self, list: ListId, position: usize, keyframe_between: impl FnOnce(usize, usize) -> bool) -> bool {
+        self.list == Some(list)
+            && self.last_applied.is_some_and(|last| last < position && !keyframe_between(last, position))
     }
 
-    /// Fold the packet at `index` of `list` into the chain (a no-op for non-keyframe packets).
-    fn fold(&mut self, list: ListId, packets: &[Packet], index: usize) -> Result<(), ReplayFileReadError> {
-        match &packets[index] {
+    /// Fold `packet`, which sits at `position` of `list`, into the chain (a no-op for
+    /// non-keyframe packets). `predecessor_held` is [`Self::holds_predecessor_of`] for that
+    /// position; a delta whose predecessor is not held cannot be applied.
+    fn fold(&mut self, list: ListId, position: usize, packet: &Packet, predecessor_held: bool) -> Result<(), ReplayFileReadError> {
+        match packet {
             Packet::Keyframe { state, .. } => {
-                self.set_full(list, index, state.as_slice());
+                self.set_full(list, position, state.as_slice());
             },
 
             Packet::DeltaKeyframe { diff, .. } => {
-                self.check_predecessor(list, packets, index)?;
+                if !predecessor_held {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe is not preceded by a keyframe in its chain") });
+                }
                 if !apply_diff_in_place(&mut self.state, diff.as_slice()) {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe failed to apply") });
                 }
-                self.last_applied = Some(index);
+                self.last_applied = Some(position);
                 self.folds += 1;
             },
 
             Packet::RegionDeltaKeyframe { state_len, control, data, .. } => {
-                self.check_predecessor(list, packets, index)?;
+                if !predecessor_held {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe is not preceded by a keyframe in its chain") });
+                }
                 if *state_len != self.state.len() as UnsignedInteger {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("region delta keyframe expects a {state_len}-byte state but the chain holds {} bytes", self.state.len())) });
                 }
                 if !apply_region_diff_in_place(self.state.as_mut_slice(), control.as_slice(), data.as_slice()) {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("region delta keyframe is malformed") });
                 }
-                self.last_applied = Some(index);
+                self.last_applied = Some(position);
                 self.folds += 1;
             },
 
@@ -179,6 +182,169 @@ impl ChainState {
         }
 
         Ok(())
+    }
+}
+
+/// How many compressed bytes an on-demand decode feeds to zstd per step. Blobs decompress about
+/// 8-10x, so a step yields a few MiB, which bounds how far past a seek target a partial decode
+/// runs.
+const DECODE_STEP_COMPRESSED_BYTES: usize = 256 * 1024;
+
+/// A blob's decompressed bytes, decoded only as far as a reader has needed so far.
+///
+/// Packets are parsed out of `raw` on demand: the cursor, and a seek's walk along the keyframe
+/// chain, never build a packet list for the whole blob. A blob with a keyframe offset table
+/// (format v6) can therefore be entered at any keyframe having decoded only the bytes before it;
+/// a blob without one is decoded in full the first time its keyframes are needed and scanned once
+/// to build the same table.
+pub(crate) struct DecodedBlob {
+    /// Decompressed bytes so far (`len()` grows as decoding proceeds, never beyond `size`).
+    raw: Vec<u8>,
+    /// The blob's full decompressed size.
+    size: usize,
+    /// Decoder for the rest of the blob; `None` once `raw` is complete.
+    decoder: Option<BlobDecoder>,
+    /// Byte offset in `raw` of every keyframe-class packet, ascending; `None` until scanned (only
+    /// a blob written without a table needs scanning).
+    keyframe_offsets: Option<Vec<usize>>,
+}
+
+impl DecodedBlob {
+    /// A blob with nothing decoded yet. `table` is the blob packet's own offset table, already
+    /// validated by [`validate_offset_table`] (an invalid one is passed as `None` and rebuilt by
+    /// scanning).
+    fn begin(compressed: &[u8], size: usize, table: Option<Vec<usize>>) -> Result<Self, ReplayFileReadError> {
+        let decoder = BlobDecoder::new(compressed, size)
+            .map_err(|e| ReplayFileReadError::Other { explanation: Cow::Owned(format!("Decompression error: {e}")) })?;
+        let mut raw = Vec::new();
+        if raw.try_reserve_exact(size).is_err() {
+            return Err(ReplayFileReadError::Other { explanation: Cow::Borrowed("failed to allocate RAM to decompress compressed blob") });
+        }
+        Ok(Self { raw, size, decoder: Some(decoder), keyframe_offsets: table })
+    }
+
+    /// A blob decoded in full (used by background workers and whole-blob readers).
+    fn complete(header: &ReplayHeaderRaw, compressed: &[u8], size: usize, table: Option<Vec<usize>>) -> Result<Self, ReplayFileReadError> {
+        let raw = decompress_data(compressed, size)
+            .map_err(|e| ReplayFileReadError::Other { explanation: Cow::Owned(format!("Decompression error: {e}")) })?;
+        let mut blob = Self { raw, size, decoder: None, keyframe_offsets: table };
+        blob.offsets(compressed, header.replay_version)?;
+        Ok(blob)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.raw.len() >= self.size
+    }
+
+    /// Decode until at least `upto` bytes (clamped to the blob size) are available.
+    fn ensure_decoded(&mut self, compressed: &[u8], upto: usize) -> Result<(), ReplayFileReadError> {
+        let upto = upto.min(self.size);
+        while self.raw.len() < upto {
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("compressed blob decompressed to {} bytes but claims {}", self.raw.len(), self.size)) });
+            };
+            let finished = decoder.step(compressed, &mut self.raw, self.size, DECODE_STEP_COMPRESSED_BYTES)
+                .map_err(|e| ReplayFileReadError::Other { explanation: Cow::Owned(format!("Decompression error: {e}")) })?;
+            if finished {
+                self.decoder = None;
+                if self.raw.len() != self.size {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("compressed blob decompressed to {} bytes but claims {}", self.raw.len(), self.size)) });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_complete(&mut self, compressed: &[u8]) -> Result<(), ReplayFileReadError> {
+        self.ensure_decoded(compressed, self.size)
+    }
+
+    /// The keyframe offset table, scanning the (fully decoded) blob for it if it has none.
+    fn offsets(&mut self, compressed: &[u8], version: u32) -> Result<&[usize], ReplayFileReadError> {
+        if self.keyframe_offsets.is_none() {
+            self.ensure_complete(compressed)?;
+            let mut offsets = Vec::new();
+            let mut b = self.raw.as_slice();
+            while !b.is_empty() {
+                let offset = self.size - b.len();
+                let packet = Packet::read_all(&mut b, version)
+                    .map_err(|e| ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("Failed to read packet - {e:?}")) })?;
+                if is_keyframe_class(&packet) {
+                    offsets.push(offset);
+                }
+            }
+            self.keyframe_offsets = Some(offsets);
+        }
+        self.ensure_decoded(compressed, 1)?;
+        let offsets = self.keyframe_offsets.as_deref().expect("just scanned");
+        if offsets.first() != Some(&0) || self.raw.first() != Some(&(PacketDiscriminator::Keyframe as u8)) {
+            return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("first packet in a blob was not a keyframe") });
+        }
+        Ok(offsets)
+    }
+
+    /// Parse the packet at byte `offset`, decoding more of the blob as needed. Returns the packet
+    /// and the offset of the one after it.
+    fn parse_at(&mut self, compressed: &[u8], version: u32, offset: usize) -> Result<(Packet, usize), ReplayFileReadError> {
+        if offset >= self.size {
+            return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("packet offset is past the end of its blob") });
+        }
+        loop {
+            self.ensure_decoded(compressed, offset + 1)?;
+            let mut b = &self.raw[offset..];
+            match Packet::read_all(&mut b, version) {
+                Ok(packet) => return Ok((packet, self.raw.len() - b.len())),
+                // Anything can fail on a packet cut short by the decode frontier (a length prefix
+                // read as garbage included), so only a complete blob makes an error final.
+                Err(_) if !self.is_complete() => {
+                    let decoded = self.raw.len();
+                    self.ensure_decoded(compressed, decoded + 1)?;
+                },
+                Err(e) => return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("Failed to read packet - {e:?}")) }),
+            }
+        }
+    }
+
+    /// Whether the packet at `offset` is a full [`Packet::Keyframe`] (by its discriminator byte;
+    /// decodes up to it if needed).
+    fn is_full_keyframe_at(&mut self, compressed: &[u8], offset: usize) -> Result<bool, ReplayFileReadError> {
+        self.ensure_decoded(compressed, offset + 1)?;
+        Ok(self.raw.get(offset) == Some(&(PacketDiscriminator::Keyframe as u8)))
+    }
+
+    /// Whether a keyframe-class packet lies strictly between byte offsets `a` and `b`. Requires
+    /// the offset table (see [`Self::offsets`]).
+    fn keyframe_between(&self, a: usize, b: usize) -> bool {
+        let offsets = self.keyframe_offsets.as_deref().expect("offset table needed before folding");
+        let first_after_a = offsets.partition_point(|&o| o <= a);
+        offsets.get(first_after_a).is_some_and(|&o| o < b)
+    }
+}
+
+/// A blob packet's own keyframe offset table as `usize`s, if it is usable: one entry per keyframe,
+/// starting at 0, strictly ascending and inside the blob. Anything else is treated as absent (the
+/// player then scans the blob, which is slower but never wrong).
+fn validate_offset_table(offsets: &[UnsignedInteger], keyframes: usize, size: UnsignedInteger) -> Option<Vec<usize>> {
+    if offsets.is_empty() || offsets.len() != keyframes || offsets[0] != 0 {
+        return None;
+    }
+    let mut table = Vec::with_capacity(offsets.len());
+    let mut previous = None;
+    for &offset in offsets {
+        if offset >= size || previous.is_some_and(|p| offset <= p) {
+            return None;
+        }
+        previous = Some(offset);
+        table.push(usize::try_from(offset).ok()?);
+    }
+    Some(table)
+}
+
+/// The usable offset table of a blob packet (see [`validate_offset_table`]).
+fn packet_offset_table(packet: &Packet) -> Option<Vec<usize>> {
+    match packet {
+        Packet::CompressedBlob { keyframe_offsets, keyframes, uncompressed_size, .. } => validate_offset_table(keyframe_offsets, keyframes.len(), *uncompressed_size),
+        _ => None
     }
 }
 
@@ -251,7 +417,7 @@ impl ReplayFilePlayer {
 
         // Every top-level delta keyframe must be preceded (after any blob) by a full keyframe in the
         // top-level list, or it can never be materialised. Deltas inside blobs are checked when the
-        // blob is decompressed (a blob always starts with a full keyframe).
+        // blob is decoded (a blob always starts with a full keyframe).
         let mut have_top_level_keyframe = false;
         for (packet_index, packet) in all_packets.iter().enumerate() {
             match packet {
@@ -312,7 +478,7 @@ impl ReplayFilePlayer {
 
         #[cfg(feature = "std")]
         let mut compressed_blobs_decompressing = BTreeMap::new();
-        let mut compressed_blobs_finished = BTreeMap::new();
+        let mut decoded_blobs = BTreeMap::new();
         let mut compressed_blob_indices = Vec::new();
 
         for (packet_index, packet) in all_packets.iter().enumerate() {
@@ -332,7 +498,7 @@ impl ReplayFilePlayer {
 
                     #[cfg(feature = "std")]
                     compressed_blobs_decompressing.insert(packet_index, None);
-                    compressed_blobs_finished.insert(packet_index, None);
+                    decoded_blobs.insert(packet_index, None);
                     compressed_blob_indices.push(packet_index);
 
                     if keyframes.is_empty() {
@@ -407,17 +573,17 @@ impl ReplayFilePlayer {
             stream_truncated,
             all_uncompressed_packets: all_packets,
             next_uncompressed_packet_index: 0usize,
-            next_compressed_packet_index: None,
+            next_blob_offset: None,
             compressed_blob_uncompressed_packet_indices: compressed_blob_indices,
             #[cfg(feature = "std")]
             compressed_blobs_decompressing,
-            compressed_blobs_finished,
+            decoded_blobs,
             total_frame_count,
             total_millis: TimestampMillis(total_millis),
             cleanup_enabled: true,
             header_raw: *header_raw,
             chain: ChainState::new(),
-            materialized: None,
+            scratch: None,
             keyframe_states_wanted: true,
 
             #[cfg(feature = "std")]
@@ -542,20 +708,23 @@ impl ReplayFilePlayer {
     /// When several keyframes share the frame (a full keyframe forced for a keyframe bookmark right
     /// after a scheduled one), the last one in the stream is used.
     ///
+    /// A seek into a blob decodes it only as far as the keyframe (given a v6 offset table) and
+    /// parses only the keyframe packets on the way there.
+    ///
     /// On failure, `Err` is returned.
     pub fn go_to_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(), ReplaySeekError> {
-        let (list, packets, target) = self.locate_keyframe(keyframe_frames_index)?;
+        let (list, target) = self.locate_keyframe(keyframe_frames_index)?;
 
-        self.fast_forward_chain(list, packets.as_slice(), target).map_err(|error| ReplaySeekError::ReadError { error })?;
+        self.fast_forward_chain(list, target).map_err(|error| ReplaySeekError::ReadError { error })?;
 
         match list {
             ListId::TopLevel => {
                 self.next_uncompressed_packet_index = target;
-                self.next_compressed_packet_index = None;
+                self.next_blob_offset = None;
             },
             ListId::Blob(top_index) => {
                 self.next_uncompressed_packet_index = top_index;
-                self.next_compressed_packet_index = Some(target);
+                self.next_blob_offset = Some(target);
             }
         }
 
@@ -563,15 +732,22 @@ impl ReplayFilePlayer {
     }
 
     /// Whether the keyframe [`Self::go_to_keyframe`] would use for this frame is stored as a full
-    /// keyframe (so seeking to it applies no deltas). Decompresses its blob if needed; does not
+    /// keyframe (so seeking to it applies no deltas). Decodes its blob up to it if needed; does not
     /// move the cursor.
     pub fn keyframe_is_stored_full(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<bool, ReplaySeekError> {
-        let (_, packets, target) = self.locate_keyframe(keyframe_frames_index)?;
-        Ok(matches!(packets[target], Packet::Keyframe { .. }))
+        let (list, target) = self.locate_keyframe(keyframe_frames_index)?;
+        match list {
+            ListId::TopLevel => Ok(matches!(self.all_uncompressed_packets[target], Packet::Keyframe { .. })),
+            ListId::Blob(top_index) => {
+                let packets = self.all_uncompressed_packets.clone();
+                let compressed = blob_compressed_data(&packets, top_index);
+                self.blob_mut(top_index).is_full_keyframe_at(compressed, target).map_err(|error| ReplaySeekError::ReadError { error })
+            }
+        }
     }
 
-    /// Find the list and index of the last keyframe-class packet on the given frame.
-    fn locate_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(ListId, Arc<Vec<Packet>>, usize), ReplaySeekError> {
+    /// Find the list and position of the last keyframe-class packet on the given frame.
+    fn locate_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(ListId, usize), ReplaySeekError> {
         if self.keyframes.get(&keyframe_frames_index).is_none() {
             return Err(ReplaySeekError::NoSuchKeyframe {
                 given: keyframe_frames_index,
@@ -587,41 +763,42 @@ impl ReplayFilePlayer {
         for (top_index, packet) in self.all_uncompressed_packets.iter().enumerate() {
             match packet {
                 Packet::CompressedBlob { keyframes, .. } => {
-                    if keyframes.iter().any(|k| k.elapsed_frames == keyframe_frames_index) {
-                        location = Some((ListId::Blob(top_index), None));
+                    if let Some(i) = keyframes.iter().rposition(|k| k.elapsed_frames == keyframe_frames_index) {
+                        location = Some((ListId::Blob(top_index), i));
                     }
                     else if location.is_some() {
                         break;
                     }
                 },
                 p if matches_frame(p) => {
-                    location = Some((ListId::TopLevel, Some(top_index)));
+                    location = Some((ListId::TopLevel, top_index));
                 },
                 Packet::NextFrame { .. } if location.is_some() => break,
                 _ => continue
             }
         }
 
-        let Some((list, top_level_target)) = location else {
+        let Some((list, index)) = location else {
             return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::Other { explanation: Cow::Borrowed("keyframe is in the index but not in the packet stream") } })
         };
 
         match list {
-            ListId::TopLevel => Ok((list, self.all_uncompressed_packets.clone(), top_level_target.expect("top-level location has an index"))),
+            ListId::TopLevel => Ok((list, index)),
             ListId::Blob(top_index) => {
                 self.decompress_immediately(top_index).map_err(|error| ReplaySeekError::ReadError { error })?;
 
-                let packets = self.compressed_blobs_finished
-                    .get(&top_index)
-                    .expect("somehow did not find the blob we just found in compressed_blobs_finished...")
-                    .clone()
-                    .expect("somehow the blob we just decompressed is not decompressed");
+                let packets = self.all_uncompressed_packets.clone();
+                let compressed = blob_compressed_data(&packets, top_index);
+                let version = self.header_raw.replay_version;
+                let offsets = self.blob_mut(top_index).offsets(compressed, version).map_err(|error| ReplaySeekError::ReadError { error })?;
 
-                let Some(target) = packets.iter().rposition(matches_frame) else {
+                // `index` counts keyframes in the blob's metadata list, which the recorder writes in
+                // step with the packets; a table that disagrees is caught when the packet is parsed.
+                let Some(&target) = offsets.get(index) else {
                     return Err(ReplaySeekError::ReadError { error: ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("keyframe listed in the blob metadata is not in the blob") } })
                 };
 
-                Ok((list, packets, target))
+                Ok((list, target))
             }
         }
     }
@@ -633,32 +810,116 @@ impl ReplayFilePlayer {
     /// restarts from the nearest full keyframe at or before `target` (which is also where an
     /// incremental seek starts if such a keyframe lies between the chain position and the target,
     /// since a full keyframe resets the chain anyway).
-    fn fast_forward_chain(&mut self, list: ListId, packets: &[Packet], target: usize) -> Result<(), ReplayFileReadError> {
-        let Some(restart) = packets[..=target].iter().rposition(|p| matches!(p, Packet::Keyframe { .. })) else {
-            return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe with no full keyframe before it") })
-        };
+    fn fast_forward_chain(&mut self, list: ListId, target: usize) -> Result<(), ReplayFileReadError> {
+        match list {
+            ListId::TopLevel => {
+                let packets = self.all_uncompressed_packets.clone();
+                let Some(restart) = packets[..=target].iter().rposition(|p| matches!(p, Packet::Keyframe { .. })) else {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe with no full keyframe before it") })
+                };
 
-        let start = match self.chain.last_applied {
-            Some(last) if self.chain.list == Some(list) && last <= target => (last + 1).max(restart),
-            _ => restart
-        };
+                let start = match self.chain.last_applied {
+                    Some(last) if self.chain.list == Some(list) && last <= target => (last + 1).max(restart),
+                    _ => restart
+                };
 
-        for index in start..target {
-            self.chain.fold(list, packets, index)?;
+                for index in start..target {
+                    self.fold_top_level(&packets, index)?;
+                }
+            },
+
+            ListId::Blob(top_index) => {
+                let packets = self.all_uncompressed_packets.clone();
+                let compressed = blob_compressed_data(&packets, top_index);
+                let version = self.header_raw.replay_version;
+
+                // The keyframes at or before the target, oldest first.
+                let offsets: Vec<usize> = {
+                    let blob = self.blob_mut(top_index);
+                    let offsets = blob.offsets(compressed, version)?;
+                    let end = offsets.partition_point(|&o| o <= target);
+                    offsets[..end].to_vec()
+                };
+                if offsets.last() != Some(&target) {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("seek target is not a keyframe of its blob") });
+                }
+
+                // Restart from the last full keyframe at or before the target (read by discriminator
+                // byte, which decodes the blob up to there).
+                let mut restart = None;
+                for (i, &offset) in offsets.iter().enumerate().rev() {
+                    if self.blob_mut(top_index).is_full_keyframe_at(compressed, offset)? {
+                        restart = Some(i);
+                        break;
+                    }
+                }
+                let Some(restart) = restart else {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe with no full keyframe before it") })
+                };
+
+                let start = match self.chain.last_applied {
+                    Some(last) if self.chain.list == Some(list) && last <= target => offsets.partition_point(|&o| o <= last).max(restart),
+                    _ => restart
+                };
+
+                let end = offsets.len() - 1;
+                for &offset in &offsets[start.min(end)..end] {
+                    self.fold_in_blob(top_index, compressed, offset)?;
+                }
+            }
         }
 
         Ok(())
     }
 
-    /// Ensure the blob at `blob_packet_index` is decompressed and cached, using (and, if
-    /// necessary, waiting for) a background worker if one is in flight for it.
+    /// Fold the top-level packet at `index` into the chain.
+    fn fold_top_level(&mut self, packets: &[Packet], index: usize) -> Result<(), ReplayFileReadError> {
+        let list = ListId::TopLevel;
+        let packet = &packets[index];
+        if !is_keyframe_class(packet) || self.chain.is_at(list, index) {
+            // Nothing to fold, or a repeated seek to the same delta finds it already folded.
+            return Ok(());
+        }
+        let held = self.chain.holds_predecessor_of(list, index, |a, b| packets[a + 1..b].iter().any(is_keyframe_class));
+        self.chain.fold(list, index, packet, held)
+    }
+
+    /// Parse the packet at byte `offset` of the blob at `top_index`, fold it into the chain if it
+    /// is a keyframe, and return it with the offset of the packet after it.
+    fn fold_in_blob(&mut self, top_index: usize, compressed: &[u8], offset: usize) -> Result<(Packet, usize), ReplayFileReadError> {
+        let list = ListId::Blob(top_index);
+        let version = self.header_raw.replay_version;
+        let blob = self.decoded_blobs.get_mut(&top_index).expect("blob index").as_mut().expect("blob decoded");
+        let (packet, next) = blob.parse_at(compressed, version, offset)?;
+
+        if is_keyframe_class(&packet) {
+            // The predecessor check below consults the offset table (a table-less blob builds it
+            // by scanning, which decodes the rest of the blob first).
+            blob.offsets(compressed, version)?;
+            // A repeated seek to the same delta finds it already folded.
+            if !self.chain.is_at(list, offset) {
+                let held = self.chain.holds_predecessor_of(list, offset, |a, b| blob.keyframe_between(a, b));
+                self.chain.fold(list, offset, &packet, held)?;
+            }
+        }
+
+        Ok((packet, next))
+    }
+
+    fn blob_mut(&mut self, top_index: usize) -> &mut DecodedBlob {
+        self.decoded_blobs.get_mut(&top_index).expect("blob index").as_mut().expect("blob decoded")
+    }
+
+    /// Ensure the blob at `blob_packet_index` has a [`DecodedBlob`] to read from, using (and, if
+    /// necessary, waiting for) a background worker if one is in flight for it; otherwise the blob
+    /// starts undecoded and is decoded on demand.
     ///
     /// Never spins: a worker still running is waited for with a blocking `recv()`, and a worker
     /// that died before sending (see [`DecompressionWorker`]) is reaped and the blob is
-    /// decompressed here instead.
+    /// decoded here instead.
     #[cfg(feature = "std")]
     fn decompress_immediately(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
-        if self.compressed_blobs_finished[&blob_packet_index].is_some() {
+        if self.decoded_blobs[&blob_packet_index].is_some() {
             return Ok(())
         }
 
@@ -669,52 +930,53 @@ impl ReplayFilePlayer {
 
         if let Some(worker) = worker {
             match worker.result.recv() {
-                Ok(Ok(packets)) => {
-                    *self.compressed_blobs_finished
+                Ok(Ok(blob)) => {
+                    *self.decoded_blobs
                         .get_mut(&blob_packet_index)
-                        .expect("compressed blob should be in finished cache") = Some(packets);
+                        .expect("compressed blob should be in finished cache") = Some(blob);
                     return Ok(());
                 }
                 Ok(Err(error)) => return Err(error),
                 Err(std::sync::mpsc::RecvError) => {
                     // The worker died before sending (an early exit; a panic would abort the whole
                     // process under this app's release profile, but not under an unwinding build
-                    // such as `cargo test`). Reap the thread and fall back to decompressing here.
+                    // such as `cargo test`). Reap the thread and fall back to decoding here.
                     let _ = worker.handle.join();
                 }
             }
         }
 
-        self.decompress_on_this_thread(blob_packet_index)
+        self.begin_decoding(blob_packet_index)
     }
 
     /// [`Self::decompress_immediately`] without a background worker: the `no_std` configuration
     /// never spawns a thread, so this is the only path.
     #[cfg(not(feature = "std"))]
     fn decompress_immediately(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
-        if self.compressed_blobs_finished[&blob_packet_index].is_some() {
+        if self.decoded_blobs[&blob_packet_index].is_some() {
             return Ok(())
         }
 
-        self.decompress_on_this_thread(blob_packet_index)
+        self.begin_decoding(blob_packet_index)
     }
 
-    /// Decompress the blob at `blob_packet_index` on the calling thread and cache the result.
-    /// Assumes it is not already cached.
-    fn decompress_on_this_thread(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
-        let Some(Packet::CompressedBlob { compressed_data, uncompressed_size, .. }) = self.all_uncompressed_packets.get(blob_packet_index) else {
-            panic!("decompress_immediately on {blob_packet_index} failed because it's not a compressed blob packet...")
+    /// Set up on-demand decoding of the blob at `blob_packet_index` (nothing is decoded yet).
+    /// Assumes it is not already decoded.
+    fn begin_decoding(&mut self, blob_packet_index: usize) -> Result<(), ReplayFileReadError> {
+        let packet = &self.all_uncompressed_packets[blob_packet_index];
+        let Packet::CompressedBlob { compressed_data, uncompressed_size, .. } = packet else {
+            panic!("begin_decoding on {blob_packet_index} failed because it's not a compressed blob packet...")
         };
 
-        let packets = decompress_compressed_blob(
-            &self.header_raw,
+        let blob = DecodedBlob::begin(
             compressed_data.as_slice(),
-            usize::try_from(*uncompressed_size).expect("we checked uncompressed size converting earlier")
+            usize::try_from(*uncompressed_size).expect("we checked uncompressed size converting earlier"),
+            packet_offset_table(packet)
         )?;
 
-        *self.compressed_blobs_finished
+        *self.decoded_blobs
             .get_mut(&blob_packet_index)
-            .expect("compressed blob should be in finished cache") = Some(packets);
+            .expect("compressed blob should be in finished cache") = Some(blob);
 
         Ok(())
     }
@@ -737,80 +999,78 @@ impl ReplayFilePlayer {
             if !matches!(self.all_uncompressed_packets[packet_index], Packet::CompressedBlob { .. }) {
                 self.next_uncompressed_packet_index += 1;
                 let packets = self.all_uncompressed_packets.clone();
-                return self.materialize(ListId::TopLevel, &packets, packet_index).map(Some);
+                self.fold_top_level(&packets, packet_index)?;
+                return self.hand_out(ListId::TopLevel, packet_index, None, &packets).map(Some);
             }
 
             self.decompress_immediately(packet_index)?;
 
-            let packets = self.compressed_blobs_finished
-                .get(&packet_index)
-                .expect("compressed blob not found in finished cache")
-                .clone()
-                .expect("should be decompressed but wasn't for some reason???");
-
-            let inner_index = self.next_compressed_packet_index.unwrap_or(0);
-            if inner_index >= packets.len() {
-                self.next_compressed_packet_index = None;
+            let packets = self.all_uncompressed_packets.clone();
+            let compressed = blob_compressed_data(&packets, packet_index);
+            let offset = self.next_blob_offset.unwrap_or(0);
+            if offset >= self.blob_mut(packet_index).size {
+                self.next_blob_offset = None;
                 self.next_uncompressed_packet_index += 1;
                 continue;
             }
 
-            self.next_compressed_packet_index = Some(inner_index + 1);
-            return self.materialize(ListId::Blob(packet_index), &packets, inner_index).map(Some);
+            let (packet, next) = self.fold_in_blob(packet_index, compressed, offset)?;
+            self.next_blob_offset = Some(next);
+            return self.hand_out(ListId::Blob(packet_index), offset, Some(packet), &packets).map(Some);
         }
     }
 
-    /// Fold the packet at `index` of `list` into the chain and return what the caller should see:
-    /// the packet itself, or a materialised [`Packet::Keyframe`] for a delta.
-    fn materialize(&mut self, list: ListId, packets: &Arc<Vec<Packet>>, index: usize) -> Result<&Packet, ReplayFileReadError> {
-        let packet = &packets[index];
+    /// What the caller should see for the packet at `position` of `list`, which has just been
+    /// folded into the chain: the packet itself, or a materialised [`Packet::Keyframe`] for a
+    /// delta. `owned` is the packet when it was parsed out of a blob; a top-level packet is
+    /// referenced in place.
+    fn hand_out(&mut self, list: ListId, position: usize, owned: Option<Packet>, packets: &Arc<Vec<Packet>>) -> Result<&Packet, ReplayFileReadError> {
+        let is_delta = match owned.as_ref() {
+            Some(packet) => matches!(packet, Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. }),
+            None => matches!(packets[position], Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. }),
+        };
 
-        match packet {
-            Packet::Keyframe { state, .. } => {
-                self.chain.set_full(list, index, state.as_slice());
-            },
-
-            Packet::DeltaKeyframe { metadata, .. } | Packet::RegionDeltaKeyframe { metadata, .. } => {
-                // A repeated seek to the same delta finds it already folded; otherwise fold it now.
-                if !self.chain.is_at(list, index) {
-                    self.chain.fold(list, packets.as_slice(), index)?;
-                }
-
-                let state = if self.keyframe_states_wanted {
-                    ByteVec::Heap(self.chain.state.clone())
-                }
-                else {
-                    ByteVec::new()
-                };
-                self.materialized = Some(Packet::Keyframe {
-                    metadata: metadata.clone(),
-                    state
-                });
-
-                return Ok(self.materialized.as_ref().expect("just set"));
-            },
-
-            _ => {}
+        if is_delta {
+            debug_assert!(self.chain.is_at(list, position), "delta handed out without being folded");
+            let metadata = match owned {
+                Some(Packet::DeltaKeyframe { metadata, .. }) | Some(Packet::RegionDeltaKeyframe { metadata, .. }) => metadata,
+                _ => keyframe_metadata(&packets[position]).expect("checked above").clone()
+            };
+            let state = if self.keyframe_states_wanted {
+                ByteVec::Heap(self.chain.state.clone())
+            }
+            else {
+                ByteVec::new()
+            };
+            self.scratch = Some(Packet::Keyframe { metadata, state });
+            return Ok(self.scratch.as_ref().expect("just set"));
         }
 
-        // SAFETY: `packets` is the top-level list or a cached decompressed blob, both of which are
-        // owned by `self` and never mutated after construction. The returned reference is bound to
-        // the `&mut self` borrow, so the cache cannot be cleaned up (which only happens inside
-        // `next_packet`) while the caller still holds it.
-        Ok(unsafe { launder_reference(packet) })
+        match owned {
+            Some(packet) => {
+                self.scratch = Some(packet);
+                Ok(self.scratch.as_ref().expect("just set"))
+            },
+            // SAFETY: `packets` is the top-level list, which is owned by `self` and never mutated
+            // after construction. The returned reference is bound to the `&mut self` borrow.
+            None => Ok(unsafe { launder_reference(&packets[position]) })
+        }
     }
 
     /// Decompress all blobs.
     ///
-    /// Decompressed blobs hold compact packet lists (delta keyframes are only materialised as the
-    /// cursor passes them), so this costs roughly the compressed size of the file, not the sum of
-    /// all keyframe states.
+    /// Decoded blobs hold their compact packet bytes (about the compressed size of the file times
+    /// the compression ratio, not the sum of all keyframe states), so this costs roughly the
+    /// decompressed size of every blob.
     pub fn decompress_all_blobs(&mut self) {
         self.cleanup_enabled = false;
 
-        for (index, packet) in self.all_uncompressed_packets.clone().iter().enumerate() {
-            if let Packet::CompressedBlob { .. } = packet {
-                let _ = self.decompress_immediately(index);
+        let packets = self.all_uncompressed_packets.clone();
+        for (index, packet) in packets.iter().enumerate() {
+            if let Packet::CompressedBlob { compressed_data, .. } = packet {
+                if self.decompress_immediately(index).is_ok() {
+                    let _ = self.blob_mut(index).ensure_complete(compressed_data.as_slice());
+                }
             }
         }
     }
@@ -828,9 +1088,13 @@ impl ReplayFilePlayer {
 
             if let Some(last_compressed_blob_packet_index) = last_compressed_blob {
                 for i in 0..last_compressed_blob_packet_index {
-                    self.compressed_blobs_finished.insert(i, None);
+                    if let Some(slot) = self.decoded_blobs.get_mut(&i) {
+                        *slot = None;
+                    }
                     #[cfg(feature = "std")]
-                    self.compressed_blobs_decompressing.insert(i, None);
+                    if let Some(slot) = self.compressed_blobs_decompressing.get_mut(&i) {
+                        *slot = None;
+                    }
                 }
             }
         }
@@ -858,7 +1122,7 @@ impl ReplayFilePlayer {
             return;
         }
 
-        if self.compressed_blobs_finished[&blob_index].is_some() {
+        if self.decoded_blobs[&blob_index].is_some() {
             return;
         }
 
@@ -875,12 +1139,16 @@ impl ReplayFilePlayer {
             let spawned = std::thread::Builder::new()
                 .name("ReplayFilePlayer-decompression-thread".to_owned())
                 .spawn(move || {
-                    let Packet::CompressedBlob { uncompressed_size, compressed_data, .. } = packets
-                        .get(blob_index)
-                        .expect("failed to get packet") else {
+                    let packet = packets.get(blob_index).expect("failed to get packet");
+                    let Packet::CompressedBlob { uncompressed_size, compressed_data, .. } = packet else {
                         panic!("compressed blob wasn't a compressed blob NOOOOO")
                     };
-                    let result = decompress_compressed_blob(&header, compressed_data.as_slice(), usize::try_from(*uncompressed_size).expect("we checked this could be a usize!"));
+                    let result = DecodedBlob::complete(
+                        &header,
+                        compressed_data.as_slice(),
+                        usize::try_from(*uncompressed_size).expect("we checked this could be a usize!"),
+                        packet_offset_table(packet)
+                    );
                     // If the receiver side was dropped (e.g. a fresh spawn detached us, see the
                     // `slot.insert`/re-spawn path), the send just fails; there is nothing else to
                     // clean up here.
@@ -896,8 +1164,8 @@ impl ReplayFilePlayer {
         };
 
         match worker.result.try_recv() {
-            Ok(Ok(packets)) => {
-                self.compressed_blobs_finished.insert(blob_index, Some(packets));
+            Ok(Ok(blob)) => {
+                self.decoded_blobs.insert(blob_index, Some(blob));
                 *slot = None;
             }
             Ok(Err(_)) => {
@@ -919,12 +1187,20 @@ impl ReplayFilePlayer {
     }
 }
 
+/// The compressed bytes of the blob at `top_index` of `packets`.
+fn blob_compressed_data(packets: &[Packet], top_index: usize) -> &[u8] {
+    match &packets[top_index] {
+        Packet::CompressedBlob { compressed_data, .. } => compressed_data.as_slice(),
+        _ => panic!("packet {top_index} is not a compressed blob")
+    }
+}
+
 /// A background decompression of one compressed blob, started by
 /// [`ReplayFilePlayer::enable_threading`].
 ///
 /// `decompress_immediately` never spins on this: it blocks on [`Self::result`] (a blocking
 /// `recv()`) rather than polling, and a worker that dies before sending (`RecvError`/
-/// `TryRecvError::Disconnected`) is reaped with `handle.join()` and the blob is decompressed on
+/// `TryRecvError::Disconnected`) is reaped with `handle.join()` and the blob is decoded on
 /// the calling thread instead, so a background failure can never wedge the caller at 100% CPU or
 /// forever.
 ///
@@ -934,7 +1210,7 @@ impl ReplayFilePlayer {
 /// worker that exits early without panicking.
 #[cfg(feature = "std")]
 pub(crate) struct DecompressionWorker {
-    result: std::sync::mpsc::Receiver<Result<Arc<Vec<Packet>>, ReplayFileReadError>>,
+    result: std::sync::mpsc::Receiver<Result<DecodedBlob, ReplayFileReadError>>,
     handle: std::thread::JoinHandle<()>,
 }
 
@@ -980,41 +1256,20 @@ fn newest_stream_snapshot(header: &ReplayHeaderRaw, packets: &[Packet]) -> Optio
         match packet {
             Packet::BookmarkTable { table } => return Some(table.clone()),
             Packet::CompressedBlob { compressed_data, uncompressed_size, .. } => {
-                let blob = decompress_compressed_blob(header, compressed_data.as_slice(), usize::try_from(*uncompressed_size).ok()?).ok()?;
-                return blob.iter().rev().find_map(|p| match p {
-                    Packet::BookmarkTable { table } => Some(table.clone()),
-                    _ => None
-                })
+                let raw = decompress_data(compressed_data.as_slice(), usize::try_from(*uncompressed_size).ok()?).ok()?;
+                let mut newest = None;
+                let mut b = raw.as_slice();
+                while !b.is_empty() {
+                    if let Packet::BookmarkTable { table } = Packet::read_all(&mut b, header.replay_version).ok()? {
+                        newest = Some(table);
+                    }
+                }
+                return newest;
             },
             _ => {}
         }
     }
     None
-}
-
-/// Decompress a blob into its packet list.
-///
-/// Delta keyframes are left compact; they are materialised by the player's [`ChainState`] as the
-/// cursor passes them. The first packet must be a full keyframe so every delta in the blob has a
-/// base.
-fn decompress_compressed_blob(header: &ReplayHeaderRaw, blob_data: &[u8], uncompressed_size: usize) -> Result<Arc<Vec<Packet>>, ReplayFileReadError> {
-    let decompressed_data = decompress_data(blob_data, uncompressed_size)
-        .map_err(|e| ReplayFileReadError::Other { explanation: Cow::Owned(format!("Decompression error: {e}")) })?;
-
-    let mut b = decompressed_data.as_slice();
-    let mut packets = Vec::new();
-
-    while !b.is_empty() {
-        packets.push(
-            Packet::read_all(&mut b, header.replay_version).map_err(|i| ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("Failed to read packet - {i:?}")) })?
-        )
-    }
-
-    if !matches!(packets.first(), Some(Packet::Keyframe { .. })) {
-        return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("first packet in a blob was not a keyframe") });
-    }
-
-    Ok(Arc::new(packets))
 }
 
 #[cfg(test)]
@@ -1212,6 +1467,170 @@ mod tests {
         }
     }
 
+    /// The packets of a small chain: a full keyframe, then region deltas, with a frame between
+    /// each (states are `size` bytes so a blob is many decode steps long when `size` is large).
+    fn chain_packets(keyframes: u64, size: usize) -> (Vec<Packet>, Vec<Vec<u8>>) {
+        let mut states = Vec::new();
+        let mut packets = Vec::new();
+        let mut previous: Option<Vec<u8>> = None;
+        for frame in 0..keyframes {
+            let mut state = match &previous {
+                None => pseudo_random_bytes(7, size),
+                Some(p) => p.clone(),
+            };
+            // Touch a different region each time so every delta is small but distinct.
+            let at = (frame as usize * 97) % (size - 8);
+            state[at..at + 8].copy_from_slice(&frame.to_le_bytes());
+            match &previous {
+                None => packets.push(Packet::Keyframe { metadata: metadata_at(frame), state: bv(&state) }),
+                Some(p) => packets.push(region_delta(frame, p, &state)),
+            }
+            if frame + 1 < keyframes {
+                packets.push(Packet::NextFrame { timestamp_delta: 16.into() });
+            }
+            states.push(state.clone());
+            previous = Some(state);
+        }
+        (packets, states)
+    }
+
+    fn walk_keyframes(player: &mut ReplayFilePlayer, order: &[u64], states: &[Vec<u8>]) {
+        for &frame in order {
+            player.go_to_keyframe(frame).unwrap();
+            match player.next_packet().unwrap() {
+                Some(Packet::Keyframe { metadata, state }) => {
+                    assert_eq!(metadata.elapsed_frames, frame);
+                    assert_eq!(state.as_slice(), states[frame as usize].as_slice(), "state at frame {frame}");
+                }
+                other => panic!("expected keyframe {frame}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A v6 blob (with its offset table) and the same blob written table-less (the plain
+    /// discriminator) play back identically, sequentially and under seeks.
+    #[test]
+    fn indexed_and_plain_blobs_play_back_the_same() {
+        let (packets, states) = chain_packets(12, 600);
+        let indexed = blob_of(&packets);
+        let Packet::CompressedBlob { keyframe_offsets, .. } = &indexed else { unreachable!() };
+        assert_eq!(keyframe_offsets.len(), 12, "blob_of builds the table");
+        let mut plain = indexed.clone();
+        let Packet::CompressedBlob { keyframe_offsets, .. } = &mut plain else { unreachable!() };
+        keyframe_offsets.clear();
+
+        let indexed_bytes = file_with_packets(&[indexed]);
+        let plain_bytes = file_with_packets(&[plain]);
+        assert_eq!(indexed_bytes[..2048], plain_bytes[..2048], "same header");
+        assert_eq!(indexed_bytes[2048], PacketDiscriminator::IndexedCompressedBlob as u8);
+        assert_eq!(plain_bytes[2048], PacketDiscriminator::CompressedBlob as u8);
+
+        let mut a = ReplayFilePlayer::new(&indexed_bytes, false).unwrap();
+        let mut b = ReplayFilePlayer::new(&plain_bytes, false).unwrap();
+
+        let mut walk_a = Vec::new();
+        while let Some(packet) = a.next_packet().unwrap() {
+            walk_a.push(packet.clone());
+        }
+        let mut walk_b = Vec::new();
+        while let Some(packet) = b.next_packet().unwrap() {
+            walk_b.push(packet.clone());
+        }
+        assert_eq!(walk_a.len(), walk_b.len());
+        for (i, (x, y)) in walk_a.iter().zip(walk_b.iter()).enumerate() {
+            assert_packet_eq(x, y, &format!("packet {i}"));
+        }
+        assert_eq!(walk_a.iter().filter(|p| matches!(p, Packet::Keyframe { .. })).count(), 12);
+
+        let order = [5u64, 5, 2, 11, 0, 7, 8, 3, 11, 1];
+        walk_keyframes(&mut a, &order, &states);
+        walk_keyframes(&mut b, &order, &states);
+        // Both walked the same chain the same way.
+        assert_eq!(a.chain_folds(), b.chain_folds());
+    }
+
+    /// A seek into an indexed blob decodes only up to the target keyframe (plus the packet
+    /// itself), not the whole blob; playing on decodes the rest incrementally.
+    #[test]
+    fn seeking_an_indexed_blob_decodes_a_prefix() {
+        // 40 full keyframes of 300 KiB of incompressible bytes: a 12 MiB blob that takes many
+        // decode steps (deltas would compress to almost nothing and fit in one).
+        let states: Vec<Vec<u8>> = (0..40u64).map(|frame| pseudo_random_bytes(100 + frame, 300 * 1024)).collect();
+        let mut packets = Vec::new();
+        for (frame, state) in states.iter().enumerate() {
+            packets.push(Packet::Keyframe { metadata: metadata_at(frame as u64), state: bv(state) });
+            if frame + 1 < states.len() {
+                packets.push(Packet::NextFrame { timestamp_delta: 16.into() });
+            }
+        }
+        let bytes = file_with_packets(&[blob_of(&packets)]);
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+
+        player.go_to_keyframe(3).unwrap();
+        let (decoded, size) = {
+            let blob = player.decoded_blobs[&0].as_ref().unwrap();
+            (blob.raw.len(), blob.size)
+        };
+        assert!(decoded < size, "seeking to keyframe 3 of 40 decoded {decoded} of {size} bytes");
+        assert!(player.decoded_blobs[&0].as_ref().unwrap().decoder.is_some(), "decoder kept for the rest");
+
+        walk_keyframes(&mut player, &[3, 4, 1, 39], &states);
+        let blob = player.decoded_blobs[&0].as_ref().unwrap();
+        assert_eq!(blob.raw.len(), blob.size, "the last keyframe needs the whole blob");
+        assert!(blob.decoder.is_none(), "decoder released once complete");
+
+        // Sequential playback from a cold start also decodes on demand.
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        let mut keyframes = 0;
+        while let Some(packet) = player.next_packet().unwrap() {
+            if let Packet::Keyframe { metadata, state } = packet {
+                assert_eq!(state.as_slice(), states[metadata.elapsed_frames as usize].as_slice());
+                keyframes += 1;
+            }
+        }
+        assert_eq!(keyframes, 40);
+    }
+
+    /// An offset table that does not describe the blob is ignored (the blob is scanned instead),
+    /// or, when it points at plausible but wrong packets, reported as a broken packet -- never a
+    /// panic or a wrong state.
+    #[test]
+    fn bad_offset_tables_are_ignored_or_reported() {
+        let (packets, states) = chain_packets(6, 500);
+        let good = blob_of(&packets);
+        let Packet::CompressedBlob { keyframe_offsets: good_offsets, uncompressed_size, .. } = &good else { unreachable!() };
+        let size = *uncompressed_size;
+
+        let with_table = |offsets: Vec<u64>| {
+            let mut blob = good.clone();
+            let Packet::CompressedBlob { keyframe_offsets, .. } = &mut blob else { unreachable!() };
+            *keyframe_offsets = offsets;
+            file_with_packets(&[blob])
+        };
+
+        // Structurally invalid tables fall back to scanning and play back correctly.
+        for offsets in [
+            vec![0u64; 6],                       // not ascending
+            vec![1, 2, 3, 4, 5, 6],              // does not start at 0
+            good_offsets[..5].to_vec(),          // wrong length
+            vec![0, 1, 2, 3, 4, size + 10],      // out of bounds
+        ] {
+            let bytes = with_table(offsets.clone());
+            let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+            walk_keyframes(&mut player, &[4, 1, 5, 0], &states);
+        }
+
+        // A plausible table pointing at non-keyframe packets is a broken packet at seek time.
+        let mut wrong = good_offsets.clone();
+        wrong[2] += 1; // the NextFrame after keyframe 2... or mid-packet garbage
+        let bytes = with_table(wrong);
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        let result = player.go_to_keyframe(4);
+        assert!(matches!(result, Err(ReplaySeekError::ReadError { .. })), "got {result:?}");
+        // Keyframes before the bad entry are unaffected.
+        walk_keyframes(&mut player, &[1, 0], &states);
+    }
+
     /// A worker whose thread drops the sender without sending (an early exit, or -- in an
     /// unwinding build -- a panic) must not wedge the reader: the fallback in
     /// `decompress_immediately` reaps it and decompresses on the calling thread instead.
@@ -1226,7 +1645,7 @@ mod tests {
         };
         let frame = keyframes[0].elapsed_frames;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Arc<Vec<Packet>>, ReplayFileReadError>>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<DecodedBlob, ReplayFileReadError>>(1);
         // The thread does nothing but drop the sender: the channel disconnects without a value
         // ever being sent, simulating a worker that exited early (or, in an unwinding build,
         // panicked).

@@ -46,6 +46,9 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
 
     current_blob: Vec<u8>,
     current_blob_keyframes: Vec<KeyframeMetadata>,
+    /// Byte offset in `current_blob` of each keyframe-class packet, parallel to
+    /// `current_blob_keyframes` (the v6 offset table of the blob being built).
+    current_blob_keyframe_offsets: Vec<u64>,
     current_blob_offset: u64,
 
     elapsed_frames: UnsignedInteger,
@@ -119,9 +122,11 @@ pub struct ReplayFileRecorderSettings {
     /// Close the blob at the first keyframe at or after this many frames since the blob's first
     /// keyframe. `0` = unlimited.
     ///
-    /// This bounds the length of a delta chain, i.e. how many deltas a cold seek may have to apply.
+    /// This bounds the length of a delta chain, i.e. how many deltas a cold seek may have to apply
+    /// (and, since format v6, how much of a blob it may have to decompress: a seek decodes only up
+    /// to its keyframe).
     ///
-    /// Default is [`DEFAULT_MAX_FRAMES_PER_BLOB`] (15 minutes at 60 fps).
+    /// Default is [`DEFAULT_MAX_FRAMES_PER_BLOB`] (30 minutes at 60 fps).
     pub max_frames_per_blob: u64,
 
     /// zstd compression level
@@ -141,8 +146,15 @@ pub struct ReplayFileRecorderSettings {
 /// Default minimum uncompressed bytes per blob
 pub const DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB: usize = 1024 * 1024 * 1024;
 
-/// Default maximum frames per blob (15 minutes at 60 fps).
-pub const DEFAULT_MAX_FRAMES_PER_BLOB: u64 = 54_000;
+/// Default maximum frames per blob (30 minutes at 60 fps).
+///
+/// Every blob starts with a full keyframe (about 1.75 MiB compressed for a Nintendo DS state),
+/// which in a masked file is a third of a 15-minute blob, and zstd matches deltas against every
+/// earlier one in the blob; so on a 2h14 HeartGold replay 15-minute blobs give 192 MiB, 30-minute
+/// ones 143 MiB and 60-minute ones 117 MiB. With the v6 offset table a cold seek decodes only up
+/// to its keyframe, so 30 minutes seeks faster than 15 minutes did without it (measured 2026-09-17:
+/// 68 ms vs 97 ms in the core, 60 minutes = 101 ms).
+pub const DEFAULT_MAX_FRAMES_PER_BLOB: u64 = 108_000;
 
 /// Default compression level for format v4 files.
 ///
@@ -249,6 +261,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             current_input: starting_input,
             current_blob: Vec::new(),
             current_blob_keyframes: Vec::new(),
+            current_blob_keyframe_offsets: Vec::new(),
             current_blob_offset: u64::try_from(current_blob_offset).expect("failed to read"),
             header: metadata,
             last_state_to_diff: None,
@@ -318,6 +331,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.last_state_to_diff = None;
         self.current_blob.clear();
         self.current_blob_keyframes.clear();
+        self.current_blob_keyframe_offsets.clear();
     }
 
     /// Start the resumed recording's bookmarks with `table` (resume support).
@@ -556,6 +570,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         };
 
         self.current_blob_keyframes.push(metadata.clone());
+        self.current_blob_keyframe_offsets.push(u64::try_from(self.current_blob.len()).expect("blob offset exceeds u64"));
 
         let mut state = state;
         let mut masked = Vec::new();
@@ -673,6 +688,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             // Cloned, not taken: if the final-sink write below fails, `current_blob_keyframes` must
             // still hold the whole blob so a later call can retry it (see the doc comment above).
             keyframes: self.current_blob_keyframes.clone(),
+            keyframe_offsets: self.current_blob_keyframe_offsets.clone(),
             // Format v5 keeps bookmarks in `BookmarkTable` packets and the bookmark section.
             bookmarks: Vec::new(),
             compressed_data: ByteVec::Heap(compressed),
@@ -697,6 +713,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         let keyframes_len = self.current_blob_keyframes.len();
         self.current_blob_keyframes.clear();
         self.current_blob_keyframes.reserve(keyframes_len + 1024);
+        self.current_blob_keyframe_offsets.clear();
         self.current_blob_offset = offset.checked_add(written).expect("overflowed adding current_blob_offset");
 
         self.temp_write(|temp_sink| {

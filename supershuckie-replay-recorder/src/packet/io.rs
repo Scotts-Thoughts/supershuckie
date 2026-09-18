@@ -305,6 +305,9 @@ pub enum PacketDiscriminator {
     /// Snapshot of the replay's bookmark table (format v5)
     BookmarkTable = 0xF8,
 
+    /// Compressed blob with a keyframe byte-offset table (format v6)
+    IndexedCompressedBlob = 0xF9,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -386,7 +389,8 @@ impl Packet {
             Packet::Keyframe { .. } => PacketDiscriminator::Keyframe as u8,
             Packet::DeltaKeyframe { .. } => PacketDiscriminator::DeltaKeyframe as u8,
             Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframe as u8,
-            Packet::CompressedBlob { .. } => PacketDiscriminator::CompressedBlob as u8,
+            Packet::CompressedBlob { keyframe_offsets, .. } if keyframe_offsets.is_empty() => PacketDiscriminator::CompressedBlob as u8,
+            Packet::CompressedBlob { .. } => PacketDiscriminator::IndexedCompressedBlob as u8,
             Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8
         }
     }
@@ -430,6 +434,7 @@ impl PacketIO<'_> for Packet {
 
             Packet::CompressedBlob {
                 keyframes,
+                keyframe_offsets,
                 bookmarks,
                 compressed_data,
                 uncompressed_size,
@@ -439,6 +444,11 @@ impl PacketIO<'_> for Packet {
                 elapsed_frames_end
             } => {
                 commands.extend(keyframes.write_packet_instructions());
+                // The plain `CompressedBlob` discriminator (chosen above when the table is empty)
+                // has no offset table, so a table-less blob round-trips byte for byte.
+                if !keyframe_offsets.is_empty() {
+                    commands.extend(keyframe_offsets.write_packet_instructions());
+                }
                 commands.extend(bookmarks.write_packet_instructions());
                 commands.extend(compressed_data.write_packet_instructions());
                 commands.extend(uncompressed_size.write_packet_instructions());
@@ -551,6 +561,18 @@ impl PacketIO<'_> for Packet {
             PacketDiscriminator::ChangeSpeed => Ok(Packet::ChangeSpeed { speed: Speed::read_all(from, version)? }),
             PacketDiscriminator::CompressedBlob => Ok(Packet::CompressedBlob {
                 keyframes: Vec::read_all(from, version)?,
+                keyframe_offsets: Vec::new(),
+                bookmarks: Vec::read_all(from, version)?,
+                compressed_data: ByteVec::read_all(from, version)?,
+                uncompressed_size: UnsignedInteger::read_all(from, version)?,
+                timestamp_start: TimestampMillis::read_all(from, version)?,
+                timestamp_end: TimestampMillis::read_all(from, version)?,
+                elapsed_frames_start: UnsignedInteger::read_all(from, version)?,
+                elapsed_frames_end: UnsignedInteger::read_all(from, version)?
+            }),
+            PacketDiscriminator::IndexedCompressedBlob => Ok(Packet::CompressedBlob {
+                keyframes: Vec::read_all(from, version)?,
+                keyframe_offsets: Vec::read_all(from, version)?,
                 bookmarks: Vec::read_all(from, version)?,
                 compressed_data: ByteVec::read_all(from, version)?,
                 uncompressed_size: UnsignedInteger::read_all(from, version)?,
@@ -711,6 +733,18 @@ mod tests {
             Packet::RegionDeltaKeyframe { metadata: metadata.clone(), state_len: 33, control: bv(&[0, 1]), data: bv(&[1, 2, 3, 4]) },
             Packet::CompressedBlob {
                 keyframes: vec![metadata.clone()],
+                keyframe_offsets: vec![],
+                bookmarks: vec![],
+                compressed_data: bv(&[1, 2, 3]),
+                uncompressed_size: 300,
+                timestamp_start: 1.into(),
+                timestamp_end: 2.into(),
+                elapsed_frames_start: 3,
+                elapsed_frames_end: 4,
+            },
+            Packet::CompressedBlob {
+                keyframes: vec![metadata.clone(), metadata.clone()],
+                keyframe_offsets: vec![0, 1234],
                 bookmarks: vec![],
                 compressed_data: bv(&[1, 2, 3]),
                 uncompressed_size: 300,
@@ -735,7 +769,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xF9, 0, 0];
+        let mut slice: &[u8] = &[0xFA, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 

@@ -1501,6 +1501,24 @@ impl SuperShuckieCore {
         self.go_to_replay_frame_inner(keyframe_hint, desired)
     }
 
+    /// The frame to hand [`Self::go_to_replay_frame`] instead of `frame` for a coarse seek: the
+    /// nearest frame at or before `frame` that a seek reaches by loading a keyframe and emulating
+    /// only [`Self::POST_LOAD_FRAMES`] past it. A timeline being dragged asks for these, since
+    /// emulating up to a whole keyframe interval per drag step costs more than the seek itself
+    /// (about 2 ms per Nintendo DS frame); the exact frame is sought once the drag ends.
+    ///
+    /// `frame` itself when no replay is attached or no keyframe lies far enough before it.
+    pub fn coarse_replay_frame(&self, frame: UnsignedInteger) -> UnsignedInteger {
+        let Some(p) = self.replay_player.as_ref() else {
+            return frame
+        };
+        let hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
+        match p.all_keyframes().range(..=hint).next_back() {
+            Some((&keyframe, _)) => keyframe.saturating_add(Self::POST_LOAD_FRAMES).min(frame),
+            None => frame
+        }
+    }
+
     fn go_to_replay_frame_inner(&mut self, frame: UnsignedInteger, desired: UnsignedInteger) -> Result<(), String> {
         if self.replay_player.is_none() {
             return Ok(())
