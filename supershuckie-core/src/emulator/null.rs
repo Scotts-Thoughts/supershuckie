@@ -98,4 +98,8 @@ impl EmulatorCore for NullEmulatorCore {
     fn is_null(&self) -> bool {
         true
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
 }

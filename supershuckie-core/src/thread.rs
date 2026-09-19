@@ -1,4 +1,5 @@
 use crate::emulator::{EmulatorCore, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
+use crate::link::{LinkFailure, LinkInbox, LinkPublisherFns, LinkRunOutcome, LinkSettings};
 use crate::live_replay::{FollowerStats, FollowerStatsSnapshot, LiveReplaySource};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
 use crate::stream::{SnapshotRequestReason, StreamPublisherFns};
@@ -10,6 +11,7 @@ use std::borrow::{Cow, ToOwned};
 use std::boxed::Box;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::num::NonZeroU64;
 use std::format;
 use std::fs::File;
 use std::string::{String, ToString};
@@ -24,7 +26,7 @@ use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash};
-use supershuckie_replay_recorder::{BookmarkTable, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
+use supershuckie_replay_recorder::{BookmarkTable, ByteVec, InputBuffer, SignedInteger, TimestampMillis, UnsignedInteger};
 
 /// What a core thread is for, which decides how it competes for the CPU.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -97,11 +99,73 @@ pub struct ThreadedSuperShuckieCore {
     /// The followed game's counters while following (see [`Self::attach_live_replay_source`]).
     follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>>,
 
+    /// Problems the stream publisher reported, until [`Self::get_stream_errors`] takes them.
+    /// Shared with the thread (like `replay_errors`) so that polling them from the UI never
+    /// waits on the core thread: the UI polls every tick, and a round trip would sit through the
+    /// core's pacing sleep (up to a frame) every time, jittering the player's own display.
+    stream_errors: Arc<Mutex<Vec<String>>>,
+
+    /// Problems following reported, until [`Self::get_follower_errors`] takes them; same reason
+    /// as `stream_errors`, and a follower thread runs below normal priority on top of that.
+    follower_errors: Arc<Mutex<Vec<String>>>,
+
+    /// Where the core stands with a link cable (see [`Self::link_status`]); written by the thread,
+    /// read from the UI tick without a round trip.
+    link_status: Arc<Mutex<LinkStatus>>,
+
+    /// Problems the link publisher reported, until [`Self::get_link_errors`] takes them.
+    link_errors: Arc<Mutex<Vec<String>>>,
+
     /// Facts about the wrapped core that never change for its life.
     memory_regions: Vec<MemoryRegionInfo>,
     console_type: Option<ReplayConsoleType>,
     rom_checksum: ReplayHeaderBlake3Hash,
     core_name: String
+}
+
+/// Where a core stands with a link cable (see `crate::link`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkStatus {
+    /// No cable.
+    Idle,
+
+    /// Held at a frame boundary for a link handshake.
+    Holding,
+
+    /// Plugging in: the partner's follower is being brought to the agreed frame.
+    Starting,
+
+    /// Linked and running.
+    Linked {
+        /// Frames the inputs are sent ahead.
+        delay_frames: u64,
+        /// Link frames completed by the local console.
+        link_frame: u64,
+        /// Whether the pair is waiting for the partner's next link frame.
+        stalled: bool
+    },
+
+    /// The link ended on its own; the lent core is back with its thread. Cleared by
+    /// [`ThreadedSuperShuckieCore::unlink`].
+    Failed(LinkFailure)
+}
+
+/// A follower's core loop, taken off its own thread to be run in lockstep with the player's own
+/// core (see [`ThreadedSuperShuckieCore::lend`]). Hand it to [`ThreadedSuperShuckieCore::link`]
+/// on the player's own core; dropping it instead ends the follower's thread.
+pub struct LentCore {
+    loop_: Box<CoreLoop>,
+    /// Commands the follower's wrapper sends while its loop is lent, forwarded by its thread.
+    commands: Receiver<ThreadCommand>,
+    /// Where the loop goes back to.
+    return_to: Sender<ReturnedCore>
+}
+
+/// A lent loop coming back to its own thread.
+struct ReturnedCore {
+    loop_: Box<CoreLoop>,
+    /// The wrapper closed while the loop was lent: finish the thread once it is back.
+    then_close: bool
 }
 
 /// Current elapsed time, retrieved atomically (the frame count corresponds to milliseconds and vice versa).
@@ -190,6 +254,10 @@ impl ThreadedSuperShuckieCore {
         let replay_stalled = Arc::new(AtomicBool::new(false));
         let playback_errors = Arc::new(Mutex::new(Vec::new()));
         let follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>> = Arc::new(Mutex::new(None));
+        let stream_errors = Arc::new(Mutex::new(Vec::new()));
+        let follower_errors = Arc::new(Mutex::new(Vec::new()));
+        let link_status = Arc::new(Mutex::new(LinkStatus::Idle));
+        let link_errors = Arc::new(Mutex::new(Vec::new()));
 
         let elapsed_time = Arc::new(RwLock::new(ElapsedTimeStats::default()));
         let frame_times = Arc::new(RwLock::new(FrameTimeStats::default()));
@@ -208,13 +276,17 @@ impl ThreadedSuperShuckieCore {
             let replay_stalled = replay_stalled.clone();
             let playback_errors = playback_errors.clone();
             let follower_stats_thread = follower_stats.clone();
+            let stream_errors = stream_errors.clone();
+            let follower_errors = follower_errors.clone();
+            let link_status = link_status.clone();
+            let link_errors = link_errors.clone();
             let name = match role {
                 CoreThreadRole::Primary => "ThreadedSuperShuckieCore",
                 CoreThreadRole::Follower => "ThreadedSuperShuckieCore/follower"
             };
             std::thread::Builder::new().name(name.to_owned()).spawn(move || {
                 mark_thread_role(role);
-                ThreadedSuperShuckieCoreThread {
+                let loop_ = CoreLoop {
                     screens,
                     is_null: emulator_core.is_null(),
                     screens_queued: emulator_core.get_screens().to_vec(),
@@ -223,8 +295,6 @@ impl ThreadedSuperShuckieCore {
                     published_run_serial: 0,
                     core: SuperShuckieCore::new(emulator_core, std_timestamp_provider()),
                     pokeabyte_integration: None,
-                    receiver,
-                    sender_close,
                     desired_replay_frame,
                     elapsed_time,
                     frame_times,
@@ -243,8 +313,18 @@ impl ThreadedSuperShuckieCore {
                     memory_monitor: None,
                     follower: None,
                     follower_stats: follower_stats_thread,
-                    stream_errors: Vec::new(),
+                    stream_errors,
+                    follower_errors,
+                    link_errors,
                     playback_paused
+                };
+                CoreThread {
+                    receiver,
+                    sender_close,
+                    loop_: Some(Box::new(loop_)),
+                    linked: None,
+                    link_status,
+                    pending_command: None
                 }.run_thread();
             }).ok().map(|handle| handle.thread().clone())
         };
@@ -271,6 +351,10 @@ impl ThreadedSuperShuckieCore {
             replay_stalled,
             thread,
             follower_stats,
+            stream_errors,
+            follower_errors,
+            link_status,
+            link_errors,
             memory_regions,
             console_type,
             rom_checksum,
@@ -395,6 +479,8 @@ impl ThreadedSuperShuckieCore {
 
         let (sender, receiver) = channel();
         if self.send(ThreadCommand::Start(sender)).is_ok() {
+            // A paused thread parks for up to 100 ms between command checks.
+            self.wake();
             let _ = receiver.recv();
         }
     }
@@ -427,9 +513,10 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::SetPlaybackFrozen(paused));
     }
 
-    /// Attach/detach a Poke-A-Byte integration server.
-    pub fn set_pokeabyte_enabled(&self, enabled: bool) -> Result<(), String> {
-        match self.call(|sender| ThreadCommand::SetPokeAByteEnabled(enabled, sender)) {
+    /// Attach a Poke-A-Byte integration server on UDP `port` (127.0.0.1), or detach it with
+    /// `None`. Already listening on that port is a no-op; a different port replaces the server.
+    pub fn set_pokeabyte_port(&self, port: Option<u16>) -> Result<(), String> {
+        match self.call(|sender| ThreadCommand::SetPokeABytePort(port, sender)) {
             Ok(r) => r,
             Err(dead) => Err(dead.to_string()),
         }
@@ -556,6 +643,12 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::SetToggledInput(input));
     }
 
+    /// Hold `input`'s buttons for exactly the next `frames` emulated frames (see
+    /// [`SuperShuckieCore::press_for_frames`]).
+    pub fn press_for_frames(&self, input: Input, frames: NonZeroU64) {
+        let _ = self.send(ThreadCommand::PressForFrames(input, frames));
+    }
+
     /// Create a save state.
     ///
     /// Returns `None` if no save state could be created for some unknown reason (including the
@@ -568,7 +661,10 @@ impl ThreadedSuperShuckieCore {
 
     /// Load a save state.
     pub fn load_save_state(&self, state: Vec<u8>) {
-        let _ = self.send(ThreadCommand::LoadSaveState(state));
+        if self.send(ThreadCommand::LoadSaveState(state)).is_ok() {
+            // A paused thread parks for up to 100 ms between command checks.
+            self.wake();
+        }
     }
 
     /// Get SRAM.
@@ -822,9 +918,11 @@ impl ThreadedSuperShuckieCore {
         self.wake();
     }
 
-    /// Problems the stream publisher reported since the last call.
+    /// Problems the stream publisher reported since the last call. Never waits on the core
+    /// thread (safe to poll every UI tick).
     pub fn get_stream_errors(&self) -> Vec<String> {
-        self.call(|reply| ThreadCommand::TakeStreamErrors(reply)).unwrap_or_default()
+        let mut errors = self.stream_errors.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *errors)
     }
 
     /// Follow another player's game (see [`SuperShuckieCore::attach_live_replay_source`]). The
@@ -869,9 +967,11 @@ impl ThreadedSuperShuckieCore {
         }
     }
 
-    /// Problems following reported since the last call (a state that would not load).
+    /// Problems following reported since the last call (a state that would not load). Never
+    /// waits on the core thread (safe to poll every UI tick).
     pub fn get_follower_errors(&self) -> Vec<String> {
-        self.call(|reply| ThreadCommand::TakeFollowerErrors(reply)).unwrap_or_default()
+        let mut errors = self.follower_errors.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *errors)
     }
 
     /// Set whether seeks requested while playback is frozen (a timeline drag) land on the nearest
@@ -898,6 +998,86 @@ impl ThreadedSuperShuckieCore {
     #[inline]
     pub fn set_audio_mute_when_sped_up(&self, mute: bool) {
         let _ = self.send(ThreadCommand::SetAudioMuteWhenSpedUp(mute));
+    }
+
+    /// Read `len` bytes of console memory at `address` (see `EmulatorCore::read_ram`); `None`
+    /// when unmapped or the thread is gone.
+    ///
+    /// NOTE: This is blocking.
+    pub fn read_ram(&self, address: u32, len: usize) -> Option<Vec<u8>> {
+        self.call(|reply| ThreadCommand::ReadRam { address, len, reply }).ok().flatten()
+    }
+
+    /// Write `data` at `address` between frames, recorded and published like any external write
+    /// (see `SuperShuckieCore::enqueue_write`); dropped during replay playback.
+    pub fn enqueue_write(&self, address: u32, data: Vec<u8>) {
+        let _ = self.send(ThreadCommand::EnqueueWrite { address, data });
+        self.wake();
+    }
+
+    /// Stop at the next frame boundary and stay there for a link handshake (see
+    /// `SuperShuckieCore::link_hold`): the replay frame the console is held at and the input it
+    /// holds.
+    ///
+    /// NOTE: This is blocking (at most one frame).
+    pub fn link_hold(&self) -> Result<(u64, InputBuffer), String> {
+        match self.call(|reply| ThreadCommand::LinkHold(reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(dead.to_string())
+        }
+    }
+
+    /// Abandon a hold without linking.
+    ///
+    /// NOTE: This is blocking.
+    pub fn link_release(&self) {
+        let _ = self.call(|reply| ThreadCommand::LinkRelease(reply));
+        self.wake();
+    }
+
+    /// Take this (follower) core's loop off its thread, to run it in lockstep with the player's
+    /// own core (see [`Self::link`]). This wrapper keeps working meanwhile: its commands are
+    /// forwarded to whichever thread holds the loop, and its screens, counters and stats keep
+    /// being updated from there. `Err` if it is already lent.
+    ///
+    /// NOTE: This is blocking.
+    pub fn lend(&self) -> Result<LentCore, String> {
+        match self.call(|reply| ThreadCommand::Lend(reply)) {
+            Ok(r) => r,
+            Err(dead) => Err(dead.to_string())
+        }
+    }
+
+    /// Plug a link cable in between this (held) core and `partner`, the lent follower of the
+    /// other player, once the follower has reached `settings.partner_start_frame` from what its
+    /// feeder holds (up to about five seconds). Returns at once; the outcome shows up in
+    /// [`Self::link_status`] (`Linked`, or `Failed`). The follower's stream feeder should be
+    /// unsubscribed meanwhile: the pair is driven by the link frames pushed into `inbox`.
+    pub fn link(&self, partner: LentCore, settings: LinkSettings, inbox: Arc<LinkInbox>, publisher: Box<dyn LinkPublisherFns>) {
+        let _ = self.send(ThreadCommand::Link { lent: partner, settings, inbox, publisher });
+        self.wake();
+    }
+
+    /// Pull the cable (or abandon a link being started, or acknowledge a failed one): the
+    /// partner's loop goes back to its own thread, where it waits for a fresh snapshot.
+    ///
+    /// NOTE: This is blocking.
+    pub fn unlink(&self) {
+        let _ = self.call(|reply| ThreadCommand::Unlink(reply));
+        self.wake();
+    }
+
+    /// Where the core stands with a link cable. Never waits on the core thread (safe to poll
+    /// every UI tick).
+    pub fn link_status(&self) -> LinkStatus {
+        self.link_status.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Problems the link publisher reported since the last call. Never waits on the core
+    /// thread.
+    pub fn get_link_errors(&self) -> Vec<String> {
+        let mut errors = self.link_errors.lock().unwrap_or_else(|p| p.into_inner());
+        core::mem::take(&mut *errors)
     }
 
     /// Transfer the given Poke-A-Byte integration if it is compatible.
@@ -983,7 +1163,7 @@ enum ThreadCommand {
     Pause(Sender<()>),
     SetPlaybackFrozen(bool),
     SetCoarseSeekWhileFrozen(bool),
-    SetPokeAByteEnabled(bool, Sender<Result<(), String>>),
+    SetPokeABytePort(Option<u16>, Sender<Result<(), String>>),
     StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, Sender<Result<(), ReplayFileWriteError>>),
     ResumeRecordingReplay {
         resume_at_frame: Option<UnsignedInteger>,
@@ -1013,6 +1193,7 @@ enum ThreadCommand {
     EnqueueInput(Input),
     SetRapidFireInput(Option<SuperShuckieRapidFire>),
     SetToggledInput(Option<Input>),
+    PressForFrames(Input, NonZeroU64),
     SetSpeed(Speed),
     HardReset,
     CreateSaveState(Sender<Vec<u8>>),
@@ -1025,7 +1206,7 @@ enum ThreadCommand {
     /// `Instant` is the deadline the wrapper is willing to wait until; the handler skips placing
     /// the bookmark (and, for a keyframe bookmark, writing its keyframe) if it is reached, so a
     /// caller that gave up waiting never gets an orphan keyframe written later (see
-    /// [`ThreadedSuperShuckieCoreThread::handle_command`]).
+    /// [`CoreLoop::handle_command`]).
     BookmarkAnchor(Sender<Result<BookmarkAnchor, BookmarkAnchorError>>, bool, Instant),
     EstimateMillisAt(Sender<Option<TimestampMillis>>, UnsignedInteger),
     SetReplayBookmarks(BookmarkTable),
@@ -1043,7 +1224,6 @@ enum ThreadCommand {
     StartStreamPublishing(Box<dyn StreamPublisherFns>, Sender<Result<(), String>>),
     StopStreamPublishing(Sender<()>),
     RequestStreamSnapshot,
-    TakeStreamErrors(Sender<Vec<String>>),
     AttachLiveSource {
         source: LiveReplaySource,
         metadata: ReplayFileMetadata,
@@ -1052,8 +1232,57 @@ enum ThreadCommand {
     },
     DetachLiveSource(Sender<()>),
     StartRecordingFollowerReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, ReplayFileMetadata, Sender<Result<(), ReplayFileWriteError>>),
-    TakeFollowerErrors(Sender<Vec<String>>),
+    ReadRam { address: u32, len: usize, reply: Sender<Option<Vec<u8>>> },
+    EnqueueWrite { address: u32, data: Vec<u8> },
+    /// Answered with `Err` when the console cannot be held (a replay is attached, already linked).
+    LinkHold(Sender<Result<(u64, InputBuffer), String>>),
+    LinkRelease(Sender<()>),
+    /// Answered with `Err` when the loop is already lent.
+    Lend(Sender<Result<LentCore, String>>),
+    Link {
+        lent: LentCore,
+        settings: LinkSettings,
+        inbox: Arc<LinkInbox>,
+        publisher: Box<dyn LinkPublisherFns>
+    },
+    Unlink(Sender<()>),
 }
+
+/// What a primary thread keeps while it runs a partner's lent loop beside its own.
+struct Linked {
+    lent: LentCore,
+    phase: LinkPhase,
+    /// When the pair first stalled waiting for the partner's link frames (cleared when it runs).
+    stalled_since: Option<Instant>,
+    /// The link frame last written to the shared status.
+    reported_frame: u64,
+    reported_stalled: bool
+}
+
+enum LinkPhase {
+    /// Bringing the lent follower to the agreed frame, then plugging in.
+    Starting {
+        settings: LinkSettings,
+        inbox: Arc<LinkInbox>,
+        publisher: Option<Box<dyn LinkPublisherFns>>,
+        deadline: Instant
+    },
+    Running
+}
+
+/// Longest the lent follower gets to reach the agreed frame.
+const LINK_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest the pair waits for the partner's link frames before the cable is pulled. A partner
+/// that merely paused looks the same as one that hung, so this is long: a partner that is gone
+/// is caught much sooner by the network layer (its departure ends the link).
+const LINK_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the primary thread parks while the pair is stalled (an inbox push unparks it).
+const LINK_STALL_WAIT: Duration = Duration::from_millis(1);
+
+/// How often a lent-out follower thread checks for its loop coming back.
+const LENT_POLL: Duration = Duration::from_millis(10);
 
 /// What the thread keeps while its core follows another player's game.
 struct FollowerLoopState {
@@ -1074,7 +1303,10 @@ fn extend_counter_map(from: &BTreeMap<String, SignedInteger>, into: &mut BTreeMa
     }
 }
 
-struct ThreadedSuperShuckieCoreThread {
+/// Everything a core thread runs: the core, its housekeeping and its stats. Normally owned by
+/// its own thread ([`CoreThread`]); a follower's loop can be lent to the player's own thread for
+/// a link cable (see [`ThreadedSuperShuckieCore::lend`]).
+struct CoreLoop {
     screens: Weak<Mutex<Vec<ScreenData>>>,
 
     screens_queued: Vec<ScreenData>,
@@ -1097,9 +1329,7 @@ struct ThreadedSuperShuckieCoreThread {
     pending_exact_frame: Option<u32>,
 
     core: SuperShuckieCore,
-    receiver: Receiver<ThreadCommand>,
     pokeabyte_integration: Option<PokeAByteIntegrationServer>,
-    sender_close: Sender<()>,
     is_null: bool,
 
     elapsed_time: Arc<RwLock<ElapsedTimeStats>>,
@@ -1122,48 +1352,152 @@ struct ThreadedSuperShuckieCoreThread {
     follower: Option<FollowerLoopState>,
     follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>>,
 
-    /// Problems the stream publisher reported, until the wrapper takes them.
-    stream_errors: Vec<String>,
+    /// Problems the stream publisher reported, for the wrapper to take (see
+    /// [`ThreadedSuperShuckieCore::get_stream_errors`]).
+    stream_errors: Arc<Mutex<Vec<String>>>,
+    /// Problems following reported, for the wrapper to take (see
+    /// [`ThreadedSuperShuckieCore::get_follower_errors`]).
+    follower_errors: Arc<Mutex<Vec<String>>>,
+    /// Problems the link publisher reported, for the wrapper to take (see
+    /// [`ThreadedSuperShuckieCore::get_link_errors`]).
+    link_errors: Arc<Mutex<Vec<String>>>,
 }
 
-impl ThreadedSuperShuckieCoreThread {
+/// The thread itself: its command channel and the loop it runs, unless that is lent out.
+struct CoreThread {
+    receiver: Receiver<ThreadCommand>,
+    sender_close: Sender<()>,
+    /// This thread's own loop; `None` while it is lent to another thread.
+    loop_: Option<Box<CoreLoop>>,
+    /// A partner's lent loop being run beside the own loop for a link cable.
+    linked: Option<Linked>,
+    /// See [`ThreadedSuperShuckieCore::link_status`].
+    link_status: Arc<Mutex<LinkStatus>>,
+    /// A command taken from the queue while the loop was lent that the borrower would no longer
+    /// take: handled here, first thing, now that the loop is back.
+    pending_command: Option<ThreadCommand>
+}
+
+impl CoreThread {
+    fn set_link_status(&self, status: LinkStatus) {
+        *self.link_status.lock().unwrap_or_else(|p| p.into_inner()) = status;
+    }
+
     fn run_thread(mut self) {
         loop {
-            if let Ok(cmd) = self.receiver.try_recv() {
-                if matches!(cmd, ThreadCommand::Close) {
-                    break
-                }
+            let Some(loop_) = self.loop_.as_deref_mut() else {
+                unreachable!("the thread runs without its loop")
+            };
 
-                self.handle_command(cmd);
-                // counters can change without a frame running (REST while paused, seeks)
-                self.update_counters();
+            let cmd = match self.pending_command.take() {
+                Some(cmd) => Some(cmd),
+                None => self.receiver.try_recv().ok()
+            };
+            if let Some(cmd) = cmd {
+                match cmd {
+                    ThreadCommand::Close => break,
+                    ThreadCommand::Lend(reply) => {
+                        // The loop goes to whoever asked; this thread forwards commands to it
+                        // and waits for it to come back.
+                        let (forward, commands) = channel();
+                        let (return_to, returned) = channel();
+                        let loop_ = self.loop_.take().expect("checked above");
+                        let _ = reply.send(Ok(LentCore { loop_, commands, return_to }));
+                        match self.forward_while_lent(forward, returned) {
+                            Some(ReturnedCore { loop_, then_close }) => {
+                                loop_.core.set_live_waker(std::thread::current());
+                                self.loop_ = Some(loop_);
+                                if then_close {
+                                    break
+                                }
+                            }
+                            // The borrower is gone with the loop: nothing left to run.
+                            None => return self.finish_without_loop()
+                        }
+                        continue
+                    }
+                    ThreadCommand::Link { lent, settings, inbox, publisher } => {
+                        self.begin_linking(lent, settings, inbox, publisher);
+                        continue
+                    }
+                    ThreadCommand::Unlink(reply) => {
+                        self.end_link(false);
+                        self.set_link_status(LinkStatus::Idle);
+                        let _ = reply.send(());
+                        continue
+                    }
+                    ThreadCommand::LinkHold(reply) => {
+                        let r = if self.linked.is_some() { Err(String::from("already linked")) } else { loop_.core.link_hold() };
+                        if r.is_ok() {
+                            self.set_link_status(LinkStatus::Holding);
+                        }
+                        let _ = reply.send(r);
+                        continue
+                    }
+                    ThreadCommand::LinkRelease(reply) => {
+                        loop_.core.link_release();
+                        if self.linked.is_none() {
+                            self.set_link_status(LinkStatus::Idle);
+                        }
+                        let _ = reply.send(());
+                        continue
+                    }
+                    cmd => {
+                        loop_.handle_command(cmd);
+                        // counters can change without a frame running (REST while paused, seeks)
+                        loop_.update_counters();
+                        continue
+                    }
+                }
+            }
+
+            if self.linked.is_some() {
+                // The partner's wrapper's commands, forwarded by its thread.
+                let mut close_lent = false;
+                while let Some(cmd) = self.linked.as_ref().and_then(|l| l.lent.commands.try_recv().ok()) {
+                    if matches!(cmd, ThreadCommand::Close) {
+                        close_lent = true;
+                        break
+                    }
+                    if let Some(linked) = self.linked.as_mut() {
+                        linked.lent.loop_.handle_command(cmd);
+                        linked.lent.loop_.update_counters();
+                    }
+                }
+                if close_lent {
+                    self.end_link(true);
+                    self.set_link_status(LinkStatus::Failed(LinkFailure::PartnerEnded));
+                    continue
+                }
+                if let Some(linked) = self.linked.as_mut() {
+                    linked.lent.loop_.housekeeping();
+                }
+            }
+
+            let loop_ = self.loop_.as_deref_mut().expect("checked above");
+            loop_.housekeeping();
+
+            if self.linked.is_some() {
+                self.run_one_linked();
                 continue
             }
 
-            self.handle_replay_recording_errors();
-            self.handle_stream_errors();
-            self.go_to_desired_frame();
-            self.refresh_screen_data();
-            self.update_queued_screens();
-            self.handle_pokeabyte_integration();
-            self.handle_memory_monitor();
-            self.check_if_replay_stalled();
-
-            if self.is_running() {
-                if !self.playback_frozen {
-                    if self.follower.is_some() {
-                        self.run_one_follower();
+            let loop_ = self.loop_.as_deref_mut().expect("checked above");
+            if loop_.is_running() {
+                if !loop_.playback_frozen {
+                    if loop_.follower.is_some() {
+                        loop_.run_one_follower();
                     }
                     else {
-                        self.run_one();
+                        loop_.run_one();
                     }
                 }
             }
-            else if self.core.stream_snapshot_pending() {
+            else if loop_.core.stream_snapshot_pending() {
                 // Paused, so no frame will complete to carry the snapshot somebody asked for.
-                self.core.publish_pending_stream_snapshot();
+                loop_.core.publish_pending_stream_snapshot();
             }
-            else if self.core.replay_player.is_none() {
+            else if loop_.core.replay_player.is_none() {
                 // unfortunately we can't just block until we're running again because we still need
                 // to handle pokeabyte writes (parked rather than slept so the RAM tools can wake us)
                 std::thread::park_timeout(Duration::from_millis(100));
@@ -1174,13 +1508,256 @@ impl ThreadedSuperShuckieCoreThread {
             }
         }
 
-        self.core.stop_stream_publishing();
-        self.core.detach_live_source();
-        self.core.stop_recording_replay();
-        self.pokeabyte_integration = None;
-        self.memory_monitor = None;
+        // A link still up when the thread closes: the partner's loop goes home first.
+        self.end_link(false);
+        self.set_link_status(LinkStatus::Idle);
+
+        if let Some(mut loop_) = self.loop_.take() {
+            loop_.core.stop_stream_publishing();
+            loop_.core.detach_live_source();
+            loop_.core.stop_recording_replay();
+            loop_.pokeabyte_integration = None;
+            loop_.memory_monitor = None;
+        }
 
         let _ = self.sender_close.send(());
+    }
+
+    /// The thread's loop went with a borrower that never returned it (the borrower's thread
+    /// died): finish as if closed.
+    fn finish_without_loop(self) {
+        let _ = self.sender_close.send(());
+    }
+
+    /// While the loop is lent: forward this thread's commands to the borrower until the loop
+    /// comes back (`Some`) or the borrower is gone (`None`).
+    fn forward_while_lent(&mut self, forward: Sender<ThreadCommand>, returned: Receiver<ReturnedCore>) -> Option<ReturnedCore> {
+        loop {
+            match self.receiver.recv_timeout(LENT_POLL) {
+                Ok(cmd) => {
+                    if let Err(std::sync::mpsc::SendError(cmd)) = forward.send(cmd) {
+                        // The borrower no longer takes commands: it has sent the loop home (the
+                        // unlink and the next command race through this thread) or it died with
+                        // it. Either way this command is ours to handle once the loop is back.
+                        return match returned.recv_timeout(LINK_START_TIMEOUT) {
+                            Ok(back) => {
+                                self.pending_command = Some(cmd);
+                                Some(back)
+                            }
+                            Err(_) => None
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // The wrapper is gone without a Close (it always sends one first, but be safe):
+                // ask for the loop back with a Close and wait for it.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = forward.send(ThreadCommand::Close);
+                    return returned.recv().ok()
+                }
+            }
+            match returned.try_recv() {
+                Ok(back) => return Some(back),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => return None
+            }
+        }
+    }
+
+    /// Start a link: the lent partner loop is brought to the agreed frame over the next
+    /// iterations, then plugged in.
+    fn begin_linking(&mut self, lent: LentCore, settings: LinkSettings, inbox: Arc<LinkInbox>, publisher: Box<dyn LinkPublisherFns>) {
+        if self.linked.is_some() {
+            // Already linked (or linking): the new loop goes straight back.
+            let _ = lent.return_to.send(ReturnedCore { loop_: lent.loop_, then_close: false });
+            return
+        }
+        // Data for the follower and link frames now wake this thread.
+        lent.loop_.core.set_live_waker(std::thread::current());
+        inbox.set_waker(std::thread::current());
+        self.linked = Some(Linked {
+            lent,
+            phase: LinkPhase::Starting { settings, inbox, publisher: Some(publisher), deadline: Instant::now() + LINK_START_TIMEOUT },
+            stalled_since: None,
+            reported_frame: u64::MAX,
+            reported_stalled: false
+        });
+        self.set_link_status(LinkStatus::Starting);
+    }
+
+    /// End the link (whatever its phase) and send the partner's loop home. With `then_close` the
+    /// partner's thread finishes once it has its loop back (its wrapper closed meanwhile).
+    fn end_link(&mut self, then_close: bool) {
+        let Some(mut linked) = self.linked.take() else {
+            return
+        };
+        if let Some(loop_) = self.loop_.as_deref_mut() {
+            if loop_.core.is_linked() {
+                loop_.core.end_link(&mut linked.lent.loop_.core);
+            }
+            loop_.core.link_release();
+        }
+        if let Some(stats) = linked.lent.loop_.follower.as_ref().map(|f| f.stats.clone()) {
+            stats.frames_behind.store(0, Ordering::Relaxed);
+            stats.waiting.store(true, Ordering::Relaxed);
+        }
+        let _ = linked.lent.return_to.send(ReturnedCore { loop_: linked.lent.loop_, then_close });
+    }
+
+    /// One iteration of the linked loop: bring the partner up to the start frame, or step the
+    /// pair.
+    fn run_one_linked(&mut self) {
+        let Some(linked) = self.linked.as_mut() else { return };
+        let Some(loop_) = self.loop_.as_deref_mut() else { return };
+
+        match &mut linked.phase {
+            LinkPhase::Starting { settings, inbox, publisher, deadline } => {
+                // Most follower frames run per iteration on the way to the start frame.
+                const CATCH_UP_FRAMES: u64 = 32;
+                let partner = &mut linked.lent.loop_;
+                let target = settings.partner_start_frame;
+                let mut ran = 0;
+                while partner.core.total_frames() < target && ran < CATCH_UP_FRAMES {
+                    partner.core.run_unlocked_presenting(true);
+                    let frames = partner.core.last_run_time().frames;
+                    ran += frames;
+                    if frames > 0 {
+                        partner.emulated_frames.fetch_add(frames, Ordering::Relaxed);
+                    }
+                    if partner.core.is_replay_waiting() || partner.core.is_replay_stalled() {
+                        break
+                    }
+                }
+                partner.update_counters();
+                let at = partner.core.total_frames();
+                if at == target && !partner.core.is_mid_frame() {
+                    let settings = settings.clone();
+                    let inbox = inbox.clone();
+                    let publisher = publisher.take().expect("taken once");
+                    match loop_.core.begin_link(&mut partner.core, settings.clone(), inbox, publisher) {
+                        Ok(()) => {
+                            *loop_.frame_times.write() = FrameTimeStats::default();
+                            *partner.frame_times.write() = FrameTimeStats::default();
+                            linked.phase = LinkPhase::Running;
+                            self.set_link_status(LinkStatus::Linked { delay_frames: settings.delay_frames, link_frame: 0, stalled: false });
+                        }
+                        Err(e) => {
+                            self.end_link(false);
+                            self.set_link_status(LinkStatus::Failed(LinkFailure::Emulator(e)));
+                        }
+                    }
+                }
+                else if at > target || partner.core.is_replay_stalled() {
+                    let why = if at > target { alloc::format!("the other player's game is at frame {at}, past the agreed frame {target}") } else { String::from("the other player's stream ended") };
+                    self.end_link(false);
+                    self.set_link_status(LinkStatus::Failed(LinkFailure::Emulator(why)));
+                }
+                else if Instant::now() > *deadline {
+                    self.end_link(false);
+                    self.set_link_status(LinkStatus::Failed(LinkFailure::Timeout));
+                }
+                else if ran == 0 {
+                    std::thread::park_timeout(LINK_STALL_WAIT);
+                }
+            }
+            LinkPhase::Running => {
+                if !loop_.is_running() {
+                    // Paused: the pair stalls for the partner too. Still answer snapshot requests.
+                    if loop_.core.stream_snapshot_pending() {
+                        loop_.core.publish_pending_stream_snapshot();
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                    return
+                }
+                let started = Instant::now();
+                let outcome = loop_.core.run_linked(&mut linked.lent.loop_.core);
+                match outcome {
+                    LinkRunOutcome::Ran { local, partner_frames } => {
+                        linked.stalled_since = None;
+                        let partner = &mut linked.lent.loop_;
+                        if partner_frames > 0 {
+                            partner.emulated_frames.fetch_add(partner_frames, Ordering::Relaxed);
+                            if let Some(follower) = partner.follower.as_ref() {
+                                follower.stats.emulated_frames.fetch_add(partner_frames, Ordering::Relaxed);
+                                follower.stats.frames_behind.store(0, Ordering::Relaxed);
+                                follower.stats.waiting.store(false, Ordering::Relaxed);
+                                if partner.core.last_frame_presented() {
+                                    follower.stats.drawn_frames.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            partner.update_counters();
+                        }
+                        if local.frames > 0 {
+                            loop_.emulated_frames.fetch_add(local.frames, Ordering::Relaxed);
+                            loop_.frame_times.write().record(started.elapsed(), loop_.core.core.frame_period_microseconds());
+                            loop_.update_counters();
+                            let frame = loop_.core.link_progress().map(|(f, _)| f).unwrap_or(0);
+                            if frame != linked.reported_frame || linked.reported_stalled {
+                                linked.reported_frame = frame;
+                                linked.reported_stalled = false;
+                                let delay = loop_.core.link_progress().map(|(_, d)| d).unwrap_or(0);
+                                self.set_link_status(LinkStatus::Linked { delay_frames: delay, link_frame: frame, stalled: false });
+                            }
+                        }
+                        else if !loop_.core.is_mid_frame() {
+                            // A paced console whose frame is not due yet (the Game Boy paces
+                            // itself inside its step; this is the Game Boy Advance's wait).
+                            if let Some(until) = loop_.core.core.microseconds_until_next_frame() {
+                                let until = Duration::from_micros(until);
+                                if until > CoreLoop::WAKE_EARLY {
+                                    std::thread::sleep((until - CoreLoop::WAKE_EARLY).min(CoreLoop::MAX_FRAME_WAIT));
+                                }
+                            }
+                        }
+                    }
+                    LinkRunOutcome::Stalled => {
+                        let since = *linked.stalled_since.get_or_insert_with(Instant::now);
+                        if let Some(follower) = linked.lent.loop_.follower.as_ref() {
+                            follower.stats.waiting.store(true, Ordering::Relaxed);
+                        }
+                        if !linked.reported_stalled {
+                            linked.reported_stalled = true;
+                            let (frame, delay) = loop_.core.link_progress().unwrap_or((0, 0));
+                            self.set_link_status(LinkStatus::Linked { delay_frames: delay, link_frame: frame, stalled: true });
+                        }
+                        if since.elapsed() > LINK_STALL_TIMEOUT {
+                            self.end_link(false);
+                            self.set_link_status(LinkStatus::Failed(LinkFailure::Timeout));
+                            return
+                        }
+                        std::thread::park_timeout(LINK_STALL_WAIT);
+                    }
+                    LinkRunOutcome::Failed(failure) => {
+                        self.end_link(false);
+                        self.set_link_status(LinkStatus::Failed(failure));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl CoreLoop {
+    /// The between-runs work of a loop iteration: errors, seeks, screens, Poke-A-Byte, the RAM
+    /// tools' monitor and the replay's stall flag.
+    fn housekeeping(&mut self) {
+        self.handle_replay_recording_errors();
+        self.handle_stream_errors();
+        self.handle_follower_errors();
+        self.handle_link_errors();
+        self.go_to_desired_frame();
+        self.refresh_screen_data();
+        self.update_queued_screens();
+        self.handle_pokeabyte_integration();
+        self.handle_memory_monitor();
+        self.check_if_replay_stalled();
+    }
+
+    fn handle_link_errors(&mut self) {
+        let errors = self.core.poll_link_errors();
+        if !errors.is_empty() {
+            self.link_errors.lock().unwrap_or_else(|p| p.into_inner()).extend(errors);
+        }
     }
 
     /// Frames a follower sits behind the newest one received, to absorb network jitter.
@@ -1219,9 +1796,14 @@ impl ThreadedSuperShuckieCoreThread {
             self.core.live_request_snapshot(SnapshotRequestReason::TooFarBehind);
         }
 
-        let want = behind.saturating_sub(Self::FOLLOWER_TARGET_LAG_FRAMES).min(Self::FOLLOWER_MAX_FRAMES_PER_PASS);
+        let mut want = behind.saturating_sub(Self::FOLLOWER_TARGET_LAG_FRAMES).min(Self::FOLLOWER_MAX_FRAMES_PER_PASS);
         let stalled = self.core.is_replay_stalled();
-        if stalled || want == 0 || self.core.live_frames_available() == 0 {
+        if !stalled && want == 0 && self.core.live_frames_available() == 0 && self.core.live_has_items() {
+            // A snapshot with no frame after it yet (the publisher is paused or held): apply it
+            // now so their screen shows where they are, rather than once they move again.
+            want = 1;
+        }
+        if stalled || want == 0 || (self.core.live_frames_available() == 0 && !self.core.live_has_items()) {
             if !stalled {
                 stats.waiting.store(true, Ordering::Relaxed);
             }
@@ -1262,7 +1844,14 @@ impl ThreadedSuperShuckieCoreThread {
     fn handle_stream_errors(&mut self) {
         let errors = self.core.poll_stream_errors();
         if !errors.is_empty() {
-            self.stream_errors.extend(errors);
+            self.stream_errors.lock().unwrap_or_else(|p| p.into_inner()).extend(errors);
+        }
+    }
+
+    fn handle_follower_errors(&mut self) {
+        let errors = self.core.poll_follower_errors();
+        if !errors.is_empty() {
+            self.follower_errors.lock().unwrap_or_else(|p| p.into_inner()).extend(errors);
         }
     }
 
@@ -1609,25 +2198,28 @@ impl ThreadedSuperShuckieCoreThread {
                 }
                 let _ = sender.send(());
             }
-            ThreadCommand::SetPokeAByteEnabled(enabled, err) => {
-                if !enabled && self.pokeabyte_integration.is_some() {
-                    self.pokeabyte_integration = None;
-                    let _ = err.send(Ok(()));
-                }
-                else if enabled {
-                    let integration = match PokeAByteIntegrationServer::begin_listen() {
-                        Ok(n) => {
-                            let _ = err.send(Ok(()));
-                            n
-                        },
-                        Err(e) => {
-                            let _ = err.send(Err(format!("{e:?}")));
-                            return
+            ThreadCommand::SetPokeABytePort(port, err) => {
+                match port {
+                    None => {
+                        self.pokeabyte_integration = None;
+                        let _ = err.send(Ok(()));
+                    }
+                    Some(port) if self.pokeabyte_integration.as_ref().is_some_and(|i| i.port() == port) => {
+                        let _ = err.send(Ok(()));
+                    }
+                    Some(port) => {
+                        // Release the old port before binding the new one (the old one may be it).
+                        self.pokeabyte_integration = None;
+                        match PokeAByteIntegrationServer::begin_listen(port) {
+                            Ok(n) => {
+                                self.pokeabyte_integration = Some(n);
+                                let _ = err.send(Ok(()));
+                            },
+                            Err(e) => {
+                                let _ = err.send(Err(format!("{e:?}")));
+                            }
                         }
-                    };
-                    self.pokeabyte_integration = Some(integration)
-                } else {
-                    let _ = err.send(Ok(()));
+                    }
                 }
             }
             ThreadCommand::StartRecordingReplay(metadata, reply) => {
@@ -1669,6 +2261,9 @@ impl ThreadedSuperShuckieCoreThread {
             }
             ThreadCommand::SetToggledInput(input) => {
                 self.core.set_toggled_input(input);
+            }
+            ThreadCommand::PressForFrames(input, frames) => {
+                self.core.press_for_frames(input, frames);
             }
             ThreadCommand::HardReset => {
                 self.core.hard_reset();
@@ -1822,9 +2417,6 @@ impl ThreadedSuperShuckieCoreThread {
                     self.core.publish_pending_stream_snapshot();
                 }
             }
-            ThreadCommand::TakeStreamErrors(reply) => {
-                let _ = reply.send(core::mem::take(&mut self.stream_errors));
-            }
             ThreadCommand::AttachLiveSource { source, metadata, allow_mismatched, reply } => {
                 let stats = source.stats().clone();
                 let r = self.core.attach_live_replay_source(source, &metadata, allow_mismatched);
@@ -1850,8 +2442,31 @@ impl ThreadedSuperShuckieCoreThread {
                 self.replay_errors.lock().unwrap_or_else(|p| p.into_inner()).clear();
                 let _ = reply.send(self.core.start_recording_follower_replay(metadata, publisher));
             }
-            ThreadCommand::TakeFollowerErrors(reply) => {
-                let _ = reply.send(self.core.poll_follower_errors());
+            ThreadCommand::ReadRam { address, len, reply } => {
+                let mut data = alloc::vec![0u8; len];
+                let _ = reply.send(self.core.get_core().read_ram(address, &mut data).ok().map(|_| data));
+            }
+            ThreadCommand::EnqueueWrite { address, data } => {
+                let mut bytes = ByteVec::with_capacity(data.len());
+                bytes.extend_from_slice(&data);
+                self.core.enqueue_write(address, bytes);
+            }
+            // Handled by the thread (they concern which thread runs the loop), never here. A
+            // forwarded one (a lent loop's wrapper asking) is answered as refused.
+            ThreadCommand::LinkHold(reply) => {
+                let _ = reply.send(Err(String::from("this console is lent to another")));
+            }
+            ThreadCommand::LinkRelease(reply) => {
+                let _ = reply.send(());
+            }
+            ThreadCommand::Lend(reply) => {
+                let _ = reply.send(Err(String::from("this console is already lent")));
+            }
+            ThreadCommand::Link { lent, .. } => {
+                let _ = lent.return_to.send(ReturnedCore { loop_: lent.loop_, then_close: false });
+            }
+            ThreadCommand::Unlink(reply) => {
+                let _ = reply.send(());
             }
         }
     }
@@ -2001,5 +2616,61 @@ mod tests {
         // The thread really is still there: a round trip still gets answered.
         assert!(core.create_save_state().is_some(), "the thread should still answer after refused marks");
         assert!(core.is_alive());
+    }
+
+    /// A lent loop keeps answering its wrapper through whoever holds it, comes home when the
+    /// borrower returns it, and a `Close` sent while lent still ends the thread cleanly.
+    #[test]
+    fn lend_and_return() {
+        let core = ThreadedSuperShuckieCore::new_with_role(Box::new(crate::emulator::NullEmulatorCore), CoreThreadRole::Follower);
+        let lent = core.lend().expect("lend");
+        assert!(core.is_alive());
+
+        // A borrower thread that runs the wrapper's commands against the lent loop, like the
+        // primary thread does for a linked partner.
+        let (done_tx, done_rx) = channel();
+        let borrower = std::thread::spawn(move || {
+            let mut lent = lent;
+            loop {
+                match lent.commands.recv() {
+                    Ok(ThreadCommand::Close) => {
+                        let _ = lent.return_to.send(ReturnedCore { loop_: lent.loop_, then_close: true });
+                        break
+                    }
+                    Ok(cmd) => lent.loop_.handle_command(cmd),
+                    Err(_) => break
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        // The wrapper's calls are answered by the borrower.
+        assert!(core.create_save_state().is_some(), "a round trip reaches the borrowed loop");
+        assert!(core.get_sram().is_some());
+        assert!(core.lend().is_err(), "a lent loop cannot be lent again");
+        assert!(core.is_alive());
+
+        // Closing while lent: the loop comes home and the thread finishes.
+        drop(core);
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("the borrower saw the Close");
+        borrower.join().unwrap();
+    }
+
+    /// A borrower that goes away with the loop (its thread died) ends the follower's thread
+    /// rather than leaving it forwarding into the void.
+    #[test]
+    fn a_lost_borrower_ends_the_lender_cleanly() {
+        let core = ThreadedSuperShuckieCore::new_with_role(Box::new(crate::emulator::NullEmulatorCore), CoreThreadRole::Follower);
+        let lent = core.lend().expect("lend");
+        drop(lent);
+        // The thread notices the loop is never coming back and exits; the wrapper sees it dead.
+        let started = Instant::now();
+        while core.is_alive() && started.elapsed() < Duration::from_secs(5) {
+            let _ = core.create_save_state();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!core.is_alive(), "the lender's thread should have exited");
+        // Dropping it must not hang.
+        drop(core);
     }
 }

@@ -33,15 +33,20 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 ///   discriminator 0xF9), so a seek decompresses a blob only up to its target keyframe and parses
 ///   only the keyframe packets before it. Blobs without the table (v4/v5 files, or blobs copied
 ///   verbatim from them on resume) still read; they are scanned once after a full decompression.
-pub const REPLAY_VERSION: u32 = 6;
+/// * v7: the stream may carry `SerialIn` packets (discriminator 0xFA): what the console received
+///   over its link cable during a frame, so a replay of a linked game (Play Together's link cable)
+///   reproduces the transfer on its own. No header change; a file without link traffic is byte
+///   for byte a v6 file apart from the version, and reading v6 files is untouched.
+pub const REPLAY_VERSION: u32 = 7;
 
 /// First format version with [`ReplayHeaderRaw::packet_stream_end`] and a bookmark section.
 pub const REPLAY_VERSION_BOOKMARK_SECTION: u32 = 5;
 
 /// Oldest format version whose keyframes are encoded the way this build writes them (region
 /// deltas, long chains). The app's batch converter skips files of this version or newer: v5 only
-/// added bookmark storage (which a v4 file gets in place on its first bookmark edit) and v6 only
-/// added the blob offset table, which speeds up seeks but does not shrink the file. Re-encoding a
+/// added bookmark storage (which a v4 file gets in place on its first bookmark edit), v6 only
+/// added the blob offset table, which speeds up seeks but does not shrink the file, and v7 only
+/// added the `SerialIn` packet. Re-encoding a
 /// v4/v5 file with the command-line converter is still worthwhile for the table and for a longer
 /// chain length than it was recorded with.
 pub const REPLAY_VERSION_CURRENT_ENCODING: u32 = 4;

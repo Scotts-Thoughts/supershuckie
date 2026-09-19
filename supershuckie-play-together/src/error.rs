@@ -27,6 +27,8 @@ pub enum DecodeError {
     ZeroPeerId,
     /// A speed of zero (speeds are `NonZeroU16`).
     BadSpeed,
+    /// An assigned player colour that is not in the palette.
+    BadColor(u8),
     /// An enumeration value (console, patch format, reason, encoding) this version does not know.
     BadEnum {
         /// Which field.
@@ -73,6 +75,7 @@ impl fmt::Display for DecodeError {
             DecodeError::BadBool(b) => write!(f, "boolean byte {b} is neither 0 nor 1"),
             DecodeError::ZeroPeerId => f.write_str("peer id 0 where a real peer is required"),
             DecodeError::BadSpeed => f.write_str("speed of zero"),
+            DecodeError::BadColor(c) => write!(f, "player colour {c} is not in the palette"),
             DecodeError::BadEnum { what, value } => write!(f, "unknown {what} value {value}"),
             DecodeError::TooMany { what, count, max } => write!(f, "{count} {what} is more than the {max} allowed"),
             DecodeError::FieldTooLong { what, len, max } => write!(f, "{what} of {len} bytes is longer than the {max} allowed"),

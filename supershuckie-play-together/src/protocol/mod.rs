@@ -1,4 +1,4 @@
-//! The wire protocol, version 1. The contract is `docs/play-together-protocol.md`; this module is
+//! The wire protocol, version 4. The contract is `docs/play-together-protocol.md`; this module is
 //! a direct transcription of it.
 
 use std::fmt;
@@ -9,20 +9,24 @@ use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayFileMet
 use supershuckie_replay_recorder::{InputBuffer, Speed};
 
 use crate::error::DecodeError;
+use crate::color::{is_valid_color, PlayerColor};
 use crate::{Blake3Hash, PeerId, SessionId, MAX_PARTICIPANTS};
 
+pub mod link;
 pub mod snapshot;
 pub mod stream;
 pub mod wire;
 
-pub use snapshot::{compress_state, SnapshotData, StateEncoding, WireSnapshot, MAX_STATE_LENGTH, SNAPSHOT_ZSTD_LEVEL};
+pub use link::{decode_link_events, encode_link_events, LinkDeclineReason, LinkMessage, UnlinkReason, MAX_LINK_DELAY, MAX_LINK_EVENT_BYTES};
+pub use snapshot::{compress_state, SnapshotData, StartStateData, StateEncoding, WireSnapshot, WireStartState, MAX_STATE_LENGTH, SNAPSHOT_ZSTD_LEVEL};
 pub use stream::{count_frames, decode_packets, encode_packets, STREAM_MERGE_LIMIT};
 pub use wire::{max_message_length, read_frame, read_frame_blocking, ReadError, MAX_MESSAGE_LENGTH, MAX_SMALL_MESSAGE_LENGTH, READ_CHUNK};
 
+use link::pair_hash_fields;
 use wire::{frame, Decoder, Encoder};
 
 /// The protocol version this crate speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Longest display name, in bytes.
 pub const MAX_DISPLAY_NAME_BYTES: usize = 32;
@@ -47,18 +51,29 @@ pub(crate) const TAG_REFUSED: u8 = 0x03;
 pub(crate) const TAG_PEER_JOINED: u8 = 0x04;
 pub(crate) const TAG_PEER_LEFT: u8 = 0x05;
 pub(crate) const TAG_RESET_ALL: u8 = 0x06;
+pub(crate) const TAG_SYNC_PAUSE: u8 = 0x07;
+pub(crate) const TAG_PAUSE: u8 = 0x08;
 pub(crate) const TAG_STREAM: u8 = 0x10;
 pub(crate) const TAG_SNAPSHOT: u8 = 0x11;
 pub(crate) const TAG_SYNC_HASH: u8 = 0x12;
 pub(crate) const TAG_REQUEST_SNAPSHOT: u8 = 0x13;
+pub(crate) const TAG_START_STATE: u8 = 0x14;
 pub(crate) const TAG_PING: u8 = 0x20;
 pub(crate) const TAG_PONG: u8 = 0x21;
 pub(crate) const TAG_GOODBYE: u8 = 0x22;
 pub(crate) const TAG_ERROR: u8 = 0x2F;
+pub(crate) const TAG_LINK_REQUEST: u8 = 0x30;
+pub(crate) const TAG_LINK_ACCEPT: u8 = 0x31;
+pub(crate) const TAG_LINK_DECLINE: u8 = 0x32;
+pub(crate) const TAG_LINK_START: u8 = 0x33;
+pub(crate) const TAG_LINK_FRAME: u8 = 0x34;
+pub(crate) const TAG_UNLINK: u8 = 0x35;
+pub(crate) const TAG_PEER_LINKED: u8 = 0x36;
+pub(crate) const TAG_PEER_UNLINKED: u8 = 0x37;
 
 /// Byte offset, in a whole frame (length prefix included), of the first `u16` peer-id field of
-/// `Stream`, `Snapshot`, `SyncHash` (`from`) and `RequestSnapshot` (`requester`). The host
-/// overwrites it in place before relaying.
+/// `Stream`, `Snapshot`, `SyncHash`, `Pause`, every link cable message (`from`) and
+/// `RequestSnapshot` (`requester`). The host overwrites it in place before relaying.
 pub(crate) const PEER_ID_OFFSET: usize = 5;
 
 /// What a participant publishes: its replay metadata and where its stream starts.
@@ -85,6 +100,8 @@ pub struct ParticipantInfo {
     pub peer_id: PeerId,
     /// The (sanitized, deduplicated) display name.
     pub display_name: String,
+    /// The colour the host gave it (a palette index, never 0).
+    pub color: PlayerColor,
     /// The participant's application version string.
     pub app_version: String,
     /// What it publishes.
@@ -97,6 +114,8 @@ pub struct ParticipantInfo {
 pub struct LocalParticipant {
     /// The requested display name (sanitized by the session; deduplicated by the host).
     pub display_name: String,
+    /// The requested colour (0 = any); the host gives another when it is taken.
+    pub color: PlayerColor,
     /// The application version string.
     pub app_version: String,
     /// What we publish.
@@ -122,6 +141,9 @@ pub enum RefusalReason {
     BadHello = 5,
     /// The host is shutting down.
     HostShuttingDown = 6,
+    /// Everyone starts from the host's save state, and the client's console, ROM, core or BIOS
+    /// differs from the host's.
+    StartStateMismatch = 7,
 }
 
 impl TryFrom<u32> for RefusalReason {
@@ -135,6 +157,7 @@ impl TryFrom<u32> for RefusalReason {
             4 => RefusalReason::PatchedRomUnsupported,
             5 => RefusalReason::BadHello,
             6 => RefusalReason::HostShuttingDown,
+            7 => RefusalReason::StartStateMismatch,
             other => return Err(DecodeError::BadEnum { what: "refusal reason", value: other }),
         })
     }
@@ -156,6 +179,7 @@ impl fmt::Display for RefusalReason {
             RefusalReason::PatchedRomUnsupported => "patched ROMs are not supported",
             RefusalReason::BadHello => "bad hello",
             RefusalReason::HostShuttingDown => "the host is shutting down",
+            RefusalReason::StartStateMismatch => "your game differs from the host's, whose save state everyone starts from",
         })
     }
 }
@@ -230,6 +254,8 @@ pub enum Message {
         app_version: String,
         /// The requested display name.
         display_name: String,
+        /// The requested colour (0 = any).
+        color: PlayerColor,
         /// What the client publishes.
         publisher: PublisherInfo,
     },
@@ -241,6 +267,8 @@ pub enum Message {
         session_id: SessionId,
         /// The client's display name after sanitizing and deduplication.
         your_display_name: String,
+        /// The colour the host gave the client.
+        your_color: PlayerColor,
         /// Everyone already in the session, the host first.
         participants: Vec<ParticipantInfo>,
     },
@@ -270,6 +298,22 @@ pub enum Message {
         /// How long from receipt until the reset.
         countdown_millis: u32,
     },
+    /// Host → clients: whether pausing is shared, and the session's pause state to adopt.
+    /// Sent right after `Welcome` and whenever the host changes the setting.
+    SyncPause {
+        /// Whether one participant's pause pauses everyone.
+        enabled: bool,
+        /// Whether the session is paused right now (meaningful while `enabled`).
+        paused: bool,
+    },
+    /// A participant paused or unpaused everyone. Relayed by the host to everyone else only
+    /// while sync pause is enabled.
+    Pause {
+        /// Who (a client sends 0; the host fills it in before relaying).
+        from: PeerId,
+        /// Paused, or unpaused.
+        paused: bool,
+    },
     /// A run of whole replay packets from `from`'s emulator.
     Stream {
         /// The publisher (rewritten by the host before relaying).
@@ -297,6 +341,9 @@ pub enum Message {
         /// Which publisher.
         target: PeerId,
     },
+    /// Host → clients: the save state everyone's own game is loaded from, or (cleared) that
+    /// there is none any more. Sent right after `Welcome` while one is set, and on every change.
+    StartState(WireStartState),
     /// Keepalive and round-trip probe; answered with `Pong` carrying the same fields.
     Ping {
         /// Matches the `Pong`.
@@ -318,6 +365,98 @@ pub enum Message {
         /// What went wrong.
         text: String,
     },
+    /// `from` asks `target` to plug a link cable between their games. Relayed by the host,
+    /// which declines on the target's behalf when either is already linked or the consoles'
+    /// families differ.
+    LinkRequest {
+        /// The requester (rewritten by the host before relaying).
+        from: PeerId,
+        /// Who is asked.
+        target: PeerId,
+        /// Distinguishes this request from the requester's other ones.
+        nonce: u32,
+        /// The requester's console type (a `ReplayConsoleType` number).
+        console: u32,
+    },
+    /// `from` accepts `target`'s request `nonce`. The host records the pair and tells everyone
+    /// with `PeerLinked`.
+    LinkAccept {
+        /// Who accepts (rewritten by the host).
+        from: PeerId,
+        /// The requester.
+        target: PeerId,
+        /// The request.
+        nonce: u32,
+    },
+    /// `from` declines `target`'s request `nonce` (or the host does, on `from`'s behalf).
+    LinkDecline {
+        /// Who declines (rewritten by the host).
+        from: PeerId,
+        /// The requester.
+        target: PeerId,
+        /// The request.
+        nonce: u32,
+        /// Why.
+        reason: LinkDeclineReason,
+    },
+    /// Where `from`'s game stopped for the link; sent by both ends once they have paused.
+    LinkStart {
+        /// Who stopped (rewritten by the host).
+        from: PeerId,
+        /// The other end.
+        target: PeerId,
+        /// The request this link came from.
+        nonce: u32,
+        /// The sender's frame count at the hold.
+        frame: u64,
+        /// The input it holds there.
+        input: InputBuffer,
+        /// The sender's last round-trip time to the host, in milliseconds (0 for the host).
+        rtt_millis: u32,
+        /// The sender's input-delay setting: 0 for automatic, else the frames it wants at least.
+        delay_setting: u8,
+    },
+    /// One lockstep frame of `from`'s events for `target`.
+    LinkFrame {
+        /// The sender (rewritten by the host).
+        from: PeerId,
+        /// The other end.
+        target: PeerId,
+        /// The link frame the events land on.
+        frame: u64,
+        /// The sender's recording clock (the `elapsed_millis` its snapshots and stream use) as
+        /// it sent the frame, `delay` frames before `frame` runs.
+        elapsed_millis: u64,
+        /// Whole packets; see [`decode_link_events`].
+        events: Vec<u8>,
+        /// The frame `pair_hash` was taken at (meaningful when `pair_hash` is not all zero).
+        pair_hash_frame: u64,
+        /// A hash of both consoles' work RAM, or all zero for none.
+        pair_hash: Blake3Hash,
+    },
+    /// `from` unplugs the cable to `target` (or the host does, when `from` left).
+    Unlink {
+        /// Who unplugs (rewritten by the host).
+        from: PeerId,
+        /// The other end.
+        target: PeerId,
+        /// Why.
+        reason: UnlinkReason,
+    },
+    /// Host → clients: `a` and `b` are linked (for the roster).
+    PeerLinked {
+        /// One end.
+        a: PeerId,
+        /// The other.
+        b: PeerId,
+    },
+    /// Host → clients: `a` and `b` are no longer linked.
+    PeerUnlinked {
+        /// One end.
+        a: PeerId,
+        /// The other.
+        b: PeerId,
+    },
 }
 
 impl Message {
@@ -330,14 +469,69 @@ impl Message {
             Message::PeerJoined { .. } => TAG_PEER_JOINED,
             Message::PeerLeft { .. } => TAG_PEER_LEFT,
             Message::ResetAll { .. } => TAG_RESET_ALL,
+            Message::SyncPause { .. } => TAG_SYNC_PAUSE,
+            Message::Pause { .. } => TAG_PAUSE,
             Message::Stream { .. } => TAG_STREAM,
             Message::Snapshot(_) => TAG_SNAPSHOT,
             Message::SyncHash { .. } => TAG_SYNC_HASH,
             Message::RequestSnapshot { .. } => TAG_REQUEST_SNAPSHOT,
+            Message::StartState(_) => TAG_START_STATE,
             Message::Ping { .. } => TAG_PING,
             Message::Pong { .. } => TAG_PONG,
             Message::Goodbye => TAG_GOODBYE,
             Message::Error { .. } => TAG_ERROR,
+            Message::LinkRequest { .. } => TAG_LINK_REQUEST,
+            Message::LinkAccept { .. } => TAG_LINK_ACCEPT,
+            Message::LinkDecline { .. } => TAG_LINK_DECLINE,
+            Message::LinkStart { .. } => TAG_LINK_START,
+            Message::LinkFrame { .. } => TAG_LINK_FRAME,
+            Message::Unlink { .. } => TAG_UNLINK,
+            Message::PeerLinked { .. } => TAG_PEER_LINKED,
+            Message::PeerUnlinked { .. } => TAG_PEER_UNLINKED,
+        }
+    }
+
+    /// Whether this is a link cable message relayed between the two ends of a link (everything
+    /// but `PeerLinked` / `PeerUnlinked`, which the host broadcasts).
+    pub fn is_link_relay(&self) -> bool {
+        matches!(
+            self,
+            Message::LinkRequest { .. }
+                | Message::LinkAccept { .. }
+                | Message::LinkDecline { .. }
+                | Message::LinkStart { .. }
+                | Message::LinkFrame { .. }
+                | Message::Unlink { .. }
+        )
+    }
+
+    /// The `from` and `target` of a link cable message relayed between two ends.
+    pub fn link_endpoints(&self) -> Option<(PeerId, PeerId)> {
+        match self {
+            Message::LinkRequest { from, target, .. }
+            | Message::LinkAccept { from, target, .. }
+            | Message::LinkDecline { from, target, .. }
+            | Message::LinkStart { from, target, .. }
+            | Message::LinkFrame { from, target, .. }
+            | Message::Unlink { from, target, .. } => Some((*from, *target)),
+            _ => None,
+        }
+    }
+
+    /// A [`LinkMessage`] as the wire message `from` sends.
+    pub fn from_link(from: PeerId, message: LinkMessage) -> Message {
+        match message {
+            LinkMessage::Request { target, nonce, console } => Message::LinkRequest { from, target, nonce, console },
+            LinkMessage::Accept { target, nonce } => Message::LinkAccept { from, target, nonce },
+            LinkMessage::Decline { target, nonce, reason } => Message::LinkDecline { from, target, nonce, reason },
+            LinkMessage::Start { target, nonce, frame, input, rtt_millis, delay_setting } => {
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting }
+            }
+            LinkMessage::Frame { target, frame, elapsed_millis, events, pair_hash } => {
+                let (pair_hash_frame, pair_hash) = pair_hash_fields(pair_hash);
+                Message::LinkFrame { from, target, frame, elapsed_millis, events: encode_link_events(&events), pair_hash_frame, pair_hash }
+            }
+            LinkMessage::Unlink { target, reason } => Message::Unlink { from, target, reason },
         }
     }
 
@@ -346,17 +540,19 @@ impl Message {
         frame(out, |e| {
             e.u8(self.tag());
             match self {
-                Message::Hello { protocol_version, replay_version, app_version, display_name, publisher } => {
+                Message::Hello { protocol_version, replay_version, app_version, display_name, color, publisher } => {
                     e.u32(*protocol_version);
                     e.u32(*replay_version);
                     e.string(app_version);
                     e.string(display_name);
+                    e.u8(*color);
                     encode_publisher(e, publisher);
                 }
-                Message::Welcome { your_peer_id, session_id, your_display_name, participants } => {
+                Message::Welcome { your_peer_id, session_id, your_display_name, your_color, participants } => {
                     e.u16(*your_peer_id);
                     e.u64(*session_id);
                     e.string(your_display_name);
+                    e.u8(*your_color);
                     e.u32(participants.len() as u32);
                     for p in participants {
                         encode_participant(e, p);
@@ -374,6 +570,14 @@ impl Message {
                 Message::ResetAll { race_id, countdown_millis } => {
                     e.u32(*race_id);
                     e.u32(*countdown_millis);
+                }
+                Message::SyncPause { enabled, paused } => {
+                    e.bool(*enabled);
+                    e.bool(*paused);
+                }
+                Message::Pause { from, paused } => {
+                    e.u16(*from);
+                    e.bool(*paused);
                 }
                 Message::Stream { from, first_frame, bytes } => {
                     e.u16(*from);
@@ -405,12 +609,62 @@ impl Message {
                     e.u16(*requester);
                     e.u16(*target);
                 }
+                Message::StartState(s) => {
+                    e.hash(&s.rom_checksum);
+                    e.u8(s.encoding as u8);
+                    e.u64(s.state_len);
+                    e.bytes(&s.state);
+                }
                 Message::Ping { nonce, sent_unix_millis } | Message::Pong { nonce, sent_unix_millis } => {
                     e.u32(*nonce);
                     e.u64(*sent_unix_millis);
                 }
                 Message::Goodbye => {}
                 Message::Error { text } => e.string(text),
+                Message::LinkRequest { from, target, nonce, console } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u32(*nonce);
+                    e.u32(*console);
+                }
+                Message::LinkAccept { from, target, nonce } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u32(*nonce);
+                }
+                Message::LinkDecline { from, target, nonce, reason } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u32(*nonce);
+                    e.u32(u32::from(*reason));
+                }
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u32(*nonce);
+                    e.u64(*frame);
+                    e.bytes(input);
+                    e.u32(*rtt_millis);
+                    e.u8(*delay_setting);
+                }
+                Message::LinkFrame { from, target, frame, elapsed_millis, events, pair_hash_frame, pair_hash } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u64(*frame);
+                    e.u64(*elapsed_millis);
+                    e.bytes(events);
+                    e.u64(*pair_hash_frame);
+                    e.hash(pair_hash);
+                }
+                Message::Unlink { from, target, reason } => {
+                    e.u16(*from);
+                    e.u16(*target);
+                    e.u32(u32::from(*reason));
+                }
+                Message::PeerLinked { a, b } | Message::PeerUnlinked { a, b } => {
+                    e.u16(*a);
+                    e.u16(*b);
+                }
             }
         });
     }
@@ -432,23 +686,27 @@ impl Message {
                 replay_version: d.u32()?,
                 app_version: d.string("app_version", MAX_APP_VERSION_BYTES)?,
                 display_name: d.string("display_name", MAX_DISPLAY_NAME_BYTES)?,
+                color: d.u8()?,
                 publisher: decode_publisher(&mut d)?,
             },
             TAG_WELCOME => {
                 let your_peer_id = peer_id(&mut d)?;
                 let session_id = d.u64()?;
                 let your_display_name = d.string("display_name", MAX_DISPLAY_NAME_BYTES)?;
+                let your_color = assigned_color(&mut d)?;
                 let n = d.count("participants", MAX_PARTICIPANTS, PARTICIPANT_MIN_BYTES)?;
                 let mut participants = Vec::with_capacity(n);
                 for _ in 0..n {
                     participants.push(decode_participant(&mut d)?);
                 }
-                Message::Welcome { your_peer_id, session_id, your_display_name, participants }
+                Message::Welcome { your_peer_id, session_id, your_display_name, your_color, participants }
             }
             TAG_REFUSED => Message::Refused { reason: RefusalReason::try_from(d.u32()?)?, text: d.string("text", MAX_TEXT_BYTES)? },
             TAG_PEER_JOINED => Message::PeerJoined { participant: decode_participant(&mut d)? },
             TAG_PEER_LEFT => Message::PeerLeft { peer_id: peer_id(&mut d)?, reason: LeaveReason::try_from(d.u32()?)? },
             TAG_RESET_ALL => Message::ResetAll { race_id: d.u32()?, countdown_millis: d.u32()? },
+            TAG_SYNC_PAUSE => Message::SyncPause { enabled: d.bool()?, paused: d.bool()? },
+            TAG_PAUSE => Message::Pause { from: d.u16()?, paused: d.bool()? },
             TAG_STREAM => Message::Stream {
                 from: peer_id(&mut d)?,
                 first_frame: d.u64()?,
@@ -472,10 +730,49 @@ impl Message {
             }
             TAG_SYNC_HASH => Message::SyncHash { from: peer_id(&mut d)?, frame: d.u64()?, hash: d.hash()? },
             TAG_REQUEST_SNAPSHOT => Message::RequestSnapshot { requester: d.u16()?, target: d.u16()? },
+            TAG_START_STATE => {
+                let rom_checksum = d.hash()?;
+                let encoding = StateEncoding::try_from(d.u8()?)?;
+                let state_len = d.u64()?;
+                if state_len > MAX_STATE_LENGTH {
+                    return Err(DecodeError::StateTooLarge(state_len));
+                }
+                let state = d.bytes("state", MAX_MESSAGE_LENGTH as usize)?.to_vec();
+                Message::StartState(WireStartState { rom_checksum, encoding, state_len, state })
+            }
             TAG_PING => Message::Ping { nonce: d.u32()?, sent_unix_millis: d.u64()? },
             TAG_PONG => Message::Pong { nonce: d.u32()?, sent_unix_millis: d.u64()? },
             TAG_GOODBYE => Message::Goodbye,
             TAG_ERROR => Message::Error { text: d.string("text", MAX_TEXT_BYTES)? },
+            TAG_LINK_REQUEST => Message::LinkRequest { from: d.u16()?, target: peer_id(&mut d)?, nonce: d.u32()?, console: d.u32()? },
+            TAG_LINK_ACCEPT => Message::LinkAccept { from: d.u16()?, target: peer_id(&mut d)?, nonce: d.u32()? },
+            TAG_LINK_DECLINE => Message::LinkDecline { from: d.u16()?, target: peer_id(&mut d)?, nonce: d.u32()?, reason: LinkDeclineReason::from(d.u32()?) },
+            TAG_LINK_START => {
+                let from = d.u16()?;
+                let target = peer_id(&mut d)?;
+                let nonce = d.u32()?;
+                let frame = d.u64()?;
+                let input = input_buffer(&mut d)?;
+                let rtt_millis = d.u32()?;
+                let delay_setting = d.u8()?;
+                if delay_setting > MAX_LINK_DELAY {
+                    return Err(DecodeError::BadEnum { what: "link delay setting", value: u32::from(delay_setting) });
+                }
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting }
+            }
+            TAG_LINK_FRAME => {
+                let from = d.u16()?;
+                let target = peer_id(&mut d)?;
+                let frame = d.u64()?;
+                let elapsed_millis = d.u64()?;
+                let events = d.bytes("link events", MAX_LINK_EVENT_BYTES)?.to_vec();
+                let pair_hash_frame = d.u64()?;
+                let pair_hash = d.hash()?;
+                Message::LinkFrame { from, target, frame, elapsed_millis, events, pair_hash_frame, pair_hash }
+            }
+            TAG_UNLINK => Message::Unlink { from: d.u16()?, target: peer_id(&mut d)?, reason: UnlinkReason::from(d.u32()?) },
+            TAG_PEER_LINKED => Message::PeerLinked { a: peer_id(&mut d)?, b: peer_id(&mut d)? },
+            TAG_PEER_UNLINKED => Message::PeerUnlinked { a: peer_id(&mut d)?, b: peer_id(&mut d)? },
             other => return Err(DecodeError::UnknownTag(other)),
         };
         d.finish()?;
@@ -506,8 +803,19 @@ impl Message {
 
 /// The fewest bytes a `ParticipantInfo` can occupy on the wire (used to refuse absurd counts
 /// before allocating).
-const PARTICIPANT_MIN_BYTES: usize = 2 + 4 + 4 + PUBLISHER_MIN_BYTES;
+const PARTICIPANT_MIN_BYTES: usize = 2 + 4 + 1 + 4 + PUBLISHER_MIN_BYTES;
 const PUBLISHER_MIN_BYTES: usize = 4 + 4 + 4 + 32 + 32 + 4 + 4 + 32 + 4 + 2 + 8;
+
+/// A colour the host assigned: must name a palette entry.
+fn assigned_color(d: &mut Decoder<'_>) -> Result<PlayerColor, DecodeError> {
+    let color = d.u8()?;
+    if is_valid_color(color) {
+        Ok(color)
+    }
+    else {
+        Err(DecodeError::BadColor(color))
+    }
+}
 
 fn peer_id(d: &mut Decoder<'_>) -> Result<PeerId, DecodeError> {
     match d.u16()? {
@@ -587,6 +895,7 @@ fn decode_publisher(d: &mut Decoder<'_>) -> Result<PublisherInfo, DecodeError> {
 fn encode_participant(e: &mut Encoder<'_>, p: &ParticipantInfo) {
     e.u16(p.peer_id);
     e.string(&p.display_name);
+    e.u8(p.color);
     e.string(&p.app_version);
     encode_publisher(e, &p.publisher);
 }
@@ -595,6 +904,7 @@ fn decode_participant(d: &mut Decoder<'_>) -> Result<ParticipantInfo, DecodeErro
     Ok(ParticipantInfo {
         peer_id: peer_id(d)?,
         display_name: d.string("display_name", MAX_DISPLAY_NAME_BYTES)?,
+        color: assigned_color(d)?,
         app_version: d.string("app_version", MAX_APP_VERSION_BYTES)?,
         publisher: decode_publisher(d)?,
     })

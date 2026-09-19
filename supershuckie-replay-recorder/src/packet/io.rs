@@ -1,6 +1,6 @@
 use core::cmp::Ordering;
 
-use crate::packet::{BookmarkMetadata, ByteVec, KeyframeMetadata, Packet, Speed, UnsignedInteger};
+use crate::packet::{BookmarkMetadata, ByteVec, KeyframeMetadata, Packet, Speed, UnsignedInteger, MAX_SERIAL_IN_BYTES};
 use crate::{Counter, InputBuffer, SignedInteger, TimestampMillis};
 use alloc::borrow::{Cow, ToOwned};
 use alloc::string::String;
@@ -317,6 +317,9 @@ pub enum PacketDiscriminator {
     /// Compressed blob with a keyframe byte-offset table (format v6)
     IndexedCompressedBlob = 0xF9,
 
+    /// What the console received over its link cable this frame (format v7)
+    SerialIn = 0xFA,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -400,7 +403,8 @@ impl Packet {
             Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframe as u8,
             Packet::CompressedBlob { keyframe_offsets, .. } if keyframe_offsets.is_empty() => PacketDiscriminator::CompressedBlob as u8,
             Packet::CompressedBlob { .. } => PacketDiscriminator::IndexedCompressedBlob as u8,
-            Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8
+            Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8,
+            Packet::SerialIn { .. } => PacketDiscriminator::SerialIn as u8
         }
     }
 }
@@ -504,6 +508,10 @@ impl PacketIO<'_> for Packet {
                 commands.extend(name.write_packet_instructions());
                 commands.extend(delta.write_packet_instructions());
             }
+
+            Packet::SerialIn { data } => {
+                commands.extend(data.write_packet_instructions());
+            }
         }
 
         commands
@@ -593,7 +601,22 @@ impl PacketIO<'_> for Packet {
             PacketDiscriminator::IncrementCounter => Ok(Packet::IncrementCounter {
                 name: String::read_all(from, version)?,
                 delta: SignedInteger::read_all(from, version)?
-            })
+            }),
+            PacketDiscriminator::SerialIn => {
+                // The length is checked before the bytes are copied: a corrupt or hostile file
+                // must not make a frame of link traffic look like a state-sized allocation.
+                let len = usize::read_all(from, version)?;
+                if len > MAX_SERIAL_IN_BYTES {
+                    return Err(PacketReadError::ParseFail { explanation: Cow::Owned(alloc::format!("SerialIn packet of {len} bytes is longer than the {MAX_SERIAL_IN_BYTES} allowed")) })
+                }
+                let Some((bytes, extra)) = from.split_at_checked(len) else {
+                    return Err(PacketReadError::NotEnoughData)
+                };
+                *from = extra;
+                let mut data = ByteVec::with_capacity(len);
+                data.extend_from_slice(bytes);
+                Ok(Packet::SerialIn { data })
+            }
         }
     }
 }
@@ -763,6 +786,9 @@ mod tests {
                 elapsed_frames_end: 4,
             },
             Packet::IncrementCounter { name: "c".into(), delta: -1 },
+            Packet::SerialIn { data: bv(&[]) },
+            Packet::SerialIn { data: bv(&[0x01, 0x03, 0xA0, 0x02, 0x02, 0x10, 0x01, 0x20, 0x00]) },
+            Packet::SerialIn { data: bv(&[7u8; 300]) },
             Packet::BookmarkTable { table: crate::BookmarkTable::new() },
             Packet::BookmarkTable { table: {
                 let mut table = crate::BookmarkTable::new();
@@ -778,8 +804,26 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xFA, 0, 0];
+        let mut slice: &[u8] = &[0xFB, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
+    }
+
+    /// A `SerialIn` packet is refused before its bytes are copied when it claims more than a
+    /// frame of link traffic could hold, and a truncated one is `NotEnoughData`, not a panic.
+    #[test]
+    fn serial_in_length_is_capped_and_truncation_is_clean() {
+        let mut oversized = vec![PacketDiscriminator::SerialIn as u8, 3, 0x01, 0x00, 0x01]; // 65537 bytes claimed
+        oversized.extend_from_slice(&[0u8; 8]);
+        let mut slice = oversized.as_slice();
+        assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
+
+        let truncated = [PacketDiscriminator::SerialIn as u8, 1, 10, 1, 2, 3];
+        let mut slice = truncated.as_slice();
+        assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::NotEnoughData)));
+
+        // Exactly the cap is fine.
+        let full = Packet::SerialIn { data: bv(&[9u8; MAX_SERIAL_IN_BYTES]) };
+        assert_eq!(round_trip(&full, REPLAY_VERSION), full);
     }
 
     #[test]

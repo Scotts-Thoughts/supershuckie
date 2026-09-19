@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 #[repr(C)]
 struct MGBACoreRaw(());
 
+#[repr(C)]
+struct MGBALinkCoordinatorRaw(());
+
 unsafe extern "C" {
     fn mgba_rs_core_new(
         rom: *const u8,
@@ -31,10 +34,80 @@ unsafe extern "C" {
     fn mgba_rs_core_get_region(core: *mut MGBACoreRaw, region: u32, size: &mut usize) -> *mut u8;
     fn mgba_rs_core_patch_write(core: *mut MGBACoreRaw, address: u32, data: *const u8, length: usize);
     fn mgba_rs_core_read_audio(core: *mut MGBACoreRaw, out: *mut i16, max_frames: usize) -> usize;
+
+    fn mgba_rs_link_coordinator_new() -> *mut MGBALinkCoordinatorRaw;
+    fn mgba_rs_link_coordinator_free(coordinator: *mut MGBALinkCoordinatorRaw);
+    fn mgba_rs_core_link_attach(core: *mut MGBACoreRaw, coordinator: *mut MGBALinkCoordinatorRaw, first: bool) -> bool;
+    fn mgba_rs_core_link_detach(core: *mut MGBACoreRaw);
+    fn mgba_rs_core_link_is_attached(core: *const MGBACoreRaw) -> bool;
+    fn mgba_rs_core_link_is_asleep(core: *const MGBACoreRaw) -> bool;
+    fn mgba_rs_core_link_player_id(core: *const MGBACoreRaw) -> i32;
+    fn mgba_rs_core_run_loop(core: *mut MGBACoreRaw) -> u32;
+    fn mgba_rs_core_timing_now(core: *const MGBACoreRaw) -> i32;
+    fn mgba_rs_core_link_frame_started(core: *mut MGBACoreRaw);
+    fn mgba_rs_core_link_take_log(core: *mut MGBACoreRaw, out: *mut u8, capacity: usize) -> usize;
+    fn mgba_rs_core_replay_detach(core: *mut MGBACoreRaw);
+    fn mgba_rs_core_replay_is_attached(core: *const MGBACoreRaw) -> bool;
+    fn mgba_rs_core_replay_misses(core: *const MGBACoreRaw) -> u64;
+    fn mgba_rs_core_replay_queue(core: *mut MGBACoreRaw, data: *const u8, size: usize) -> u32;
+}
+
+/// mGBA's lockstep coordinator: what joins the cores of a link cable. One per cable; every
+/// core plugged in holds a clone (see [`Core::link_attach`]) and the last one to let go frees
+/// it. The cores it joins must be stepped from one thread.
+pub struct LinkCoordinator {
+    inner: alloc::sync::Arc<CoordinatorHandle>
+}
+
+struct CoordinatorHandle(*mut MGBALinkCoordinatorRaw);
+
+unsafe impl Send for CoordinatorHandle {}
+unsafe impl Sync for CoordinatorHandle {}
+
+impl Drop for CoordinatorHandle {
+    fn drop(&mut self) {
+        unsafe { mgba_rs_link_coordinator_free(self.0) }
+    }
+}
+
+impl Default for LinkCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LinkCoordinator {
+    /// A coordinator with nobody plugged in.
+    pub fn new() -> Self {
+        Self { inner: alloc::sync::Arc::new(CoordinatorHandle(unsafe { mgba_rs_link_coordinator_new() })) }
+    }
+
+    /// Whether `other` is the same coordinator.
+    pub fn same_as(&self, other: &LinkCoordinator) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Clone for LinkCoordinator {
+    fn clone(&self) -> Self {
+        Self { inner: alloc::sync::Arc::clone(&self.inner) }
+    }
+}
+
+/// What [`Core::replay_queue`] did with a frame's serial log.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReplayQueued {
+    /// Applied.
+    Applied,
+    /// Applied, and the cable came out during that frame: call [`Core::replay_detach`] once the
+    /// frame has run.
+    AppliedThenDetach
 }
 
 pub struct Core {
-    inner: *mut MGBACoreRaw
+    inner: *mut MGBACoreRaw,
+    /// The cable's coordinator while one is attached: kept alive as long as this core is on it.
+    coordinator: Option<LinkCoordinator>
 }
 
 /// Memory regions reachable through [`Core::get_region`].
@@ -108,7 +181,7 @@ impl Core {
         if inner.is_null() {
             return Err(CoreError::from(error_code))
         }
-        Ok(Self { inner })
+        Ok(Self { inner, coordinator: None })
     }
 
     #[inline]
@@ -246,6 +319,114 @@ impl Core {
     #[inline]
     pub fn read_audio(&mut self, out: &mut [i16]) -> usize {
         unsafe { mgba_rs_core_read_audio(self.inner, out.as_mut_ptr(), out.len() / 2) }
+    }
+}
+
+impl Core {
+    /// Plug this core into `coordinator` as the cable's first (`first`) or second player. mGBA's
+    /// lockstep driver replaces the SIO driver; from here on the core is stepped with
+    /// [`run_loop`](Self::run_loop) and only while [`is_link_asleep`](Self::is_link_asleep) is
+    /// false, cooperatively with the other core on the same coordinator. Fails while a cable or
+    /// a replay is already in.
+    pub fn link_attach(&mut self, coordinator: &LinkCoordinator, first: bool) -> bool {
+        let ok = unsafe { mgba_rs_core_link_attach(self.inner, coordinator.inner.0, first) };
+        if ok {
+            self.coordinator = Some(coordinator.clone());
+        }
+        ok
+    }
+
+    /// Pull the cable (nothing without one).
+    pub fn link_detach(&mut self) {
+        unsafe { mgba_rs_core_link_detach(self.inner) }
+        self.coordinator = None;
+    }
+
+    /// The coordinator this core is plugged into, while it is.
+    #[inline]
+    pub fn link_coordinator(&self) -> Option<&LinkCoordinator> {
+        self.coordinator.as_ref()
+    }
+
+    #[inline]
+    pub fn is_link_attached(&self) -> bool {
+        unsafe { mgba_rs_core_link_is_attached(self.inner) }
+    }
+
+    /// Whether the lockstep coordinator has put this core to sleep (it waits for the other
+    /// core; stepping it now would break the lockstep).
+    #[inline]
+    pub fn is_link_asleep(&self) -> bool {
+        unsafe { mgba_rs_core_link_is_asleep(self.inner) }
+    }
+
+    /// The player number the coordinator gave this core (0 = the clock owner), or -1.
+    #[inline]
+    pub fn link_player_id(&self) -> i32 {
+        unsafe { mgba_rs_core_link_player_id(self.inner) }
+    }
+
+    /// One slice of emulation (until mGBA's next timing event): how many frames completed in
+    /// it (0 or 1). The pixel buffer holds the new frame when 1.
+    #[inline]
+    pub fn run_loop(&mut self) -> u32 {
+        unsafe { mgba_rs_core_run_loop(self.inner) }
+    }
+
+    /// The core's cycle clock: wraps every couple of minutes, so take differences.
+    #[inline]
+    pub fn timing_now(&self) -> i32 {
+        unsafe { mgba_rs_core_timing_now(self.inner) }
+    }
+
+    /// A new frame begins now (while a cable is in): the serial log's times are relative to it.
+    #[inline]
+    pub fn link_frame_started(&mut self) {
+        unsafe { mgba_rs_core_link_frame_started(self.inner) }
+    }
+
+    /// The serial log gathered since the last call (the `SerialIn` payload of a Game Boy
+    /// Advance frame), appended to `into`.
+    pub fn link_take_log(&mut self, into: &mut Vec<u8>) {
+        let mut capacity = 256usize;
+        loop {
+            let start = into.len();
+            into.resize(start + capacity, 0);
+            let needed = unsafe { mgba_rs_core_link_take_log(self.inner, into.as_mut_ptr().add(start), capacity) };
+            if needed <= capacity {
+                into.truncate(start + needed);
+                return
+            }
+            into.truncate(start);
+            capacity = needed;
+        }
+    }
+
+    /// Feed one frame's recorded serial log, at the frame boundary before that frame runs; the
+    /// replay driver goes in with the first. `None` when the log does not parse.
+    pub fn replay_queue(&mut self, log: &[u8]) -> Option<ReplayQueued> {
+        match unsafe { mgba_rs_core_replay_queue(self.inner, log.as_ptr(), log.len()) } {
+            1 => Some(ReplayQueued::Applied),
+            2 => Some(ReplayQueued::AppliedThenDetach),
+            _ => None
+        }
+    }
+
+    /// Take the replay driver out (nothing without one).
+    #[inline]
+    pub fn replay_detach(&mut self) {
+        unsafe { mgba_rs_core_replay_detach(self.inner) }
+    }
+
+    #[inline]
+    pub fn is_replay_attached(&self) -> bool {
+        unsafe { mgba_rs_core_replay_is_attached(self.inner) }
+    }
+
+    /// How often the game asked the replay driver for something the log did not have.
+    #[inline]
+    pub fn replay_misses(&self) -> u64 {
+        unsafe { mgba_rs_core_replay_misses(self.inner) }
     }
 }
 

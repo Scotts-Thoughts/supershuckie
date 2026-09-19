@@ -136,9 +136,17 @@ from **Play Together → Host or join a session…** and shares a code; the othe
 game and join. What travels over the network is only what a replay holds (inputs, memory edits,
 resets) and each friend's game is emulated locally from it, in a window of its own, at a few
 kilobytes a second; your own game keeps its priority and its frame rate. Friends' games are also
-saved as replays. Game Boy, Game Boy Color and Game Boy Advance for now. See
+saved as replays. Game Boy, Game Boy Color and Game Boy Advance for now. Two players can plug a
+**link cable** between their games and trade or battle (Generations 1–3): right-click a friend's
+window and choose **Plug in link cable**; both games then run in step with a small input delay,
+and the trade or battle is in everyone's replays. See
 [docs/play_together.md](docs/play_together.md) and
 [docs/play-together-protocol.md](docs/play-together-protocol.md).
+
+Poke-A-Byte can read every game in the session at once: your own is served on the Poke-A-Byte
+port (55356 unless changed under **Settings → Poke-A-Byte port…**) and each friend's game on the
+next free port above it, which a single Poke-A-Byte reaches through its `/instances/<port>/`
+routes. See "Poke-A-Byte and friends' games" in [docs/play_together.md](docs/play_together.md).
 
 ## Converting old replays
 

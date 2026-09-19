@@ -1,17 +1,18 @@
 //! Sessions: the host (listens, admits, relays) and the client (connects to a host). Both
 //! implement [`Session`] so the application handles them alike.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use supershuckie_replay_recorder::Packet;
+use supershuckie_replay_recorder::{InputBuffer, Packet};
 
 use crate::conn::{Outbound, SnapshotItem, Stats};
 use crate::error::{DisconnectReason, PlayTogetherError, PublishError};
-use crate::protocol::{LeaveReason, Message, ParticipantInfo};
-use crate::{Blake3Hash, PeerId, SessionId, SnapshotData, MAX_PARTICIPANTS};
+use crate::protocol::link::pair_hash_option;
+use crate::protocol::{decode_link_events, LeaveReason, LinkDeclineReason, LinkMessage, Message, ParticipantInfo, UnlinkReason};
+use crate::{Blake3Hash, PeerId, SessionId, SnapshotData, StartStateData, MAX_PARTICIPANTS};
 
 pub mod client;
 pub(crate) mod follow;
@@ -43,6 +44,8 @@ pub enum SessionEvent {
         local_peer_id: PeerId,
         /// Our display name as the session knows it.
         local_display_name: String,
+        /// The colour the host gave us.
+        local_color: u8,
         /// Everyone else already in the session.
         participants: Vec<ParticipantInfo>,
     },
@@ -76,6 +79,28 @@ pub enum SessionEvent {
         /// When to reset.
         deadline: Instant,
     },
+    /// Client only: the host set whether pausing is shared, and (while it is) the pause state
+    /// to adopt right now. Arrives once on joining and again whenever the host changes it.
+    SyncPauseChanged {
+        /// Whether one participant's pause pauses everyone.
+        enabled: bool,
+        /// The session's pause state to adopt (meaningful while `enabled`).
+        paused: bool,
+    },
+    /// Another participant paused or unpaused everyone (sync pause is enabled): adopt `paused`.
+    /// Never our own pause echoed back.
+    PauseChanged {
+        /// Who.
+        from: PeerId,
+        /// Paused, or unpaused.
+        paused: bool,
+    },
+    /// Client only: the host set the save state everyone's own game is loaded from (load it and
+    /// pause), or cleared it (`None`). Arrives on joining while one is set, and on every change.
+    StartStateChanged {
+        /// The state, decoded; `None` when cleared.
+        state: Option<StartStateData>,
+    },
     /// A round-trip time was measured.
     RttUpdated {
         /// Whose link (the host, for a client).
@@ -83,6 +108,8 @@ pub enum SessionEvent {
         /// The time.
         rtt: Duration,
     },
+    /// Something about a link cable (ours, or the roster's).
+    Link(LinkEvent),
     /// Something worth telling the user that did not end the session.
     Warning(String),
     /// The session is over. Terminal: nothing follows.
@@ -90,6 +117,85 @@ pub enum SessionEvent {
         /// Why.
         reason: DisconnectReason,
     },
+}
+
+/// A link cable message addressed to us, or a change in who is linked with whom.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkEvent {
+    /// `from` wants to plug a cable into our game; answer with `LinkMessage::Accept` or
+    /// `Decline` carrying `nonce`.
+    Requested {
+        /// Who asks.
+        from: PeerId,
+        /// Its request.
+        nonce: u32,
+        /// Its console type (a `ReplayConsoleType` number).
+        console: u32,
+    },
+    /// `from` accepted our request `nonce`: hold our game and send `LinkMessage::Start`.
+    Accepted {
+        /// Who accepted.
+        from: PeerId,
+        /// Our request.
+        nonce: u32,
+    },
+    /// `from` (or the host on its behalf) declined our request `nonce`.
+    Declined {
+        /// Who declined.
+        from: PeerId,
+        /// Our request.
+        nonce: u32,
+        /// Why.
+        reason: LinkDeclineReason,
+    },
+    /// `from` has held its game for the link at `frame` with `input` held.
+    Started {
+        /// The other end.
+        from: PeerId,
+        /// The request the link came from.
+        nonce: u32,
+        /// Its frame count at the hold.
+        frame: u64,
+        /// The input it holds there.
+        input: InputBuffer,
+        /// Its last round-trip time to the host, in milliseconds (0 for the host).
+        rtt_millis: u32,
+        /// Its input-delay setting: 0 for automatic, else the frames it wants at least.
+        delay_setting: u8,
+    },
+    /// `from` unplugged the cable (or the host did, because `from` left). The link sink for
+    /// `from`, if any, has been told `ended` and dropped.
+    Unlinked {
+        /// The other end.
+        from: PeerId,
+        /// Why.
+        reason: UnlinkReason,
+    },
+    /// Two participants are linked (for the roster; never about a request of ours).
+    PeerLinked {
+        /// One end.
+        a: PeerId,
+        /// The other.
+        b: PeerId,
+    },
+    /// Two participants are no longer linked.
+    PeerUnlinked {
+        /// One end.
+        a: PeerId,
+        /// The other.
+        b: PeerId,
+    },
+}
+
+/// Receives one link partner's frames straight from the network reader thread (no UI hop: a
+/// dialog on the UI thread must never stall the two linked games). Calls are short: a sink
+/// pushes into the core's link inbox and returns.
+pub trait LinkSink: Send + 'static {
+    /// The partner's events for link frame `frame`, its recording clock as it sent them, and
+    /// its pair hash when one is due.
+    fn frame(&mut self, frame: u64, elapsed_millis: u64, events: Vec<Packet>, pair_hash: Option<(u64, Blake3Hash)>);
+    /// The partner unplugged the cable, left, or we did; no more calls follow.
+    fn ended(&mut self, reason: LeaveReason);
 }
 
 /// Receives one publisher's data straight from the network reader thread (no UI hop).
@@ -166,6 +272,10 @@ pub struct SessionStats {
     pub outbound_queued_bytes: u64,
     /// The last measured round-trip time per connection.
     pub rtt: Vec<(PeerId, Duration)>,
+    /// `LinkFrame` messages written on every connection (a host counts relayed ones too).
+    pub link_frames_sent: u64,
+    /// `LinkFrame` messages received for our own link.
+    pub link_frames_received: u64,
 }
 
 /// A running session of either role.
@@ -193,8 +303,25 @@ pub trait Session: Send + Sync {
     fn request_snapshot(&self, publisher: PeerId);
     /// Host only: everybody resets after `countdown`. The host gets the `ResetAll` event too.
     fn send_reset_all(&self, countdown: Duration) -> Result<u32, PlayTogetherError>;
+    /// Host only: set whether pausing is shared, and the pause state everyone adopts right now
+    /// (the host's own). Told to every client, and to each client as it joins.
+    fn set_sync_pause(&self, enabled: bool, paused: bool) -> Result<(), PlayTogetherError>;
+    /// We paused (or unpaused) everyone. The host relays it to everyone else while sync pause is
+    /// enabled and drops it otherwise; nobody gets their own pause back.
+    fn send_pause(&self, paused: bool) -> Result<(), PlayTogetherError>;
+    /// Host only: set (or with `None` clear) the save state everyone's own game is loaded from.
+    /// Sent to every client now and to each client as it joins; while one is set, a client whose
+    /// console, ROM, core or BIOS differs from the host's is refused.
+    fn set_start_state(&self, state: Option<StartStateData>) -> Result<(), PlayTogetherError>;
     /// Host only: remove a participant.
     fn kick(&self, peer: PeerId) -> Result<(), PlayTogetherError>;
+    /// Send a link cable message to its target. Queued on the connection's urgent lane, ahead
+    /// of streams and snapshots; never blocks. The host routes it like a message from itself.
+    fn send_link(&self, message: LinkMessage) -> Result<(), PlayTogetherError>;
+    /// Install (or with `None` remove) the sink that receives `peer`'s `LinkFrame`s, on the
+    /// reader thread. Frames from a peer without a sink are dropped. A removed sink is dropped
+    /// without a call; one still installed when `peer` leaves or the session ends hears `ended`.
+    fn set_link_sink(&self, peer: PeerId, sink: Option<Box<dyn LinkSink>>);
     /// Counters.
     fn stats(&self) -> SessionStats;
     /// Say goodbye, stop and join the threads (bounded, about two seconds). Also on drop.
@@ -315,6 +442,84 @@ impl Coalescer {
     }
 }
 
+/// The link sinks of one session, keyed by partner. Delivery holds the map's lock for the
+/// length of the sink call, which is a queue push.
+#[derive(Default)]
+pub(crate) struct LinkSinks {
+    sinks: Mutex<HashMap<PeerId, Box<dyn LinkSink>>>,
+}
+
+impl LinkSinks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, Box<dyn LinkSink>>> {
+        self.sinks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Install or remove `peer`'s sink; a replaced or removed one is dropped silently.
+    pub(crate) fn set(&self, peer: PeerId, sink: Option<Box<dyn LinkSink>>) {
+        let mut sinks = self.lock();
+        match sink {
+            Some(sink) => {
+                sinks.insert(peer, sink);
+            }
+            None => {
+                sinks.remove(&peer);
+            }
+        }
+    }
+
+    /// Hand a frame to `peer`'s sink; `false` when there is none (the frame is dropped).
+    pub(crate) fn deliver(&self, peer: PeerId, frame: u64, elapsed_millis: u64, events: Vec<Packet>, pair_hash: Option<(u64, Blake3Hash)>) -> bool {
+        match self.lock().get_mut(&peer) {
+            Some(sink) => {
+                sink.frame(frame, elapsed_millis, events, pair_hash);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tell `peer`'s sink it is over and drop it.
+    pub(crate) fn end(&self, peer: PeerId, reason: LeaveReason) {
+        if let Some(mut sink) = self.lock().remove(&peer) {
+            sink.ended(reason);
+        }
+    }
+
+    /// Tell every sink it is over and drop them.
+    pub(crate) fn end_all(&self, reason: LeaveReason) {
+        for (_, mut sink) in self.lock().drain() {
+            sink.ended(reason);
+        }
+    }
+}
+
+/// A link cable message addressed to us arrived from `from`: turn it into an event, or hand a
+/// frame to the sink. `Err` carries a protocol error's text.
+pub(crate) fn receive_link(events: &EventQueue, sinks: &LinkSinks, stats: &Stats, message: Message) -> Result<(), String> {
+    match message {
+        Message::LinkRequest { from, nonce, console, .. } => events.push(SessionEvent::Link(LinkEvent::Requested { from, nonce, console })),
+        Message::LinkAccept { from, nonce, .. } => events.push(SessionEvent::Link(LinkEvent::Accepted { from, nonce })),
+        Message::LinkDecline { from, nonce, reason, .. } => events.push(SessionEvent::Link(LinkEvent::Declined { from, nonce, reason })),
+        Message::LinkStart { from, nonce, frame, input, rtt_millis, delay_setting, .. } => {
+            events.push(SessionEvent::Link(LinkEvent::Started { from, nonce, frame, input, rtt_millis, delay_setting }))
+        }
+        Message::LinkFrame { from, frame, elapsed_millis, events: bytes, pair_hash_frame, pair_hash, .. } => {
+            let decoded = decode_link_events(&bytes).map_err(|e| e.to_string())?;
+            if sinks.deliver(from, frame, elapsed_millis, decoded, pair_hash_option(pair_hash_frame, pair_hash)) {
+                stats.link_frames_received.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Message::Unlink { from, reason, .. } => {
+            sinks.end(from, LeaveReason::Left);
+            events.push(SessionEvent::Link(LinkEvent::Unlinked { from, reason }));
+        }
+        Message::PeerLinked { a, b } => events.push(SessionEvent::Link(LinkEvent::PeerLinked { a, b })),
+        Message::PeerUnlinked { a, b } => events.push(SessionEvent::Link(LinkEvent::PeerUnlinked { a, b })),
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The `LeaveReason` a sink hears when our own session ends for `reason`.
 pub(crate) fn leave_reason_for(reason: &DisconnectReason) -> LeaveReason {
     match reason {
@@ -328,6 +533,39 @@ pub(crate) fn leave_reason_for(reason: &DisconnectReason) -> LeaveReason {
         DisconnectReason::Refused { .. } | DisconnectReason::ConnectFailed(_) => LeaveReason::Left,
     }
 }
+
+/// Start a session thread: named, and scheduled below the player's own threads.
+///
+/// Everything a session does off the emulator thread (accepting, reading, relaying, compressing
+/// snapshots, writing) is work the player is not waiting on frame by frame, so on Windows these
+/// threads run at below-normal priority, like the follower emulator threads that consume what
+/// they deliver. The player's own core thread (above normal) and UI thread (normal) then win
+/// every contest for a core. Elsewhere the priority is left alone.
+pub(crate) fn spawn_session_thread<F: FnOnce() + Send + 'static>(name: String, f: F) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(name).spawn(move || {
+        lower_current_thread_priority();
+        f()
+    })
+}
+
+#[cfg(windows)]
+fn lower_current_thread_priority() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+
+    // SAFETY: plain Win32 calls on the current thread.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_thread_priority() {}
 
 /// Wait up to `timeout` for every handle to finish, join the finished ones and detach the rest.
 pub(crate) fn join_bounded(handles: Vec<std::thread::JoinHandle<()>>, timeout: Duration) {
@@ -355,5 +593,7 @@ pub(crate) fn base_stats(stats: &Stats) -> SessionStats {
         unknown_messages_skipped: stats.unknown_messages_skipped.load(Ordering::Relaxed),
         outbound_queued_bytes: 0,
         rtt: Vec::new(),
+        link_frames_sent: stats.link_frames_sent.load(Ordering::Relaxed),
+        link_frames_received: stats.link_frames_received.load(Ordering::Relaxed),
     }
 }

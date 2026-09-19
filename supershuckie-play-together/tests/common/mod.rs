@@ -33,11 +33,11 @@ pub fn publisher_info(console: ReplayConsoleType) -> PublisherInfo {
 }
 
 pub fn local(name: &str) -> LocalParticipant {
-    LocalParticipant { display_name: name.to_owned(), app_version: "test 0.4.14".to_owned(), publisher: publisher_info(ReplayConsoleType::GameBoyAdvance) }
+    LocalParticipant { display_name: name.to_owned(), color: 0, app_version: "test 0.4.14".to_owned(), publisher: publisher_info(ReplayConsoleType::GameBoyAdvance) }
 }
 
 pub fn local_with(name: &str, publisher: PublisherInfo) -> LocalParticipant {
-    LocalParticipant { display_name: name.to_owned(), app_version: "test 0.4.14".to_owned(), publisher }
+    LocalParticipant { display_name: name.to_owned(), color: 0, app_version: "test 0.4.14".to_owned(), publisher }
 }
 
 /// A host config on a free loopback port with short timeouts.
@@ -68,7 +68,12 @@ pub fn bind_host(name: &str) -> HostSession {
 /// Connect a client and wait for the handshake to settle (either way), so that clients connected
 /// one after another get their peer ids in that order.
 pub fn connect_client(host: &HostSession, name: &str) -> ClientSession {
-    let client = ClientSession::connect(code_for(host), client_config(), local(name));
+    connect_client_with(host, local(name))
+}
+
+/// [`connect_client`] with a custom local participant.
+pub fn connect_client_with(host: &HostSession, local: LocalParticipant) -> ClientSession {
+    let client = ClientSession::connect(code_for(host), client_config(), local);
     let deadline = Instant::now() + WAIT;
     // A refused or failed connect never becomes connected; the caller's wait sees why.
     while !client.is_connected() && !client.has_disconnected() && Instant::now() < deadline {

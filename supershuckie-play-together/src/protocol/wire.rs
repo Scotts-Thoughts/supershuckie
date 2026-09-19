@@ -27,7 +27,7 @@ pub const MAX_SMALL_MESSAGE_LENGTH: u32 = 64 << 10;
 pub const READ_CHUNK: usize = 64 << 10;
 
 /// The tags whose messages may be as long as [`MAX_MESSAGE_LENGTH`].
-pub(crate) const LARGE_TAGS: [u8; 2] = [super::TAG_STREAM, super::TAG_SNAPSHOT];
+pub(crate) const LARGE_TAGS: [u8; 3] = [super::TAG_STREAM, super::TAG_SNAPSHOT, super::TAG_START_STATE];
 
 /// The longest framed length (tag + payload) accepted for a message with this tag.
 pub fn max_message_length(tag: u8) -> u32 {
@@ -57,7 +57,6 @@ impl Encoder<'_> {
     pub(crate) fn i64(&mut self, v: i64) {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
-    #[allow(dead_code)]
     pub(crate) fn bool(&mut self, v: bool) {
         self.out.push(u8::from(v));
     }
@@ -204,7 +203,6 @@ impl<'a> Decoder<'a> {
     pub(crate) fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
-    #[allow(dead_code)]
     pub(crate) fn bool(&mut self) -> Result<bool, DecodeError> {
         match self.u8()? {
             0 => Ok(false),

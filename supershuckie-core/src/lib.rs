@@ -29,6 +29,9 @@ pub mod stream;
 #[cfg(feature = "std")]
 pub mod live_replay;
 
+#[cfg(feature = "std")]
+pub mod link;
+
 pub mod export;
 pub use export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 
@@ -42,6 +45,10 @@ pub mod memory_monitor;
 
 #[cfg(feature = "std")]
 pub use thread::*;
+
+/// The UDP port a Poke-A-Byte integration server listens on unless told otherwise.
+#[cfg(feature = "pokeabyte")]
+pub use supershuckie_pokeabyte_integration::DEFAULT_PORT as POKEABYTE_DEFAULT_PORT;
 
 #[cfg(feature = "std")]
 pub mod audio;
@@ -62,6 +69,18 @@ pub struct SuperShuckieCore {
     /// A live replay arriving from another player (Play Together); see [`live_replay`].
     #[cfg(feature = "std")]
     follower: Option<live_replay::FollowerState>,
+
+    /// The local end of a link cable to another player's console (see [`link`]).
+    #[cfg(feature = "std")]
+    link: Option<link::LinkState>,
+
+    /// The other end of a link cable: this core is a follower lent to the player's own core
+    /// thread and driven by the partner's link frames (see [`link`]).
+    #[cfg(feature = "std")]
+    link_partner: Option<link::LinkPartnerState>,
+
+    /// Held at a frame boundary for a link handshake: nothing runs (see `link_hold`).
+    link_holding: bool,
 
     /// Where the running session is mirrored to, if it is being published (see [`stream`]).
     stream_publisher: Option<Box<dyn StreamPublisherFns>>,
@@ -100,6 +119,18 @@ pub struct SuperShuckieCore {
     ///
     /// This input is always applied.
     toggled_input: Option<Input>,
+
+    /// Presses made via [`Self::press_for_frames`] that no frame has run with yet.
+    ///
+    /// They move to [`Self::timed_presses`] when [`Self::update_input`] next applies the input,
+    /// so a press that lands in the middle of a frame (the Game Boy core is stepped in sub-frame
+    /// slices) gets its whole hold from the next frame on rather than losing a frame to the one
+    /// already under way.
+    pending_timed_presses: Vec<TimedPress>,
+
+    /// Presses being held for the frame now being run (or about to be); each is released once
+    /// its frames have run.
+    timed_presses: Vec<TimedPress>,
 
     /// The "total" input that was actually applied.
     current_input: Input,
@@ -221,6 +252,14 @@ struct QueuedWrite {
     data: ByteVec
 }
 
+/// A press made via [`SuperShuckieCore::press_for_frames`]: its buttons and how many more frames
+/// they are held for.
+#[derive(Copy, Clone, PartialEq, Debug)]
+struct TimedPress {
+    input: Input,
+    frames_left: u64
+}
+
 /// Defines parameters for rapid fire.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct SuperShuckieRapidFire {
@@ -265,6 +304,8 @@ impl SuperShuckieCore {
             rapid_fire_input: None,
             writes: Vec::new(),
             toggled_input: None,
+            pending_timed_presses: Vec::new(),
+            timed_presses: Vec::new(),
             current_input: Default::default(),
             input_scratch_buffer: Vec::new(),
             total_milliseconds: 0.into(),
@@ -278,6 +319,11 @@ impl SuperShuckieCore {
             replay_player: None,
             #[cfg(feature = "std")]
             follower: None,
+            #[cfg(feature = "std")]
+            link: None,
+            #[cfg(feature = "std")]
+            link_partner: None,
+            link_holding: false,
             stream_publisher: None,
             stream_snapshot_pending: false,
             stream_frames_since_hash: 0,
@@ -395,6 +441,25 @@ impl SuperShuckieCore {
     #[cfg(not(feature = "std"))]
     pub fn is_following(&self) -> bool {
         false
+    }
+
+    /// Whether this console is one end of a link cable (see [`link`]); never without `std`.
+    #[inline]
+    fn is_linked_any(&self) -> bool {
+        #[cfg(feature = "std")]
+        {
+            self.link.is_some() || self.link_partner.is_some()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
+    }
+
+    /// Whether the console is held for a link or linked (see [`link`]); never without `std`.
+    #[inline]
+    fn is_link_frozen_any(&self) -> bool {
+        self.link_holding || self.is_linked_any()
     }
 
     /// Whether the attached live replay has nothing to run yet (see [`Self::is_replay_stalled`]
@@ -568,6 +633,12 @@ impl SuperShuckieCore {
     fn do_run_fn(&mut self, run_fn: fn(&mut dyn EmulatorCore) -> RunTime, audible: bool) {
         self.last_run = RunTime::NONE;
 
+        // Held for a link handshake, or linked: a linked pair only ever steps through
+        // `run_linked`, never one console on its own.
+        if self.link_holding || self.is_linked_any() {
+            return
+        }
+
         if !self.replay_stalled {
             self.before_run();
         }
@@ -652,9 +723,11 @@ impl SuperShuckieCore {
         }
     }
 
-    /// Run unlocked until the next frame.
+    /// Run unlocked until the next frame. Does nothing while the console is linked or held for
+    /// a link (a linked pair only steps through `run_linked`; a state taken mid-frame is a valid
+    /// state on every console).
     pub fn finish_current_frame(&mut self) {
-        while self.core.is_mid_frame() && !self.replay_stalled {
+        while self.core.is_mid_frame() && !self.replay_stalled && !self.is_link_frozen_any() {
             self.run_unlocked();
         }
     }
@@ -722,9 +795,13 @@ impl SuperShuckieCore {
         self.core.as_ref()
     }
 
-    /// Set the speed multiplier of the game.
+    /// Set the speed multiplier of the game. Anything other than 1x is ignored while the console
+    /// is linked (the pair runs at the partner's pace).
     pub fn set_speed(&mut self, speed: Speed) {
         let multiplier = speed.into_multiplier_float();
+        if self.is_linked_any() && speed != Speed::from_multiplier_float(1.0) {
+            return
+        }
         self.game_speed = Speed::from_multiplier_float(multiplier);
         self.core.set_speed(multiplier);
         self.present_every = if multiplier >= 2.0 { (multiplier.floor() as u64).clamp(1, 16) } else { 1 };
@@ -954,6 +1031,13 @@ impl SuperShuckieCore {
             Packet::IncrementCounter { name, delta } => {
                 self.change_replay_counter_map(name, *delta);
             }
+            Packet::SerialIn { data } => {
+                // Link cable traffic the console received: replayed into its port, which is
+                // then in replay mode (see `emulator::link`). A core without a port ignores it.
+                if let Some(port) = self.core.link_port() && port.queue_serial_in(data.as_slice()).is_err() {
+                    self.replay_write_failures += 1;
+                }
+            }
         }
 
         #[cfg(feature = "std")]
@@ -1017,6 +1101,23 @@ impl SuperShuckieCore {
             return
         }
 
+        // Held for a link: the writes wait for the cable, which schedules them like inputs.
+        if self.link_holding {
+            return
+        }
+
+        // Linked: scheduled `delay` frames ahead with this frame's input, applied on both
+        // machines at the same frame (see `link`).
+        #[cfg(feature = "std")]
+        if let Some(link) = self.link.as_mut() {
+            let mut writes = core::mem::take(&mut self.writes);
+            for write in writes.drain(..) {
+                link.schedule(Packet::WriteMemory { address: write.address as UnsignedInteger, data: write.data });
+            }
+            self.writes = writes;
+            return
+        }
+
         if self.core.is_mid_frame() {
             return
         }
@@ -1048,6 +1149,17 @@ impl SuperShuckieCore {
     /// replay's resume seeks back to its resume point regardless of what was done live.
     pub fn hard_reset(&mut self) {
         if self.is_playing_back() {
+            return;
+        }
+        // Linked: scheduled `delay` frames ahead like an input, so both machines reset this
+        // console at the same frame; held for a link: ignored (the pair has to start from the
+        // state that was announced).
+        #[cfg(feature = "std")]
+        if let Some(link) = self.link.as_mut() {
+            link.schedule(Packet::ResetConsole);
+            return;
+        }
+        if self.link_holding {
             return;
         }
         self.finish_current_frame();
@@ -1099,9 +1211,10 @@ impl SuperShuckieCore {
         self.core.save_sram()
     }
 
-    /// Load a save state. Ignored while a replay is playing back (see [`Self::hard_reset`]).
+    /// Load a save state. Ignored while a replay is playing back (see [`Self::hard_reset`]) and
+    /// while the console is linked or held for a link (the other machine could not follow).
     pub fn load_save_state(&mut self, state: &[u8]) {
-        if self.is_playing_back() {
+        if self.is_playing_back() || self.is_link_frozen_any() {
             return
         }
 
@@ -1129,6 +1242,20 @@ impl SuperShuckieCore {
     /// Any activated buttons will be "stuck".
     pub fn set_toggled_input(&mut self, input: Option<Input>) {
         self.toggled_input = input;
+        // See `set_rapid_fire_input`.
+        self.input_latched = false;
+    }
+
+    /// Hold `input`'s buttons for exactly the next `frames` emulated frames, on top of whatever
+    /// else is held, and release them once those have run. Presses may overlap; each is released
+    /// on its own schedule.
+    ///
+    /// Ignored while a replay is playing back (it owns the console; see [`Self::hard_reset`]).
+    pub fn press_for_frames(&mut self, input: Input, frames: NonZeroU64) {
+        if self.is_playing_back() {
+            return
+        }
+        self.pending_timed_presses.push(TimedPress { input, frames_left: frames.get() });
         // See `set_rapid_fire_input`.
         self.input_latched = false;
     }
@@ -1528,6 +1655,29 @@ impl SuperShuckieCore {
         any.then_some(hash)
     }
 
+    /// The input the next frame gets: the user's, plus rapid fire, toggles and the single-frame
+    /// presses that have come due. Moves the pending timed presses to active.
+    fn compute_pending_input(&mut self) -> Input {
+        if let Some(pending_input) = self.next_input.take() {
+            self.base_input = pending_input;
+        };
+
+        let mut new_input = self.base_input;
+        if let Some(rapid_fire_input) = self.rapid_fire_input && rapid_fire_input.current_frame < rapid_fire_input.hold_length.get() {
+            new_input |= rapid_fire_input.input;
+        }
+
+        if let Some(toggled_input) = self.toggled_input {
+            new_input |= toggled_input
+        }
+
+        self.timed_presses.append(&mut self.pending_timed_presses);
+        for press in &self.timed_presses {
+            new_input |= press.input;
+        }
+        new_input
+    }
+
     fn update_input(&mut self) {
         if self.is_playing_back() {
             return
@@ -1544,18 +1694,7 @@ impl SuperShuckieCore {
         }
         self.input_latched = true;
 
-        if let Some(pending_input) = self.next_input.take() {
-            self.base_input = pending_input;
-        };
-
-        let mut new_input = self.base_input;
-        if let Some(rapid_fire_input) = self.rapid_fire_input && rapid_fire_input.current_frame < rapid_fire_input.hold_length.get() {
-            new_input |= rapid_fire_input.input;
-        }
-
-        if let Some(toggled_input) = self.toggled_input {
-            new_input |= toggled_input
-        }
+        let new_input = self.compute_pending_input();
 
         self.current_input = new_input;
         self.input_scratch_buffer.clear();
@@ -1583,11 +1722,26 @@ impl SuperShuckieCore {
         if time.frames > 0 {
             self.replay_frame_pending = false;
             self.input_latched = false;
+            // Release the timed presses whose frames have now all run.
+            self.timed_presses.retain_mut(|press| {
+                press.frames_left = press.frames_left.saturating_sub(time.frames);
+                press.frames_left > 0
+            });
 
             if let Some(rf) = self.rapid_fire_input.as_mut() {
                 // Advance the duty cycle once per emulated frame (not once per call: a paced core's
                 // `run` is polled far more often than it actually advances a frame).
                 rf.current_frame = (rf.current_frame + (time.frames % rf.total_frames)) % rf.total_frames;
+            }
+
+            // What came in over the link cable during the frame, before the frame's own marker.
+            #[cfg(feature = "std")]
+            if let Some(data) = self.take_serial_in_bytes() {
+                if self.stream_publisher.is_some() {
+                    let data = data.clone();
+                    self.with_publisher(|p| p.serial_in(data));
+                }
+                self.with_recorder(|r| r.serial_in(data));
             }
 
             if !self.is_playing_back() {
@@ -1598,6 +1752,21 @@ impl SuperShuckieCore {
                     self.with_publisher(|p| p.next_frame(ms));
                 }
             }
+            else {
+                // The lent partner of a link: its clock advanced by a nominal frame when its link
+                // frame was applied (see `link`); its file gets the frame marker here, after the
+                // frame's link traffic, like a publisher's would.
+                #[cfg(feature = "std")]
+                if self.link_partner.is_some() {
+                    let ms = self.recording_millis();
+                    for _ in 0..time.frames {
+                        self.with_recorder(|f| f.next_frame(ms));
+                    }
+                }
+            }
+
+            #[cfg(feature = "std")]
+            self.link_frame_completed(time.frames);
         }
     }
 
@@ -1672,6 +1841,11 @@ impl SuperShuckieCore {
         if self.stream_publisher.is_some() {
             return Err(ReplayPlayerAttachError::Incompatible {
                 description: String::from("This console is being published to other players; leave the Play Together session first.")
+            })
+        }
+        if self.is_link_frozen_any() {
+            return Err(ReplayPlayerAttachError::Incompatible {
+                description: String::from("Unplug the link cable first.")
             })
         }
 
@@ -1781,9 +1955,11 @@ impl SuperShuckieCore {
         self.total_frames = resume_frames;
     }
 
-    /// Reset the current input.
+    /// Reset the current input, including any timed presses still running or yet to run.
     pub fn reset_input(&mut self) {
         self.enqueue_input(Input::new());
+        self.pending_timed_presses.clear();
+        self.timed_presses.clear();
     }
 
     /// Minimum number of frames emulated after loading a keyframe when seeking.
@@ -2337,6 +2513,10 @@ mod tests {
         fn frame_rate(&self) -> (u32, u32) {
             (60, 1)
         }
+
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
+        }
     }
 
     /// A core modelled on the Game Boy core's sub-frame stepping: `run`/`run_unlocked` report
@@ -2345,13 +2525,24 @@ mod tests {
         steps_before_frame: u8,
         step: u8,
         mid_frame: bool,
+        input_byte: u8,
+        /// The input byte active on every frame that completed, oldest first.
+        frame_inputs: Arc<Mutex<Vec<u8>>>,
         rom_checksum: ReplayHeaderBlake3Hash,
         bios_checksum: ReplayHeaderBlake3Hash
     }
 
     impl FakeSlicedCore {
         fn new(steps_before_frame: u8) -> Self {
-            Self { steps_before_frame, step: 0, mid_frame: false, rom_checksum: [0; 32], bios_checksum: [0; 32] }
+            Self {
+                steps_before_frame,
+                step: 0,
+                mid_frame: false,
+                input_byte: 0,
+                frame_inputs: Arc::new(Mutex::new(Vec::new())),
+                rom_checksum: [0; 32],
+                bios_checksum: [0; 32]
+            }
         }
     }
 
@@ -2369,6 +2560,7 @@ mod tests {
             else {
                 self.step = 0;
                 self.mid_frame = false;
+                self.frame_inputs.lock().unwrap().push(self.input_byte);
                 RunTime::ONE_FRAME
             }
         }
@@ -2396,11 +2588,13 @@ mod tests {
             Ok(())
         }
 
-        fn encode_input(&self, _input: Input, into: &mut Vec<u8>) {
-            into.clear();
+        fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
+            into.push(input.a as u8);
         }
 
-        fn set_input_encoded(&mut self, _input: &[u8]) {}
+        fn set_input_encoded(&mut self, input: &[u8]) {
+            self.input_byte = input.first().copied().unwrap_or(0);
+        }
 
         fn get_screens(&self) -> &[ScreenData] {
             &[]
@@ -2435,6 +2629,10 @@ mod tests {
 
         fn is_mid_frame(&self) -> bool {
             self.mid_frame
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+            self
         }
     }
 
@@ -2540,6 +2738,88 @@ mod tests {
         let seen = log.lock().unwrap().clone();
         let expected: Vec<u8> = (0..12u8).map(|i| u8::from((i % 6) < 3)).collect();
         assert_eq!(seen, expected, "rapid fire should hold for 3 frames then release for 3, repeating");
+    }
+
+    /// A timed press holds the button for exactly its frames, starting with the very next one
+    /// however many pacing-miss polls come between, and is released again on its own; presses
+    /// that overlap each run their own course; on top of a button that is held normally it
+    /// changes nothing, and releasing the held button is still the user's.
+    #[test]
+    fn timed_press_holds_for_exactly_its_frames_on_a_paced_core() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let a = Input { a: true, ..Input::default() };
+        let three = NonZeroU64::new(3).unwrap();
+
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        core.press_for_frames(a, three);
+        for _ in 0..10 {
+            core.run();
+            assert_eq!(core.last_run_time().frames, 0, "not yet time for a frame");
+        }
+        for _ in 0..5 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 1, 1, 1, 0, 0], "three frames pressed, then released");
+
+        // A press that arrives after the first poll of the interval has already applied the
+        // input must still make the very next frame; a second press two frames in extends the
+        // hold by its own three frames from there (five in all).
+        core.run();
+        core.press_for_frames(a, three);
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        core.press_for_frames(a, three);
+        for _ in 0..4 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0]);
+
+        // Held normally: the timed press neither presses nor releases anything.
+        core.enqueue_input(a);
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        core.press_for_frames(a, three);
+        for _ in 0..4 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        core.enqueue_input(Input::default());
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0]);
+    }
+
+    /// The Game Boy core is stepped in sub-frame slices, and the input is only applied between
+    /// frames: a timed press that lands in the middle of a frame must get its whole hold from
+    /// the next frame on rather than lose a frame to the one under way, and must then still be
+    /// released after exactly its frames.
+    #[test]
+    fn timed_press_mid_frame_starts_on_the_next_whole_frame_on_a_sliced_core() {
+        let fake_core = FakeSlicedCore::new(2);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(FakeClock::new()));
+
+        let run_frame = |core: &mut SuperShuckieCore| {
+            let target = core.total_frames() + 1;
+            while core.total_frames() < target {
+                core.run_unlocked();
+            }
+        };
+
+        run_frame(&mut core);
+
+        // First slice of the next frame applies the (empty) input; the press comes after it.
+        core.run_unlocked();
+        assert!(core.is_mid_frame());
+        core.press_for_frames(Input { a: true, ..Input::default() }, NonZeroU64::new(3).unwrap());
+        run_frame(&mut core);
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 0], "the frame already under way is unaffected");
+
+        for _ in 0..4 {
+            run_frame(&mut core);
+        }
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 0, 1, 1, 1, 0], "the next three whole frames get the press, the one after does not");
     }
 
     /// The thread loop polls a paced core's `run` many times per emulated frame (it wakes 1 ms
@@ -3073,6 +3353,7 @@ mod tests {
         Reset,
         LoadState(Vec<u8>),
         Counter(String, i64),
+        SerialIn(Vec<u8>),
         SyncHash(u64, [u8; 32]),
         End
     }
@@ -3112,6 +3393,9 @@ mod tests {
         }
         fn change_counter(&mut self, name: String, delta: SignedInteger) {
             self.0.lock().unwrap().push(StreamEvent::Counter(name, delta));
+        }
+        fn serial_in(&mut self, data: ByteVec) {
+            self.0.lock().unwrap().push(StreamEvent::SerialIn(data.to_vec()));
         }
         fn sync_hash(&mut self, frame: UnsignedInteger, hash: [u8; 32]) {
             self.0.lock().unwrap().push(StreamEvent::SyncHash(frame, hash));

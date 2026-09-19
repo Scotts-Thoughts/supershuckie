@@ -16,15 +16,15 @@ use crate::code::JoinCode;
 use crate::compat::sanitize_display_name;
 use crate::conn::{writer_loop, ConnShared, Outbound, PushError, Stats};
 use crate::error::{DisconnectReason, Phase, PlayTogetherError, PublishError};
-use crate::protocol::{decode_packets, read_frame, LeaveReason, Message, ParticipantInfo, ReadError, PROTOCOL_VERSION};
+use crate::protocol::{decode_packets, read_frame, LeaveReason, LinkMessage, Message, ParticipantInfo, ReadError, PROTOCOL_VERSION};
 use crate::session::follow::{FollowSlot, StreamOutcome};
 use crate::session::host::HOST_PEER_ID;
 use crate::session::{
-    base_stats, join_bounded, leave_reason_for, ClientConfig, Coalescer, EventQueue, FollowerSink, PublishBackend, PublisherHandle, Role,
-    Session, SessionEvent, SessionStats, GOODBYE_GRACE, LEAVE_TIMEOUT, POLL_INTERVAL,
+    base_stats, join_bounded, leave_reason_for, receive_link, spawn_session_thread, ClientConfig, Coalescer, EventQueue, FollowerSink, LinkSink, LinkSinks,
+    PublishBackend, PublisherHandle, Role, Session, SessionEvent, SessionStats, GOODBYE_GRACE, LEAVE_TIMEOUT, POLL_INTERVAL,
 };
 use crate::transport::{resolve, Connection, TcpTransport, Transport};
-use crate::{LocalParticipant, PeerId, SessionId};
+use crate::{LocalParticipant, PeerId, SessionId, StartStateData};
 
 /// A session joined as a client.
 pub struct ClientSession {
@@ -45,6 +45,8 @@ struct ClientShared {
     stats: Arc<Stats>,
     coalescer: Mutex<Coalescer>,
     disconnected: Mutex<Option<DisconnectReason>>,
+    /// Where our link partner's frames go.
+    link_sinks: LinkSinks,
 }
 
 #[derive(Default)]
@@ -68,13 +70,13 @@ impl ClientSession {
         Self::connect_with(TcpTransport, code, config, local)
     }
 
-    /// Connect through `transport`.
     /// Whether the session has ended (for any reason) rather than never having started; the
     /// reason arrives as a `Disconnected` event.
     pub fn has_disconnected(&self) -> bool {
         self.shared.disconnected_reason().is_some()
     }
 
+    /// Connect through `transport`.
     pub fn connect_with<T: Transport>(transport: T, code: JoinCode, config: ClientConfig, local: LocalParticipant) -> ClientSession {
         let shared = Arc::new(ClientShared {
             config,
@@ -89,10 +91,11 @@ impl ClientSession {
             stats: Arc::new(Stats::default()),
             coalescer: Mutex::new(Coalescer::default()),
             disconnected: Mutex::new(None),
+            link_sinks: LinkSinks::default(),
         });
         let connect = {
             let shared = Arc::clone(&shared);
-            std::thread::Builder::new().name("pt-client-connect".to_owned()).spawn(move || connect_thread(shared, transport))
+            spawn_session_thread("pt-client-connect".to_owned(), move || connect_thread(shared, transport))
         };
         let threads = match connect {
             Ok(handle) => vec![handle],
@@ -173,7 +176,7 @@ fn connect_thread<T: Transport>(shared: Arc<ClientShared>, transport: T) {
     let writer = {
         let shared = Arc::clone(&shared);
         let conn = Arc::clone(&conn);
-        std::thread::Builder::new().name("pt-client-writer".to_owned()).spawn(move || {
+        spawn_session_thread("pt-client-writer".to_owned(), move || {
             let warn = |text: String| shared.events.push(SessionEvent::Warning(text));
             if let Err(e) = writer_loop(write, &conn, &warn) {
                 shared.disconnect(DisconnectReason::IoError(e.to_string()));
@@ -185,13 +188,14 @@ fn connect_thread<T: Transport>(shared: Arc<ClientShared>, transport: T) {
         replay_version: REPLAY_VERSION,
         app_version: shared.local.app_version.clone(),
         display_name: shared.local.display_name.clone(),
+        color: shared.local.color,
         publisher: shared.local.publisher.clone(),
     };
     let _ = conn.send(&hello);
     let reader = {
         let shared = Arc::clone(&shared);
         let conn = Arc::clone(&conn);
-        std::thread::Builder::new().name("pt-client-reader".to_owned()).spawn(move || reader_thread(shared, conn, read))
+        spawn_session_thread("pt-client-reader".to_owned(), move || reader_thread(shared, conn, read))
     };
     let mut inner = shared.lock();
     match (reader, writer) {
@@ -232,6 +236,7 @@ impl ClientShared {
         for slot in follows.values() {
             slot.end(ended);
         }
+        self.link_sinks.end_all(ended);
         // A Goodbye or Error we queued should still get out; anything else is moot.
         let flush = matches!(reason, DisconnectReason::Left | DisconnectReason::ProtocolError(_));
         if let Some(conn) = conn {
@@ -274,7 +279,7 @@ impl ClientShared {
         self.lock().participants.get(&peer).map(|p| p.display_name.clone()).unwrap_or_else(|| format!("peer {peer}"))
     }
 
-    fn on_welcome(&self, your_peer_id: PeerId, session_id: SessionId, your_display_name: String, participants: Vec<ParticipantInfo>) {
+    fn on_welcome(&self, your_peer_id: PeerId, session_id: SessionId, your_display_name: String, your_color: u8, participants: Vec<ParticipantInfo>) {
         {
             let mut inner = self.lock();
             for p in &participants {
@@ -285,7 +290,7 @@ impl ClientShared {
         self.local_id.store(your_peer_id, Ordering::Release);
         self.session_id.store(session_id, Ordering::Release);
         self.connected.store(true, Ordering::Release);
-        self.events.push(SessionEvent::Connected { session_id, local_peer_id: your_peer_id, local_display_name: your_display_name, participants });
+        self.events.push(SessionEvent::Connected { session_id, local_peer_id: your_peer_id, local_display_name: your_display_name, local_color: your_color, participants });
     }
 
     /// One message after admission.
@@ -323,12 +328,24 @@ impl ClientShared {
                 };
                 self.coalescer.lock().unwrap_or_else(|e| e.into_inner()).forget(peer_id);
                 self.events.push(SessionEvent::Left { peer_id, reason });
+                self.link_sinks.end(peer_id, reason);
                 if let Some(slot) = slot {
                     slot.end(reason);
                 }
             }
             Message::ResetAll { race_id, countdown_millis } => {
                 self.events.push(SessionEvent::ResetAll { race_id, deadline: Instant::now() + Duration::from_millis(u64::from(countdown_millis)) });
+            }
+            Message::SyncPause { enabled, paused } => self.events.push(SessionEvent::SyncPauseChanged { enabled, paused }),
+            Message::StartState(wire) => match wire.into_state() {
+                Ok(state) => self.events.push(SessionEvent::StartStateChanged { state }),
+                Err(e) => self.protocol_error(conn, e.to_string()),
+            },
+            Message::Pause { from, paused } => {
+                if from == 0 || from == local_id {
+                    return self.protocol_error(conn, "a Pause relayed without its sender, or our own".to_owned());
+                }
+                self.events.push(SessionEvent::PauseChanged { from, paused });
             }
             Message::Stream { from, first_frame, bytes } => {
                 let Some(slot) = self.follow_slot(from) else { return };
@@ -382,6 +399,22 @@ impl ClientShared {
             }
             Message::Goodbye => self.disconnect(DisconnectReason::HostLeft),
             Message::Error { text } => self.disconnect(DisconnectReason::ProtocolError(format!("the host reported: {text}"))),
+            Message::LinkRequest { .. } | Message::LinkAccept { .. } | Message::LinkDecline { .. } | Message::LinkStart { .. } | Message::LinkFrame { .. } | Message::Unlink { .. } => {
+                let (from, target) = message.link_endpoints().unwrap_or((0, 0));
+                if from == 0 || from == local_id {
+                    return self.protocol_error(conn, "a link cable message relayed without its sender, or our own".to_owned());
+                }
+                if target != local_id {
+                    // Not for us: the host never relays these to anyone but the target.
+                    return self.protocol_error(conn, "a link cable message for someone else".to_owned());
+                }
+                if let Err(text) = receive_link(&self.events, &self.link_sinks, &self.stats, message) {
+                    self.protocol_error(conn, text);
+                }
+            }
+            Message::PeerLinked { .. } | Message::PeerUnlinked { .. } => {
+                let _ = receive_link(&self.events, &self.link_sinks, &self.stats, message);
+            }
         }
     }
 }
@@ -433,8 +466,8 @@ fn reader_thread<R: Read>(shared: Arc<ClientShared>, conn: Arc<ConnShared>, mut 
         };
         if in_handshake {
             match message {
-                Message::Welcome { your_peer_id, session_id, your_display_name, participants } => {
-                    shared.on_welcome(your_peer_id, session_id, your_display_name, participants);
+                Message::Welcome { your_peer_id, session_id, your_display_name, your_color, participants } => {
+                    shared.on_welcome(your_peer_id, session_id, your_display_name, your_color, participants);
                 }
                 Message::Refused { reason, text } => return shared.disconnect(DisconnectReason::Refused { reason, text }),
                 Message::Error { text } => return shared.disconnect(DisconnectReason::ProtocolError(format!("the host reported: {text}"))),
@@ -539,8 +572,62 @@ impl Session for ClientSession {
         Err(PlayTogetherError::NotHost)
     }
 
+    fn set_sync_pause(&self, _enabled: bool, _paused: bool) -> Result<(), PlayTogetherError> {
+        Err(PlayTogetherError::NotHost)
+    }
+
+    fn set_start_state(&self, _state: Option<StartStateData>) -> Result<(), PlayTogetherError> {
+        Err(PlayTogetherError::NotHost)
+    }
+
+    fn send_pause(&self, paused: bool) -> Result<(), PlayTogetherError> {
+        if let Some(reason) = self.shared.disconnected_reason() {
+            return Err(PlayTogetherError::Disconnected(reason));
+        }
+        if !self.shared.connected.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::NotConnected);
+        }
+        let Some(conn) = self.shared.conn() else {
+            return Err(PlayTogetherError::NotConnected);
+        };
+        // The host fills `from` in.
+        let _ = conn.send(&Message::Pause { from: 0, paused });
+        Ok(())
+    }
+
     fn kick(&self, _peer: PeerId) -> Result<(), PlayTogetherError> {
         Err(PlayTogetherError::NotHost)
+    }
+
+    fn send_link(&self, message: LinkMessage) -> Result<(), PlayTogetherError> {
+        if let Some(reason) = self.shared.disconnected_reason() {
+            return Err(PlayTogetherError::Disconnected(reason));
+        }
+        if !self.shared.connected.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::NotConnected);
+        }
+        let Some(conn) = self.shared.conn() else {
+            return Err(PlayTogetherError::NotConnected);
+        };
+        let target = message.target();
+        let local_id = self.shared.local_id.load(Ordering::Acquire);
+        if target == 0 || target == local_id || (target != HOST_PEER_ID && !self.shared.lock().participants.contains_key(&target)) {
+            return Err(PlayTogetherError::NoSuchPeer(target));
+        }
+        // The host stamps `from` anyway; filling it in keeps the bytes honest.
+        let raw = Arc::new(Message::from_link(local_id, message).encoded());
+        match conn.send_urgent(raw) {
+            Ok(()) => Ok(()),
+            Err(PushError::Full { queued_bytes }) => {
+                self.shared.disconnect(DisconnectReason::TooSlow { queued_bytes });
+                Err(PlayTogetherError::Disconnected(DisconnectReason::TooSlow { queued_bytes }))
+            }
+            Err(PushError::Closed) => Err(PlayTogetherError::Disconnected(self.shared.disconnected_reason().unwrap_or(DisconnectReason::Left))),
+        }
+    }
+
+    fn set_link_sink(&self, peer: PeerId, sink: Option<Box<dyn LinkSink>>) {
+        self.shared.link_sinks.set(peer, sink);
     }
 
     fn stats(&self) -> SessionStats {

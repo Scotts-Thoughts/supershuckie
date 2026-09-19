@@ -1,6 +1,8 @@
+use crate::emulator::link::{GbSerialEvent, GbSerialEvents, LinkError, LinkPort};
 use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -30,6 +32,17 @@ use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderB
 /// second, [`ShadowAudio`] instance of the same ROM runs one `GB_run` behind it in lockstep at
 /// [`AUDIO_SAMPLE_RATE`] and only its samples are used; it is resynced from the emulated
 /// instance's state the moment its instruction stream drifts (which the bounce quirk can cause).
+///
+/// # Link cable
+///
+/// The console's serial port is a [`LinkPort`] (see [`crate::emulator::link`]). Live, the
+/// partner's SameBoy instance is reachable from this instance's serial callbacks for the duration
+/// of one [`LinkPort::step_linked`]: a bit this console clocks out is shifted into the partner
+/// (and the partner's outgoing bit read) right there, the way SameBoy's own frontend links two
+/// windows. Everything received is logged per frame as [`GbSerialEvents`]; in replay mode the same
+/// events are fed back at the same points of the instruction stream. The audio shadow gets the
+/// same bits its emulated instance got, at the same step boundaries, so it never diverges over a
+/// transfer.
 pub struct GameBoyColor {
     core: Gameboy,
     turbo_mode: TurboMode,
@@ -72,11 +85,90 @@ struct RegionSource {
 
 struct GameBoyCallbackData {
     run_frames: AtomicU32,
-    screen: UnsafeCell<ScreenData>
+    screen: UnsafeCell<ScreenData>,
+    /// The link port's state; only ever touched from the thread stepping the core (by
+    /// [`GameBoyColor`] itself and by the serial callbacks it triggers, including the partner's).
+    link: UnsafeCell<GbLinkState>
 }
 
 unsafe impl Send for GameBoyCallbackData {}
 unsafe impl Sync for GameBoyCallbackData {}
+
+/// What the port is doing (see [`LinkPort`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum LinkMode {
+    /// No cable: the serial callbacks are not installed.
+    Off,
+    /// Plugged into a partner instance, reached through [`GbLinkState::partner`] during a step.
+    Live,
+    /// Fed what a live instance once received.
+    Replay
+}
+
+/// The state of the serial port as a link cable end.
+struct GbLinkState {
+    mode: LinkMode,
+
+    /// For the duration of one [`LinkPort::step_linked`]: the partner's pinned instance and its
+    /// callback data (to log the bits shifted into it). Null pointers otherwise.
+    partner: *mut RunningGameboy,
+    partner_data: *const GameBoyCallbackData,
+
+    /// The bit announced by the last `serial_transfer_bit_start`, sent at the next bit end.
+    bit_to_send: bool,
+
+    /// Emulated 8 MHz cycles since [`LinkPort::connect`].
+    link_time: u64,
+
+    /// Emulated 8 MHz cycles since the last step that completed a frame: the position slave bits
+    /// are logged at (they arrive between this console's steps, from the partner's).
+    link_cycles: u64,
+
+    /// Events received since the log was last taken (see [`LinkPort::take_serial_in`]).
+    log: Vec<GbSerialEvent>,
+
+    /// Replay mode: master bits still to hand to the callbacks, in order.
+    replay_master: VecDeque<bool>,
+
+    /// Replay mode: slave bits still to shift in, as `(link_cycles, bit)` in cycle order.
+    replay_slave: VecDeque<(u64, bool)>,
+
+    /// Replay mode: whether the recording says a cable was plugged in (an empty master queue is
+    /// then a miss, not "no cable").
+    replay_connected: bool,
+
+    /// See [`LinkPort::serial_replay_misses`].
+    misses: u64,
+
+    /// Bits the master callbacks received during the current step: the shadow's instance gets
+    /// them queued before its own step.
+    step_master_bits: Vec<bool>,
+
+    /// Bits shifted into the emulated instance as a slave since the shadow last stepped (live
+    /// mode: by the partner, between this console's steps); applied to the shadow before its
+    /// next step.
+    shadow_pending_slave: Vec<bool>
+}
+
+impl GbLinkState {
+    fn new() -> Self {
+        Self {
+            mode: LinkMode::Off,
+            partner: core::ptr::null_mut(),
+            partner_data: core::ptr::null(),
+            bit_to_send: false,
+            link_time: 0,
+            link_cycles: 0,
+            log: Vec::new(),
+            replay_master: VecDeque::new(),
+            replay_slave: VecDeque::new(),
+            replay_connected: false,
+            misses: 0,
+            step_master_bits: Vec::new(),
+            shadow_pending_slave: Vec::new()
+        }
+    }
+}
 
 /// See [`GameBoyColor`]'s audio notes.
 struct ShadowAudio {
@@ -92,7 +184,11 @@ struct ShadowAudio {
 
 struct ShadowCallbackData {
     /// Interleaved stereo samples rendered since the last `take_audio`.
-    audio: UnsafeCell<Vec<i16>>
+    audio: UnsafeCell<Vec<i16>>,
+    /// Master bits the emulated instance received this step, for the shadow's own transfer.
+    master_bits: UnsafeCell<VecDeque<bool>>,
+    /// Whether the shadow asked for a master bit the queue did not have (a divergence).
+    missed: UnsafeCell<bool>
 }
 
 unsafe impl Send for ShadowCallbackData {}
@@ -108,6 +204,19 @@ impl GameboyCallbacks for ShadowCallbackHandler {
         let audio = unsafe { &mut *self.data.audio.get() };
         audio.push(left);
         audio.push(right);
+    }
+
+    fn serial_transfer_bit_end(&mut self, _instance: &mut RunningGameboy) -> bool {
+        // SAFETY: as above.
+        let bits = unsafe { &mut *self.data.master_bits.get() };
+        match bits.pop_front() {
+            Some(bit) => bit,
+            None => {
+                // SAFETY: as above.
+                unsafe { *self.data.missed.get() = true };
+                true
+            }
+        }
     }
 }
 
@@ -129,7 +238,11 @@ impl ShadowAudio {
         gb.set_clock_multiplier(speed);
         gb.set_sample_rate(AUDIO_SAMPLE_RATE);
 
-        let data = Arc::new(ShadowCallbackData { audio: UnsafeCell::new(Vec::new()) });
+        let data = Arc::new(ShadowCallbackData {
+            audio: UnsafeCell::new(Vec::new()),
+            master_bits: UnsafeCell::new(VecDeque::new()),
+            missed: UnsafeCell::new(false)
+        });
         gb.set_callbacks(Some(Box::new(ShadowCallbackHandler { data: data.clone() })));
 
         Self { gb, data, cycles: 0, frames_since_check: 0, resyncs: 0 }
@@ -140,9 +253,19 @@ impl ShadowAudio {
         unsafe { &mut *self.data.audio.get() }
     }
 
-    /// Make the shadow a copy of `main`. Both cycle counters restart from zero: the caller
-    /// resets its own.
-    fn sync_from(&mut self, main: &Gameboy, input_mask: u8) {
+    fn master_bits(&mut self) -> &mut VecDeque<bool> {
+        // SAFETY: as above.
+        unsafe { &mut *self.data.master_bits.get() }
+    }
+
+    fn take_missed(&mut self) -> bool {
+        // SAFETY: as above.
+        core::mem::take(unsafe { &mut *self.data.missed.get() })
+    }
+
+    /// Make the shadow a copy of `main`, with the same link cable situation. Both cycle
+    /// counters restart from zero: the caller resets its own.
+    fn sync_from(&mut self, main: &Gameboy, input_mask: u8, link_mode: LinkMode) {
         let mut state = main.create_save_state();
         // The emulated instance runs its APU lazily in batches of up to 1024 cycles; the shadow,
         // with a sample rate, batches by ~44 and asserts on more than ~175 pending at once. Drop
@@ -150,6 +273,16 @@ impl ShadowAudio {
         zero_pending_apu_cycles(&mut state);
         let _ = self.gb.load_save_state(&state);
         self.gb.set_input_button_mask(input_mask);
+        // The callbacks are not part of a state; the shadow talks to nobody but reads the bits
+        // its instance got, so it needs the callbacks exactly when the emulated instance has them.
+        if link_mode == LinkMode::Off {
+            self.gb.disconnect_serial();
+        }
+        else {
+            self.gb.connect_serial();
+        }
+        self.master_bits().clear();
+        self.take_missed();
         self.cycles = 0;
         self.frames_since_check = 0;
     }
@@ -186,7 +319,8 @@ impl GameBoyColor {
 
         let callback_data = Arc::new(GameBoyCallbackData {
             run_frames: AtomicU32::new(0),
-            screen: UnsafeCell::new(screen_data)
+            screen: UnsafeCell::new(screen_data),
+            link: UnsafeCell::new(GbLinkState::new())
         });
 
         core.set_callbacks(Some(Box::new(CallbackHandler { callback_data: callback_data.clone() })));
@@ -219,29 +353,90 @@ impl GameBoyColor {
         self.shadow.as_ref().map(|s| s.resyncs).unwrap_or(0)
     }
 
+    fn link(&mut self) -> &mut GbLinkState {
+        // SAFETY: `self` is mutably borrowed, so neither instance is running and no callback
+        // (this instance's or a partner's) can be touching the state.
+        unsafe { &mut *self.callback_data.link.get() }
+    }
+
+    fn link_ref(&self) -> &GbLinkState {
+        // SAFETY: as above; nothing runs without a mutable borrow.
+        unsafe { &*self.callback_data.link.get() }
+    }
+
     /// Step the emulated instance once and keep the shadow, if any, in lockstep with it.
     fn step(&mut self) -> RunTime {
+        let link_mode = self.link().mode;
+        debug_assert!(
+            link_mode != LinkMode::Live || !self.link().partner.is_null(),
+            "a live link port must be stepped through LinkPort::step_linked"
+        );
+
+        // Slave bits the partner shifted into the emulated instance since the last step (live
+        // mode); the shadow gets them before its own step, like the emulated instance did.
+        let shadow_slave = core::mem::take(&mut self.link().shadow_pending_slave);
+        self.link().step_master_bits.clear();
+
         let cycles = self.core.run() as u64;
         self.cycles += cycles;
         let frames = self.callback_data.run_frames.swap(0, Ordering::Relaxed) as u64;
         self.mid_frame = frames == 0;
+        debug_assert!(frames <= 1, "one GB_run completed {frames} frames");
+
+        // Link time bookkeeping, then the slave bits a recording says arrived at this boundary.
+        let mut applied_now: Vec<bool> = Vec::new();
+        if link_mode != LinkMode::Off {
+            let link = self.link();
+            link.link_time += cycles;
+            link.link_cycles += cycles;
+            if link_mode == LinkMode::Replay {
+                let at = link.link_cycles;
+                while let Some(&(cycles_at, bit)) = link.replay_slave.front() {
+                    if cycles_at > at && frames == 0 {
+                        break
+                    }
+                    // Past its moment (or the frame is over and it never came due): applied late
+                    // rather than dropped, so the byte count the game sees stays right.
+                    if cycles_at != at {
+                        link.misses += 1;
+                    }
+                    link.replay_slave.pop_front();
+                    applied_now.push(bit);
+                }
+                for bit in &applied_now {
+                    self.core.serial_set_data_bit(*bit);
+                }
+            }
+            if frames > 0 {
+                self.link().link_cycles = 0;
+            }
+        }
 
         if let Some(shadow) = self.shadow.as_mut() {
             // Same instruction stream, same step sizes: one GB_run each keeps them exactly
             // aligned, so a cycle count that differs means the shadow took another path (the
             // joypad-bounce quirk); a state check every so often is the backstop for a
             // divergence that did not change the step sizes.
+            for bit in shadow_slave {
+                shadow.gb.serial_set_data_bit(bit);
+            }
+            // SAFETY: `self` is mutably borrowed (see `link`).
+            let step_master_bits = unsafe { &(*self.callback_data.link.get()).step_master_bits };
+            shadow.master_bits().extend(step_master_bits.iter().copied());
             shadow.cycles += shadow.gb.run() as u64;
             shadow.frames_since_check += frames as u32;
+            for bit in &applied_now {
+                shadow.gb.serial_set_data_bit(*bit);
+            }
 
-            let mut diverged = shadow.cycles != self.cycles;
+            let mut diverged = shadow.cycles != self.cycles || shadow.take_missed() || !shadow.master_bits().is_empty();
             if !diverged && shadow.frames_since_check >= ShadowAudio::CHECK_EVERY_FRAMES {
                 shadow.frames_since_check = 0;
                 diverged = !same_observable_state(&self.core, &shadow.gb);
             }
             if diverged {
                 shadow.resyncs += 1;
-                shadow.sync_from(&self.core, self.input_mask);
+                shadow.sync_from(&self.core, self.input_mask, link_mode);
                 self.cycles = 0;
             }
         }
@@ -252,8 +447,9 @@ impl GameBoyColor {
     /// Bring the shadow back to the emulated instance's state after something other than a
     /// step changed it (a state load, a reset).
     fn resync_shadow(&mut self) {
+        let link_mode = self.link().mode;
         if let Some(shadow) = self.shadow.as_mut() {
-            shadow.sync_from(&self.core, self.input_mask);
+            shadow.sync_from(&self.core, self.input_mask, link_mode);
             self.cycles = 0;
         }
     }
@@ -301,6 +497,193 @@ impl GameboyCallbacks for CallbackHandler {
 
         screen.pixels.copy_from_slice(instance.get_pixel_buffer_pixels());
         self.callback_data.run_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn serial_transfer_bit_start(&mut self, _instance: &mut RunningGameboy, bit: bool) {
+        // SAFETY: as in `vblank`.
+        let link = unsafe { &mut *self.callback_data.link.get() };
+        link.bit_to_send = bit;
+    }
+
+    fn serial_transfer_bit_end(&mut self, _instance: &mut RunningGameboy) -> bool {
+        // SAFETY: as in `vblank`.
+        let link = unsafe { &mut *self.callback_data.link.get() };
+        match link.mode {
+            LinkMode::Live => {
+                if link.partner.is_null() {
+                    // Not inside `step_linked`; there is nobody at the other end right now.
+                    return true
+                }
+                // SAFETY: `step_linked` set these for exactly this step: the partner instance is
+                // alive, not running and not otherwise borrowed (its `GameBoyColor` is behind the
+                // `&mut` that `step_linked` holds and does not use until the pointers are cleared),
+                // and only this thread touches either instance.
+                let partner = unsafe { &mut *link.partner };
+                let partner_link = unsafe { &mut *(*link.partner_data).link.get() };
+                let got = partner.serial_get_data_bit();
+                partner.serial_set_data_bit(link.bit_to_send);
+                partner_link.log.push(GbSerialEvent::SlaveBit { cycles: partner_link.link_cycles, bit: link.bit_to_send });
+                partner_link.shadow_pending_slave.push(link.bit_to_send);
+                link.log.push(GbSerialEvent::MasterBit(got));
+                link.step_master_bits.push(got);
+                got
+            }
+            LinkMode::Replay => match link.replay_master.pop_front() {
+                Some(bit) => {
+                    link.step_master_bits.push(bit);
+                    bit
+                }
+                None => {
+                    if link.replay_connected {
+                        link.misses += 1;
+                    }
+                    // What SameBoy returns with no cable.
+                    true
+                }
+            },
+            LinkMode::Off => true
+        }
+    }
+}
+
+impl LinkPort for GameBoyColor {
+    fn step_linked(&mut self, partner: &mut dyn EmulatorCore, paced: bool) -> Result<RunTime, LinkError> {
+        let partner = partner.as_any_mut().downcast_mut::<GameBoyColor>().ok_or(LinkError::IncompatiblePartner)?;
+        if self.link().mode != LinkMode::Live || partner.link().mode != LinkMode::Live {
+            return Err(LinkError::NotConnected)
+        }
+        let partner_ptr = partner.core.running_instance_ptr();
+        let partner_data = Arc::as_ptr(&partner.callback_data);
+        {
+            let link = self.link();
+            link.partner = partner_ptr;
+            link.partner_data = partner_data;
+        }
+        let time = if paced {
+            self.step()
+        }
+        else {
+            self.core.set_turbo_mode(TurboMode::Enabled);
+            let time = self.step();
+            self.core.set_turbo_mode(self.turbo_mode);
+            time
+        };
+        let link = self.link();
+        link.partner = core::ptr::null_mut();
+        link.partner_data = core::ptr::null();
+        Ok(time)
+    }
+
+    fn link_time(&self) -> u64 {
+        self.link_ref().link_time
+    }
+
+    fn connect(&mut self, _first: bool) -> Result<(), LinkError> {
+        if self.link().mode == LinkMode::Live {
+            return Err(LinkError::NotConnected)
+        }
+        {
+            let link = self.link();
+            link.mode = LinkMode::Live;
+            link.link_time = 0;
+            link.link_cycles = 0;
+            link.replay_master.clear();
+            link.replay_slave.clear();
+            link.replay_connected = false;
+            link.step_master_bits.clear();
+            link.shadow_pending_slave.clear();
+            link.log.push(GbSerialEvent::Connected(true));
+        }
+        self.core.connect_serial();
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.gb.connect_serial();
+            shadow.master_bits().clear();
+        }
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        let mode = self.link().mode;
+        if mode == LinkMode::Off {
+            return
+        }
+        {
+            let link = self.link();
+            if mode == LinkMode::Live {
+                link.log.push(GbSerialEvent::Connected(false));
+            }
+            link.mode = LinkMode::Off;
+            link.partner = core::ptr::null_mut();
+            link.partner_data = core::ptr::null();
+            link.replay_master.clear();
+            link.replay_slave.clear();
+            link.replay_connected = false;
+            link.shadow_pending_slave.clear();
+        }
+        self.core.disconnect_serial();
+        if let Some(shadow) = self.shadow.as_mut() {
+            shadow.gb.disconnect_serial();
+            shadow.master_bits().clear();
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.link_ref().mode == LinkMode::Live
+    }
+
+    fn take_serial_in(&mut self, into: &mut Vec<u8>) {
+        let log = core::mem::take(&mut self.link().log);
+        GbSerialEvents::encode(&log, into);
+    }
+
+    fn queue_serial_in(&mut self, data: &[u8]) -> Result<(), LinkError> {
+        let events = GbSerialEvents::decode(data)?;
+        if self.link().mode == LinkMode::Live {
+            // A live port hears the real partner; a recording of what somebody else once heard
+            // has no business here.
+            return Err(LinkError::NotConnected)
+        }
+        if self.link().mode == LinkMode::Off {
+            self.link().mode = LinkMode::Replay;
+            self.link().link_time = 0;
+            self.link().link_cycles = 0;
+            self.core.connect_serial();
+            if let Some(shadow) = self.shadow.as_mut() {
+                shadow.gb.connect_serial();
+                shadow.master_bits().clear();
+            }
+        }
+        let mut due_now = Vec::new();
+        {
+            let link = self.link();
+            for event in events {
+                match event {
+                    GbSerialEvent::MasterBit(bit) => link.replay_master.push_back(bit),
+                    GbSerialEvent::SlaveBit { cycles, bit } => {
+                        // A bit at the frame boundary itself is due before the frame's first step.
+                        if cycles == 0 && link.link_cycles == 0 && link.replay_slave.is_empty() {
+                            due_now.push(bit);
+                        }
+                        else {
+                            link.replay_slave.push_back((cycles, bit));
+                        }
+                    }
+                    GbSerialEvent::Connected(connected) => link.replay_connected = connected
+                }
+            }
+        }
+        for bit in &due_now {
+            self.core.serial_set_data_bit(*bit);
+        }
+        if !due_now.is_empty() {
+            // The shadow gets them before its next step, like a live slave bit.
+            self.link().shadow_pending_slave.extend(due_now);
+        }
+        Ok(())
+    }
+
+    fn serial_replay_misses(&self) -> u64 {
+        self.link_ref().misses
     }
 }
 
@@ -405,8 +788,9 @@ impl EmulatorCore for GameBoyColor {
             return
         }
         if enabled {
+            let link_mode = self.link().mode;
             let mut shadow = ShadowAudio::new(&self.rom, &self.bios, self.model, self.speed);
-            shadow.sync_from(&self.core, self.input_mask);
+            shadow.sync_from(&self.core, self.input_mask, link_mode);
             self.cycles = 0;
             self.shadow = Some(shadow);
         }
@@ -481,6 +865,12 @@ impl EmulatorCore for GameBoyColor {
 
     #[inline]
     fn hard_reset(&mut self) {
+        // What a reset leaves in RAM, HRAM, OAM and the wave RAM comes from SameBoy's random
+        // number generator; seeded the same way every time, every reset starts from the same
+        // garbage, here, in a replay of this session and on the other end of a link cable.
+        safeboy::seed_random(RESET_RANDOM_SEED);
+        // The cable stays plugged in across a reset: SameBoy keeps the callbacks (they live in the
+        // unsaved section) and the port keeps its mode; only the pending replay bits are moot.
         self.core.reset();
 
         // skip the intro
@@ -537,7 +927,18 @@ impl EmulatorCore for GameBoyColor {
     fn is_mid_frame(&self) -> bool {
         self.mid_frame
     }
+
+    fn link_port(&mut self) -> Option<&mut dyn LinkPort> {
+        Some(self)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
+    }
 }
+
+/// The seed every reset starts SameBoy's random number generator from (see `hard_reset`).
+const RESET_RANDOM_SEED: u64 = 0x5375_7065_7253_6875;
 
 static GB_VERSION_WITH_HACKS: Lazy<String> = Lazy::new(|| {
     alloc::format!("{} with SGB intro skipped", safeboy::GB_VERSION)

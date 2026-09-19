@@ -156,8 +156,20 @@ pub enum Packet {
     IncrementCounter {
         name: String,
         delta: SignedInteger
-    }
+    },
+
+    /// Everything the console received over its link cable during the frame that the next
+    /// [`Packet::NextFrame`] closes (format v7), so that a replay of a linked game reproduces the
+    /// transfer without the other console. The bytes are console-specific (see the core's
+    /// `emulator::link` module); a frame with nothing received writes no packet. At most
+    /// [`MAX_SERIAL_IN_BYTES`] bytes.
+    #[allow(missing_docs)]
+    SerialIn { data: ByteVec }
 }
+
+/// Longest `SerialIn` payload accepted when reading (a frame of link traffic is a few kilobytes
+/// at most; anything larger is a corrupt or hostile file).
+pub const MAX_SERIAL_IN_BYTES: usize = 64 * 1024;
 
 /// Speed value that uses a fixed point number.
 #[derive(Copy, Clone, Debug, PartialEq)]

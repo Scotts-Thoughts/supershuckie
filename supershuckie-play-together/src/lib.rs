@@ -5,7 +5,7 @@
 //! other participant (a star). A follower asks a publisher for a snapshot (its full save state),
 //! then applies the packets that follow it.
 //!
-//! The wire format is `docs/play-together-protocol.md`, version 1. Everything read from a socket
+//! The wire format is `docs/play-together-protocol.md`, version 4. Everything read from a socket
 //! is treated as hostile: lengths are capped before allocation, bodies are read in chunks, and
 //! nothing that arrives can make this crate panic.
 //!
@@ -15,11 +15,13 @@
 //! session.poll_events()                    every frame from the UI thread
 //! session.publisher().publish(..)          from the emulator thread
 //! session.subscribe(peer, sink)            to follow a participant
+//! session.send_link(..) / set_link_sink(..) to plug a link cable into a participant's game
 //! ```
 
 #![warn(missing_docs)]
 
 pub mod code;
+pub mod color;
 pub mod compat;
 pub mod conn;
 pub mod error;
@@ -28,14 +30,15 @@ pub mod session;
 pub mod transport;
 
 pub use code::{probe_local_ip, JoinCode, JoinCodeError};
-pub use compat::{dedupe_display_name, describe_incompatibility, follow_compatibility, sanitize_display_name, FollowCompatibility};
+pub use color::{assign_color, color_entry, is_valid_color, PaletteEntry, PlayerColor, COLOR_COUNT, COLOR_RANDOM, PALETTE};
+pub use compat::{can_link, dedupe_display_name, describe_incompatibility, follow_compatibility, link_family, sanitize_display_name, FollowCompatibility, LinkFamily};
 pub use error::{DecodeError, DisconnectReason, Phase, PlayTogetherError, PublishError};
 pub use protocol::{
-    count_frames, decode_packets, encode_packets, LeaveReason, LocalParticipant, Message, ParticipantInfo, PublisherInfo, RefusalReason, SnapshotData,
-    PROTOCOL_VERSION,
+    count_frames, decode_link_events, decode_packets, encode_link_events, encode_packets, LeaveReason, LinkDeclineReason, LinkMessage, LocalParticipant,
+    Message, ParticipantInfo, PublisherInfo, RefusalReason, SnapshotData, StartStateData, UnlinkReason, MAX_LINK_DELAY, PROTOCOL_VERSION,
 };
 pub use session::{
-    ClientConfig, ClientSession, FollowerSink, HostConfig, HostSession, PublisherHandle, Role, Session, SessionEvent, SessionStats,
+    ClientConfig, ClientSession, FollowerSink, HostConfig, HostSession, LinkEvent, LinkSink, PublisherHandle, Role, Session, SessionEvent, SessionStats,
 };
 pub use transport::{Connection, Listener, TcpTransport, Transport};
 

@@ -45,6 +45,11 @@ serde = { version = "1.0.228", features = ["derive"] }
 safeboy = "0.3.0-beta.6"
 serde_json = "1.0.145"
 
+# safeboy with the slave side of SameBoy's serial API, which the link cable between two cores
+# needs; see third-party/safeboy/patches. Drop once a release carries the patch.
+[patch.crates-io]
+safeboy = { path = "third-party/safeboy" }
+
 [profile.release]
 lto = true
 opt-level = 3

@@ -40,6 +40,7 @@ fn a_slow_peer_is_dropped_and_nobody_else_notices() {
             replay_version: REPLAY_VERSION,
             app_version: "raw".to_owned(),
             display_name: "Slow".to_owned(),
+            color: 0,
             publisher: publisher_info(ReplayConsoleType::GameBoy),
         }
         .encoded(),
@@ -152,6 +153,52 @@ fn queued_streams_are_merged_into_one_message() {
             "snapshot@4".to_owned(),
         ]
     );
+}
+
+#[test]
+fn the_urgent_lane_goes_out_first_and_between_runs() {
+    let queue = OutboundQueue::new();
+    // Four 100 KiB streams: merged into a 300 KiB message and a 100 KiB one.
+    for i in 0..4u64 {
+        queue.try_push(Outbound::Stream { first_frame: i, bytes: Arc::new(vec![0u8; 100 << 10]) }).unwrap();
+    }
+    let frame = Arc::new(Message::LinkFrame { from: 2, target: 3, frame: 1, elapsed_millis: 0, events: vec![], pair_hash_frame: 0, pair_hash: [0; 32] }.encoded());
+    queue.try_push_urgent(Arc::clone(&frame)).unwrap();
+    assert_eq!(queue.queued_bytes(), 4 * ((100 << 10) + 16) + frame.len() as u64);
+    let drained = queue.wait_drain(Duration::ZERO);
+    assert_eq!(drained.urgent.len(), 1, "the urgent lane comes out with the drain");
+    assert!(Arc::ptr_eq(&drained.urgent[0], &frame));
+    assert_eq!(drained.items.len(), 4);
+    assert_eq!(queue.queued_bytes(), 0);
+    let batch = encode_outbound(&drained.items, 2);
+    assert_eq!(batch.messages, 2);
+    assert_eq!(batch.boundaries.len(), 2);
+    assert_eq!(batch.boundaries[1], batch.bytes.len());
+    // Runs end on message boundaries: the writer looks at the urgent lane between them.
+    let runs = batch.runs();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0], 0..batch.boundaries[0]);
+    assert_eq!(runs[1], batch.boundaries[0]..batch.bytes.len());
+    // Many small messages are grouped into runs of about WRITE_RUN.
+    let items: Vec<Outbound> = (0..100).map(|_| Outbound::Encoded(Arc::new(vec![0u8; 2 << 10]))).collect();
+    let batch = encode_outbound(&items, 2);
+    let runs = batch.runs();
+    assert_eq!(runs.len(), 4, "{runs:?}");
+    assert!(runs.iter().all(|r| r.len() % (2 << 10) == 0));
+    assert_eq!(runs.last().unwrap().end, batch.bytes.len());
+    // An empty batch has no runs.
+    assert!(encode_outbound(&[], 2).runs().is_empty());
+    // `take_urgent` between runs, without waiting.
+    assert!(queue.take_urgent().is_empty());
+    queue.try_push_urgent(Arc::clone(&frame)).unwrap();
+    queue.try_push_urgent(Arc::clone(&frame)).unwrap();
+    assert_eq!(queue.take_urgent().len(), 2);
+    assert_eq!(queue.queued_bytes(), 0);
+    // Closing with discard drops the urgent lane too.
+    queue.try_push_urgent(frame).unwrap();
+    queue.close(true);
+    let drained = queue.wait_drain(Duration::ZERO);
+    assert!(drained.closed && drained.urgent.is_empty() && drained.items.is_empty());
 }
 
 #[test]

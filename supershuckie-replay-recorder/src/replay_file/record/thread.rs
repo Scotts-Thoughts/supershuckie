@@ -32,6 +32,18 @@ pub struct NonBlockingReplayFileRecorder<Final: ReplayFileSink + Send + 'static,
 impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'static> NonBlockingReplayFileRecorder<Final, Temp> {
     /// Instantiate a non-blocking replay recorder.
     pub fn new(recorder: ReplayFileRecorder<Final, Temp>) -> NonBlockingReplayFileRecorder<Final, Temp> {
+        Self::spawn(recorder, false)
+    }
+
+    /// Like [`Self::new`], but the writer thread is scheduled below the process's normal
+    /// priority (on Windows; elsewhere the same as `new`). For recordings nobody is waiting on
+    /// frame by frame, such as a friend's game being followed in Play Together: its keyframe
+    /// compression then never takes a core from the player's own game or display.
+    pub fn new_background(recorder: ReplayFileRecorder<Final, Temp>) -> NonBlockingReplayFileRecorder<Final, Temp> {
+        Self::spawn(recorder, true)
+    }
+
+    fn spawn(recorder: ReplayFileRecorder<Final, Temp>, background: bool) -> NonBlockingReplayFileRecorder<Final, Temp> {
         let recorder = Arc::new(Mutex::new(recorder));
 
         let (sender_main, receiver_helper) = channel();
@@ -50,6 +62,9 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         std::thread::Builder::new()
             .name("ThreadedReplayFileRecorderThread".to_owned())
             .spawn(move || {
+                if background {
+                    lower_current_thread_priority();
+                }
                 helper.run();
             })
             .expect("failed to start a thread...");
@@ -158,6 +173,15 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let _ = self.sender.send(ThreadedReplayFileRecorderCommand::LoadSaveState { state });
     }
 
+    /// What the console received over its link cable this frame (see
+    /// [`ReplayFileRecorder::serial_in`]).
+    pub fn serial_in(&mut self, data: ByteVec) {
+        if data.is_empty() {
+            return
+        }
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::SerialIn { data });
+    }
+
     /// Check for errors, if any.
     pub fn poll_errors(&mut self) -> Vec<ReplayFileWriteError> {
         let mut errors = Vec::new();
@@ -184,6 +208,27 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let _ = self.sender.send(ThreadedReplayFileRecorderCommand::IncrementCounter { name, delta });
     }
 }
+
+/// Schedule the calling thread below the process's normal priority (see
+/// [`NonBlockingReplayFileRecorder::new_background`]).
+#[cfg(windows)]
+fn lower_current_thread_priority() {
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+
+    // SAFETY: plain Win32 calls on the current thread.
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn lower_current_thread_priority() {}
 
 struct ThreadedReplayFileRecorderThread<Final: ReplayFileSink, Temp: ReplayFileSink> {
     recorder: Weak<RecorderMutex<Final, Temp>>,
@@ -282,6 +327,9 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::LoadSaveState { state } => {
                 recorder.load_save_state(state)
             }
+            ThreadedReplayFileRecorderCommand::SerialIn { data } => {
+                recorder.serial_in(data)
+            }
             ThreadedReplayFileRecorderCommand::MarkStart { timer_offset } => {
                 recorder.mark_start(timer_offset)
             }
@@ -303,6 +351,7 @@ enum ThreadedReplayFileRecorderCommand {
     SetSpeed { speed: Speed },
     WriteMemory { address: UnsignedInteger, data: ByteVec },
     LoadSaveState { state: ByteVec },
+    SerialIn { data: ByteVec },
     IncrementCounter { name: String, delta: SignedInteger },
     MarkStart { timer_offset: TimestampMillis },
     MarkEnd,
@@ -373,6 +422,12 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
     #[inline]
     fn load_save_state(&mut self, state: ByteVec) -> Result<(), ReplayFileWriteError> {
         self.load_save_state(state);
+        Ok(())
+    }
+
+    #[inline]
+    fn serial_in(&mut self, data: ByteVec) -> Result<(), ReplayFileWriteError> {
+        self.serial_in(data);
         Ok(())
     }
 

@@ -394,6 +394,31 @@ bool supershuckie_frontend_is_pokeabyte_enabled(const struct SuperShuckieFronten
 bool supershuckie_frontend_set_pokeabyte_enabled(struct SuperShuckieFrontendRaw *frontend, bool enabled, char *error, size_t error_len);
 
 /**
+ * The UDP port the player's own game is served to Poke-A-Byte on (55356 unless changed; Poke-A-Byte
+ * connects to 55356 by default and to any other port through its /instances/<port>/ routes).
+ */
+uint16_t supershuckie_frontend_get_pokeabyte_port(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Serve the player's own game to Poke-A-Byte on `port` from now on (restarting the server if it is
+ * enabled). Friends' games in a Play Together session keep the ports they already have.
+ *
+ * Returns false if an error occurs, filling the error buffer with the error.
+ *
+ * Safety:
+ * - error must not be null and must be at least error_len bytes long.
+ */
+bool supershuckie_frontend_set_pokeabyte_port(struct SuperShuckieFrontendRaw *frontend, uint16_t port, char *error, size_t error_len);
+
+/**
+ * Whether friends' games in a Play Together session are served to Poke-A-Byte too, each on the
+ * lowest free port above the player's own (shown per friend as pokeabyte_port in the Play Together
+ * state; see play_together.h).
+ */
+bool supershuckie_frontend_get_pokeabyte_serve_friends(const struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_set_pokeabyte_serve_friends(struct SuperShuckieFrontendRaw *frontend, bool serve);
+
+/**
  * Get whether or not remote commands are enabled.
  *
  * If false, error may be filled with error data if there is any error data (or it will be empty if it is simply not

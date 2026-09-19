@@ -208,6 +208,8 @@ private:
     std::unique_ptr<DisplaySyncThread> display_sync;
     void apply_display_sync(bool on);
     QAction *enable_pokeabyte_integration;
+    QAction *pokeabyte_port;
+    QAction *pokeabyte_serve_friends;
     QAction *enable_external_commands;
 
     SuperShuckieReplayState last_known_replay_state = SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
@@ -259,12 +261,18 @@ private:
     QAction *pt_open;
     QAction *pt_leave;
     QAction *pt_reset_all;
+    QAction *pt_sync_pause;
+    QAction *pt_start_state;
     QAction *pt_show_windows;
     QAction *pt_save_replays;
-    static const std::size_t PEER_SCALE_COUNT = 6;
+    QAction *pt_unlink;
+    static const std::size_t LINK_DELAY_COUNT = 16;
+    NumberedAction *pt_link_delay[LINK_DELAY_COUNT];
+    static const std::size_t PEER_SCALE_COUNT = 10;
     NumberedAction *pt_scale[PEER_SCALE_COUNT];
     void set_up_play_together_menu();
     void set_peer_video_scale(std::uint8_t scale);
+    void set_link_input_delay(std::uint8_t frames);
     void refresh_play_together_actions();
 
     void apply_audio_gain();
@@ -292,6 +300,9 @@ private:
     void convert_replays_at(const QString &path);
 
     char title_text[128] = {};
+
+    /** The local player's display name while a Play Together session is active (else empty). */
+    std::string play_together_name;
 
     static void on_refresh_screens(void *user_data, std::size_t screen_count, const uint32_t *const *pixels);
     static void on_change_video_mode(void *user_data, std::size_t screen_count, const SuperShuckieScreenData *screen_data, std::uint8_t scaling);
@@ -339,6 +350,8 @@ private slots:
     void do_toggle_sync_display();
     void present_frame();
     void do_toggle_pokeabyte();
+    void do_set_pokeabyte_port();
+    void do_toggle_pokeabyte_serve_friends();
     void do_toggle_stop_replay_on_input();
     void do_open_controls_settings_dialog() noexcept;
     void do_open_shortcuts_dialog();
@@ -379,7 +392,10 @@ private slots:
     void do_play_together_open();
     void do_play_together_leave();
     void do_play_together_reset_all();
+    void do_toggle_play_together_sync_pause();
+    void do_toggle_play_together_start_state();
     void do_play_together_show_windows();
+    void do_play_together_unlink();
     void do_toggle_save_peer_replays();
 };
 

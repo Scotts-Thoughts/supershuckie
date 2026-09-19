@@ -81,6 +81,18 @@ impl SuperShuckieWebserver {
                         Err(_) => return emulator_not_available_error()
                     }
                 },
+                "/play-together" => {
+                    let (responder, response) = channel();
+
+                    if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::PlayTogetherState(responder))).is_err() {
+                        return emulator_not_available_error();
+                    }
+
+                    match response.recv_timeout(REPLY_TIMEOUT) {
+                        Ok(json) => Response::from_data("application/json", json),
+                        Err(_) => return emulator_not_available_error()
+                    }
+                },
                 "/mark-start" => {
                     let (responder, response) = channel();
 
@@ -492,6 +504,9 @@ fn string_or_number<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option
 
 pub enum SuperShuckieServerCommand {
     Stats(Sender<Arc<Stats>>),
+    /// `/play-together`: the Play Together state as JSON (the same document the C API's
+    /// `supershuckie_frontend_play_together_state_json` gives).
+    PlayTogetherState(Sender<String>),
     Bookmarks(Sender<BookmarkReply>, BookmarkRequest),
     MarkStart(Sender<bool>, u32),
     MarkEnd(Sender<bool>),

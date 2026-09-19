@@ -283,6 +283,7 @@ fn describe_packet(packet: &Packet) -> String {
         Packet::DeltaKeyframe { metadata, .. } => format!("DeltaKeyframe(frame {})", metadata.elapsed_frames),
         Packet::RegionDeltaKeyframe { metadata, .. } => format!("RegionDeltaKeyframe(frame {})", metadata.elapsed_frames),
         Packet::CompressedBlob { .. } => "CompressedBlob".into(),
+        Packet::SerialIn { data } => format!("SerialIn({} bytes)", data.len()),
         other => format!("{other:?}"),
     }
 }

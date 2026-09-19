@@ -1,0 +1,24 @@
+# SuperShuckie's vendored copy of safeboy 0.3.0-beta.6 (https://github.com/SnowyMouse/safeboy),
+# selected over the crates.io release through `[patch.crates-io]` in the workspace Cargo.toml.
+#
+# It differs from the release only by `patches/0001-serial-slave-api.patch`: the slave side of
+# SameBoy's serial API (`GB_serial_get_data_bit` / `GB_serial_set_data_bit`), the infrared input
+# and a stable pointer to the pinned running instance, which the link cable between two cores
+# needs (see supershuckie-core's `emulator::link`). Offer the patch upstream; drop this directory
+# once a release carries it.
+[package]
+name = "safeboy"
+description = "Safe Rust wrapper for SameBoy"
+version = "0.3.0-beta.6"
+license = "GPL-3.0-only"
+readme = "README.md"
+edition = "2024"
+repository = "https://github.com/SnowyMouse/safeboy"
+publish = false
+
+[dependencies]
+sameboy-sys = { version = "0.3.0-beta.6", default-features = false }
+
+[features]
+default = []
+debugger = ["sameboy-sys/debugger"]

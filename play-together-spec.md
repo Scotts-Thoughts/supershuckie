@@ -224,6 +224,8 @@ pub struct PlayTogetherSettings {            // Settings.play_together, #[serde(
 
 - The only per-poll additions are `follower.is_some()` and `is_capturing()` checks; every tee call rides an existing per-frame path (`input_latched`, `time.frames > 0`). Verify with `packet_stats` (≈1.0 ChangeInput/frame) on a friend replay and `record_pacing_smoke` unchanged.
 - Local thread stays Primary/ABOVE_NORMAL; followers are BELOW_NORMAL, park when caught up, and run capped passes (8 frames / 4 ms) when behind; a follower that cannot keep up resyncs rather than spins.
+- Everything else a session runs is BELOW_NORMAL too (2026-09-18): the network threads (`session::spawn_session_thread`: accept, tick, connect, every reader and writer — relaying, packet decoding and snapshot zstd all happen there) and the friends' replay-file writers (`NonBlockingReplayFileRecorder::new_background`). The player's own core (above normal) and the UI thread (normal) win every contest for a core.
+- **Nothing `tick` does for a session may wait on a core thread.** `tick_play_together` runs on the UI thread every millisecond, and that thread also hands the player's frames to the window; a `call()` there sits through the core's pacing sleep (up to 8 ms; a full frame on Game Boy, where SameBoy sleeps inside `GB_run`) or a follower's 4 ms park. `get_stream_errors` / `get_follower_errors` were such calls and are now shared-mutex reads (like `replay_errors`). `play_together_smoke` times every tick and fails when the p99 exceeds 4 ms.
 - Snapshot cost on the publisher: one pooled `create_save_state_into` + channel push per request, coalesced (≤ 1 per 2 s per publisher); compression happens on the writer thread. Sync hash ≈ 0.2 ms every 60 frames on GBA.
 - Follower cores never `run()` (no wall clock), never get a sample rate (GB), NDS JIT forced off, built from the publisher's declared console type, no save file (SRAM comes with the snapshot), `ChangeSpeed` never streamed.
 - Hashes cover work RAM only; suppressed for `POST_LOAD_FRAMES` after a snapshot; snapshots are exact states (no delta masking), so the GBA "14 bytes differ after seek" class cannot false-positive.
@@ -338,3 +340,13 @@ confirmation and the windows' geometry persistence need an in-app check on two m
 **Follow-ups:** a join can take up to 4 s with 3+ players (the publisher-side request coalescer
 waits 2 s between announcements); the `errors` list in the state JSON is shown in the dialog but
 not the status bar; friend audio is wired but unheard in any test.
+
+**Stutter fix (2026-09-18).** The user saw a slight stutter in their own game while playing with
+friends although the core held its speed. Cause: `tick_play_together` polled the publisher's and
+every follower's error lists through blocking `ThreadCommand`s every UI tick, so the UI thread
+(which also presents the player's frames) waited on the core's pacing sleep and on each
+below-normal follower's park — measured with the smoke's new per-tick timer on Emerald at 4x,
+3 players: 6.6 ms average / 7.4 ms p99 per tick, 97 % of ticks over 4 ms, while the core stayed
+at 239 fps. Now: 0.002 ms average / 0.29 ms max (Crystal at 1x: 0.035 ms max), core unchanged,
+followers 2–3 frames behind, 0 desyncs. Alongside: session threads and friends' replay writers
+run below normal priority, and a friend's screen is not uploaded while their window is closed.

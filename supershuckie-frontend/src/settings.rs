@@ -94,8 +94,8 @@ pub struct Settings {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub rom_config: BTreeMap<String, ROMConfig>,
 
-    #[serde(default = "SimpleEnabledByDefaultSettings::default")]
-    pub pokeabyte: SimpleEnabledByDefaultSettings,
+    #[serde(default = "PokeAByteSettings::default")]
+    pub pokeabyte: PokeAByteSettings,
 
     #[serde(default = "SimpleEnabledByDefaultSettings::default")]
     pub external_commands: SimpleEnabledByDefaultSettings,
@@ -127,6 +127,10 @@ pub struct PlayTogetherSettings {
     #[serde(default = "PlayTogetherSettings::DEFAULT_DISPLAY_NAME")]
     pub display_name: String,
 
+    /// The colour asked for when hosting or joining (a palette index; 0 = let the host pick).
+    #[serde(default)]
+    pub color: u8,
+
     /// The TCP port to host on.
     #[serde(default = "PlayTogetherSettings::DEFAULT_HOST_PORT")]
     pub host_port: u16,
@@ -151,6 +155,21 @@ pub struct PlayTogetherSettings {
     #[serde(default = "PlayTogetherSettings::DEFAULT_ALLOW_NINTENDO_DS")]
     pub allow_nintendo_ds: bool,
 
+    /// Sync pause: when anyone pauses, everyone's game pauses. The host's setting applies to the
+    /// whole session; a client's copy only matters for sessions it hosts later.
+    #[serde(default = "PlayTogetherSettings::DEFAULT_SYNC_PAUSE")]
+    pub sync_pause: bool,
+
+    /// The link cable's input delay in frames: 0 picks it from the round-trip times, else this
+    /// many at least (the larger of the two players' settings wins).
+    #[serde(default)]
+    pub link_input_delay: u8,
+
+    /// Plug in without asking when another player requests a link cable (for unattended
+    /// sessions and the smoke test).
+    #[serde(default)]
+    pub link_auto_accept: bool,
+
     /// ROMs by blake3 hash (lowercase hex), so another player's ROM can be found on this
     /// machine without asking. Learned from every ROM loaded or located.
     #[serde(default = "BTreeMap::default")]
@@ -165,6 +184,7 @@ impl PlayTogetherSettings {
     const DEFAULT_SAVE_PEER_REPLAYS: fn() -> bool = || true;
     const DEFAULT_PEER_VIDEO_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(2) };
     const DEFAULT_ALLOW_NINTENDO_DS: fn() -> bool = || false;
+    const DEFAULT_SYNC_PAUSE: fn() -> bool = || false;
 
     /// Longest display name kept.
     pub const MAX_DISPLAY_NAME_BYTES: usize = 32;
@@ -183,6 +203,9 @@ impl PlayTogetherSettings {
             name.pop();
         }
         self.display_name = if name.is_empty() { Self::DEFAULT_DISPLAY_NAME() } else { name };
+        if !supershuckie_play_together::is_valid_color(self.color) {
+            self.color = supershuckie_play_together::COLOR_RANDOM;
+        }
 
         if self.host_port == 0 {
             self.host_port = Self::DEFAULT_HOST_PORT();
@@ -196,6 +219,9 @@ impl PlayTogetherSettings {
         if self.peer_video_scale.get() > Self::MAX_PEER_VIDEO_SCALE {
             self.peer_video_scale = NonZeroU8::new(Self::MAX_PEER_VIDEO_SCALE).unwrap();
         }
+        if self.link_input_delay > supershuckie_play_together::MAX_LINK_DELAY {
+            self.link_input_delay = supershuckie_play_together::MAX_LINK_DELAY;
+        }
         while self.known_roms.len() > Self::MAX_KNOWN_ROMS {
             let first = self.known_roms.keys().next().cloned().expect("non-empty");
             self.known_roms.remove(&first);
@@ -207,12 +233,16 @@ impl Default for PlayTogetherSettings {
     fn default() -> Self {
         Self {
             display_name: Self::DEFAULT_DISPLAY_NAME(),
+            color: supershuckie_play_together::COLOR_RANDOM,
             host_port: Self::DEFAULT_HOST_PORT(),
             bind_address: Self::DEFAULT_BIND_ADDRESS(),
             last_join_code: String::new(),
             save_peer_replays: Self::DEFAULT_SAVE_PEER_REPLAYS(),
             peer_video_scale: Self::DEFAULT_PEER_VIDEO_SCALE(),
             allow_nintendo_ds: Self::DEFAULT_ALLOW_NINTENDO_DS(),
+            sync_pause: Self::DEFAULT_SYNC_PAUSE(),
+            link_input_delay: 0,
+            link_auto_accept: false,
             known_roms: BTreeMap::new()
         }
     }
@@ -295,6 +325,7 @@ impl Settings {
 
         self.recent_roms.clamp();
         self.play_together.clamp();
+        self.pokeabyte.clamp();
     }
 }
 
@@ -647,6 +678,49 @@ pub struct SimpleEnabledByDefaultSettings {
     pub enabled: bool
 }
 
+/// The Poke-A-Byte integration server (UDP + shared memory, one per game).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PokeAByteSettings {
+    #[serde(default = "PokeAByteSettings::DEFAULT_ENABLED")]
+    pub enabled: bool,
+
+    /// The UDP port the player's own game is served on (Poke-A-Byte connects to 55356 unless
+    /// told otherwise).
+    #[serde(default = "PokeAByteSettings::DEFAULT_PORT")]
+    pub port: u16,
+
+    /// Also serve every friend's game in a Play Together session, each on the lowest free port
+    /// above `port`, so one Poke-A-Byte can read all of them (its `/instances/<port>/` routes).
+    #[serde(default = "PokeAByteSettings::DEFAULT_SERVE_FRIENDS")]
+    pub serve_friends: bool
+}
+
+impl PokeAByteSettings {
+    const DEFAULT_ENABLED: fn() -> bool = || true;
+    const DEFAULT_PORT: fn() -> u16 = || supershuckie_core::POKEABYTE_DEFAULT_PORT;
+    const DEFAULT_SERVE_FRIENDS: fn() -> bool = || true;
+
+    /// How many ports above `port` a friend's game may be served on (`port + 1 ..= port + MAX_FRIEND_PORTS`).
+    pub const MAX_FRIEND_PORTS: u16 = 32;
+
+    /// Bring out-of-range values from the config file back into range.
+    pub(crate) fn clamp(&mut self) {
+        if self.port == 0 {
+            self.port = Self::DEFAULT_PORT();
+        }
+    }
+}
+
+impl Default for PokeAByteSettings {
+    fn default() -> Self {
+        Self {
+            enabled: Self::DEFAULT_ENABLED(),
+            port: Self::DEFAULT_PORT(),
+            serve_friends: Self::DEFAULT_SERVE_FRIENDS()
+        }
+    }
+}
+
 impl Default for SimpleEnabledByDefaultSettings {
     fn default() -> Self {
         Self {
@@ -900,10 +974,19 @@ pub enum ControlModifier {
     #[default]
     Normal,
     Rapid,
-    Toggle
+    Toggle,
+    /// One short press per key press, however long the key is held: the button goes down for
+    /// [`ControlModifier::SINGLE_PRESS_HOLD_LENGTH`] frames and comes back up on its own.
+    // Briefly saved as `single_frame` (before it held for more than one).
+    #[serde(alias = "single_frame")]
+    SinglePress
 }
 
 impl ControlModifier {
+    /// How many frames a [`ControlModifier::SinglePress`] press holds the button for: as short
+    /// as a tap can be while a game that does not read the joypad every frame still sees it.
+    pub const SINGLE_PRESS_HOLD_LENGTH: NonZeroU64 = NonZeroU64::new(3).unwrap();
+
     fn is_default(&self) -> bool {
         self == &ControlModifier::Normal
     }
@@ -922,7 +1005,8 @@ impl ControlModifier {
         match self {
             ControlModifier::Normal => c"Normal",
             ControlModifier::Rapid => c"Rapid Fire",
-            ControlModifier::Toggle => c"Toggle"
+            ControlModifier::Toggle => c"Toggle",
+            ControlModifier::SinglePress => c"Single Press"
         }
     }
 

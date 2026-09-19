@@ -46,6 +46,30 @@ pub fn follow_compatibility(local: &ReplayFileMetadata, publisher: &ReplayFileMe
     FollowCompatibility::Ok
 }
 
+/// A family of consoles a link cable can join: two games link only within one family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LinkFamily {
+    /// Game Boy, Game Boy Color and Super Game Boy 2 (the Game Boy link cable).
+    GameBoy,
+    /// Game Boy Advance (the GBA link cable).
+    GameBoyAdvance,
+}
+
+/// The link cable family of a console, or `None` when it cannot link.
+pub fn link_family(console: ReplayConsoleType) -> Option<LinkFamily> {
+    match console {
+        ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor => Some(LinkFamily::GameBoy),
+        ReplayConsoleType::GameBoyAdvance => Some(LinkFamily::GameBoyAdvance),
+        ReplayConsoleType::Unknown | ReplayConsoleType::NintendoDS => None,
+    }
+}
+
+/// Whether two consoles can be joined by a link cable.
+pub fn can_link(a: ReplayConsoleType, b: ReplayConsoleType) -> bool {
+    matches!((link_family(a), link_family(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// A sentence for the user about why `display_name`'s session cannot be followed.
 pub fn describe_incompatibility(compat: &FollowCompatibility, display_name: &str) -> String {
     match compat {

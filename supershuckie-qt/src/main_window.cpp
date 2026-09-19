@@ -236,6 +236,8 @@ MainWindow::MainWindow(): QMainWindow() {
     else if(buf[0] != 0) {
         this->show_error("Failed to automatically start Poke-A-Byte integration", "An error occurred on startup when trying to enable Poke-A-Byte integration:\n\n%s", buf);
     }
+    this->pokeabyte_port->setText(QString("Poke-A-Byte port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
+    this->pokeabyte_serve_friends->setChecked(supershuckie_frontend_get_pokeabyte_serve_friends(this->frontend));
     if(supershuckie_frontend_get_external_commands_enabled(this->frontend, buf, sizeof(buf))) {
         this->enable_external_commands->setChecked(true);
     }
@@ -339,15 +341,22 @@ void MainWindow::refresh_title() {
     if(rom_name == nullptr) {
         rom_name = "No ROM Loaded";
     };
-    
+
+    // While playing with friends, lead with the player's name so each window is identifiable
+    // (peer windows are titled the same way).
+    char prefix[160] = {};
+    if(!this->play_together_name.empty()) {
+        std::snprintf(prefix, sizeof(prefix), "%s — ", this->play_together_name.c_str());
+    }
+
     if(this->status_bar->isVisible()) {
-        std::snprintf(fmt, sizeof(fmt), "Super Shuckie " SUPERSHUCKIE_VERSION " - %s", rom_name);
+        std::snprintf(fmt, sizeof(fmt), "%sSuper Shuckie " SUPERSHUCKIE_VERSION " - %s", prefix, rom_name);
     }
     else if(this->title_text[0] == 0) {
-        std::snprintf(fmt, sizeof(fmt), "Super Shuckie " SUPERSHUCKIE_VERSION " - %s - %.00f FPS", rom_name, this->current_fps);
+        std::snprintf(fmt, sizeof(fmt), "%sSuper Shuckie " SUPERSHUCKIE_VERSION " - %s - %.00f FPS", prefix, rom_name, this->current_fps);
     }
     else {
-        std::snprintf(fmt, sizeof(fmt), "Super Shuckie " SUPERSHUCKIE_VERSION " - %s - %s - %.00f FPS", rom_name, this->title_text, this->current_fps);
+        std::snprintf(fmt, sizeof(fmt), "%sSuper Shuckie " SUPERSHUCKIE_VERSION " - %s - %s - %.00f FPS", prefix, rom_name, this->title_text, this->current_fps);
     }
 
     this->setWindowTitle(fmt);
@@ -1208,6 +1217,17 @@ void MainWindow::set_up_settings_menu() {
     this->enable_pokeabyte_integration->setObjectName("enable-pokeabyte-integration");
     this->enable_pokeabyte_integration->setCheckable(true);
     connect(this->enable_pokeabyte_integration, SIGNAL(triggered()), this, SLOT(do_toggle_pokeabyte()));
+
+    this->pokeabyte_port = this->settings_menu->addAction("Poke-A-Byte port…");
+    this->pokeabyte_port->setObjectName("pokeabyte-port");
+    this->pokeabyte_port->setToolTip("The UDP port this game is served to Poke-A-Byte on (Poke-A-Byte connects to 55356 unless told otherwise)");
+    connect(this->pokeabyte_port, SIGNAL(triggered()), this, SLOT(do_set_pokeabyte_port()));
+
+    this->pokeabyte_serve_friends = this->settings_menu->addAction("Serve friends' games to Poke-A-Byte");
+    this->pokeabyte_serve_friends->setObjectName("pokeabyte-serve-friends");
+    this->pokeabyte_serve_friends->setCheckable(true);
+    this->pokeabyte_serve_friends->setToolTip("In a Play Together session, serve each friend's game on its own port above the Poke-A-Byte port (right-click a friend's window to see which)");
+    connect(this->pokeabyte_serve_friends, SIGNAL(triggered()), this, SLOT(do_toggle_pokeabyte_serve_friends()));
 
     this->enable_external_commands = this->settings_menu->addAction("Enable external commands");
     this->enable_external_commands->setObjectName("enable-external-commands");
@@ -2238,6 +2258,31 @@ void MainWindow::do_toggle_pokeabyte() {
     }
 }
 
+void MainWindow::do_set_pokeabyte_port() {
+    auto current = supershuckie_frontend_get_pokeabyte_port(this->frontend);
+    auto text = AskForTextDialog::ask(this, "Poke-A-Byte port", "Enter the UDP port this game is served to Poke-A-Byte on", "Poke-A-Byte connects to 55356 unless told otherwise. In Play Together, friends' games are served on the ports above this one.", QString::number(current));
+    if(!text.has_value()) {
+        return;
+    }
+
+    bool ok = false;
+    int port = QString::fromStdString(*text).trimmed().toInt(&ok);
+    if(!ok || port < 1 || port > 65535) {
+        this->show_error("Poke-A-Byte port", "%s is not a port number (1-65535).", text->c_str());
+        return;
+    }
+
+    char err[256];
+    if(!supershuckie_frontend_set_pokeabyte_port(this->frontend, static_cast<uint16_t>(port), err, sizeof(err))) {
+        this->show_error("Failed to change the Poke-A-Byte port", "An error occurred when moving the Poke-A-Byte integration to port %d:\n\n%s", port, err);
+    }
+    this->pokeabyte_port->setText(QString("Poke-A-Byte port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
+}
+
+void MainWindow::do_toggle_pokeabyte_serve_friends() {
+    supershuckie_frontend_set_pokeabyte_serve_friends(this->frontend, this->pokeabyte_serve_friends->isChecked());
+}
+
 void MainWindow::do_toggle_stop_replay_on_input() {
     supershuckie_frontend_set_auto_stop_playback_on_input_setting(this->frontend, this->auto_stop_replay_on_input->isChecked());
 }
@@ -2482,6 +2527,18 @@ void MainWindow::set_up_play_together_menu() {
     this->pt_reset_all->setToolTip("Every player's console resets after a 3 second countdown (host only)");
     connect(this->pt_reset_all, SIGNAL(triggered()), this, SLOT(do_play_together_reset_all()));
 
+    this->pt_sync_pause = this->play_together_menu->addAction("Sync pause");
+    this->pt_sync_pause->setObjectName("play-together-sync-pause");
+    this->pt_sync_pause->setCheckable(true);
+    this->pt_sync_pause->setToolTip("When anyone pauses, everyone's game pauses; the host's setting applies to the whole session");
+    connect(this->pt_sync_pause, SIGNAL(triggered()), this, SLOT(do_toggle_play_together_sync_pause()));
+
+    this->pt_start_state = this->play_together_menu->addAction("Start from host's save state");
+    this->pt_start_state->setObjectName("play-together-start-state");
+    this->pt_start_state->setCheckable(true);
+    this->pt_start_state->setToolTip("Pause and send your current save state to everyone, so every game starts from it (host only; everyone needs your ROM). \"Reset everyone\" then restarts from it.");
+    connect(this->pt_start_state, SIGNAL(triggered()), this, SLOT(do_toggle_play_together_start_state()));
+
     this->pt_show_windows = this->play_together_menu->addAction("Show friends' windows");
     this->pt_show_windows->setObjectName("play-together-show-windows");
     connect(this->pt_show_windows, SIGNAL(triggered()), this, SLOT(do_play_together_show_windows()));
@@ -2499,10 +2556,44 @@ void MainWindow::set_up_play_together_menu() {
 
     this->play_together_menu->addSeparator();
 
+    this->pt_unlink = this->play_together_menu->addAction("Unplug link cable");
+    this->pt_unlink->setObjectName("play-together-unlink");
+    this->pt_unlink->setToolTip("Pull the link cable out of the friend's game it is plugged into (plug one in from a friend's window)");
+    connect(this->pt_unlink, SIGNAL(triggered()), this, SLOT(do_play_together_unlink()));
+
+    auto *delay_menu = this->play_together_menu->addMenu("Link cable input delay");
+    delay_menu->setToolTip("How many frames ahead inputs are sent while linked: automatic from the ping, or at least this many (the larger of the two players' settings wins)");
+    for(std::size_t i = 0; i < MainWindow::LINK_DELAY_COUNT; i++) {
+        char text[32];
+        if(i == 0) {
+            std::snprintf(text, sizeof(text), "Auto (from ping)");
+        }
+        else {
+            std::snprintf(text, sizeof(text), "%zu frame%s", i, i == 1 ? "" : "s");
+        }
+        auto *action = new NumberedAction(this, text, static_cast<std::uint8_t>(i), &MainWindow::set_link_input_delay);
+        action->setObjectName(QString("play-together-link-delay-%1").arg(i));
+        action->setCheckable(true);
+        delay_menu->addAction(action);
+        this->pt_link_delay[i] = action;
+    }
+
+    this->play_together_menu->addSeparator();
+
     this->pt_save_replays = this->play_together_menu->addAction("Save friends' games as replays");
     this->pt_save_replays->setObjectName("play-together-save-replays");
     this->pt_save_replays->setCheckable(true);
     connect(this->pt_save_replays, SIGNAL(triggered()), this, SLOT(do_toggle_save_peer_replays()));
+}
+
+void MainWindow::set_link_input_delay(std::uint8_t frames) {
+    supershuckie_frontend_play_together_set_link_input_delay(this->frontend, frames);
+    this->refresh_play_together_actions();
+}
+
+void MainWindow::do_play_together_unlink() {
+    this->play_together->unlink();
+    this->refresh_action_states();
 }
 
 void MainWindow::refresh_play_together_actions() {
@@ -2519,18 +2610,43 @@ void MainWindow::refresh_play_together_actions() {
     this->pt_leave->setEnabled(active);
     this->pt_leave->setText(host ? "Stop hosting" : "Leave session");
     this->pt_reset_all->setEnabled(active && host);
+    // The host's setting rules the session: a client sees it and cannot change it.
+    this->pt_sync_pause->setChecked(supershuckie_frontend_play_together_get_sync_pause(this->frontend));
+    this->pt_sync_pause->setEnabled(!active || host);
+    this->pt_sync_pause->setText(active && !host ? "Sync pause (set by the host)" : "Sync pause");
+    this->pt_start_state->setChecked(supershuckie_frontend_play_together_get_start_state(this->frontend));
+    this->pt_start_state->setEnabled(active && host);
+    this->pt_reset_all->setText(this->pt_start_state->isChecked() ? "Restart everyone from the start state (race start)" : "Reset everyone (race start)");
     this->pt_show_windows->setEnabled(active);
 
     auto scale = supershuckie_frontend_play_together_get_video_scale(this->frontend);
     for(auto *action : this->pt_scale) {
         action->setChecked(action->number == scale);
     }
+    auto delay = supershuckie_frontend_play_together_get_link_input_delay(this->frontend);
+    for(auto *action : this->pt_link_delay) {
+        action->setChecked(action->number == delay);
+    }
+    bool linked = active && this->play_together->is_link_cable_plugged();
+    this->pt_unlink->setEnabled(linked);
 
     // The game being played together cannot be swapped for a replay or another Game Boy model.
     if(active) {
         this->play_replay->setEnabled(false);
         this->continue_last_replay->setEnabled(false);
         this->game_boy_settings->setEnabled(false);
+    }
+    // Two linked games have to stay in step: nothing that changes one of them behind the
+    // other's back, and no other speed than 1x (the frontend refuses these too).
+    if(linked) {
+        for(auto &state : this->quick_load_save_states) {
+            state->setEnabled(false);
+        }
+        this->undo_load_save_state->setEnabled(false);
+        this->redo_load_save_state->setEnabled(false);
+        this->resume_replay->setEnabled(false);
+        this->export_video->setEnabled(false);
+        this->reload_core->setEnabled(false);
     }
 }
 
@@ -2550,6 +2666,22 @@ void MainWindow::do_play_together_leave() {
 
 void MainWindow::do_play_together_reset_all() {
     this->play_together->reset_all();
+}
+
+void MainWindow::do_toggle_play_together_start_state() {
+    char error[1024] = {};
+    if(!supershuckie_frontend_play_together_set_start_state(this->frontend, this->pt_start_state->isChecked(), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
+        this->show_error("Start state", "%s", error);
+    }
+    this->refresh_play_together_actions();
+}
+
+void MainWindow::do_toggle_play_together_sync_pause() {
+    char error[512] = {};
+    if(!supershuckie_frontend_play_together_set_sync_pause(this->frontend, this->pt_sync_pause->isChecked(), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
+        this->show_error("Sync pause", "%s", error);
+    }
+    this->refresh_play_together_actions();
 }
 
 void MainWindow::do_play_together_show_windows() {

@@ -1199,6 +1199,7 @@ mod tests {
         fn bios_checksum(&self) -> &ReplayHeaderBlake3Hash { unimplemented!() }
         fn core_name(&self) -> &'static str { "fake" }
         fn frame_rate(&self) -> (u32, u32) { (60, 1) }
+        fn as_any_mut(&mut self) -> &mut dyn core::any::Any { self }
     }
 
     struct FakeCore {

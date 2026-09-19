@@ -38,6 +38,15 @@ impl MetadataHeader {
         }
     }
 
+    /// A header as a client would send it (the server sends itself one to wake its socket read).
+    pub const fn new_request(instruction: Instruction) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            instruction,
+            is_response: false
+        }
+    }
+
     pub const fn into_bytes(self) -> [u8; METADATA_HEADER_SIZE] {
         [
             PROTOCOL_VERSION, 0, 0, 0, self.instruction as u8, self.is_response as u8, 0, 0,

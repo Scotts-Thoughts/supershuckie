@@ -754,6 +754,16 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         self.write_packet_data(&Packet::LoadSaveState { state })
     }
 
+    /// What the console received over its link cable during the frame being recorded (see
+    /// [`Packet::SerialIn`]); written before that frame's [`Self::next_frame`]. Nothing is written
+    /// for empty `data`.
+    pub fn serial_in(&mut self, data: ByteVec) -> Result<(), ReplayFileWriteError> {
+        if data.is_empty() {
+            return Ok(())
+        }
+        self.write_packet_data(&Packet::SerialIn { data })
+    }
+
     fn write_packet_data<'a, P: PacketIO<'a>>(&mut self, what: &'a P) -> Result<(), ReplayFileWriteError> {
         self.write_packet_unchecked(what)
     }
@@ -1047,6 +1057,7 @@ pub trait ReplayFileRecorderFns: core::any::Any + 'static + Send {
     fn write_memory(&mut self, address: UnsignedInteger, data: ByteVec) -> Result<(), ReplayFileWriteError>;
     fn set_speed(&mut self, speed: Speed) -> Result<(), ReplayFileWriteError>;
     fn load_save_state(&mut self, state: ByteVec) -> Result<(), ReplayFileWriteError>;
+    fn serial_in(&mut self, data: ByteVec) -> Result<(), ReplayFileWriteError>;
     fn get_errors(&mut self) -> Vec<ReplayFileWriteError>;
     fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(), ReplayFileWriteError>;
     fn mark_end(&mut self) -> Result<(), ReplayFileWriteError>;
@@ -1121,6 +1132,11 @@ impl<Final: ReplayFileSink + 'static + Send, Temp: ReplayFileSink + 'static + Se
     #[inline]
     fn load_save_state(&mut self, state: ByteVec) -> Result<(), ReplayFileWriteError> {
         self.load_save_state(state)
+    }
+
+    #[inline]
+    fn serial_in(&mut self, data: ByteVec) -> Result<(), ReplayFileWriteError> {
+        self.serial_in(data)
     }
 
     #[inline]
@@ -1251,6 +1267,115 @@ mod tests {
             let (temp, closed) = record_script(settings);
             check_script_replay(&temp, &format!("{name}: temp layout"));
             check_script_replay(&closed, &format!("{name}: closed layout"));
+        }
+    }
+
+    /// Link-cable traffic (`SerialIn`) is an ordinary per-frame packet: written just before the
+    /// frame's `NextFrame`, it comes back in that position from every layout (top level, inside a
+    /// blob, after a seek), an empty payload writes nothing, the file is format v7, and resuming
+    /// from such a file re-feeds the packets into the new file.
+    #[test]
+    fn serial_in_packets_round_trip_and_survive_a_resume() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::record::build_resumed_recorder;
+        use crate::replay_file::REPLAY_VERSION;
+
+        let traffic = |frame: u64| -> Vec<u8> {
+            // Something that changes per frame; frame 5 sends nothing at all.
+            if frame == 5 { Vec::new() } else { (0..(frame as u8 % 7 + 1)).map(|i| i.wrapping_mul(31).wrapping_add(frame as u8)).collect() }
+        };
+
+        for (name, layout) in [("one blob per 3 frames", settings(3, 1)), ("top level", settings(0, usize::MAX))] {
+            let mut recorder = ReplayFileRecorder::new_with_metadata(
+                make_metadata(), ByteVec::new(), layout, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_for(0)), Vec::new(), Vec::new()
+            ).unwrap();
+            let mut running = 0u64;
+            for frame in 1..=12u64 {
+                if frame % 4 == 0 {
+                    recorder.set_input(ib(&[frame as u8])).unwrap();
+                }
+                recorder.serial_in(bv(&traffic(frame))).unwrap();
+                running += 16;
+                recorder.next_frame(running.into()).unwrap();
+                if frame % 6 == 0 {
+                    recorder.insert_keyframe(bv(&state_for(frame)), running.into()).unwrap();
+                }
+            }
+            let (closed, _) = recorder.close().map_err(|e| e.2).unwrap();
+            assert_eq!(u32::from_le_bytes(closed[4..8].try_into().unwrap()), REPLAY_VERSION, "{name}");
+            assert_eq!(REPLAY_VERSION, 7);
+
+            let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+            player.go_to_keyframe(0).unwrap();
+            let mut frame = 0u64;
+            let mut serial_seen = 0;
+            let mut pending_serial: Option<Vec<u8>> = None;
+            while let Some(packet) = player.next_packet().unwrap() {
+                match packet {
+                    Packet::SerialIn { data } => {
+                        assert!(pending_serial.is_none(), "{name}: two SerialIn packets in frame {}", frame + 1);
+                        pending_serial = Some(data.to_vec());
+                    }
+                    Packet::NextFrame { .. } => {
+                        frame += 1;
+                        let expected = traffic(frame);
+                        if expected.is_empty() {
+                            assert!(pending_serial.is_none(), "{name}: frame {frame} should carry no SerialIn");
+                        }
+                        else {
+                            assert_eq!(pending_serial.take(), Some(expected), "{name}: frame {frame}");
+                            serial_seen += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(frame, 12, "{name}");
+            assert_eq!(serial_seen, 11, "{name}");
+
+            // After a seek to the mid-file keyframe the packets of frame 7 (the first one after it)
+            // come back with their SerialIn before their NextFrame.
+            player.go_to_keyframe(6).unwrap();
+            assert!(matches!(player.next_packet().unwrap(), Some(Packet::Keyframe { .. })), "{name}");
+            let mut got = Vec::new();
+            loop {
+                match player.next_packet().unwrap() {
+                    Some(Packet::NextFrame { .. }) => break,
+                    Some(Packet::SerialIn { data }) => got.push(data.to_vec()),
+                    Some(_) => {}
+                    None => panic!("{name}: ended before frame 7"),
+                }
+            }
+            assert_eq!(got, alloc::vec![traffic(7)], "{name}: frame 7 after a seek");
+
+            // Resume from frame 9: the frames re-fed after the boundary keyframe keep their traffic.
+            let mut source = ReplayFilePlayer::new(&closed, false).unwrap();
+            source.set_keyframe_states_wanted(true);
+            let (resumed, info) = build_resumed_recorder(&mut source, Some(9), settings(0, usize::MAX), ResumeCropPolicy::PreserveStartDropEnd, None, Vec::new(), Vec::new()).unwrap();
+            assert_eq!(info.elapsed_frames, 9, "{name}");
+            let mut resumed = resumed;
+            resumed.serial_in(bv(&[0xEE])).unwrap();
+            resumed.next_frame((running + 16).into()).unwrap();
+            let (resumed_bytes, _) = resumed.close().map_err(|e| e.2).unwrap();
+            let mut player = ReplayFilePlayer::new(&resumed_bytes, false).unwrap();
+            player.go_to_keyframe(0).unwrap();
+            let mut per_frame: Vec<Option<Vec<u8>>> = Vec::new();
+            let mut pending = None;
+            while let Some(packet) = player.next_packet().unwrap() {
+                match packet {
+                    Packet::SerialIn { data } => pending = Some(data.to_vec()),
+                    Packet::NextFrame { .. } => per_frame.push(pending.take()),
+                    _ => {}
+                }
+            }
+            assert_eq!(per_frame.len(), 10, "{name}: 9 resumed frames plus one new");
+            // Frames 7..=9 were re-fed after the boundary keyframe at frame 6; the earlier ones sit
+            // in blobs copied verbatim (or were re-fed too), either way with their traffic intact.
+            for frame in 1..=9u64 {
+                let expected = traffic(frame);
+                assert_eq!(per_frame[frame as usize - 1].clone().unwrap_or_default(), expected, "{name}: resumed frame {frame}");
+            }
+            assert_eq!(per_frame[9], Some(alloc::vec![0xEE]), "{name}: the new frame");
         }
     }
 

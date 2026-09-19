@@ -13,7 +13,8 @@
 //!   ([`SuperShuckieCore::request_stream_snapshot`](crate::SuperShuckieCore::request_stream_snapshot)),
 //!   always at a frame boundary and in order with the packets around it;
 //! * the per-frame events: input changes (once per emulated frame at most), external memory
-//!   writes that were actually applied, resets, save-state loads, counter changes and one
+//!   writes that were actually applied, resets, save-state loads, counter changes, what the
+//!   console received over its link cable (`serial_in`, while one is plugged in) and one
 //!   `next_frame` per emulated frame;
 //! * a **sync hash** of the console's work RAM every [`SYNC_HASH_INTERVAL_FRAMES`] frames, right
 //!   after that frame's `next_frame`, so a follower can tell that it has drifted and ask for a
@@ -63,6 +64,10 @@ pub trait StreamPublisherFns: Send + 'static {
 
     /// A replay counter changed by `delta`.
     fn change_counter(&mut self, name: String, delta: SignedInteger);
+
+    /// What the console received over its link cable during the frame about to be closed by
+    /// [`next_frame`](Self::next_frame) (see `Packet::SerialIn`); never empty.
+    fn serial_in(&mut self, data: ByteVec);
 
     /// blake3 of the work RAM after frame `frame` (see [`SYNC_HASH_INTERVAL_FRAMES`]).
     fn sync_hash(&mut self, frame: UnsignedInteger, hash: [u8; 32]);

@@ -4,6 +4,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QClipboard>
 #include <QFormLayout>
 #include <QHeaderView>
@@ -11,6 +12,7 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPixmap>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTabWidget>
@@ -24,6 +26,31 @@ static QString read_string(size_t (*getter)(const SuperShuckieFrontendRaw *, uin
     char buf[256] = {};
     getter(frontend, reinterpret_cast<uint8_t *>(buf), sizeof(buf));
     return QString::fromUtf8(buf);
+}
+
+/** A solid square of `color`, for combo entries and table cells. */
+static QIcon color_swatch(const QColor &color) {
+    QPixmap pixmap(16, 16);
+    pixmap.fill(color);
+    return QIcon(pixmap);
+}
+
+QComboBox *PlayTogetherDialog::make_color_combo(QWidget *parent) {
+    auto *combo = new QComboBox(parent);
+    combo->addItem("Random", 0);
+    uint8_t count = supershuckie_play_together_color_count();
+    for(uint8_t color = 1; color <= count; color++) {
+        uint32_t rgb = 0;
+        char name[64] = {};
+        if(!supershuckie_play_together_color(color, &rgb, reinterpret_cast<uint8_t *>(name), sizeof(name))) {
+            continue;
+        }
+        combo->addItem(color_swatch(QColor::fromRgb(rgb)), QString::fromUtf8(name), static_cast<int>(color));
+    }
+    int saved = combo->findData(static_cast<int>(supershuckie_frontend_play_together_get_color(this->controller->main_window()->frontend)));
+    combo->setCurrentIndex(saved >= 0 ? saved : 0);
+    combo->setToolTip("Your colour in the session. If another player already has it, the host gives you a free one.");
+    return combo;
 }
 
 PlayTogetherDialog::PlayTogetherDialog(PlayTogetherController *controller): QDialog(controller->main_window()), controller(controller) {
@@ -42,6 +69,8 @@ PlayTogetherDialog::PlayTogetherDialog(PlayTogetherController *controller): QDia
     this->host_name = new QLineEdit(read_string(supershuckie_frontend_play_together_get_display_name, frontend), host_tab);
     this->host_name->setMaxLength(32);
     host_layout->addRow("Your name", this->host_name);
+    this->host_color = this->make_color_combo(host_tab);
+    host_layout->addRow("Your colour", this->host_color);
     this->host_port = new QSpinBox(host_tab);
     this->host_port->setRange(1, 65535);
     this->host_port->setValue(supershuckie_frontend_play_together_get_host_port(frontend));
@@ -76,6 +105,8 @@ PlayTogetherDialog::PlayTogetherDialog(PlayTogetherController *controller): QDia
     this->join_name = new QLineEdit(read_string(supershuckie_frontend_play_together_get_display_name, frontend), join_tab);
     this->join_name->setMaxLength(32);
     join_layout->addRow("Your name", this->join_name);
+    this->join_color = this->make_color_combo(join_tab);
+    join_layout->addRow("Your colour", this->join_color);
     this->join_code = new QLineEdit(read_string(supershuckie_frontend_play_together_get_last_join_code, frontend), join_tab);
     this->join_code->setPlaceholderText("host:port");
     join_layout->addRow("Code", this->join_code);
@@ -129,11 +160,18 @@ void PlayTogetherDialog::refresh(const QJsonObject &state) {
 
     this->host_button->setEnabled(!active);
     this->host_name->setEnabled(!active);
+    this->host_color->setEnabled(!active);
     this->host_port->setEnabled(!active);
     this->join_button->setEnabled(!active);
     this->join_name->setEnabled(!active);
+    this->join_color->setEnabled(!active);
     this->join_code->setEnabled(!active);
     this->reset_button->setEnabled(active && host);
+    bool start_state = state["start_state"].toBool();
+    this->reset_button->setText(start_state ? "Restart from start state (3 s)" : "Reset everyone (3 s)");
+    this->reset_button->setToolTip(start_state
+        ? "Race start: every player's game loads the host's start state and unpauses after a 3 second countdown"
+        : "Race start: every player's console resets after a 3 second countdown");
     this->leave_button->setEnabled(active);
     this->leave_button->setText(host ? "Stop hosting" : "Leave");
 
@@ -145,7 +183,22 @@ void PlayTogetherDialog::refresh(const QJsonObject &state) {
             this->session_label->setText(QString("Connecting to %1…").arg(state["code"].toString()));
         }
         else {
-            this->session_label->setText(QString("%1 as <b>%2</b> (%3)").arg(host ? "Hosting" : "Joined", state["local_name"].toString().toHtmlEscaped(), state["code"].toString().toHtmlEscaped()));
+            QString name = state["local_name"].toString().toHtmlEscaped();
+            QString rgb = state["local_color_rgb"].toString();
+            QString color_note;
+            if(!rgb.isEmpty()) {
+                name = QString("<span style=\"color: %1\">%2</span>").arg(rgb, name);
+                color_note = QString(" — you are <span style=\"color: %1\">■</span> %2").arg(rgb, state["local_color_name"].toString().toHtmlEscaped());
+            }
+            QString sync_note;
+            if(state["sync_pause"].toBool()) {
+                QString paused_by = state["paused_by"].toString().toHtmlEscaped();
+                sync_note = paused_by.isEmpty() ? QString(" — sync pause on") : QString(" — sync pause on, <b>paused by %1</b>").arg(paused_by);
+            }
+            if(state["start_state"].toBool()) {
+                sync_note += host ? " — everyone starts from your save state" : " — everyone starts from the host's save state";
+            }
+            this->session_label->setText(QString("%1 as <b>%2</b> (%3)%4%5").arg(host ? "Hosting" : "Joined", name, state["code"].toString().toHtmlEscaped(), color_note, sync_note));
         }
     }
     else {
@@ -185,6 +238,11 @@ void PlayTogetherDialog::refresh(const QJsonObject &state) {
             }
             item->setText(cells[column]);
         }
+        // The player's colour next to their name, as their window shows it.
+        QColor color(p["color_rgb"].toString());
+        auto *name_item = this->participants->item(row, 0);
+        name_item->setIcon(color.isValid() ? color_swatch(color) : QIcon());
+        name_item->setToolTip(color.isValid() ? p["color_name"].toString() : QString());
         row++;
     }
     this->participants->resizeColumnsToContents();
@@ -202,7 +260,8 @@ void PlayTogetherDialog::do_host() {
     char code[128] = {};
     char error[1024] = {};
     auto name = this->host_name->text().toUtf8();
-    if(!supershuckie_frontend_play_together_host(frontend, static_cast<uint16_t>(this->host_port->value()), name.constData(), reinterpret_cast<uint8_t *>(code), sizeof(code), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
+    auto color = static_cast<uint8_t>(this->host_color->currentData().toInt());
+    if(!supershuckie_frontend_play_together_host(frontend, static_cast<uint16_t>(this->host_port->value()), name.constData(), color, reinterpret_cast<uint8_t *>(code), sizeof(code), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
         this->controller->main_window()->show_error("Can't host", "%s", error);
         return;
     }
@@ -214,7 +273,8 @@ void PlayTogetherDialog::do_join() {
     char error[1024] = {};
     auto name = this->join_name->text().toUtf8();
     auto code = this->join_code->text().trimmed().toUtf8();
-    if(!supershuckie_frontend_play_together_join(frontend, code.constData(), name.constData(), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
+    auto color = static_cast<uint8_t>(this->join_color->currentData().toInt());
+    if(!supershuckie_frontend_play_together_join(frontend, code.constData(), name.constData(), color, reinterpret_cast<uint8_t *>(error), sizeof(error))) {
         this->controller->main_window()->show_error("Can't join", "%s", error);
         return;
     }

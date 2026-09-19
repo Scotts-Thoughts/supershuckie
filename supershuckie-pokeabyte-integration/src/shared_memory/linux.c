@@ -9,15 +9,23 @@
 #include <string.h>
 #include <stdbool.h>
 
-static int fd = -1;
-static uint8_t *mapped = NULL;
-static size_t mapped_len = 0;
-static const char *shm = "/dev/shm/EDPS_MemoryData.bin";
+// One mapping. Several may be open at once (one per Poke-A-Byte integration server, each under
+// its own name), so nothing here is static.
+struct supershuckie_pokeabyte_shm {
+    int fd;
+    uint8_t *mapped;
+    size_t mapped_len;
+    char *path;
+};
 
-uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char **error) {
-    if(fd != -1) {
+void *supershuckie_pokeabyte_try_create_shared_memory(const char *name, size_t len, const char **error, uint8_t **memory) {
+    if(memory) {
+        *memory = NULL;
+    }
+
+    if(name == NULL || name[0] == 0) {
         if(error) {
-            *error = "shared memory already created";
+            *error = "no mapping name";
         }
         return NULL;
     }
@@ -29,11 +37,24 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
         return NULL;
     }
 
-    int new_fd = open(shm, O_CREAT|O_RDWR, 0644);
+    // Poke-A-Byte opens the file by this fixed path (its SharedConstants.GetMmfPath()).
+    static const char *prefix = "/dev/shm/";
+    char *path = malloc(strlen(prefix) + strlen(name) + 1);
+    if(path == NULL) {
+        if(error) {
+            *error = "out of memory";
+        }
+        return NULL;
+    }
+    strcpy(path, prefix);
+    strcat(path, name);
+
+    int new_fd = open(path, O_CREAT|O_RDWR, 0644);
     if(new_fd < 0) {
         if(error) {
             *error = "open failed";
         }
+        free(path);
         return NULL;
     }
 
@@ -42,6 +63,7 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
             *error = "ftruncate failed";
         }
         close(new_fd);
+        free(path);
         return NULL;
     }
 
@@ -52,33 +74,48 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
             *error = "mmap failed";
         }
         close(new_fd);
+        free(path);
         return NULL;
     }
 
-    fd = new_fd;
-    mapped = f;
-    mapped_len = len;
+    struct supershuckie_pokeabyte_shm *shm = malloc(sizeof(*shm));
+    if(shm == NULL) {
+        if(error) {
+            *error = "out of memory";
+        }
+        munmap(f, len);
+        close(new_fd);
+        free(path);
+        return NULL;
+    }
+
+    shm->fd = new_fd;
+    shm->mapped = f;
+    shm->mapped_len = len;
+    shm->path = path;
 
     if(error) {
         *error = "succeeded";
     }
 
-    return f;
+    if(memory) {
+        *memory = f;
+    }
+
+    return shm;
 }
 
-void supershuckie_pokeabyte_close_shared_memory(void) {
-    if(fd == -1) {
-        // Nothing was ever created (or it was already closed); a caller relying on Drop running
-        // more than once should not crash the process.
+void supershuckie_pokeabyte_close_shared_memory(void *token) {
+    struct supershuckie_pokeabyte_shm *shm = token;
+    if(shm == NULL) {
         return;
     }
 
-    if(mapped != NULL) {
-        munmap(mapped, mapped_len);
-        mapped = NULL;
-        mapped_len = 0;
+    if(shm->mapped != NULL) {
+        munmap(shm->mapped, shm->mapped_len);
     }
 
-    close(fd);
-    fd = -1;
+    close(shm->fd);
+    free(shm->path);
+    free(shm);
 }

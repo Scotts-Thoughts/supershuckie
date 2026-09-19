@@ -11,6 +11,7 @@ class QSpinBox;
 class QTabWidget;
 class QTableWidget;
 class QCheckBox;
+class QComboBox;
 
 namespace SuperShuckie64 {
 
@@ -42,6 +43,7 @@ private:
     QTabWidget *tabs;
 
     QLineEdit *host_name;
+    QComboBox *host_color;
     QSpinBox *host_port;
     QPushButton *host_button;
     QLabel *code_label;
@@ -49,6 +51,7 @@ private:
     QLabel *addresses_label;
 
     QLineEdit *join_name;
+    QComboBox *join_color;
     QLineEdit *join_code;
     QPushButton *join_button;
 
@@ -59,6 +62,9 @@ private:
     QCheckBox *save_replays;
     QLabel *errors_label;
     QString shown_code;
+
+    /** "Random" plus every palette colour, with the saved one selected. */
+    QComboBox *make_color_combo(QWidget *parent);
 };
 
 }

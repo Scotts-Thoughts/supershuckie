@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use common::*;
-use supershuckie_play_together::protocol::{Message, WireSnapshot};
+use supershuckie_play_together::protocol::{Message, WireSnapshot, WireStartState};
 use supershuckie_play_together::*;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, REPLAY_VERSION};
 
@@ -45,6 +45,7 @@ impl Raw {
             replay_version: REPLAY_VERSION,
             app_version: "raw".to_owned(),
             display_name: name.to_owned(),
+            color: 0,
             publisher: publisher_info(ReplayConsoleType::GameBoy),
         }
     }
@@ -209,6 +210,55 @@ fn a_spoofed_from_is_rewritten_by_the_host() {
 }
 
 #[test]
+fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
+    let _wd = watchdog(10, "only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender");
+    let host = bind_host("Host");
+    let mut hl = Vec::new();
+    wait_connected(&host, &mut hl);
+    host.set_sync_pause(true, false).unwrap();
+    let (mut liar, liar_id) = Raw::handshake(host.local_addr(), "Liar");
+    let (mut witness, witness_id) = Raw::handshake(host.local_addr(), "Witness");
+    assert_eq!((liar_id, witness_id), (2, 3));
+    wait_joined(&host, &mut hl);
+    wait_joined(&host, &mut hl);
+
+    // Each was told the setting right after its Welcome.
+    assert_eq!(witness.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: false }));
+
+    // A spoofed sender is rewritten.
+    liar.send(&Message::Pause { from: 3, paused: true });
+    assert_eq!(witness.read_until(|m| matches!(m, Message::Pause { .. })), Some(Message::Pause { from: 2, paused: true }));
+    assert_eq!(wait_for(&host, &mut hl, "PauseChanged", |e| matches!(e, SessionEvent::PauseChanged { .. })), SessionEvent::PauseChanged { from: 2, paused: true });
+
+    // A client that claims to set the session's start state, or its setting, is dropped.
+    liar.send(&Message::StartState(WireStartState::cleared()));
+    match liar.read_until(|m| matches!(m, Message::Error { .. })) {
+        Some(Message::Error { text }) => assert!(text.contains("only the host"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(liar.eof());
+    match wait_for(&host, &mut hl, "Left", |e| matches!(e, SessionEvent::Left { .. })) {
+        SessionEvent::Left { peer_id, reason } => assert_eq!((peer_id, reason), (2, LeaveReason::ProtocolError)),
+        other => panic!("{other:?}"),
+    }
+    let (mut liar, _) = Raw::handshake(host.local_addr(), "Liar");
+    wait_joined(&host, &mut hl);
+    liar.send(&Message::SyncPause { enabled: false, paused: false });
+    match liar.read_until(|m| matches!(m, Message::Error { .. })) {
+        Some(Message::Error { text }) => assert!(text.contains("only the host"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(liar.eof());
+    match wait_for(&host, &mut hl, "Left", |e| matches!(e, SessionEvent::Left { .. })) {
+        SessionEvent::Left { peer_id, reason } => assert_eq!((peer_id, reason), (4, LeaveReason::ProtocolError)),
+        other => panic!("{other:?}"),
+    }
+    // The setting survives the attempts: a newcomer still hears it.
+    let (mut late, _) = Raw::handshake(host.local_addr(), "Late");
+    assert_eq!(late.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: true }));
+}
+
+#[test]
 fn unknown_targets_are_ignored() {
     let _wd = watchdog(10, "unknown_targets_are_ignored");
     let host = bind_host("Host");
@@ -259,7 +309,7 @@ fn a_bad_snapshot_or_message_from_a_client_is_a_protocol_error() {
     let (mut raw, _) = Raw::handshake(host.local_addr(), "Bad");
     wait_joined(&host, &mut hl);
     // Only the host sends Welcome.
-    raw.send(&Message::Welcome { your_peer_id: 9, session_id: 1, your_display_name: "x".into(), participants: vec![] });
+    raw.send(&Message::Welcome { your_peer_id: 9, session_id: 1, your_display_name: "x".into(), your_color: 1, participants: vec![] });
     match raw.read_until(|m| matches!(m, Message::Error { .. })) {
         Some(Message::Error { text }) => assert!(text.contains("host"), "{text}"),
         other => panic!("{other:?}"),

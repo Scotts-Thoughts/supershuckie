@@ -219,12 +219,15 @@ void ControlSettingsSetting::mousePressEvent(QMouseEvent *event) {
 }
 
 void ControlSettingsSetting::keyPressEvent(QKeyEvent *event) {
-    event->ignore();
-
+    // Escape is never bound: it goes to the dialog, which closes on it.
     auto device = this->window->ss_device_name();
-    if(device != nullptr) {
+    if(device != nullptr || event->key() == Qt::Key_Escape) {
+        event->ignore();
         return;
     }
+
+    // Keep the key here: an ignored Return/Enter would reach the dialog and press OK.
+    event->accept();
 
     supershuckie_control_settings_set_control_for_device(
         this->window->current_settings,

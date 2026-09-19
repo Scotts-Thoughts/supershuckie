@@ -1,16 +1,24 @@
 // shared memory in Windows
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <windows.h>
 
-static HANDLE handle = INVALID_HANDLE_VALUE;
-static void *view = NULL;
-static const char *mmf_name = "EDPS_MemoryData.bin";
+// One mapping. Several may be open at once (one per Poke-A-Byte integration server, each under
+// its own name), so nothing here is static.
+struct supershuckie_pokeabyte_shm {
+    HANDLE handle;
+    void *view;
+};
 
-uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char **error) {
-    if(handle != INVALID_HANDLE_VALUE) {
+void *supershuckie_pokeabyte_try_create_shared_memory(const char *name, size_t len, const char **error, uint8_t **memory) {
+    if(memory) {
+        *memory = NULL;
+    }
+
+    if(name == NULL || name[0] == 0) {
         if(error) {
-            *error = "shared memory already created";
+            *error = "no mapping name";
         }
         return NULL;
     }
@@ -28,7 +36,7 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
         PAGE_READWRITE,
         (uint32_t)((uint64_t)(len) >> 32),
         (uint32_t)len,
-        mmf_name
+        name
     );
 
     // CreateFileMappingA returns NULL on failure, not INVALID_HANDLE_VALUE.
@@ -57,21 +65,39 @@ uint8_t *supershuckie_pokeabyte_try_create_shared_memory(size_t len, const char 
         return NULL;
     }
 
-    // Only commit to the statics once both steps have actually succeeded.
-    handle = handle_maybe;
-    view = mapped;
+    struct supershuckie_pokeabyte_shm *shm = malloc(sizeof(*shm));
+    if(shm == NULL) {
+        if(error) {
+            *error = "out of memory";
+        }
+        UnmapViewOfFile(mapped);
+        CloseHandle(handle_maybe);
+        return NULL;
+    }
 
-    return (uint8_t *)mapped;
+    shm->handle = handle_maybe;
+    shm->view = mapped;
+
+    if(memory) {
+        *memory = (uint8_t *)mapped;
+    }
+
+    return shm;
 }
 
-void supershuckie_pokeabyte_close_shared_memory(void) {
-    if(view != NULL) {
-        UnmapViewOfFile(view);
-        view = NULL;
+void supershuckie_pokeabyte_close_shared_memory(void *token) {
+    struct supershuckie_pokeabyte_shm *shm = token;
+    if(shm == NULL) {
+        return;
     }
 
-    if(handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(handle);
-        handle = INVALID_HANDLE_VALUE;
+    if(shm->view != NULL) {
+        UnmapViewOfFile(shm->view);
     }
+
+    if(shm->handle != NULL && shm->handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(shm->handle);
+    }
+
+    free(shm);
 }

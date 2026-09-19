@@ -192,6 +192,128 @@ fn reset_all_reaches_everyone() {
 }
 
 #[test]
+fn sync_pause_is_the_hosts_setting_and_pauses_are_relayed_only_while_it_is_on() {
+    let _wd = watchdog(15, "sync_pause_is_the_hosts_setting_and_pauses_are_relayed_only_while_it_is_on");
+    let host = bind_host("Host");
+    let a = connect_client(&host, "A");
+    let b = connect_client(&host, "B");
+    let (mut hl, mut al, mut bl) = (Vec::new(), Vec::new(), Vec::new());
+    let a_id = wait_connected(&a, &mut al);
+    wait_connected(&b, &mut bl);
+    wait_joined(&host, &mut hl);
+    wait_joined(&host, &mut hl);
+    let is_sync = |e: &SessionEvent| matches!(e, SessionEvent::SyncPauseChanged { .. });
+    let is_pause = |e: &SessionEvent| matches!(e, SessionEvent::PauseChanged { .. });
+
+    // Joining tells a client the setting (off, to begin with).
+    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false });
+    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false });
+    assert!(matches!(a.set_sync_pause(true, false), Err(PlayTogetherError::NotHost)));
+
+    // Off: a pause goes nowhere, and the host's own is not sent either.
+    a.send_pause(true).unwrap();
+    host.send_pause(true).unwrap();
+    assert_no_event(&host, &mut hl, Duration::from_millis(300), "PauseChanged while off", is_pause);
+    assert_no_event(&b, &mut bl, Duration::from_millis(100), "PauseChanged while off", is_pause);
+    assert_no_event(&a, &mut al, Duration::from_millis(100), "PauseChanged while off", is_pause);
+
+    // On, with the host paused: everyone hears both.
+    host.set_sync_pause(true, true).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
+    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
+
+    // A client's pause reaches the host and the other client, never the sender.
+    a.send_pause(false).unwrap();
+    assert_eq!(wait_for(&host, &mut hl, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: a_id, paused: false });
+    assert_eq!(wait_for(&b, &mut bl, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: a_id, paused: false });
+    assert_no_event(&a, &mut al, Duration::from_millis(200), "own pause echoed", is_pause);
+
+    // The host's pause reaches both clients.
+    host.send_pause(true).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: 1, paused: true });
+    assert_eq!(wait_for(&b, &mut bl, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: 1, paused: true });
+
+    // A late joiner is told the setting and the state the session is in (paused, by the host).
+    let c = connect_client(&host, "C");
+    let mut cl = Vec::new();
+    wait_connected(&c, &mut cl);
+    wait_joined(&host, &mut hl);
+    assert_eq!(wait_for(&c, &mut cl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
+
+    // Off again: everyone hears it, and pauses stop travelling.
+    host.set_sync_pause(false, true).unwrap();
+    for (session, log) in [(&a as &dyn Session, &mut al), (&b, &mut bl), (&c, &mut cl)] {
+        assert_eq!(wait_for(session, log, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: true });
+    }
+    b.send_pause(false).unwrap();
+    assert_no_event(&host, &mut hl, Duration::from_millis(300), "PauseChanged after turning off", is_pause);
+    assert_no_event(&a, &mut al, Duration::from_millis(100), "PauseChanged after turning off", is_pause);
+    assert_no_event(&c, &mut cl, Duration::from_millis(100), "PauseChanged after turning off", is_pause);
+}
+
+#[test]
+fn the_start_state_reaches_everyone_and_only_matching_games_may_join_while_it_is_set() {
+    let _wd = watchdog(15, "the_start_state_reaches_everyone_and_only_matching_games_may_join_while_it_is_set");
+    let host = bind_host("Host");
+    let a = connect_client(&host, "A");
+    let (mut hl, mut al) = (Vec::new(), Vec::new());
+    wait_connected(&a, &mut al);
+    wait_joined(&host, &mut hl);
+    let is_start = |e: &SessionEvent| matches!(e, SessionEvent::StartStateChanged { .. });
+
+    // Nothing is said about a start state until one is set.
+    assert_no_event(&a, &mut al, Duration::from_millis(200), "StartStateChanged before any was set", is_start);
+    assert!(matches!(a.set_start_state(None), Err(PlayTogetherError::NotHost)));
+
+    // Setting one delivers it (compressed on the wire, decoded on arrival) to the client.
+    let state = StartStateData { rom_checksum: [0x11; 32], state: (0..300_000u32).map(|i| (i % 13) as u8).collect() };
+    host.set_start_state(Some(state.clone())).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: Some(state.clone()) });
+
+    // A late joiner with the host's game gets it right after joining; one with another ROM,
+    // core or BIOS is refused with the reason and a sentence about the host's game.
+    let b = connect_client(&host, "B");
+    let mut bl = Vec::new();
+    wait_connected(&b, &mut bl);
+    wait_joined(&host, &mut hl);
+    assert_eq!(wait_for(&b, &mut bl, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: Some(state.clone()) });
+    let mut other = publisher_info(ReplayConsoleType::GameBoyAdvance);
+    other.metadata.rom_checksum = [0x99; 32];
+    let refused = connect_client_with(&host, local_with("Other", other));
+    let mut rl = Vec::new();
+    match wait_disconnected(&refused, &mut rl) {
+        DisconnectReason::Refused { reason, text } => {
+            assert_eq!(reason, RefusalReason::StartStateMismatch);
+            assert!(text.contains("different ROM") && text.contains("host's save state"), "{text}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut other_core = publisher_info(ReplayConsoleType::GameBoyAdvance);
+    other_core.metadata.emulator_core_name = "mGBA 0.9.0".to_owned();
+    let refused = connect_client_with(&host, local_with("OldCore", other_core));
+    let mut rl = Vec::new();
+    assert!(matches!(wait_disconnected(&refused, &mut rl), DisconnectReason::Refused { reason: RefusalReason::StartStateMismatch, .. }));
+    assert_no_event(&host, &mut hl, Duration::from_millis(200), "Joined for a refused client", |e| matches!(e, SessionEvent::Joined(_)));
+
+    // Replacing it delivers the new one; clearing it is heard by everyone, and then any ROM
+    // may join again.
+    let second = StartStateData { rom_checksum: [0x11; 32], state: vec![7; 100] };
+    host.set_start_state(Some(second.clone())).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: Some(second.clone()) });
+    assert_eq!(wait_for(&b, &mut bl, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: Some(second) });
+    host.set_start_state(None).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: None });
+    assert_eq!(wait_for(&b, &mut bl, "StartStateChanged", is_start), SessionEvent::StartStateChanged { state: None });
+    let mut other = publisher_info(ReplayConsoleType::GameBoyAdvance);
+    other.metadata.rom_checksum = [0x99; 32];
+    let c = connect_client_with(&host, local_with("Other", other));
+    let mut cl = Vec::new();
+    wait_connected(&c, &mut cl);
+    wait_joined(&host, &mut hl);
+    assert_no_event(&c, &mut cl, Duration::from_millis(200), "StartStateChanged after clearing", is_start);
+}
+
+#[test]
 fn client_leave_is_seen_by_everyone_and_ends_sinks() {
     let _wd = watchdog(10, "client_leave_is_seen_by_everyone_and_ends_sinks");
     let host = bind_host("Host");
@@ -305,7 +427,7 @@ impl Raw {
         Message::read(&mut self.stream).ok().flatten()
     }
     fn hello(protocol_version: u32, replay_version: u32, publisher: PublisherInfo) -> Message {
-        Message::Hello { protocol_version, replay_version, app_version: "raw".to_owned(), display_name: "Raw".to_owned(), publisher }
+        Message::Hello { protocol_version, replay_version, app_version: "raw".to_owned(), display_name: "Raw".to_owned(), color: 0, publisher }
     }
 }
 
@@ -319,9 +441,9 @@ fn refusals() {
 
     // Protocol and replay version, via a raw client (a real one always sends the right ones).
     for (hello, expected) in [
-        (Raw::hello(2, REPLAY_VERSION, publisher_info(ReplayConsoleType::GameBoy)), RefusalReason::ProtocolVersion),
-        (Raw::hello(1, REPLAY_VERSION + 1, publisher_info(ReplayConsoleType::GameBoy)), RefusalReason::ReplayVersion),
-        (Raw::hello(1, REPLAY_VERSION, publisher_info(ReplayConsoleType::Unknown)), RefusalReason::ConsoleUnsupported),
+        (Raw::hello(PROTOCOL_VERSION + 1, REPLAY_VERSION, publisher_info(ReplayConsoleType::GameBoy)), RefusalReason::ProtocolVersion),
+        (Raw::hello(PROTOCOL_VERSION, REPLAY_VERSION + 1, publisher_info(ReplayConsoleType::GameBoy)), RefusalReason::ReplayVersion),
+        (Raw::hello(PROTOCOL_VERSION, REPLAY_VERSION, publisher_info(ReplayConsoleType::Unknown)), RefusalReason::ConsoleUnsupported),
     ] {
         let mut raw = Raw::connect(addr);
         raw.send(&hello);
@@ -391,6 +513,39 @@ fn display_names_are_deduplicated_by_the_host() {
     let connected = |session: &dyn Session, log: &mut Vec<SessionEvent>| wait_for(session, log, "Connected", |e| matches!(e, SessionEvent::Connected { .. }));
     assert_eq!(name_of(connected(&a, &mut al)), ("Ash (2)".to_owned(), 1));
     assert_eq!(name_of(connected(&b, &mut bl)), ("Ash (3)".to_owned(), 2));
+}
+
+#[test]
+fn colors_are_unique_within_a_session() {
+    let _wd = watchdog(10, "colors_are_unique_within_a_session");
+    let host = HostSession::bind(host_config(), LocalParticipant { color: 5, ..local("Host") }).expect("bind");
+    let mut hl = Vec::new();
+    match wait_for(&host, &mut hl, "Connected", |e| matches!(e, SessionEvent::Connected { .. })) {
+        SessionEvent::Connected { local_color, .. } => assert_eq!(local_color, 5),
+        other => panic!("{other:?}"),
+    }
+    // Asks for the host's colour: gets another. Asks for nothing: gets one. Asks for a free
+    // one: gets it. Every colour in the session differs.
+    let a = connect_client_with(&host, LocalParticipant { color: 5, ..local("A") });
+    let b = connect_client_with(&host, LocalParticipant { color: 0, ..local("B") });
+    let c = connect_client_with(&host, LocalParticipant { color: 9, ..local("C") });
+    let color_of = |session: &dyn Session, log: &mut Vec<SessionEvent>| match wait_for(session, log, "Connected", |e| matches!(e, SessionEvent::Connected { .. })) {
+        SessionEvent::Connected { local_color, participants, .. } => {
+            assert!(participants.iter().all(|p| is_valid_color(p.color) && p.color != local_color));
+            local_color
+        }
+        other => panic!("{other:?}"),
+    };
+    let (mut al, mut bl, mut cl) = (Vec::new(), Vec::new(), Vec::new());
+    let colors = [5, color_of(&a, &mut al), color_of(&b, &mut bl), color_of(&c, &mut cl)];
+    assert_ne!(colors[1], 5);
+    assert_eq!(colors[3], 9);
+    for c in colors {
+        assert!(is_valid_color(c));
+        assert_eq!(colors.iter().filter(|&&o| o == c).count(), 1, "{colors:?}");
+    }
+    let joined: Vec<u8> = (0..3).map(|_| wait_joined(&host, &mut hl).color).collect();
+    assert_eq!(joined, colors[1..]);
 }
 
 // ---------------------------------------------------------------------------------------------

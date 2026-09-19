@@ -3,6 +3,12 @@
 //! Threads: `pt-host-accept` (non-blocking accept, polled every 20 ms), `pt-host-tick` (flushes
 //! the snapshot-request coalescer, reaps finished connection threads, backstops the timeouts),
 //! and `pt-reader-N` / `pt-writer-N` per connection.
+//!
+//! The host also keeps the link cable roster: which pairs are linked, which requests are
+//! outstanding. It declines a request on the target's behalf when either end is busy or the
+//! consoles' families differ, records a pair on `LinkAccept`, and tells the survivor (and
+//! everyone else) when one end unplugs or leaves. Its own link messages take the same path as
+//! a client's.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -14,17 +20,21 @@ use std::time::{Duration, Instant};
 
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayPatchFormat, REPLAY_VERSION};
 
-use crate::compat::{dedupe_display_name, sanitize_display_name};
-use crate::conn::{writer_loop, ConnShared, Outbound, PushError, Stats};
+use crate::color::assign_color;
+use crate::compat::{dedupe_display_name, describe_incompatibility, follow_compatibility, link_family, sanitize_display_name, FollowCompatibility};
+use crate::conn::{writer_loop, ConnShared, Outbound, PushError, StartStateItem, Stats};
 use crate::error::{DisconnectReason, PlayTogetherError, PublishError};
-use crate::protocol::{decode_packets, read_frame, LeaveReason, Message, ParticipantInfo, ReadError, RefusalReason, PEER_ID_OFFSET, PROTOCOL_VERSION};
+use crate::protocol::{
+    decode_link_events, decode_packets, read_frame, LeaveReason, LinkDeclineReason, LinkMessage, Message, ParticipantInfo, ReadError, RefusalReason,
+    UnlinkReason, WireStartState, PEER_ID_OFFSET, PROTOCOL_VERSION,
+};
 use crate::session::follow::{FollowSlot, StreamOutcome};
 use crate::session::{
-    base_stats, join_bounded, Coalescer, EventQueue, FollowerSink, HostConfig, PublishBackend, PublisherHandle, Role, Session, SessionEvent,
-    SessionStats, GOODBYE_GRACE, LEAVE_TIMEOUT, POLL_INTERVAL,
+    base_stats, join_bounded, receive_link, spawn_session_thread, Coalescer, EventQueue, FollowerSink, HostConfig, LinkSink, LinkSinks, PublishBackend,
+    PublisherHandle, Role, Session, SessionEvent, SessionStats, GOODBYE_GRACE, LEAVE_TIMEOUT, POLL_INTERVAL,
 };
 use crate::transport::{Connection, Listener, TcpTransport, Transport};
-use crate::{LocalParticipant, PeerId, SessionId, MAX_PARTICIPANTS};
+use crate::{LocalParticipant, PeerId, SessionId, StartStateData, MAX_PARTICIPANTS};
 
 /// The host's own peer id.
 pub const HOST_PEER_ID: PeerId = 1;
@@ -52,6 +62,21 @@ struct HostShared {
     coalescer: Mutex<Coalescer>,
     race_counter: AtomicU32,
     conn_counter: AtomicUsize,
+    /// Whether pausing is shared and, while it is, the session's pause state (what a joining
+    /// client is told).
+    sync_pause: Mutex<SyncPauseState>,
+    /// The save state everyone's own game is loaded from, while one is set (sent to each joining
+    /// client, whose game must then match the host's).
+    start_state: Mutex<Option<Arc<StartStateItem>>>,
+    /// Where the host's own link partner's frames go.
+    link_sinks: LinkSinks,
+}
+
+/// The session's sync-pause setting and state, as sent in a `SyncPause` message.
+#[derive(Clone, Copy, Default)]
+struct SyncPauseState {
+    enabled: bool,
+    paused: bool,
 }
 
 #[derive(Default)]
@@ -62,6 +87,11 @@ struct HostInner {
     follows: HashMap<PeerId, Arc<FollowSlot>>,
     /// Reader and writer threads of every connection ever accepted, reaped by the tick thread.
     threads: Vec<JoinHandle<()>>,
+    /// Who is linked with whom (each pair once, in either order).
+    links: Vec<(PeerId, PeerId)>,
+    /// Link requests relayed and not yet answered: `(requester, target, nonce)`; one per
+    /// requester.
+    link_requests: Vec<(PeerId, PeerId, u32)>,
 }
 
 struct HostConn {
@@ -105,9 +135,10 @@ impl HostSession {
 
         let display_name = sanitize_display_name(&local.display_name);
         let session_id = new_session_id(local_addr);
+        let color = assign_color(local.color, &[], session_id);
         let shared = Arc::new(HostShared {
             config: HostConfig { max_participants: config.max_participants.clamp(1, MAX_PARTICIPANTS), ..config },
-            local: ParticipantInfo { peer_id: HOST_PEER_ID, display_name: display_name.clone(), app_version: local.app_version, publisher: local.publisher },
+            local: ParticipantInfo { peer_id: HOST_PEER_ID, display_name: display_name.clone(), color, app_version: local.app_version, publisher: local.publisher },
             session_id,
             local_id: Arc::new(AtomicU16::new(HOST_PEER_ID)),
             running: AtomicBool::new(true),
@@ -118,24 +149,25 @@ impl HostSession {
             coalescer: Mutex::new(Coalescer::default()),
             race_counter: AtomicU32::new(1),
             conn_counter: AtomicUsize::new(1),
+            sync_pause: Mutex::new(SyncPauseState::default()),
+            start_state: Mutex::new(None),
+            link_sinks: LinkSinks::default(),
         });
         shared.events.push(SessionEvent::Connected {
             session_id,
             local_peer_id: HOST_PEER_ID,
             local_display_name: display_name,
+            local_color: color,
             participants: Vec::new(),
         });
 
         let accept = {
             let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
-                .name("pt-host-accept".to_owned())
-                .spawn(move || accept_loop(shared, listener))
-                .map_err(PlayTogetherError::Io)?
+            spawn_session_thread("pt-host-accept".to_owned(), move || accept_loop(shared, listener)).map_err(PlayTogetherError::Io)?
         };
         let tick = {
             let shared = Arc::clone(&shared);
-            std::thread::Builder::new().name("pt-host-tick".to_owned()).spawn(move || tick_loop(shared)).map_err(PlayTogetherError::Io)?
+            spawn_session_thread("pt-host-tick".to_owned(), move || tick_loop(shared)).map_err(PlayTogetherError::Io)?
         };
 
         Ok(HostSession { shared, local_addr, threads: Mutex::new(vec![accept, tick]) })
@@ -238,12 +270,12 @@ impl HostShared {
         let reader = {
             let shared = Arc::clone(self);
             let conn = Arc::clone(&conn);
-            std::thread::Builder::new().name(format!("pt-reader-{number}")).spawn(move || reader_thread(shared, conn, read))
+            spawn_session_thread(format!("pt-reader-{number}"), move || reader_thread(shared, conn, read))
         };
         let writer = {
             let shared = Arc::clone(self);
             let conn = Arc::clone(&conn);
-            std::thread::Builder::new().name(format!("pt-writer-{number}")).spawn(move || {
+            spawn_session_thread(format!("pt-writer-{number}"), move || {
                 let warn = |text: String| shared.events.push(SessionEvent::Warning(text));
                 if writer_loop(write, &conn.shared, &warn).is_err() {
                     shared.close_connection(&conn, LeaveReason::IoError, false);
@@ -332,11 +364,169 @@ impl HostShared {
             self.coalescer.lock().unwrap_or_else(|e| e.into_inner()).forget(peer_id);
             self.events.push(SessionEvent::Left { peer_id, reason });
             if self.running.load(Ordering::Acquire) {
+                // The survivor's `Unlink` goes on the urgent lane, so queueing it first keeps it
+                // ahead of the `PeerLeft` on the wire: the survivor's link sink always ends
+                // through the `Unlink`, before it hears of the departure.
+                self.unlink_departed(peer_id);
                 self.broadcast(&Message::PeerLeft { peer_id, reason }, peer_id);
             }
+            self.link_sinks.end(peer_id, reason);
             if let Some(slot) = slot {
                 slot.end(reason);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Link cable roster
+
+    /// The console of a participant (the host itself included), if it is in the session.
+    fn console_of(&self, peer: PeerId) -> Option<ReplayConsoleType> {
+        if peer == HOST_PEER_ID {
+            return Some(self.local.publisher.metadata.console_type);
+        }
+        self.conn_for(peer).and_then(|c| c.info.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.publisher.metadata.console_type))
+    }
+
+    /// Whether `peer` is one end of a recorded link.
+    fn is_linked(inner: &HostInner, peer: PeerId) -> bool {
+        inner.links.iter().any(|(a, b)| *a == peer || *b == peer)
+    }
+
+    /// Whether `a` and `b` are linked with each other.
+    fn are_linked(inner: &HostInner, a: PeerId, b: PeerId) -> bool {
+        inner.links.iter().any(|(x, y)| (*x == a && *y == b) || (*x == b && *y == a))
+    }
+
+    /// Hand a link cable message to `target`: the host's own event queue and sink when it is
+    /// the host, else the target's urgent lane. `raw` is the framed message with `from`
+    /// already stamped.
+    fn deliver_link(&self, target: PeerId, message: Message, raw: Arc<Vec<u8>>) {
+        if target == HOST_PEER_ID {
+            if let Err(text) = receive_link(&self.events, &self.link_sinks, &self.stats, message) {
+                self.events.push(SessionEvent::Warning(format!("a link cable message could not be read: {text}")));
+            }
+        } else if let Some(conn) = self.conn_for(target) {
+            match conn.shared.send_urgent(raw) {
+                Ok(()) | Err(PushError::Closed) => {}
+                Err(PushError::Full { .. }) => self.close_connection(&conn, LeaveReason::TooSlow, false),
+            }
+        }
+    }
+
+    /// Tell everyone (the host's own event queue included) that `a` and `b` are linked, or no
+    /// longer are.
+    fn announce_link(&self, a: PeerId, b: PeerId, linked: bool) {
+        let (a, b) = (a.min(b), a.max(b));
+        let message = if linked { Message::PeerLinked { a, b } } else { Message::PeerUnlinked { a, b } };
+        self.broadcast(&message, 0);
+        let _ = receive_link(&self.events, &self.link_sinks, &self.stats, message);
+    }
+
+    /// Route a link cable message `from` sent (a client's, stamped, or the host's own): decline
+    /// or drop what the roster forbids, keep the roster, and deliver the rest to its target.
+    fn route_link(&self, from: PeerId, message: Message, raw: Vec<u8>) {
+        let Some((_, target)) = message.link_endpoints() else { return };
+        if target == from {
+            return;
+        }
+        let raw = Arc::new(raw);
+        match &message {
+            Message::LinkRequest { nonce, .. } => {
+                let nonce = *nonce;
+                let decline = |reason: LinkDeclineReason| {
+                    let answer = Message::LinkDecline { from: target, target: from, nonce, reason };
+                    let encoded = Arc::new(answer.encoded());
+                    self.deliver_link(from, answer, encoded);
+                };
+                let Some(their_console) = self.console_of(target) else {
+                    return decline(LinkDeclineReason::Unavailable);
+                };
+                let our_console = self.console_of(from).unwrap_or(ReplayConsoleType::Unknown);
+                {
+                    let mut inner = self.lock();
+                    if Self::is_linked(&inner, from) || Self::is_linked(&inner, target) {
+                        drop(inner);
+                        return decline(LinkDeclineReason::Busy);
+                    }
+                    match (link_family(our_console), link_family(their_console)) {
+                        (Some(a), Some(b)) if a == b => {}
+                        _ => {
+                            drop(inner);
+                            return decline(LinkDeclineReason::ConsoleMismatch);
+                        }
+                    }
+                    // One outstanding request per requester: a new one replaces the old.
+                    inner.link_requests.retain(|(requester, _, _)| *requester != from);
+                    inner.link_requests.push((from, target, nonce));
+                }
+                self.deliver_link(target, message, raw);
+            }
+            Message::LinkAccept { nonce, .. } => {
+                let nonce = *nonce;
+                let mut inner = self.lock();
+                let Some(index) = inner.link_requests.iter().position(|r| *r == (target, from, nonce)) else {
+                    // Nothing to accept (the request was answered, withdrawn, or never relayed).
+                    return;
+                };
+                inner.link_requests.remove(index);
+                if Self::is_linked(&inner, from) || Self::is_linked(&inner, target) {
+                    drop(inner);
+                    let answer = Message::Unlink { from: target, target: from, reason: UnlinkReason::Busy };
+                    let encoded = Arc::new(answer.encoded());
+                    return self.deliver_link(from, answer, encoded);
+                }
+                inner.links.push((target, from));
+                drop(inner);
+                self.deliver_link(target, message, raw);
+                self.announce_link(target, from, true);
+            }
+            Message::LinkDecline { nonce, .. } => {
+                let nonce = *nonce;
+                let mut inner = self.lock();
+                let Some(index) = inner.link_requests.iter().position(|r| *r == (target, from, nonce)) else {
+                    return;
+                };
+                inner.link_requests.remove(index);
+                drop(inner);
+                self.deliver_link(target, message, raw);
+            }
+            Message::LinkStart { .. } | Message::LinkFrame { .. } => {
+                if !Self::are_linked(&self.lock(), from, target) {
+                    return;
+                }
+                self.deliver_link(target, message, raw);
+            }
+            Message::Unlink { .. } => {
+                let mut inner = self.lock();
+                inner.link_requests.retain(|(requester, t, _)| !((*requester == from && *t == target) || (*requester == target && *t == from)));
+                let was_linked = Self::are_linked(&inner, from, target);
+                inner.links.retain(|(a, b)| !((*a == from && *b == target) || (*a == target && *b == from)));
+                drop(inner);
+                if !was_linked {
+                    return;
+                }
+                self.deliver_link(target, message, raw);
+                self.announce_link(from, target, false);
+            }
+            _ => {}
+        }
+    }
+
+    /// `peer` left: unplug whatever it was linked with and forget its requests.
+    fn unlink_departed(&self, peer: PeerId) {
+        let partners: Vec<PeerId> = {
+            let mut inner = self.lock();
+            inner.link_requests.retain(|(requester, target, _)| *requester != peer && *target != peer);
+            let partners = inner.links.iter().filter_map(|(a, b)| if *a == peer { Some(*b) } else if *b == peer { Some(*a) } else { None }).collect();
+            inner.links.retain(|(a, b)| *a != peer && *b != peer);
+            partners
+        };
+        for partner in partners {
+            let message = Message::Unlink { from: peer, target: partner, reason: UnlinkReason::PeerLeft };
+            let encoded = Arc::new(message.encoded());
+            self.deliver_link(partner, message, encoded);
+            self.announce_link(peer, partner, false);
         }
     }
 
@@ -354,7 +544,7 @@ impl HostShared {
     }
 
     /// Admit a pending connection on its `Hello`.
-    fn admit(&self, conn: &Arc<HostConn>, protocol_version: u32, replay_version: u32, app_version: String, display_name: String, publisher: crate::PublisherInfo) {
+    fn admit(&self, conn: &Arc<HostConn>, protocol_version: u32, replay_version: u32, app_version: String, display_name: String, color: u8, publisher: crate::PublisherInfo) {
         if !self.running.load(Ordering::Acquire) {
             return self.refuse(conn, RefusalReason::HostShuttingDown, "the host is shutting down".to_owned());
         }
@@ -384,6 +574,15 @@ impl HostShared {
         if publisher.metadata.patch_format != ReplayPatchFormat::Unpatched {
             return self.refuse(conn, RefusalReason::PatchedRomUnsupported, "patched ROMs are not supported by Play Together yet".to_owned());
         }
+        // Everyone starts from the host's save state: the joiner's game has to be able to load it.
+        let start_state = self.start_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if start_state.is_some() {
+            let compat = follow_compatibility(&publisher.metadata, &self.local.publisher.metadata);
+            if compat != FollowCompatibility::Ok {
+                let why = describe_incompatibility(&compat, "The host");
+                return self.refuse(conn, RefusalReason::StartStateMismatch, format!("{why} Everyone in this session starts from the host's save state."));
+            }
+        }
 
         let (participant, welcome) = {
             let mut inner = self.lock();
@@ -396,18 +595,48 @@ impl HostShared {
             inner.next_peer_id += 1;
             let taken: Vec<String> = std::iter::once(self.local.display_name.clone()).chain(admitted.iter().map(|p| p.display_name.clone())).collect();
             let display_name = dedupe_display_name(&display_name, &taken);
-            let participant = ParticipantInfo { peer_id, display_name: display_name.clone(), app_version, publisher };
+            let taken_colors: Vec<u8> = std::iter::once(self.local.color).chain(admitted.iter().map(|p| p.color)).collect();
+            let color = assign_color(color, &taken_colors, self.session_id ^ u64::from(peer_id).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let participant = ParticipantInfo { peer_id, display_name: display_name.clone(), color, app_version, publisher };
             *conn.info.lock().unwrap_or_else(|e| e.into_inner()) = Some(participant.clone());
-            conn.shared.peer_id.store(peer_id, Ordering::Release);
-            inner.follows.insert(peer_id, Arc::new(FollowSlot::new()));
             let mut participants = Vec::with_capacity(admitted.len() + 1);
             participants.push(self.local.clone());
             participants.extend(admitted);
-            (participant, Message::Welcome { your_peer_id: peer_id, session_id: self.session_id, your_display_name: display_name, participants })
+            let welcome = Message::Welcome { your_peer_id: peer_id, session_id: self.session_id, your_display_name: display_name, your_color: color, participants };
+            // Queued before the connection counts as admitted (still under the lock): another
+            // connection's admission broadcasting its `PeerJoined` meanwhile must not get in
+            // ahead of this `Welcome`.
+            let _ = conn.shared.send(&welcome);
+            let _ = conn.shared.send(&self.sync_pause_message());
+            if let Some(item) = start_state {
+                let _ = conn.shared.queue.try_push(Outbound::StartState(item));
+            }
+            conn.shared.peer_id.store(peer_id, Ordering::Release);
+            inner.follows.insert(peer_id, Arc::new(FollowSlot::new()));
+            (participant, welcome)
         };
-        let _ = conn.shared.send(&welcome);
+        let _ = welcome;
         self.broadcast(&Message::PeerJoined { participant: participant.clone() }, participant.peer_id);
         self.events.push(SessionEvent::Joined(participant));
+    }
+
+    fn sync_pause_state(&self) -> SyncPauseState {
+        *self.sync_pause.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The `SyncPause` message describing the current setting and state.
+    fn sync_pause_message(&self) -> Message {
+        let state = self.sync_pause_state();
+        Message::SyncPause { enabled: state.enabled, paused: state.paused }
+    }
+
+    /// Note the session's pause state (only while sync pause is enabled). Returns whether it is.
+    fn note_pause(&self, paused: bool) -> bool {
+        let mut state = self.sync_pause.lock().unwrap_or_else(|e| e.into_inner());
+        if state.enabled {
+            state.paused = paused;
+        }
+        state.enabled
     }
 
     fn follow_slot(&self, peer: PeerId) -> Option<Arc<FollowSlot>> {
@@ -429,8 +658,41 @@ impl HostShared {
     fn handle_admitted(&self, conn: &Arc<HostConn>, from: PeerId, message: Message, mut raw: Vec<u8>) {
         match message {
             Message::Hello { .. } => self.protocol_error(conn, "a second Hello on an admitted connection".to_owned()),
-            Message::Welcome { .. } | Message::Refused { .. } | Message::PeerJoined { .. } | Message::PeerLeft { .. } | Message::ResetAll { .. } => {
-                self.protocol_error(conn, "only the host sends that message".to_owned())
+            Message::Welcome { .. }
+            | Message::Refused { .. }
+            | Message::PeerJoined { .. }
+            | Message::PeerLeft { .. }
+            | Message::ResetAll { .. }
+            | Message::SyncPause { .. }
+            | Message::StartState(_)
+            | Message::PeerLinked { .. }
+            | Message::PeerUnlinked { .. } => self.protocol_error(conn, "only the host sends that message".to_owned()),
+            Message::LinkRequest { .. } | Message::LinkAccept { .. } | Message::LinkDecline { .. } | Message::LinkStart { .. } | Message::LinkFrame { .. } | Message::Unlink { .. } => {
+                if let Message::LinkFrame { events, .. } = &message {
+                    if let Err(e) = decode_link_events(events) {
+                        return self.protocol_error(conn, e.to_string());
+                    }
+                }
+                stamp_peer_id(&mut raw, from);
+                let message = match message.link_endpoints() {
+                    Some(_) => stamp_from(message, from),
+                    None => return,
+                };
+                self.route_link(from, message, raw);
+            }
+            Message::Pause { paused, .. } => {
+                // Dropped while sync pause is off: the client may not have heard that it was
+                // turned off yet.
+                if self.note_pause(paused) {
+                    stamp_peer_id(&mut raw, from);
+                    let raw = Arc::new(raw);
+                    for other in self.admitted_conns() {
+                        if other.peer_id() != from {
+                            self.push_to(&other, Outbound::Encoded(Arc::clone(&raw)));
+                        }
+                    }
+                    self.events.push(SessionEvent::PauseChanged { from, paused });
+                }
             }
             Message::Stream { first_frame, bytes, .. } => {
                 let packets = match decode_packets(&bytes) {
@@ -536,6 +798,23 @@ fn stamp_peer_id(frame: &mut [u8], id: PeerId) {
     }
 }
 
+/// The decoded counterpart of [`stamp_peer_id`] for a link cable message.
+fn stamp_from(message: Message, id: PeerId) -> Message {
+    match message {
+        Message::LinkRequest { target, nonce, console, .. } => Message::LinkRequest { from: id, target, nonce, console },
+        Message::LinkAccept { target, nonce, .. } => Message::LinkAccept { from: id, target, nonce },
+        Message::LinkDecline { target, nonce, reason, .. } => Message::LinkDecline { from: id, target, nonce, reason },
+        Message::LinkStart { target, nonce, frame, input, rtt_millis, delay_setting, .. } => {
+            Message::LinkStart { from: id, target, nonce, frame, input, rtt_millis, delay_setting }
+        }
+        Message::LinkFrame { target, frame, elapsed_millis, events, pair_hash_frame, pair_hash, .. } => {
+            Message::LinkFrame { from: id, target, frame, elapsed_millis, events, pair_hash_frame, pair_hash }
+        }
+        Message::Unlink { target, reason, .. } => Message::Unlink { from: id, target, reason },
+        other => other,
+    }
+}
+
 fn reader_thread<R: Read>(shared: Arc<HostShared>, conn: Arc<HostConn>, mut read: R) {
     let idle_timeout = shared.config.idle_timeout;
     let mut last_rx = Instant::now();
@@ -597,8 +876,8 @@ fn reader_thread<R: Read>(shared: Arc<HostShared>, conn: Arc<HostConn>, mut read
         let peer_id = conn.peer_id();
         if peer_id == 0 {
             match message {
-                Message::Hello { protocol_version, replay_version, app_version, display_name, publisher } => {
-                    shared.admit(&conn, protocol_version, replay_version, app_version, display_name, publisher);
+                Message::Hello { protocol_version, replay_version, app_version, display_name, color, publisher } => {
+                    shared.admit(&conn, protocol_version, replay_version, app_version, display_name, color, publisher);
                 }
                 Message::Ping { nonce, sent_unix_millis } => {
                     let _ = conn.shared.send(&Message::Pong { nonce, sent_unix_millis });
@@ -697,6 +976,42 @@ impl Session for HostSession {
         Ok(race_id)
     }
 
+    fn set_sync_pause(&self, enabled: bool, paused: bool) -> Result<(), PlayTogetherError> {
+        if self.shared.left.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
+        }
+        *self.shared.sync_pause.lock().unwrap_or_else(|e| e.into_inner()) = SyncPauseState { enabled, paused };
+        self.shared.broadcast(&Message::SyncPause { enabled, paused }, 0);
+        Ok(())
+    }
+
+    fn send_pause(&self, paused: bool) -> Result<(), PlayTogetherError> {
+        if self.shared.left.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
+        }
+        if self.shared.note_pause(paused) {
+            self.shared.broadcast(&Message::Pause { from: HOST_PEER_ID, paused }, 0);
+        }
+        Ok(())
+    }
+
+    fn set_start_state(&self, state: Option<StartStateData>) -> Result<(), PlayTogetherError> {
+        if self.shared.left.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
+        }
+        let item = state.map(|data| Arc::new(StartStateItem::new(data)));
+        *self.shared.start_state.lock().unwrap_or_else(|e| e.into_inner()) = item.clone();
+        match item {
+            Some(item) => {
+                for conn in self.shared.admitted_conns() {
+                    self.shared.push_to(&conn, Outbound::StartState(Arc::clone(&item)));
+                }
+            }
+            None => self.shared.broadcast(&Message::StartState(WireStartState::cleared()), 0),
+        }
+        Ok(())
+    }
+
     fn kick(&self, peer: PeerId) -> Result<(), PlayTogetherError> {
         if self.shared.left.load(Ordering::Acquire) {
             return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
@@ -705,6 +1020,27 @@ impl Session for HostSession {
         let _ = conn.shared.send(&Message::PeerLeft { peer_id: peer, reason: LeaveReason::Kicked });
         self.shared.close_connection(&conn, LeaveReason::Kicked, true);
         Ok(())
+    }
+
+    fn send_link(&self, message: LinkMessage) -> Result<(), PlayTogetherError> {
+        if self.shared.left.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
+        }
+        let target = message.target();
+        if target == HOST_PEER_ID || target == 0 {
+            return Err(PlayTogetherError::NoSuchPeer(target));
+        }
+        if self.shared.conn_for(target).is_none() {
+            return Err(PlayTogetherError::NoSuchPeer(target));
+        }
+        let message = Message::from_link(HOST_PEER_ID, message);
+        let raw = message.encoded();
+        self.shared.route_link(HOST_PEER_ID, message, raw);
+        Ok(())
+    }
+
+    fn set_link_sink(&self, peer: PeerId, sink: Option<Box<dyn LinkSink>>) {
+        self.shared.link_sinks.set(peer, sink);
     }
 
     fn stats(&self) -> SessionStats {
@@ -739,6 +1075,7 @@ impl Session for HostSession {
         for slot in follows.values() {
             slot.end(LeaveReason::Left);
         }
+        shared.link_sinks.end_all(LeaveReason::Left);
         shared.events.push(SessionEvent::Disconnected { reason: DisconnectReason::Left });
 
         // Give the writers a moment to get the Goodbye out, then cut the sockets so blocked

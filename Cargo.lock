@@ -850,8 +850,6 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "safeboy"
 version = "0.3.0-beta.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47cd2823f2767fe75a59da5df54727326e25923bb43536c0ae01488bb8397c6b"
 dependencies = [
  "sameboy-sys",
 ]

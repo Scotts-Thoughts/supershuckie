@@ -151,7 +151,9 @@ impl Shared {
     }
 }
 
-/// The producer half: a network reader pushes what the publisher sent.
+/// The producer half: a network reader pushes what the publisher sent. Clones share the queue
+/// (so a stream can be subscribed to again with a fresh sink).
+#[derive(Clone)]
 pub struct LiveReplayFeeder(Arc<Shared>);
 
 /// The consumer half: the follower core reads from it.
@@ -265,6 +267,11 @@ impl LiveReplaySource {
     /// Complete frames queued and not yet read.
     pub fn frames_available(&self) -> u64 {
         self.0.queue.lock().unwrap_or_else(|p| p.into_inner()).frames_queued
+    }
+
+    /// Whether anything at all is queued (a snapshot with no frames after it, say).
+    pub fn has_items(&self) -> bool {
+        !self.0.queue.lock().unwrap_or_else(|p| p.into_inner()).items.is_empty()
     }
 
     /// The publisher's newest frame number received.
@@ -485,6 +492,12 @@ impl SuperShuckieCore {
         self.follower.as_ref().map(|f| f.source.frames_available()).unwrap_or(0)
     }
 
+    /// Whether anything from the publisher is queued and not yet read (a snapshot that no frame
+    /// has followed yet, for example).
+    pub fn live_has_items(&self) -> bool {
+        self.follower.as_ref().is_some_and(|f| f.source.has_items())
+    }
+
     /// The newest frame number the publisher has sent.
     pub fn live_newest_publisher_frame(&self) -> u64 {
         self.follower.as_ref().map(|f| f.source.newest_publisher_frame()).unwrap_or(0)
@@ -534,7 +547,8 @@ impl SuperShuckieCore {
         let metadata = ReplayFileMetadata { crop_start: None, crop_end: None, timer_offset: None, ..metadata };
         let make: MakeFollowerRecorder = Box::new(move |starting_timestamp, input, speed, state| {
             let recorder = ReplayFileRecorder::new_with_metadata(metadata, patch_data, settings, starting_timestamp, input, speed, state, final_file, temp_file)?;
-            Ok(Box::new(NonBlockingReplayFileRecorder::new(recorder)) as Box<dyn ReplayFileRecorderFns>)
+            // A friend's file: its writer yields to the player's own game (see the thread roles).
+            Ok(Box::new(NonBlockingReplayFileRecorder::new_background(recorder)) as Box<dyn ReplayFileRecorderFns>)
         });
 
         let follower = self.follower.as_mut().expect("checked above");
@@ -724,6 +738,10 @@ impl SuperShuckieCore {
             Packet::IncrementCounter { name, delta } => {
                 let (name, delta) = (name.clone(), *delta);
                 self.with_recorder(|r| r.change_counter(name, delta));
+            }
+            Packet::SerialIn { data } => {
+                let data = data.clone();
+                self.with_recorder(|r| r.serial_in(data));
             }
             _ => {}
         }

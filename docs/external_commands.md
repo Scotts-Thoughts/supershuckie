@@ -23,6 +23,7 @@ The server is `127.0.0.1:30158`
   - [load-replay](#load-replay)
   - [mark-start](#mark-start)
   - [mark-end](#mark-end)
+  - [play-together](#play-together)
   - [set-paused](#set-paused)
   - [set-playback-speed](#set-playback-speed)
   - [stats](#stats)
@@ -314,6 +315,34 @@ A replay must be recording for this to work.
 Usage:
 
 - `http://127.0.0.1:30158/mark-end`
+
+### play-together
+
+Get the Play Together session state as JSON: whether a session is active, this player's role and
+name, whether sync pause is on and who paused everyone, whether the host's start state is set, the
+link cable (`link`: its phase, the other end, the input delay, whether it is waiting), and one
+entry per other participant with their name, ROM, status, timer and counters, who they are linked
+with (`linked_with`), whether a cable could be plugged into their game (`can_link`), and
+`pokeabyte_port`, the UDP port their game is served to Poke-A-Byte on (`null` while it is not).
+The document is the one described in `supershuckie-frontend-c/include/supershuckie/play_together.h`.
+
+Usage:
+
+- `http://127.0.0.1:30158/play-together`
+
+```json
+{"active": true, "role": "host", "code": "192.168.1.7:30170", "local_name": "Scott", "local_peer_id": 1,
+ "reset_countdown_ms": 0, "save_peer_replays": true, "sync_pause": true, "paused_by": "Ash", "start_state": false,
+ "participants": [{"peer_id": 2, "name": "Ash", "rom_name": "Emerald", "console": "Game Boy Advance",
+                   "status": "following", "status_text": "", "frames_behind": 2, "waiting": false,
+                   "snapshots_applied": 1, "hash_mismatches": 0, "fps": 60.0, "elapsed_frames": 12345,
+                   "elapsed_ms": 205750, "counters": {}, "replay_file": "Ash - 2026-09-18 19.28.48.replay",
+                   "video_scale": 2, "audio": false, "window_hidden": false, "pokeabyte_port": 55357,
+                   "linked_with": null, "can_link": true}],
+ "link": {"phase": "none", "peer_id": 0, "peer_name": "", "nonce": 0, "input_delay": 0, "stalled": false,
+          "since_ms": 0, "link_frame": 0, "last_reason": ""},
+ "errors": []}
+```
 
 ### set-paused
 

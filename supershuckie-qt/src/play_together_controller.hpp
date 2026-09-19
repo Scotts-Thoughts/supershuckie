@@ -3,6 +3,7 @@
 
 #include <QJsonObject>
 #include <QObject>
+#include <QPoint>
 #include <QSet>
 #include <cstdint>
 #include <map>
@@ -10,6 +11,7 @@
 #include <supershuckie/supershuckie.h>
 
 class QLabel;
+class QMessageBox;
 
 namespace SuperShuckie64 {
 
@@ -43,6 +45,10 @@ public:
     void reset_all();
     void show_windows();
     void set_scale(std::uint8_t scale);
+    void unlink();
+
+    /** Whether the local player's link cable is in (or going in). */
+    bool is_link_cable_plugged() const;
 
     /**
      * Ask before an action that ends the session (opening another ROM, closing it, quitting).
@@ -55,6 +61,13 @@ public:
 
     /** Remember every window's position (at exit and when leaving). */
     void save_windows();
+
+    /**
+     * Where to put `window` so it does not sit on top of the main window or another player's
+     * window: `wanted` if that spot is free, else cascaded down-right from it. With no `wanted`
+     * the cascade starts beside the main window.
+     */
+    QPoint place_window(const PeerWindow *window, const QPoint *wanted = nullptr) const;
 
     /** Callback thunks (see SuperShuckieFrontendCallbacks). */
     static void on_peer_refresh_screens(void *user_data, std::uint16_t peer, std::size_t screen_count, const uint32_t *const *pixels);
@@ -70,8 +83,14 @@ private:
     QLabel *status_label;
     QJsonObject last_state;
     bool was_active = false;
+    /** The non-modal prompt for an incoming link request, while one is up, and its nonce. */
+    QMessageBox *link_prompt = nullptr;
+    std::uint32_t link_prompt_nonce = 0;
+    QString last_link_reason;
 
     void apply_state(const QJsonObject &state, bool roster_changed);
+    void apply_link_state(const QJsonObject &link, bool active);
+    void close_link_prompt();
     QJsonObject participant(std::uint16_t peer) const;
 };
 

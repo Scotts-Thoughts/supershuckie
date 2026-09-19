@@ -1,7 +1,8 @@
+use crate::emulator::link::{LinkError, LinkPort};
 use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use std::prelude::rust_2015::Box;
-use mgba_rs::{Core, Region};
+use mgba_rs::{Core, LinkCoordinator, Region, ReplayQueued};
 use supershuckie_replay_recorder::blake3_hash;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash};
 use crate::{MonotonicTimestampProvider, TimestampMicros};
@@ -14,7 +15,38 @@ pub struct GameBoyAdvance {
     screen: ScreenData,
     last_frame_microseconds: TimestampMicros,
     microseconds_per_frames: TimestampMicros,
-    clock: Box<dyn MonotonicTimestampProvider>
+    clock: Box<dyn MonotonicTimestampProvider>,
+    link: GbaLinkState
+}
+
+/// Where the link port stands (see [`LinkPort`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum LinkMode {
+    Off,
+    /// Plugged into a partner: mGBA's lockstep driver joins the two cores, which are stepped a
+    /// slice at a time (`run_loop`) by whoever runs the pair.
+    Live,
+    /// Fed a recording of a live console's serial traffic (the replay driver answers the game).
+    Replay
+}
+
+/// The link cable's state on a Game Boy Advance core.
+struct GbaLinkState {
+    mode: LinkMode,
+    /// Whether this console is the pair's first: the lockstep's clock owner.
+    first: bool,
+    /// Emulated cycles since the cable went in (mGBA's clock wraps; this does not).
+    link_time: u64,
+    last_now: i32,
+    /// Between two slices of a frame (live mode only): the frame is not complete.
+    mid_frame: bool,
+    /// The replayed cable came out during the frame about to run: take the replay driver out
+    /// once the frame has.
+    replay_detach_pending: bool
+}
+
+impl GbaLinkState {
+    const OFF: Self = Self { mode: LinkMode::Off, first: false, link_time: 0, last_now: 0, mid_frame: false, replay_detach_pending: false };
 }
 
 // ~59.7 Hz
@@ -59,7 +91,159 @@ impl GameBoyAdvance {
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
             core: Core::new(rom, sram.unwrap_or(&[]), bios).map_err(|e| alloc::format!("mGBA rejected the ROM: {e}"))?,
             clock,
+            link: GbaLinkState::OFF
         })
+    }
+
+    /// Copy mGBA's frame into the screen buffer.
+    fn publish_frame(&mut self) {
+        // TODO: implement A8B8G8R8 so we don't have to do this swizzling
+        for (a, &pixel) in self.screen.pixels.iter_mut().zip(self.core.get_pixels().iter()) {
+            let r = (pixel >> 16) & 0xFF;
+            let g = pixel & 0xFF00;
+            let b = (pixel << 16) & 0xFF0000;
+
+            *a = 0xFF000000 | r | g | b;
+        }
+    }
+
+    /// A frame just completed: keep the pacing clock where [`EmulatorCore::run`] would.
+    fn note_frame_paced(&mut self) {
+        // if our clock is way too far behind, limit it a bit
+        let several_frames_ago = self.clock
+            .get_timestamp_microseconds()
+            .saturating_sub(self.microseconds_per_frames * 16);
+
+        self.last_frame_microseconds = (self.last_frame_microseconds + self.microseconds_per_frames)
+            .max(several_frames_ago);
+    }
+
+    /// Advance the link clock by what mGBA's clock did since the last look.
+    fn advance_link_time(&mut self) {
+        let now = self.core.timing_now();
+        let delta = now.wrapping_sub(self.link.last_now);
+        self.link.last_now = now;
+        if delta > 0 {
+            self.link.link_time += delta as u64;
+        }
+    }
+
+    /// Both cores of the pair on one coordinator (the first step of either side does this;
+    /// whichever core already has one shares it).
+    fn ensure_attached(&mut self, partner: &mut GameBoyAdvance) -> Result<(), LinkError> {
+        if self.core.is_link_attached() && partner.core.is_link_attached() {
+            return Ok(())
+        }
+        let coordinator = match (self.core.link_coordinator(), partner.core.link_coordinator()) {
+            (Some(c), _) => c.clone(),
+            (None, Some(c)) => c.clone(),
+            (None, None) => LinkCoordinator::new()
+        };
+        if !self.core.is_link_attached() && !self.core.link_attach(&coordinator, self.link.first) {
+            return Err(LinkError::Emulator(String::from("mGBA refused the link cable (a replay driver is in?)")))
+        }
+        if !partner.core.is_link_attached() && !partner.core.link_attach(&coordinator, partner.link.first) {
+            self.core.link_detach();
+            return Err(LinkError::Emulator(String::from("mGBA refused the other console's link cable")))
+        }
+        self.core.link_frame_started();
+        partner.core.link_frame_started();
+        self.link.last_now = self.core.timing_now();
+        partner.link.last_now = partner.core.timing_now();
+        Ok(())
+    }
+}
+
+impl LinkPort for GameBoyAdvance {
+    fn step_linked(&mut self, partner: &mut dyn EmulatorCore, paced: bool) -> Result<RunTime, LinkError> {
+        let partner = partner.as_any_mut().downcast_mut::<GameBoyAdvance>().ok_or(LinkError::IncompatiblePartner)?;
+        if self.link.mode != LinkMode::Live || partner.link.mode != LinkMode::Live {
+            return Err(LinkError::NotConnected)
+        }
+        self.ensure_attached(partner)?;
+        if self.core.is_link_asleep() {
+            // The coordinator parked this console; the partner has to run first.
+            return Ok(RunTime::NONE)
+        }
+        // A paced console starts a new frame only when it is due.
+        if !self.link.mid_frame && paced {
+            let expected_next = self.last_frame_microseconds + self.microseconds_per_frames;
+            if self.clock.get_timestamp_microseconds() < expected_next {
+                return Ok(RunTime::NONE)
+            }
+        }
+        let frames = self.core.run_loop();
+        self.advance_link_time();
+        if frames == 0 {
+            self.link.mid_frame = true;
+            return Ok(RunTime::NONE)
+        }
+        self.link.mid_frame = false;
+        self.publish_frame();
+        if paced {
+            self.note_frame_paced();
+        }
+        else {
+            self.last_frame_microseconds = self.clock.get_timestamp_microseconds();
+        }
+        // The next frame's serial log counts from here.
+        self.core.link_frame_started();
+        Ok(RunTime::ONE_FRAME)
+    }
+
+    fn link_time(&self) -> u64 {
+        self.link.link_time
+    }
+
+    fn is_asleep(&self) -> bool {
+        self.link.mode == LinkMode::Live && self.core.is_link_asleep()
+    }
+
+    fn connect(&mut self, first: bool) -> Result<(), LinkError> {
+        if self.link.mode == LinkMode::Live {
+            return Err(LinkError::NotConnected)
+        }
+        if self.link.mode == LinkMode::Replay {
+            self.core.replay_detach();
+        }
+        self.link = GbaLinkState { mode: LinkMode::Live, first, link_time: 0, last_now: self.core.timing_now(), mid_frame: false, replay_detach_pending: false };
+        // The coordinator comes with the first step, once the partner is known.
+        Ok(())
+    }
+
+    fn disconnect(&mut self) {
+        match self.link.mode {
+            LinkMode::Off => return,
+            LinkMode::Live => self.core.link_detach(),
+            LinkMode::Replay => self.core.replay_detach()
+        }
+        // A frame cut short by the unplug completes on the next ordinary run.
+        self.link = GbaLinkState::OFF;
+    }
+
+    fn is_live(&self) -> bool {
+        self.link.mode == LinkMode::Live
+    }
+
+    fn take_serial_in(&mut self, into: &mut Vec<u8>) {
+        self.core.link_take_log(into);
+    }
+
+    fn queue_serial_in(&mut self, data: &[u8]) -> Result<(), LinkError> {
+        if self.link.mode == LinkMode::Live {
+            return Err(LinkError::NotConnected)
+        }
+        match self.core.replay_queue(data) {
+            Some(ReplayQueued::Applied) => {}
+            Some(ReplayQueued::AppliedThenDetach) => self.link.replay_detach_pending = true,
+            None => return Err(LinkError::BadSerialData(String::from("the Game Boy Advance serial log does not parse")))
+        }
+        self.link.mode = LinkMode::Replay;
+        Ok(())
+    }
+
+    fn serial_replay_misses(&self) -> u64 {
+        self.core.replay_misses()
     }
 }
 
@@ -72,31 +256,29 @@ impl EmulatorCore for GameBoyAdvance {
         }
 
         let rval = self.run_unlocked();
-
-        // if our clock is way too far behind, limit it a bit
-        let several_frames_ago = self.clock
-            .get_timestamp_microseconds()
-            .saturating_sub(self.microseconds_per_frames * 16);
-
-        self.last_frame_microseconds = (self.last_frame_microseconds + self.microseconds_per_frames)
-            .max(several_frames_ago);
-
+        self.note_frame_paced();
         rval
     }
 
     fn run_unlocked(&mut self) -> RunTime {
+        // A whole frame (the rest of one, after a linked run's slices ended mid-frame).
         self.core.run_frame();
-
-        // TODO: implement A8B8G8R8 so we don't have to do this swizzling
-        for (a, &pixel) in self.screen.pixels.iter_mut().zip(self.core.get_pixels().iter()) {
-            let r = (pixel >> 16) & 0xFF;
-            let g = pixel & 0xFF00;
-            let b = (pixel << 16) & 0xFF0000;
-
-            *a = 0xFF000000 | r | g | b;
+        self.link.mid_frame = false;
+        if self.link.replay_detach_pending {
+            self.link.replay_detach_pending = false;
+            self.core.replay_detach();
+            self.link.mode = LinkMode::Off;
         }
-
+        self.publish_frame();
         RunTime::ONE_FRAME
+    }
+
+    fn is_mid_frame(&self) -> bool {
+        self.link.mid_frame
+    }
+
+    fn link_port(&mut self) -> Option<&mut dyn LinkPort> {
+        Some(self)
     }
 
     fn microseconds_until_next_frame(&mut self) -> Option<u64> {
@@ -259,5 +441,9 @@ impl EmulatorCore for GameBoyAdvance {
         // GBA: 16777216 Hz / 280896 dots per frame, which reduces to 4194304/70224 ~= 59.7275 Hz
         // (same rational as GB/GBC).
         (4194304, 70224)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
+        self
     }
 }

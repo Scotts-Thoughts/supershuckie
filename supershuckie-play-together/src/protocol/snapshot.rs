@@ -1,10 +1,13 @@
 //! Snapshots: a publisher's full save state plus the metadata a follower needs to start
-//! applying its stream at `frame`.
+//! applying its stream at `frame`. Also the host's start state, a save state carried the same
+//! way for everyone's own game to be loaded from.
+
+use std::fmt;
 
 use supershuckie_replay_recorder::{compress_data, decompress_data, InputBuffer, Speed};
 
 use crate::error::DecodeError;
-use crate::PeerId;
+use crate::{Blake3Hash, PeerId};
 
 /// Longest decompressed save state a snapshot may carry.
 pub const MAX_STATE_LENGTH: u64 = 48 << 20;
@@ -80,6 +83,85 @@ pub fn compress_state(state: &[u8]) -> Option<Vec<u8>> {
     compress_data(state, SNAPSHOT_ZSTD_LEVEL).ok()
 }
 
+/// Decode a state carried as `encoding`, `state_len`, `state`: `state_len` is checked against
+/// [`MAX_STATE_LENGTH`] before anything is allocated, a zstd frame whose own header disagrees
+/// with `state_len` is refused, and a raw state must be exactly `state_len` bytes.
+fn decode_state(encoding: StateEncoding, state_len: u64, state: Vec<u8>) -> Result<Vec<u8>, DecodeError> {
+    if state_len > MAX_STATE_LENGTH {
+        return Err(DecodeError::StateTooLarge(state_len));
+    }
+    match encoding {
+        StateEncoding::Raw => {
+            if state.len() as u64 != state_len {
+                return Err(DecodeError::BadState(format!("raw state is {} bytes but state_len says {}", state.len(), state_len)));
+            }
+            Ok(state)
+        }
+        StateEncoding::Zstd => decompress_data(&state, state_len as usize).map_err(|e| DecodeError::BadState(e.into_owned())),
+    }
+}
+
+/// The host's start state: the save state every participant's own game is loaded from, as the
+/// application sees it.
+#[derive(Clone, PartialEq)]
+pub struct StartStateData {
+    /// The ROM it belongs to (the host's).
+    pub rom_checksum: Blake3Hash,
+    /// The raw (decompressed) save state.
+    pub state: Vec<u8>,
+}
+
+impl fmt::Debug for StartStateData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartStateData").field("rom_checksum", &self.rom_checksum).field("state_len", &self.state.len()).finish()
+    }
+}
+
+/// A `StartState` message as it travels: the state still encoded. A `state_len` of 0 with an
+/// empty `state` means the host cleared its start state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireStartState {
+    /// See [`StartStateData::rom_checksum`] (all zeros when cleared).
+    pub rom_checksum: Blake3Hash,
+    /// How `state` is encoded.
+    pub encoding: StateEncoding,
+    /// The decompressed length of the state.
+    pub state_len: u64,
+    /// The encoded state.
+    pub state: Vec<u8>,
+}
+
+impl WireStartState {
+    /// The message that clears the start state.
+    pub fn cleared() -> WireStartState {
+        WireStartState { rom_checksum: [0; 32], encoding: StateEncoding::Raw, state_len: 0, state: Vec::new() }
+    }
+
+    /// Wrap a start state with its state sent raw.
+    pub fn raw(data: &StartStateData) -> WireStartState {
+        WireStartState { rom_checksum: data.rom_checksum, encoding: StateEncoding::Raw, state_len: data.state.len() as u64, state: data.state.clone() }
+    }
+
+    /// Wrap a start state around an already-encoded state.
+    pub fn with_state(data: &StartStateData, encoding: StateEncoding, state: Vec<u8>) -> WireStartState {
+        WireStartState { rom_checksum: data.rom_checksum, encoding, state_len: data.state.len() as u64, state }
+    }
+
+    /// Whether this clears the start state.
+    pub fn is_cleared(&self) -> bool {
+        self.state_len == 0 && self.state.is_empty()
+    }
+
+    /// Decode the state (`None` when cleared); see [`WireSnapshot::into_snapshot`] for the checks.
+    pub fn into_state(self) -> Result<Option<StartStateData>, DecodeError> {
+        if self.is_cleared() {
+            return Ok(None);
+        }
+        let state = decode_state(self.encoding, self.state_len, self.state)?;
+        Ok(Some(StartStateData { rom_checksum: self.rom_checksum, state }))
+    }
+}
+
 impl WireSnapshot {
     /// Wrap a snapshot with its state sent raw.
     pub fn raw(snapshot: &SnapshotData, from: PeerId, target: PeerId) -> WireSnapshot {
@@ -114,22 +196,7 @@ impl WireSnapshot {
     /// allocated, a zstd frame whose own header disagrees with `state_len` is refused, and a
     /// raw state must be exactly `state_len` bytes.
     pub fn into_snapshot(self) -> Result<SnapshotData, DecodeError> {
-        if self.state_len > MAX_STATE_LENGTH {
-            return Err(DecodeError::StateTooLarge(self.state_len));
-        }
-        let state = match self.encoding {
-            StateEncoding::Raw => {
-                if self.state.len() as u64 != self.state_len {
-                    return Err(DecodeError::BadState(format!(
-                        "raw state is {} bytes but state_len says {}",
-                        self.state.len(),
-                        self.state_len
-                    )));
-                }
-                self.state
-            }
-            StateEncoding::Zstd => decompress_data(&self.state, self.state_len as usize).map_err(|e| DecodeError::BadState(e.into_owned()))?,
-        };
+        let state = decode_state(self.encoding, self.state_len, self.state)?;
         Ok(SnapshotData {
             frame: self.frame,
             elapsed_millis: self.elapsed_millis,

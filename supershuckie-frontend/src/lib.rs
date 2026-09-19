@@ -447,6 +447,7 @@ impl SuperShuckieFrontend {
         if self.core.is_playing_back() {
             return Err("Cannot load save states when playing back a replay".into());
         }
+        self.refuse_if_link_cable_plugged()?;
 
         let current_rom_name = self.get_current_rom_name().expect("no rom name when game is running in load_save_state_if_exists");
         let save_states_dir = self.get_save_states_dir_for_rom(current_rom_name);
@@ -737,6 +738,15 @@ impl SuperShuckieFrontend {
         self.core.create_save_state()
     }
 
+    /// The game's save state right now, as bytes (blocks on the emulator thread; `None` without
+    /// a game or when the emulator would not produce one). For tools and tests.
+    pub fn create_save_state_bytes(&self) -> Option<Vec<u8>> {
+        if self.current_export.is_some() || !self.is_game_running() {
+            return None
+        }
+        self.create_save_state_now()
+    }
+
     /// Undo loading a save state, loading the state before loading the save state.
     pub fn undo_load_save_state(&mut self) -> bool {
         if self.refuse_if_exporting().is_err() {
@@ -753,7 +763,7 @@ impl SuperShuckieFrontend {
             return false;
         }
 
-        if self.core.is_playing_back() {
+        if self.core.is_playing_back() || self.is_link_cable_plugged() {
             return false;
         }
 
@@ -785,7 +795,7 @@ impl SuperShuckieFrontend {
             return false;
         }
 
-        if self.core.is_playing_back() {
+        if self.core.is_playing_back() || self.is_link_cable_plugged() {
             return false;
         }
 
@@ -884,6 +894,18 @@ impl SuperShuckieFrontend {
                         self.current_toggled_input = None;
                     }
                     self.core.set_toggled_input(self.current_toggled_input);
+                },
+                ControlModifier::SinglePress => {
+                    // Only the press counts: the core releases the button itself once the hold
+                    // has run, and the key has to be let go before it can press again (the GUI
+                    // does not pass on key repeats).
+                    if !pressed {
+                        return
+                    }
+
+                    let mut input = Input::new();
+                    control.control.set_for_input(&mut input, true);
+                    self.core.press_for_frames(input, ControlModifier::SINGLE_PRESS_HOLD_LENGTH);
                 }
             }
         }
@@ -1041,7 +1063,9 @@ impl SuperShuckieFrontend {
         self.get_userdir_for_rom(rom).join("save data")
     }
 
-    fn get_replays_dir_for_rom(&self, rom: &str) -> PathBuf {
+    /// The replays directory of the ROM file named `rom` (also where a friend's replay goes when
+    /// their game is followed from that file).
+    pub fn get_replays_dir_for_rom(&self, rom: &str) -> PathBuf {
         self.get_userdir_for_rom(rom).join("replays")
     }
 
@@ -1076,6 +1100,7 @@ impl SuperShuckieFrontend {
 
     #[inline]
     pub fn reload_core(&mut self) -> Result<(), UTF8CString> {
+        self.refuse_if_link_cable_plugged()?;
         let emulator_type = self.emulator_type.expect("reload_rom_in_place with no emulator type");
         self.bios_override = None;
         self.instantiate_and_load_core(emulator_type)
@@ -1620,6 +1645,9 @@ impl SuperShuckieFrontend {
                     SuperShuckieServerCommand::Stats(t) => {
                         let _ = t.send(make_stats(self, &stats).clone());
                     }
+                    SuperShuckieServerCommand::PlayTogetherState(t) => {
+                        let _ = t.send(serde_json::to_string(&self.play_together_state()).unwrap_or_else(|_| "{}".to_owned()));
+                    }
                     SuperShuckieServerCommand::Bookmarks(t, request) => {
                         reset_stats(&mut stats);
                         let _ = t.send(self.handle_bookmark_request(request));
@@ -2162,6 +2190,7 @@ impl SuperShuckieFrontend {
     /// Returns the name of the new replay if started.
     pub fn resume_recording_from_replay(&mut self, source_name: &str, resume_at_frame: Option<u32>, new_name: Option<&str>) -> Result<UTF8CString, UTF8CString> {
         self.refuse_if_exporting()?;
+        self.refuse_if_link_cable_plugged()?;
         check_user_file_name(source_name)?;
         if let Some(n) = new_name {
             check_user_file_name(n)?;
@@ -2343,6 +2372,7 @@ impl SuperShuckieFrontend {
         scale: NonZeroU8,
         layout: ScreenLayout,
     ) -> Result<VideoExportHandle, UTF8CString> {
+        self.refuse_if_link_cable_plugged()?;
         self.assert_replays_available()?;
         check_user_file_name(replay_name)?;
 
@@ -2428,6 +2458,16 @@ impl SuperShuckieFrontend {
     fn refuse_if_exporting(&self) -> Result<(), UTF8CString> {
         if self.current_export.is_some() {
             return Err("A video export is in progress; cancel it first".into())
+        }
+        Ok(())
+    }
+
+    /// Refuse the caller's request while a Play Together link cable is plugged in (or going in):
+    /// the two linked games have to stay in step, so nothing may change one of them behind the
+    /// other's back.
+    fn refuse_if_link_cable_plugged(&self) -> Result<(), UTF8CString> {
+        if self.is_link_cable_plugged() {
+            return Err("Unplug the link cable first.".into())
         }
         Ok(())
     }
@@ -2847,17 +2887,69 @@ impl SuperShuckieFrontend {
         }
     }
 
-    /// Set whether or not the Poke-A-Byte integration server is enabled.
+    /// Set whether or not the Poke-A-Byte integration server is enabled (the player's own game
+    /// on the configured port and, in a Play Together session, every friend's game on a port of
+    /// its own; see [`Self::set_pokeabyte_serve_friends`]).
     pub fn set_pokeabyte_enabled(&mut self, enabled: bool) -> Result<(), &UTF8CString> {
         self.settings.pokeabyte.enabled = enabled;
         self.pokeabyte_error = None;
-        match self.core.set_pokeabyte_enabled(enabled) {
+        let result = self.core.set_pokeabyte_port(enabled.then_some(self.settings.pokeabyte.port));
+        self.play_together_apply_pokeabyte_setting();
+        match result {
             Ok(_) => Ok(()),
             Err(e) => {
                 self.pokeabyte_error = Some(e.into());
                 Err(self.pokeabyte_error.as_ref().expect("pokeabyte_error was just set earlier..."))
             }
         }
+    }
+
+    /// The UDP port the player's own game is served to Poke-A-Byte on.
+    #[inline]
+    pub fn get_pokeabyte_port(&self) -> u16 {
+        self.settings.pokeabyte.port
+    }
+
+    /// Serve the player's own game to Poke-A-Byte on `port` from now on. Friends' games keep the
+    /// ports they were given; new ones are placed above the new port.
+    pub fn set_pokeabyte_port(&mut self, port: u16) -> Result<(), UTF8CString> {
+        if port == 0 {
+            return Err("Port 0 is not a Poke-A-Byte port.".into())
+        }
+        if port == self.settings.pokeabyte.port {
+            return Ok(())
+        }
+        self.settings.pokeabyte.port = port;
+        self.mark_settings_dirty();
+        if !self.settings.pokeabyte.enabled {
+            return Ok(())
+        }
+        self.pokeabyte_error = None;
+        match self.core.set_pokeabyte_port(Some(port)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let e = UTF8CString::from(e);
+                self.pokeabyte_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether friends' games in a Play Together session are served to Poke-A-Byte too.
+    #[inline]
+    pub fn get_pokeabyte_serve_friends(&self) -> bool {
+        self.settings.pokeabyte.serve_friends
+    }
+
+    /// Serve (or stop serving) friends' games to Poke-A-Byte, each on the lowest free port above
+    /// the player's own; applies to the friends already in the session as well.
+    pub fn set_pokeabyte_serve_friends(&mut self, serve: bool) {
+        if self.settings.pokeabyte.serve_friends == serve {
+            return
+        }
+        self.settings.pokeabyte.serve_friends = serve;
+        self.mark_settings_dirty();
+        self.play_together_apply_pokeabyte_setting();
     }
 
     /// Returns true if external commands are enabled, false if not, or an error if there was an error starting it.

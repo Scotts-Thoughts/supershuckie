@@ -745,6 +745,44 @@ pub unsafe extern "C" fn supershuckie_frontend_set_pokeabyte_enabled(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_pokeabyte_port(
+    frontend: &SuperShuckieFrontend
+) -> u16 {
+    frontend.get_pokeabyte_port()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_set_pokeabyte_port(
+    frontend: &mut SuperShuckieFrontend,
+    port: u16,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.set_pokeabyte_port(port) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_pokeabyte_serve_friends(
+    frontend: &SuperShuckieFrontend
+) -> bool {
+    frontend.get_pokeabyte_serve_friends()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_pokeabyte_serve_friends(
+    frontend: &mut SuperShuckieFrontend,
+    serve: bool
+) {
+    frontend.set_pokeabyte_serve_friends(serve)
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_set_external_commands_enabled(
     frontend: &mut SuperShuckieFrontend,
     enabled: bool,

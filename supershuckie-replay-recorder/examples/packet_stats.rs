@@ -38,6 +38,7 @@ fn main() {
             Packet::Bookmark { .. } => "Bookmark",
             Packet::BookmarkTable { .. } => "BookmarkTable",
             Packet::Keyframe { .. } => "Keyframe",
+            Packet::SerialIn { .. } => "SerialIn",
             _ => "Other"
         };
         *counts.entry(name).or_default() += 1;
@@ -59,11 +60,15 @@ fn main() {
         println!("  {name:<14} {count}");
     }
     let change_inputs = counts.get("ChangeInput").copied().unwrap_or(0);
+    let serial_ins = counts.get("SerialIn").copied().unwrap_or(0);
     if frames > 0 {
         println!(
             "ChangeInput per frame: {:.1} average, {} max (over {frames} frames)",
             change_inputs as f64 / frames as f64,
             max_change_inputs_in_a_frame
         );
+        if serial_ins > 0 {
+            println!("SerialIn per frame: {:.3} (link cable traffic in {serial_ins} of {frames} frames)", serial_ins as f64 / frames as f64);
+        }
     }
 }

@@ -26,6 +26,9 @@ standard library's `share/doc/rustc/`). This directory holds only what none of t
   errors out on any other crate without a license file; add an override here after checking
   the crate's repository.
 
+A crate vendored under `third-party/` (safeboy, patched for the link cable; selected through
+`[patch.crates-io]`) is listed like a registry crate, from its vendored manifest directory.
+
 When adding a dependency, nothing needs doing unless the script fails. When changing which
 Qt modules/plugins are linked, or the MSYS2 packages the static link pulls in
 (`MSYS2_PACKAGES` in the script mirrors the link line in `supershuckie-qt/CMakeLists.txt`),

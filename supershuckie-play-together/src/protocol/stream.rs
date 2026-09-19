@@ -23,8 +23,8 @@ pub fn encode_packets(packets: &[Packet]) -> Vec<u8> {
 ///
 /// Trailing garbage is an error, and so is any packet kind Play Together never sends: only
 /// `NoOp`, `NextFrame`, `ChangeInput`, `WriteMemory`, `ChangeSpeed`, `ResetConsole`,
-/// `LoadSaveState` and `IncrementCounter` pass. Anything else (keyframes, blobs, bookmarks) is
-/// [`DecodeError::ForbiddenPacket`].
+/// `LoadSaveState`, `IncrementCounter` and `SerialIn` pass. Anything else (keyframes, blobs,
+/// bookmarks) is [`DecodeError::ForbiddenPacket`].
 pub fn decode_packets(bytes: &[u8]) -> Result<Vec<Packet>, DecodeError> {
     let mut packets = Vec::new();
     let mut cursor = bytes;
@@ -53,7 +53,8 @@ fn forbidden_kind(packet: &Packet) -> Option<&'static str> {
         | Packet::ChangeSpeed { .. }
         | Packet::ResetConsole
         | Packet::LoadSaveState { .. }
-        | Packet::IncrementCounter { .. } => None,
+        | Packet::IncrementCounter { .. }
+        | Packet::SerialIn { .. } => None,
         Packet::Keyframe { .. } => Some("Keyframe"),
         Packet::DeltaKeyframe { .. } => Some("DeltaKeyframe"),
         Packet::RegionDeltaKeyframe { .. } => Some("RegionDeltaKeyframe"),

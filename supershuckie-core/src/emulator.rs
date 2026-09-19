@@ -4,6 +4,7 @@ mod game_boy_color;
 mod null;
 mod nintendo_ds;
 mod game_boy_advance;
+pub mod link;
 
 use alloc::string::String;
 
@@ -11,6 +12,7 @@ pub use game_boy_color::*;
 pub use null::*;
 pub use nintendo_ds::*;
 pub use game_boy_advance::*;
+pub use link::{LinkError, LinkPort};
 
 use alloc::vec::Vec;
 use core::num::NonZeroU64;
@@ -238,6 +240,16 @@ pub trait EmulatorCore: Send + 'static {
     fn is_mid_frame(&self) -> bool {
         false
     }
+
+    /// The console's link port, for cores whose serial hardware can be wired to another core of
+    /// the same family in this process (see [`link`]). `None` (the default) means the console
+    /// cannot be linked and ignores link traffic in replays.
+    fn link_port(&mut self) -> Option<&mut dyn LinkPort> {
+        None
+    }
+
+    /// `self` as `Any`, so a link port can reach the concrete type of its partner core.
+    fn as_any_mut(&mut self) -> &mut dyn core::any::Any;
 }
 
 /// Amount of time passed when running the emulator core.

@@ -441,13 +441,16 @@ fn check_pokeabyte_freeze(console: Console, rom: &[u8]) {
     while core.get_elapsed_time().frames < 55 {
         std::thread::sleep(Duration::from_millis(5));
     }
-    if let Err(e) = core.set_pokeabyte_enabled(true) {
+    // Not the default port: a live Super Shuckie on this machine is probably holding that one.
+    const PORT: u16 = 56356;
+    if let Err(e) = core.set_pokeabyte_port(Some(PORT)) {
         println!("  skipping the Poke-A-Byte check: {e}");
         return
     }
     let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let server = "127.0.0.1:55356";
+    let server = format!("127.0.0.1:{PORT}");
+    let server = server.as_str();
 
     let header = |instruction: u8| {
         let mut h = vec![0u8; 32];
@@ -498,7 +501,7 @@ fn check_pokeabyte_freeze(console: Console, rom: &[u8]) {
     close.resize(32, 0);
     let _ = client.send_to(&close, server);
     assert!(core.stop_recording_replay(), "{console:?}: recording closed");
-    let _ = core.set_pokeabyte_enabled(false);
+    let _ = core.set_pokeabyte_port(None);
     drop(core);
 
     let bytes = std::fs::read(&replay_path).expect("read replay");

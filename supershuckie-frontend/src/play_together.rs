@@ -3,10 +3,15 @@
 //! One player hosts, the others join. Everyone publishes their own game as a live replay stream
 //! (see `supershuckie_core::stream`) and follows everyone else's on a core of its own (see
 //! `supershuckie_core::live_replay`), driven straight from the network reader threads; the
-//! frontend only handles the roster, snapshot requests, the race-start countdown, status and the
-//! other players' screens and replay files.
+//! frontend only handles the roster, snapshot requests, the race-start countdown, sync pause,
+//! the host's start state, status and the other players' screens and replay files.
+//!
+//! Two players can also plug a link cable between their games (trading and battling in the
+//! Game Boy and Game Boy Advance Pokémon games); see [`link`].
 
-use crate::settings::PlayTogetherSettings;
+pub mod link;
+
+use crate::settings::{PlayTogetherSettings, PokeAByteSettings};
 use crate::util::UTF8CString;
 use crate::{ScreenInfo, SuperShuckieEmulatorType, SuperShuckieFrontend, REPLAY_EXTENSION};
 use serde::Serialize;
@@ -23,13 +28,17 @@ use supershuckie_core::live_replay::{live_replay_channel, FollowerStatsSnapshot,
 use supershuckie_core::stream::{SnapshotRequestReason, StreamPublisherFns};
 use supershuckie_core::{AudioOutput, CoreThreadRole, ElapsedTimeStats, ThreadedSuperShuckieCore};
 use supershuckie_play_together::{
-    probe_local_ip, ClientConfig, ClientSession, FollowerSink, HostConfig, HostSession, JoinCode, LeaveReason, LocalParticipant, ParticipantInfo,
-    PublishError, PublisherHandle, PublisherInfo, Session, SessionEvent, SnapshotData, PROTOCOL_VERSION
+    describe_incompatibility, follow_compatibility, is_valid_color, probe_local_ip, ClientConfig, ClientSession, FollowCompatibility, FollowerSink,
+    HostConfig, HostSession, JoinCode, LeaveReason, LocalParticipant, ParticipantInfo, PublishError, PublisherHandle, PublisherInfo, Session,
+    SessionEvent, SnapshotData, StartStateData, PROTOCOL_VERSION
 };
+pub use link::LinkView;
+pub use supershuckie_play_together::{color_entry, PlayerColor, COLOR_COUNT, COLOR_RANDOM, PALETTE};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{append_packet, blake3_hash, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, SignedInteger, TimestampMillis, UnsignedInteger};
 
 pub use supershuckie_play_together::PeerId;
+use supershuckie_play_together::session::host::HOST_PEER_ID;
 
 /// Longest ROM file considered when looking for another player's ROM by hash.
 const MAX_ROM_BYTES: u64 = 64 << 20;
@@ -126,7 +135,14 @@ pub struct PeerInstance {
     /// When their game last advanced here.
     last_advance: Instant,
     /// Whether the window for this peer should be shown (the UI's hint; not persisted).
-    pub window_hidden: bool
+    pub window_hidden: bool,
+    /// The UDP port their game is served to Poke-A-Byte on, while it is.
+    pokeabyte_port: Option<u16>,
+    /// The producer half of their follower's queue, kept so their stream can be subscribed to
+    /// again after a link cable is unplugged.
+    feeder: Option<LiveReplayFeeder>,
+    /// Who they are linked with by cable, as the host announces it.
+    pub linked_with: Option<PeerId>
 }
 
 /// The whole session as the frontend sees it.
@@ -136,12 +152,35 @@ pub struct PlayTogetherSession {
     code: String,
     local_peer_id: PeerId,
     local_name: String,
+    local_color: PlayerColor,
     peers: Vec<PeerInstance>,
     publishing: bool,
     /// Who asked for the next snapshot (shared with the publisher tee, which picks the target).
     pending_requesters: Arc<Mutex<Vec<PeerId>>>,
     /// The race-start countdown in progress: its id and deadline.
     pending_reset: Option<(u32, Instant)>,
+    /// Sync pause as the session has it: the host's setting (a client learns it from the host).
+    sync_pause: bool,
+    /// The pause state the session last agreed on, while sync pause is on. The local game
+    /// pausing or unpausing away from it is what gets published; adopting a remote pause moves
+    /// it, so nothing echoes.
+    synced_paused: bool,
+    /// Who paused everyone (the local player included), while sync pause holds the game paused.
+    paused_by: Option<PeerId>,
+    /// What we publish (console, ROM, core, BIOS), for compatibility checks.
+    local_metadata: ReplayFileMetadata,
+    /// The host's start state, while one is set: the save state everyone's own game was loaded
+    /// from, and is loaded from again at a race start.
+    start_state: Option<Arc<Vec<u8>>>,
+    /// Where this player stands with a link cable (see [`link`]).
+    link: Option<link::LinkPhase>,
+    /// Why the last link cable came out, or why a request came to nothing, for the UI.
+    last_link_reason: String,
+    /// Our last round-trip time to the host, in milliseconds (0 for the host itself): half the
+    /// link cable's input delay estimate.
+    local_rtt_ms: u32,
+    /// The next link request's nonce.
+    next_link_nonce: u32,
     errors: Vec<String>,
     generation: u64
 }
@@ -153,6 +192,14 @@ impl PlayTogetherSession {
 
     fn peer_mut(&mut self, peer_id: PeerId) -> Option<&mut PeerInstance> {
         self.peers.iter_mut().find(|p| p.peer_id == peer_id)
+    }
+
+    /// A participant's name for the UI: ours, a peer's, or a placeholder for someone gone.
+    fn name_of(&self, peer_id: PeerId) -> String {
+        if peer_id == self.local_peer_id {
+            return self.local_name.clone()
+        }
+        self.peers.iter().find(|p| p.peer_id == peer_id).map(|p| p.name.clone()).unwrap_or_else(|| format!("player {peer_id}"))
     }
 
     fn note_error(&mut self, error: String) {
@@ -253,6 +300,10 @@ impl StreamPublisherFns for SessionPublisher {
         self.append(&Packet::IncrementCounter { name, delta });
     }
 
+    fn serial_in(&mut self, data: ByteVec) {
+        self.append(&Packet::SerialIn { data });
+    }
+
     fn sync_hash(&mut self, frame: UnsignedInteger, hash: [u8; 32]) {
         if self.ended {
             return
@@ -311,6 +362,10 @@ impl FollowerSink for FeederSink {
 pub struct PeerView {
     pub peer_id: PeerId,
     pub name: String,
+    /// The player's colour: palette index, name and `#rrggbb`.
+    pub color: PlayerColor,
+    pub color_name: String,
+    pub color_rgb: String,
     pub rom_name: String,
     pub console: String,
     pub status: &'static str,
@@ -326,7 +381,13 @@ pub struct PeerView {
     pub replay_file: Option<String>,
     pub video_scale: u8,
     pub audio: bool,
-    pub window_hidden: bool
+    pub window_hidden: bool,
+    /// The UDP port their game is served to Poke-A-Byte on (`null` while it is not).
+    pub pokeabyte_port: Option<u16>,
+    /// Who they are linked with by cable (`null` when nobody).
+    pub linked_with: Option<PeerId>,
+    /// Whether a link cable could be plugged into their game right now.
+    pub can_link: bool
 }
 
 /// The session, for the UI.
@@ -336,11 +397,34 @@ pub struct PlayTogetherStateView {
     pub role: &'static str,
     pub code: String,
     pub local_name: String,
+    /// Our colour as the session knows it (0 until connected, then a palette index).
+    pub local_color: PlayerColor,
+    pub local_color_name: String,
+    pub local_color_rgb: String,
     pub local_peer_id: PeerId,
     pub reset_countdown_ms: u32,
     pub save_peer_replays: bool,
+    /// Whether one player's pause pauses everyone: the host's setting while in a session, the
+    /// local setting (for hosting) otherwise.
+    pub sync_pause: bool,
+    /// Who paused everyone, while sync pause holds the game paused: a player's name, `"you"`,
+    /// or empty.
+    pub paused_by: String,
+    /// Whether the host's start state is set (everyone's game was loaded from it, and a race
+    /// start loads it again instead of resetting the console).
+    pub start_state: bool,
+    /// The link cable.
+    pub link: LinkView,
     pub participants: Vec<PeerView>,
     pub errors: Vec<String>
+}
+
+/// A colour's name and `#rrggbb` for the UI (empty strings for 0 / unknown).
+fn describe_color(color: PlayerColor) -> (String, String) {
+    match color_entry(color) {
+        Some(entry) => (entry.name.to_owned(), format!("#{:06X}", entry.rgb)),
+        None => (String::new(), String::new())
+    }
 }
 
 /// The display name as other players will see it: trimmed, without control characters, at most
@@ -427,24 +511,48 @@ impl SuperShuckieFrontend {
                 role: "none",
                 code: String::new(),
                 local_name: self.settings.play_together.display_name.clone(),
+                local_color: COLOR_RANDOM,
+                local_color_name: String::new(),
+                local_color_rgb: String::new(),
                 local_peer_id: 0,
                 reset_countdown_ms: 0,
                 save_peer_replays: self.settings.play_together.save_peer_replays,
+                sync_pause: self.settings.play_together.sync_pause,
+                paused_by: String::new(),
+                start_state: false,
+                link: LinkView::none(String::new()),
                 participants: Vec::new(),
                 errors: Vec::new()
             }
         };
+        let (local_color_name, local_color_rgb) = describe_color(s.local_color);
         PlayTogetherStateView {
             active: true,
             role: s.role.as_str(),
             code: s.code.clone(),
             local_name: s.local_name.clone(),
+            local_color: s.local_color,
+            local_color_name,
+            local_color_rgb,
             local_peer_id: s.local_peer_id,
             reset_countdown_ms: self.play_together_reset_countdown_ms(),
             save_peer_replays: self.settings.play_together.save_peer_replays,
-            participants: s.peers.iter().map(|p| PeerView {
+            sync_pause: s.sync_pause,
+            paused_by: match s.paused_by {
+                Some(id) if s.sync_pause && s.synced_paused => if id == s.local_peer_id { String::from("you") } else { s.name_of(id) },
+                _ => String::new()
+            },
+            start_state: s.start_state.is_some(),
+            link: self.play_together_link_state(),
+            participants: s.peers.iter().map(|p| {
+                let (color_name, color_rgb) = describe_color(p.info.color);
+                let can_link = self.link_precondition(s, p.peer_id).is_ok();
+                PeerView {
                 peer_id: p.peer_id,
                 name: p.name.clone(),
+                color: p.info.color,
+                color_name,
+                color_rgb,
                 rom_name: p.info.publisher.metadata.rom_name.clone(),
                 console: console_name(p.info.publisher.metadata.console_type).to_owned(),
                 status: p.status.as_str(),
@@ -460,8 +568,11 @@ impl SuperShuckieFrontend {
                 replay_file: p.replay.as_ref().map(|r| r.name.clone()),
                 video_scale: p.video_scale.get(),
                 audio: p.audio.is_some(),
-                window_hidden: p.window_hidden
-            }).collect(),
+                window_hidden: p.window_hidden,
+                pokeabyte_port: p.pokeabyte_port,
+                linked_with: p.linked_with,
+                can_link
+            }}).collect(),
             errors: s.errors.clone()
         }
     }
@@ -474,7 +585,7 @@ impl SuperShuckieFrontend {
             .unwrap_or(0)
     }
 
-    fn play_together_local_participant(&self, display_name: &str) -> Result<LocalParticipant, UTF8CString> {
+    fn play_together_local_participant(&self, display_name: &str, color: PlayerColor) -> Result<LocalParticipant, UTF8CString> {
         self.refuse_if_exporting()?;
         let Some(emulator_type) = self.emulator_type else {
             return Err("Load a game first.".into())
@@ -506,6 +617,7 @@ impl SuperShuckieFrontend {
         let stats = self.core.get_elapsed_time();
         Ok(LocalParticipant {
             display_name: sanitize_display_name(display_name),
+            color: if is_valid_color(color) { color } else { COLOR_RANDOM },
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
             publisher: PublisherInfo {
                 metadata,
@@ -516,8 +628,9 @@ impl SuperShuckieFrontend {
         })
     }
 
-    fn install_session(&mut self, session: Arc<dyn Session>, role: PlayTogetherRole, code: String, display_name: &str) {
+    fn install_session(&mut self, session: Arc<dyn Session>, role: PlayTogetherRole, code: String, display_name: &str, color: PlayerColor, local_metadata: ReplayFileMetadata) {
         self.settings.play_together.display_name = sanitize_display_name(display_name);
+        self.settings.play_together.color = if is_valid_color(color) { color } else { COLOR_RANDOM };
         self.mark_settings_dirty();
         self.play_together = Some(PlayTogetherSession {
             session,
@@ -525,19 +638,30 @@ impl SuperShuckieFrontend {
             code,
             local_peer_id: 0,
             local_name: self.settings.play_together.display_name.clone(),
+            local_color: COLOR_RANDOM,
             peers: Vec::new(),
             publishing: false,
             pending_requesters: Arc::new(Mutex::new(Vec::new())),
             pending_reset: None,
+            sync_pause: false,
+            synced_paused: false,
+            paused_by: None,
+            local_metadata,
+            start_state: None,
+            link: None,
+            last_link_reason: String::new(),
+            local_rtt_ms: 0,
+            next_link_nonce: (SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1) | 1),
             errors: Vec::new(),
             generation: 1
         });
     }
 
-    /// Host a session on `port` (0 = the configured port) as `display_name`. The current game
-    /// is published from now on. Returns the code to share.
-    pub fn play_together_host(&mut self, port: u16, display_name: &str) -> Result<UTF8CString, UTF8CString> {
-        let local = self.play_together_local_participant(display_name)?;
+    /// Host a session on `port` (0 = the configured port) as `display_name` in `color` (a
+    /// palette index; 0 = any). The current game is published from now on. Returns the code to
+    /// share.
+    pub fn play_together_host(&mut self, port: u16, display_name: &str, color: PlayerColor) -> Result<UTF8CString, UTF8CString> {
+        let local = self.play_together_local_participant(display_name, color)?;
         let port = if port == 0 { self.settings.play_together.host_port } else { port };
         let config = HostConfig {
             bind_address: self.settings.play_together.bind_address.clone(),
@@ -545,6 +669,7 @@ impl SuperShuckieFrontend {
             allow_nintendo_ds: self.settings.play_together.allow_nintendo_ds,
             ..HostConfig::default()
         };
+        let local_metadata = local.publisher.metadata.clone();
         let session = HostSession::bind(config, local).map_err(|e| UTF8CString::from(format!("{e}")))?;
         let bound_port = session.local_addr().port();
         let code = JoinCode {
@@ -552,18 +677,21 @@ impl SuperShuckieFrontend {
             port: bound_port
         }.format();
         self.settings.play_together.host_port = bound_port;
-        self.install_session(Arc::new(session), PlayTogetherRole::Host, code.clone(), display_name);
+        self.install_session(Arc::new(session), PlayTogetherRole::Host, code.clone(), display_name, color, local_metadata);
+        self.push_sync_pause_to_session();
         Ok(code.into())
     }
 
-    /// Join the session at `code` (`host:port`) as `display_name`. Returns at once; the outcome
-    /// shows up in the state (role becomes `client`, or an error).
-    pub fn play_together_join(&mut self, code: &str, display_name: &str) -> Result<(), UTF8CString> {
-        let local = self.play_together_local_participant(display_name)?;
+    /// Join the session at `code` (`host:port`) as `display_name` in `color` (a palette index;
+    /// 0 = any; the host gives another when it is taken). Returns at once; the outcome shows up
+    /// in the state (role becomes `client`, or an error).
+    pub fn play_together_join(&mut self, code: &str, display_name: &str, color: PlayerColor) -> Result<(), UTF8CString> {
+        let local = self.play_together_local_participant(display_name, color)?;
         let join_code = JoinCode::parse(code).map_err(|e| UTF8CString::from(format!("{e}")))?;
+        let local_metadata = local.publisher.metadata.clone();
         let session = ClientSession::connect(join_code.clone(), ClientConfig::default(), local);
         self.settings.play_together.last_join_code = join_code.format();
-        self.install_session(Arc::new(session), PlayTogetherRole::Connecting, join_code.format(), display_name);
+        self.install_session(Arc::new(session), PlayTogetherRole::Connecting, join_code.format(), display_name, color, local_metadata);
         Ok(())
     }
 
@@ -573,6 +701,9 @@ impl SuperShuckieFrontend {
         let Some(mut session) = self.play_together.take() else {
             return
         };
+        // The cable first: a lent follower core has to be back on its own thread before it is
+        // shut down.
+        self.unlink_cable(&mut session, supershuckie_play_together::UnlinkReason::Unplugged, true, String::from("You left the session."));
         if session.publishing {
             self.core.stop_stream_publishing();
         }
@@ -594,6 +725,122 @@ impl SuperShuckieFrontend {
         }
         let countdown = Duration::from_secs(countdown_seconds.min(60) as u64);
         s.session.send_reset_all(countdown).map(|_| ()).map_err(|e| UTF8CString::from(format!("{e}")))
+    }
+
+    /// Whether one player's pause pauses everyone: the host's setting while in a session, the
+    /// local setting (used when hosting) otherwise.
+    pub fn get_play_together_sync_pause(&self) -> bool {
+        match self.play_together.as_ref() {
+            Some(s) if s.role != PlayTogetherRole::Connecting => s.sync_pause,
+            _ => self.settings.play_together.sync_pause
+        }
+    }
+
+    /// Set whether one player's pause pauses everyone. In a session only the host can: the
+    /// setting is told to every client, and everyone adopts the host's current pause state.
+    pub fn set_play_together_sync_pause(&mut self, enabled: bool) -> Result<(), UTF8CString> {
+        if self.play_together.as_ref().is_some_and(|s| s.role != PlayTogetherRole::Host) {
+            return Err("Only the host can change sync pause; it applies to everyone in the session.".into())
+        }
+        self.settings.play_together.sync_pause = enabled;
+        self.mark_settings_dirty();
+        self.push_sync_pause_to_session();
+        Ok(())
+    }
+
+    /// Host only: tell the session (and every client) the sync-pause setting, with the host's
+    /// current pause state as the one everyone adopts.
+    fn push_sync_pause_to_session(&mut self) {
+        let enabled = self.settings.play_together.sync_pause;
+        let paused = self.is_paused();
+        let Some(s) = self.play_together.as_mut() else {
+            return
+        };
+        if s.role != PlayTogetherRole::Host {
+            return
+        }
+        s.sync_pause = enabled;
+        s.synced_paused = paused;
+        // Our id, not `local_peer_id`: right after binding, `Connected` has not been handled yet.
+        s.paused_by = (enabled && paused).then_some(HOST_PEER_ID);
+        if let Err(e) = s.session.set_sync_pause(enabled, paused) {
+            s.note_error(format!("Could not set sync pause: {e}"));
+        }
+        s.bump();
+    }
+
+    /// Adopt a pause state the session agreed on (another player's pause, or the host's state
+    /// on joining or when the setting changed), without publishing it back.
+    fn adopt_synced_pause(&mut self, session: &mut PlayTogetherSession, paused: bool, by: PeerId) {
+        self.set_paused(paused);
+        session.synced_paused = self.is_paused();
+        session.paused_by = paused.then_some(by);
+        session.bump();
+    }
+
+    /// Whether the host's start state is set: everyone's game was loaded from the host's save
+    /// state, a race start loads it again, and only players with the host's game may join.
+    pub fn get_play_together_start_state(&self) -> bool {
+        self.play_together.as_ref().is_some_and(|s| s.start_state.is_some())
+    }
+
+    /// Host only. Set: pause, take a save state, and have everyone's own game load it (they
+    /// pause too); refused while someone in the session plays a different game (console, ROM,
+    /// core or BIOS), since they could not load it. Clear: nobody's game changes, and a race
+    /// start resets consoles again.
+    pub fn set_play_together_start_state(&mut self, enabled: bool) -> Result<(), UTF8CString> {
+        self.refuse_if_exporting()?;
+        let Some(s) = self.play_together.as_ref() else {
+            return Err("Not in a Play Together session.".into())
+        };
+        if s.role != PlayTogetherRole::Host {
+            return Err("Only the host can set the start state; everyone starts from the host's save state.".into())
+        }
+        if !enabled {
+            let s = self.play_together.as_mut().expect("checked above");
+            s.start_state = None;
+            if let Err(e) = s.session.set_start_state(None) {
+                s.note_error(format!("Could not clear the start state: {e}"));
+            }
+            s.bump();
+            return Ok(())
+        }
+        let mismatched: Vec<String> = s.peers.iter()
+            .map(|p| (p, follow_compatibility(&s.local_metadata, &p.info.publisher.metadata)))
+            .filter(|(_, compat)| *compat != FollowCompatibility::Ok)
+            .map(|(p, compat)| describe_incompatibility(&compat, &p.name))
+            .collect();
+        if !mismatched.is_empty() {
+            return Err(format!("Everyone must be playing your game to start from your save state.
+
+{}", mismatched.join("
+")).into())
+        }
+        // Paused first, so the state everyone gets is the one on the host's screen.
+        self.set_paused(true);
+        let state = Arc::new(self.core.create_save_state().ok_or_else(|| UTF8CString::from("The emulator did not produce a save state"))?);
+        let rom_checksum = *self.core.rom_checksum();
+        // The host's own game loads it too: a state that has been loaded is not byte for byte
+        // the one that was saved (the emulator settles a few fields on loading), and everyone
+        // else's game is at the loaded one.
+        self.load_start_state(&state);
+        let s = self.play_together.as_mut().expect("checked above");
+        s.start_state = Some(Arc::clone(&state));
+        if let Err(e) = s.session.set_start_state(Some(StartStateData { rom_checksum, state: state.to_vec() })) {
+            s.note_error(format!("Could not send the start state: {e}"));
+        }
+        s.bump();
+        Ok(())
+    }
+
+    /// Load the start state into the local game (kept in the save-state history, so it can be
+    /// undone). Nothing while exporting, like a reset.
+    fn load_start_state(&mut self, state: &Arc<Vec<u8>>) {
+        if self.current_export.is_some() {
+            return
+        }
+        self.push_save_state_history();
+        self.core.load_save_state(state.to_vec());
     }
 
     /// Use the ROM at `path` for `peer` (after checking it is the same ROM they are playing),
@@ -697,10 +944,14 @@ impl SuperShuckieFrontend {
         self.play_together.as_ref()?.peers.iter().find(|p| p.peer_id == peer_id)?.audio.clone()
     }
 
-    /// Remember that `peer`'s window is hidden (or shown), for the UI.
+    /// Remember that `peer`'s window is hidden (or shown), for the UI. Their screen is not
+    /// uploaded while hidden; showing it again uploads the current one at the next tick.
     pub fn play_together_set_window_hidden(&mut self, peer_id: PeerId, hidden: bool) {
         if let Some(s) = self.play_together.as_mut() && let Some(p) = s.peer_mut(peer_id) && p.window_hidden != hidden {
             p.window_hidden = hidden;
+            if !hidden {
+                p.last_stats.screen_generation = p.last_stats.screen_generation.wrapping_sub(1);
+            }
             s.bump();
         }
     }
@@ -727,6 +978,12 @@ impl SuperShuckieFrontend {
     #[inline]
     pub fn get_play_together_display_name(&self) -> &str {
         &self.settings.play_together.display_name
+    }
+
+    /// The colour last asked for (0 = any).
+    #[inline]
+    pub fn get_play_together_color(&self) -> PlayerColor {
+        self.settings.play_together.color
     }
 
     #[inline]
@@ -862,6 +1119,9 @@ impl SuperShuckieFrontend {
             snapshot_requested_at: None,
             last_advance: Instant::now(),
             window_hidden: false,
+            pokeabyte_port: None,
+            feeder: None,
+            linked_with: None,
             info
         };
         match emulator_type {
@@ -909,7 +1169,7 @@ impl SuperShuckieFrontend {
             (t, peer.info.publisher.metadata.clone(), peer.name.clone())
         };
 
-        let outcome: Result<(ThreadedSuperShuckieCore, Receiver<SnapshotRequestReason>, Option<PeerReplayFile>, String), String> = (|| {
+        let outcome: Result<(ThreadedSuperShuckieCore, Receiver<SnapshotRequestReason>, Option<PeerReplayFile>, String, LiveReplayFeeder), String> = (|| {
             // Their BIOS if it is one this build carries, else this machine's; a mismatch is
             // reported by the attach below rather than silently desyncing.
             let bios = self.compute_builtin_bios_override(metadata.bios_checksum).unwrap_or_else(|| self.default_bios_for(emulator_type));
@@ -955,26 +1215,32 @@ impl SuperShuckieFrontend {
                 }
             }
 
-            session.session.subscribe(peer_id, Box::new(FeederSink { feeder })).map_err(|e| e.to_string())?;
+            session.session.subscribe(peer_id, Box::new(FeederSink { feeder: feeder.clone() })).map_err(|e| e.to_string())?;
             core.start();
-            Ok((core, requests, replay, bios_note))
+            Ok((core, requests, replay, bios_note, feeder))
         })();
 
         let scale = session.peers[index].video_scale;
+        let serve_pokeabyte = self.settings.pokeabyte.enabled && self.settings.pokeabyte.serve_friends;
+        let base_port = self.settings.pokeabyte.port;
         let peer = &mut session.peers[index];
         match outcome {
-            Ok((core, requests, replay, note)) => {
+            Ok((core, requests, replay, note, feeder)) => {
                 let infos: Vec<ScreenInfo> = core.read_screens(|screens| {
                     screens.iter().map(|s| ScreenInfo { width: s.width, height: s.height, encoding: s.encoding }).collect()
                 });
                 peer.core = Some(core);
                 peer.snapshot_requests = Some(requests);
+                peer.feeder = Some(feeder);
                 peer.replay = replay;
                 peer.local_rom_path = Some(path);
                 peer.status = PeerStatus::Starting;
                 peer.status_text = note;
                 peer.snapshot_requested_at = Some(Instant::now());
                 self.callbacks.peer_change_video_mode(peer_id, &infos, scale);
+                if serve_pokeabyte {
+                    Self::serve_peer_to_pokeabyte(session, index, base_port, true);
+                }
             }
             Err(e) => {
                 peer.status = PeerStatus::Error;
@@ -982,6 +1248,101 @@ impl SuperShuckieFrontend {
             }
         }
         session.bump();
+    }
+
+    /// Serve (or stop serving) the game of the peer at `index` to Poke-A-Byte. The port is the
+    /// lowest one above `base_port` (the player's own) that no other friend holds and that can be
+    /// bound. A failure is noted in the session's errors, not returned: their game runs either way.
+    fn serve_peer_to_pokeabyte(session: &mut PlayTogetherSession, index: usize, base_port: u16, serve: bool) {
+        if session.peers[index].core.is_none() {
+            return
+        }
+        if !serve {
+            let peer = &mut session.peers[index];
+            if peer.pokeabyte_port.take().is_some() {
+                let _ = peer.core.as_ref().expect("checked above").set_pokeabyte_port(None);
+                session.bump();
+            }
+            return
+        }
+        if session.peers[index].pokeabyte_port.is_some() {
+            return
+        }
+
+        let taken: Vec<u16> = session.peers.iter().filter_map(|p| p.pokeabyte_port).collect();
+        let mut last_error = String::from("no port left");
+        let mut bound = None;
+        {
+            let core = session.peers[index].core.as_ref().expect("checked above");
+            for offset in 1..=PokeAByteSettings::MAX_FRIEND_PORTS {
+                let Some(port) = base_port.checked_add(offset) else { break };
+                if taken.contains(&port) {
+                    continue
+                }
+                match core.set_pokeabyte_port(Some(port)) {
+                    Ok(()) => {
+                        bound = Some(port);
+                        break
+                    }
+                    Err(e) => last_error = e
+                }
+            }
+        }
+        match bound {
+            Some(port) => {
+                session.peers[index].pokeabyte_port = Some(port);
+                session.bump();
+            }
+            None => {
+                let name = session.peers[index].name.clone();
+                session.note_error(format!("{name}'s game could not be served to Poke-A-Byte: {last_error}"));
+            }
+        }
+    }
+
+    /// Serve (or stop serving) `peer`'s game to Poke-A-Byte, regardless of the setting. Shown in
+    /// the state as `pokeabyte_port`.
+    pub fn play_together_set_peer_pokeabyte_enabled(&mut self, peer_id: PeerId, enabled: bool) -> Result<(), UTF8CString> {
+        let base_port = self.settings.pokeabyte.port;
+        let Some(s) = self.play_together.as_mut() else {
+            return Err("Not in a Play Together session.".into())
+        };
+        let Some(index) = s.peers.iter().position(|p| p.peer_id == peer_id) else {
+            return Err("No such player.".into())
+        };
+        if s.peers[index].core.is_none() {
+            return Err("That player's game is not running here.".into())
+        }
+        let errors_before = s.errors.len();
+        Self::serve_peer_to_pokeabyte(s, index, base_port, enabled);
+        if s.errors.len() > errors_before {
+            return Err(s.errors.last().expect("just noted").as_str().into())
+        }
+        Ok(())
+    }
+
+    /// The port `peer`'s game is served to Poke-A-Byte on, while it is.
+    pub fn play_together_peer_pokeabyte_port(&self, peer_id: PeerId) -> Option<u16> {
+        self.play_together.as_ref()?.peers.iter().find(|p| p.peer_id == peer_id)?.pokeabyte_port
+    }
+
+    /// `len` bytes at `address` of `peer`'s game as it runs here (`None` when it does not).
+    /// A round trip to the thread running their core: for tools and tests, not for every tick.
+    pub fn play_together_peer_read_ram(&self, peer_id: PeerId, address: u32, len: usize) -> Option<Vec<u8>> {
+        self.play_together.as_ref()?.peers.iter().find(|p| p.peer_id == peer_id)?.core.as_ref()?.read_ram(address, len)
+    }
+
+    /// Bring every friend's game in line with the Poke-A-Byte settings (after they change): serve
+    /// the ones that are not served yet, or stop serving all of them.
+    pub(crate) fn play_together_apply_pokeabyte_setting(&mut self) {
+        let serve = self.settings.pokeabyte.enabled && self.settings.pokeabyte.serve_friends;
+        let base_port = self.settings.pokeabyte.port;
+        let Some(s) = self.play_together.as_mut() else {
+            return
+        };
+        for index in 0..s.peers.len() {
+            Self::serve_peer_to_pokeabyte(s, index, base_port, serve);
+        }
     }
 
     /// Create `<friend> - <UTC stamp>.replay` (and its temp sibling) in the replays folder of
@@ -1030,14 +1391,17 @@ impl SuperShuckieFrontend {
             }
         }
         peer.snapshot_requests = None;
+        peer.feeder = None;
         peer.audio = None;
+        peer.pokeabyte_port = None;
     }
 
     fn handle_session_event(&mut self, session: &mut PlayTogetherSession, event: SessionEvent) -> bool {
         match event {
-            SessionEvent::Connected { local_peer_id, local_display_name, participants, .. } => {
+            SessionEvent::Connected { local_peer_id, local_display_name, local_color, participants, .. } => {
                 session.local_peer_id = local_peer_id;
                 session.local_name = local_display_name;
+                session.local_color = local_color;
                 if session.role == PlayTogetherRole::Connecting {
                     session.role = PlayTogetherRole::Client;
                 }
@@ -1049,6 +1413,10 @@ impl SuperShuckieFrontend {
             }
             SessionEvent::Joined(info) => self.add_peer(session, info),
             SessionEvent::Left { peer_id, reason } => {
+                if session.link.as_ref().is_some_and(|l| l.peer() == peer_id) {
+                    let name = session.name_of(peer_id);
+                    self.unlink_cable(session, supershuckie_play_together::UnlinkReason::PeerLeft, false, format!("{name} left the session."));
+                }
                 if let Some(index) = session.peers.iter().position(|p| p.peer_id == peer_id) {
                     let mut peer = session.peers.remove(index);
                     self.shutdown_peer(&mut peer);
@@ -1069,7 +1437,47 @@ impl SuperShuckieFrontend {
                 session.pending_reset = Some((race_id, deadline));
                 session.bump();
             }
-            SessionEvent::RttUpdated { .. } => {}
+            SessionEvent::SyncPauseChanged { enabled, paused } => {
+                session.sync_pause = enabled;
+                if enabled {
+                    self.adopt_synced_pause(session, paused, HOST_PEER_ID);
+                }
+                else {
+                    session.paused_by = None;
+                    session.bump();
+                }
+            }
+            // Only relayed by the host while sync pause is on, so it applies whether or not the
+            // host's setting has been heard yet (a joiner's `SyncPauseChanged` follows it).
+            SessionEvent::PauseChanged { from, paused } => self.adopt_synced_pause(session, paused, from),
+            SessionEvent::StartStateChanged { state: Some(state) } => {
+                if state.rom_checksum != *self.core.rom_checksum() {
+                    session.note_error(String::from("The host sent a start state for a different ROM; ignored."));
+                }
+                else {
+                    let state = Arc::new(state.state);
+                    // Paused at the state, like the host; with sync pause on that is the state
+                    // the session agreed on (the host paused too), not a pause to publish.
+                    self.set_paused(true);
+                    self.load_start_state(&state);
+                    session.start_state = Some(state);
+                    if session.sync_pause {
+                        session.synced_paused = self.is_paused();
+                        session.paused_by = Some(HOST_PEER_ID);
+                    }
+                    session.bump();
+                }
+            }
+            SessionEvent::StartStateChanged { state: None } => {
+                session.start_state = None;
+                session.bump();
+            }
+            SessionEvent::RttUpdated { peer_id, rtt } => {
+                if session.role == PlayTogetherRole::Client && peer_id == HOST_PEER_ID {
+                    session.local_rtt_ms = rtt.as_millis().min(u32::MAX as u128) as u32;
+                }
+            }
+            SessionEvent::Link(event) => self.handle_link_event(session, event),
             SessionEvent::Warning(text) => session.note_error(text),
             SessionEvent::Disconnected { reason } => {
                 self.report_later(format!("Play Together: {reason}"));
@@ -1097,14 +1505,39 @@ impl SuperShuckieFrontend {
 
         if let Some((_, deadline)) = session.pending_reset && Instant::now() >= deadline {
             session.pending_reset = None;
-            self.hard_reset_console();
+            // With a start state set, the race starts from it rather than from power-on.
+            match session.start_state.clone() {
+                Some(state) => self.load_start_state(&state),
+                None => self.hard_reset_console()
+            }
+            // Everyone unpauses by the protocol; nothing to publish.
             self.set_paused(false);
+            session.synced_paused = self.is_paused();
+            session.paused_by = None;
             session.bump();
+        }
+
+        // Sync pause: the local game pausing or unpausing (from the menu, a hotkey, a click, the
+        // command server...) is published as a change from the state the session agreed on.
+        // Read here once a tick rather than at every `set_paused`, so a pause-load-restore
+        // sequence within one call is not two messages.
+        if session.sync_pause && session.role != PlayTogetherRole::Connecting {
+            let paused = self.is_paused();
+            if paused != session.synced_paused {
+                session.synced_paused = paused;
+                session.paused_by = paused.then_some(session.local_peer_id);
+                if let Err(e) = session.session.send_pause(paused) {
+                    session.note_error(format!("Could not tell the others about the pause: {e}"));
+                }
+                session.bump();
+            }
         }
 
         for e in self.core.get_stream_errors() {
             errors.push_str(&format!("- PLAY TOGETHER: {e}\n"));
         }
+
+        self.tick_link(&mut session, errors);
 
         let now = Instant::now();
         for peer in session.peers.iter_mut() {
@@ -1119,9 +1552,10 @@ impl SuperShuckieFrontend {
                 continue
             }
 
-            // Their screen.
+            // Their screen (not uploaded while their window is closed: that is UI-thread work
+            // nobody sees, taken from the player's own frames).
             let stats = core.get_elapsed_time();
-            if stats.screen_generation != peer.last_stats.screen_generation {
+            if stats.screen_generation != peer.last_stats.screen_generation && !peer.window_hidden {
                 core.read_screens(|screens| self.callbacks.peer_refresh_screens(peer.peer_id, screens));
             }
             peer.last_stats = stats;

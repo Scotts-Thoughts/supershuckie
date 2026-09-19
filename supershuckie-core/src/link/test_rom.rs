@@ -1,0 +1,210 @@
+//! A Game Boy ROM that exchanges 256 bytes over the link cable, built at run time (no assembler
+//! needed), and its Game Boy Advance counterpart: the fixtures for the link cable tests and the
+//! `--link` smoke test.
+//!
+//! Each console clears `$C001`, then spins until somebody writes the magic word `$A5 $5A` to
+//! `$C002`/`$C003` and reads its role from `$C000` (`1` = master, anything else = slave); a test
+//! writes all four bytes at once (see [`role_write`]). Nothing else in RAM is touched before that,
+//! so the write may land at any time, before or after the boot ROM finishes (the Game Boy Color's
+//! takes about fourteen frames). The master waits about six frames (so the slave is surely set
+//! up), then sends bytes `0..=255` with the internal clock (`SC = $81`); the slave preloads
+//! `i ^ $FF` and starts each byte with the external clock (`SC = $80`). Both poll the transfer
+//! flag rather than use the serial interrupt, store what they received at `$C100 + i`, and write
+//! `$AA` to `$C001` once all 256 bytes are through. Afterwards the master holds `0 ^ $FF,
+//! 1 ^ $FF, …` and the slave `0, 1, …`.
+//!
+//! The RGBDS source (assembled by hand; the bytes below are the output):
+//!
+//! ```text
+//! SECTION "Code", ROM0[$150]
+//! Start:      di
+//!             ld sp, $FFFE
+//!             xor a
+//!             ld [$C001], a
+//! WaitRole:   ld a, [$C002]
+//!             cp $A5
+//!             jr nz, WaitRole
+//!             ld a, [$C003]
+//!             cp $5A
+//!             jr nz, WaitRole
+//!             ld a, [$C000]
+//!             cp 1
+//!             jp z, Master
+//! Slave:      ld hl, $C100
+//!             ld c, 0
+//! SlaveLoop:  ld a, c
+//!             cpl
+//!             ldh [rSB], a
+//!             ld a, $80
+//!             ldh [rSC], a
+//! SlaveWait:  ldh a, [rSC]
+//!             bit 7, a
+//!             jr nz, SlaveWait
+//!             ldh a, [rSB]
+//!             ld [hl+], a
+//!             inc c
+//!             jr nz, SlaveLoop
+//!             ld a, $AA
+//!             ld [$C001], a
+//! SDone:      jr SDone
+//! Master:     ld bc, $4000
+//! MDelay:     dec bc
+//!             ld a, b
+//!             or c
+//!             jr nz, MDelay
+//!             ld hl, $C100
+//!             ld c, 0
+//! MasterLoop: ld a, c
+//!             ldh [rSB], a
+//!             ld a, $81
+//!             ldh [rSC], a
+//! MasterWait: ldh a, [rSC]
+//!             bit 7, a
+//!             jr nz, MasterWait
+//!             ldh a, [rSB]
+//!             ld [hl+], a
+//!             ld b, 40
+//! MPause:     dec b
+//!             jr nz, MPause
+//!             inc c
+//!             jr nz, MasterLoop
+//!             ld a, $AA
+//!             ld [$C001], a
+//! MDone:      jr MDone
+//! ```
+
+use alloc::vec::Vec;
+
+/// Where the test writes the role byte (`1` = master, `2` = slave).
+pub const ROLE_ADDRESS: u32 = 0xC000;
+
+/// Where the ROM writes [`DONE`] once every byte is exchanged.
+pub const DONE_ADDRESS: u32 = 0xC001;
+
+/// The value at [`DONE_ADDRESS`] once every byte is exchanged.
+pub const DONE: u8 = 0xAA;
+
+/// Where the 256 received bytes are stored.
+pub const RECEIVED_ADDRESS: u32 = 0xC100;
+
+/// The role byte of the console that clocks the transfer.
+pub const ROLE_MASTER: u8 = 1;
+
+/// The role byte of the console that is clocked.
+pub const ROLE_SLAVE: u8 = 2;
+
+/// The bytes to write at [`ROLE_ADDRESS`] to hand a console its role: the role, a cleared done
+/// flag, and the magic word the ROM waits for.
+pub fn role_write(role: u8) -> [u8; 4] {
+    [role, 0, 0xA5, 0x5A]
+}
+
+/// The Nintendo logo every cartridge header carries.
+const LOGO: [u8; 48] = [
+    0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C, 0x00, 0x0D,
+    0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99,
+    0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E,
+];
+
+/// The program at `$150` (see the module docs for the source).
+const CODE: [u8; 106] = [
+    0xF3, 0x31, 0xFE, 0xFF, 0xAF, 0xEA, 0x01, 0xC0, 0xFA, 0x02, 0xC0, 0xFE, 0xA5, 0x20, 0xF9, 0xFA,
+    0x03, 0xC0, 0xFE, 0x5A, 0x20, 0xF2, 0xFA, 0x00, 0xC0, 0xFE, 0x01, 0xCA, 0x8E, 0x01, 0x21, 0x00,
+    0xC1, 0x0E, 0x00, 0x79, 0x2F, 0xE0, 0x01, 0x3E, 0x80, 0xE0, 0x02, 0xF0, 0x02, 0xCB, 0x7F, 0x20,
+    0xFA, 0xF0, 0x01, 0x22, 0x0C, 0x20, 0xEC, 0x3E, 0xAA, 0xEA, 0x01, 0xC0, 0x18, 0xFE, 0x01, 0x00,
+    0x40, 0x0B, 0x78, 0xB1, 0x20, 0xFB, 0x21, 0x00, 0xC1, 0x0E, 0x00, 0x79, 0xE0, 0x01, 0x3E, 0x81,
+    0xE0, 0x02, 0xF0, 0x02, 0xCB, 0x7F, 0x20, 0xFA, 0xF0, 0x01, 0x22, 0x06, 0x28, 0x05, 0x20, 0xFD,
+    0x0C, 0x20, 0xE8, 0x3E, 0xAA, 0xEA, 0x01, 0xC0, 0x18, 0xFE,
+];
+
+/// Build the 32 KiB ROM. With `color`, the header's CGB flag marks it Game Boy Color
+/// compatible (it runs on either model; the flag only decides which model a frontend picks).
+pub fn build(color: bool) -> Vec<u8> {
+    let mut rom = alloc::vec![0u8; 0x8000];
+    // Entry: nop; jp $150
+    rom[0x100] = 0x00;
+    rom[0x101] = 0xC3;
+    rom[0x102] = 0x50;
+    rom[0x103] = 0x01;
+    rom[0x104..0x134].copy_from_slice(&LOGO);
+    rom[0x134..0x13C].copy_from_slice(b"LINKTEST");
+    rom[0x143] = if color { 0x80 } else { 0x00 };
+    rom[0x144] = b'0';
+    rom[0x145] = b'0';
+    rom[0x146] = 0x00; // no SGB
+    rom[0x147] = 0x00; // ROM only
+    rom[0x148] = 0x00; // 32 KiB
+    rom[0x149] = 0x00; // no RAM
+    rom[0x14A] = 0x01; // non-Japanese
+    rom[0x14B] = 0x33; // new licensee code in use
+    rom[0x14C] = 0x00;
+    let mut checksum = 0u8;
+    for byte in &rom[0x134..0x14D] {
+        checksum = checksum.wrapping_sub(*byte).wrapping_sub(1);
+    }
+    rom[0x14D] = checksum;
+    rom[0x150..0x150 + CODE.len()].copy_from_slice(&CODE);
+    let global: u16 = rom.iter().enumerate().filter(|(i, _)| *i != 0x14E && *i != 0x14F).map(|(_, b)| *b as u16).fold(0, u16::wrapping_add);
+    rom[0x14E] = (global >> 8) as u8;
+    rom[0x14F] = global as u8;
+    rom
+}
+
+/// The bytes a console with `role` ends up with at [`RECEIVED_ADDRESS`] (either console).
+pub fn expected_received(role: u8) -> Vec<u8> {
+    (0..=255u8).map(|i| if role == ROLE_MASTER { i ^ 0xFF } else { i }).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Game Boy Advance
+
+/// Where the Game Boy Advance ROM's role byte, done flag and magic word live (EWRAM; the same
+/// layout as the Game Boy's, `0x0200_0000` up).
+pub const GBA_ROLE_ADDRESS: u32 = 0x0200_0000;
+
+/// Where the Game Boy Advance ROM writes [`DONE`].
+pub const GBA_DONE_ADDRESS: u32 = 0x0200_0001;
+
+/// Where the Game Boy Advance ROM stores the 256 bytes it received.
+pub const GBA_RECEIVED_ADDRESS: u32 = 0x0200_0100;
+
+/// The program from `0xC0` of the Game Boy Advance ROM: `gba_test_rom.s` next to this file,
+/// assembled with devkitARM (the file says how). It exchanges 256 halfwords in MULTI mode at
+/// 115200 baud, the master sending `i` and the slave `i ^ 0xFF`, each storing the low byte of
+/// what the other sent.
+const GBA_CODE: [u8; 240] = [
+    0xE0, 0x40, 0x9F, 0xE5, 0x02, 0x54, 0xA0, 0xE3, 0x00, 0x00, 0xA0, 0xE3, 0x01, 0x00, 0xC5, 0xE5,
+    0x02, 0x00, 0xD5, 0xE5, 0xA5, 0x00, 0x50, 0xE3, 0xFC, 0xFF, 0xFF, 0x1A, 0x03, 0x00, 0xD5, 0xE5,
+    0x5A, 0x00, 0x50, 0xE3, 0xF9, 0xFF, 0xFF, 0x1A, 0x00, 0x00, 0xA0, 0xE3, 0xB4, 0x01, 0xC4, 0xE1,
+    0xB4, 0x00, 0x9F, 0xE5, 0xB8, 0x00, 0xC4, 0xE1, 0x00, 0x00, 0xD5, 0xE5, 0x01, 0x00, 0x50, 0xE3,
+    0x0F, 0x00, 0x00, 0x0A, 0x01, 0x6C, 0x85, 0xE2, 0x00, 0x70, 0xA0, 0xE3, 0xFF, 0x00, 0x27, 0xE2,
+    0xBA, 0x00, 0xC4, 0xE1, 0xB8, 0x00, 0xD4, 0xE1, 0x80, 0x00, 0x10, 0xE3, 0xFC, 0xFF, 0xFF, 0x0A,
+    0xB8, 0x00, 0xD4, 0xE1, 0x80, 0x00, 0x10, 0xE3, 0xFC, 0xFF, 0xFF, 0x1A, 0xB0, 0x00, 0xD4, 0xE1,
+    0x07, 0x00, 0xC6, 0xE7, 0x01, 0x70, 0x87, 0xE2, 0x01, 0x0C, 0x57, 0xE3, 0xF2, 0xFF, 0xFF, 0x1A,
+    0x15, 0x00, 0x00, 0xEA, 0x01, 0x07, 0xA0, 0xE3, 0x01, 0x00, 0x50, 0xE2, 0xFD, 0xFF, 0xFF, 0x1A,
+    0x01, 0x6C, 0x85, 0xE2, 0x00, 0x70, 0xA0, 0xE3, 0xBA, 0x70, 0xC4, 0xE1, 0xB8, 0x00, 0xD4, 0xE1,
+    0x08, 0x00, 0x10, 0xE3, 0xFC, 0xFF, 0xFF, 0x0A, 0x80, 0x00, 0x80, 0xE3, 0xB8, 0x00, 0xC4, 0xE1,
+    0xB8, 0x00, 0xD4, 0xE1, 0x80, 0x00, 0x10, 0xE3, 0xFC, 0xFF, 0xFF, 0x1A, 0xB2, 0x00, 0xD4, 0xE1,
+    0x07, 0x00, 0xC6, 0xE7, 0x02, 0x0B, 0xA0, 0xE3, 0x01, 0x00, 0x50, 0xE2, 0xFD, 0xFF, 0xFF, 0x1A,
+    0x01, 0x70, 0x87, 0xE2, 0x01, 0x0C, 0x57, 0xE3, 0xEE, 0xFF, 0xFF, 0x1A, 0xAA, 0x00, 0xA0, 0xE3,
+    0x01, 0x00, 0xC5, 0xE5, 0xFE, 0xFF, 0xFF, 0xEA, 0x20, 0x01, 0x00, 0x04, 0x03, 0x20, 0x00, 0x00,
+];
+
+/// Build the Game Boy Advance link test ROM (32 KiB: the entry branch, the header's fixed byte
+/// and the program). The role is handed over with [`role_write`] at [`GBA_ROLE_ADDRESS`].
+pub fn build_gba() -> Vec<u8> {
+    let mut rom = alloc::vec![0u8; 0x8000];
+    // b main (0xC0): an ARM branch, offset (0xC0 - 8) / 4 = 0x2E.
+    rom[0..4].copy_from_slice(&[0x2E, 0x00, 0x00, 0xEA]);
+    rom[0xA0..0xAC].copy_from_slice(b"LINKTEST    ");
+    rom[0xAC..0xB0].copy_from_slice(b"SSLK");
+    rom[0xB2] = 0x96;
+    rom[0xC0..0xC0 + GBA_CODE.len()].copy_from_slice(&GBA_CODE);
+    // The header checksum over 0xA0..0xBD (the BIOS checks it; mGBA does not, but keep it right).
+    let mut checksum = 0u8;
+    for byte in &rom[0xA0..0xBD] {
+        checksum = checksum.wrapping_sub(*byte);
+    }
+    rom[0xBD] = checksum.wrapping_sub(0x19);
+    rom
+}

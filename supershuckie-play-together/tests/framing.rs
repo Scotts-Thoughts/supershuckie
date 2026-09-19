@@ -59,11 +59,15 @@ impl Read for CountingReader<'_> {
 // Samples
 
 fn participant(id: PeerId, name: &str) -> ParticipantInfo {
-    ParticipantInfo { peer_id: id, display_name: name.to_owned(), app_version: "0.4.14".to_owned(), publisher: publisher_info(ReplayConsoleType::GameBoy) }
+    ParticipantInfo { peer_id: id, display_name: name.to_owned(), color: 1, app_version: "0.4.14".to_owned(), publisher: publisher_info(ReplayConsoleType::GameBoy) }
 }
 
 fn max_name() -> String {
     "x".repeat(MAX_DISPLAY_NAME_BYTES)
+}
+
+fn start_state(len: usize) -> StartStateData {
+    StartStateData { rom_checksum: [0x11; 32], state: (0..len).map(|i| (i % 251) as u8).collect() }
 }
 
 fn samples() -> Vec<Message> {
@@ -77,16 +81,20 @@ fn samples() -> Vec<Message> {
     let eight: Vec<ParticipantInfo> = (1..=8).map(|i| participant(i as PeerId, &max_name())).collect();
     let snapshot = snapshot_at(1234);
     vec![
-        Message::Hello { protocol_version: 1, replay_version: REPLAY_VERSION, app_version: "0.4.14".to_owned(), display_name: max_name(), publisher: publisher.clone() },
-        Message::Hello { protocol_version: 0, replay_version: 0, app_version: String::new(), display_name: String::new(), publisher: publisher_info(ReplayConsoleType::GameBoy) },
-        Message::Welcome { your_peer_id: 9, session_id: u64::MAX, your_display_name: "Player (2)".to_owned(), participants: eight },
-        Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: String::new(), participants: vec![] },
+        Message::Hello { protocol_version: 2, replay_version: REPLAY_VERSION, app_version: "0.4.14".to_owned(), display_name: max_name(), color: 22, publisher: publisher.clone() },
+        Message::Hello { protocol_version: 0, replay_version: 0, app_version: String::new(), display_name: String::new(), color: 0, publisher: publisher_info(ReplayConsoleType::GameBoy) },
+        Message::Welcome { your_peer_id: 9, session_id: u64::MAX, your_display_name: "Player (2)".to_owned(), your_color: 9, participants: eight },
+        Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: String::new(), your_color: 1, participants: vec![] },
         Message::Refused { reason: RefusalReason::SessionFull, text: "full".to_owned() },
         Message::Refused { reason: RefusalReason::HostShuttingDown, text: String::new() },
         Message::PeerJoined { participant: participant(3, "Bob") },
         Message::PeerLeft { peer_id: 3, reason: LeaveReason::TooSlow },
         Message::PeerLeft { peer_id: u16::MAX, reason: LeaveReason::HostLeft },
         Message::ResetAll { race_id: 7, countdown_millis: 3000 },
+        Message::SyncPause { enabled: true, paused: false },
+        Message::SyncPause { enabled: false, paused: true },
+        Message::Pause { from: 0, paused: true },
+        Message::Pause { from: 3, paused: false },
         Message::Stream { from: 2, first_frame: 100, bytes: frames(3) },
         Message::Stream { from: 2, first_frame: 0, bytes: vec![] },
         Message::Snapshot(WireSnapshot::raw(&snapshot, 2, 3)),
@@ -95,11 +103,37 @@ fn samples() -> Vec<Message> {
         Message::SyncHash { from: 4, frame: 5, hash: [0xEE; 32] },
         Message::RequestSnapshot { requester: 0, target: 2 },
         Message::RequestSnapshot { requester: 5, target: 0 },
+        Message::StartState(WireStartState::raw(&start_state(1234))),
+        Message::StartState(WireStartState::with_state(&start_state(1234), StateEncoding::Zstd, compress_state(&start_state(1234).state).unwrap())),
+        Message::StartState(WireStartState::cleared()),
         Message::Ping { nonce: 1, sent_unix_millis: 2 },
         Message::Pong { nonce: u32::MAX, sent_unix_millis: u64::MAX },
         Message::Goodbye,
         Message::Error { text: "e".repeat(MAX_TEXT_BYTES) },
+        Message::LinkRequest { from: 0, target: 2, nonce: 7, console: 3 },
+        Message::LinkRequest { from: 2, target: 1, nonce: u32::MAX, console: u32::MAX },
+        Message::LinkAccept { from: 3, target: 2, nonce: 7 },
+        Message::LinkDecline { from: 3, target: 2, nonce: 7, reason: LinkDeclineReason::Busy },
+        Message::LinkDecline { from: 0, target: 2, nonce: 0, reason: LinkDeclineReason::Other },
+        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 1234, input: (0..64u8).collect(), rtt_millis: 40, delay_setting: 15 },
+        Message::LinkStart { from: 0, target: 3, nonce: 7, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 0 },
+        Message::LinkFrame { from: 2, target: 3, frame: 99, elapsed_millis: 123_456, events: link_events(), pair_hash_frame: 60, pair_hash: [0xCD; 32] },
+        Message::LinkFrame { from: 2, target: 3, frame: 0, elapsed_millis: 0, events: vec![], pair_hash_frame: 0, pair_hash: [0; 32] },
+        Message::Unlink { from: 2, target: 3, reason: UnlinkReason::Desync },
+        Message::Unlink { from: 0, target: 3, reason: UnlinkReason::Other },
+        Message::PeerLinked { a: 2, b: 3 },
+        Message::PeerUnlinked { a: 1, b: u16::MAX },
     ]
+}
+
+/// A link frame's worth of events: an input change, a write and a reset.
+fn link_events() -> Vec<u8> {
+    encode_link_events(&[
+        Packet::ChangeInput { data: [1u8, 2].iter().copied().collect() },
+        Packet::WriteMemory { address: 0xC000, data: [9u8; 40].iter().copied().collect() },
+        Packet::ResetConsole,
+        Packet::NoOp,
+    ])
 }
 
 fn round_trip(m: &Message) {
@@ -132,11 +166,44 @@ fn wire_layout_matches_the_document() {
         ]
     );
     assert_eq!(Message::RequestSnapshot { requester: 0, target: 0x0102 }.encoded(), [5, 0, 0, 0, 0x13, 0, 0, 2, 1]);
+    assert_eq!(Message::SyncPause { enabled: true, paused: false }.encoded(), [3, 0, 0, 0, 0x07, 1, 0]);
+    // `from` sits right after the tag, like `Stream.from`: what the host overwrites when relaying.
+    assert_eq!(Message::Pause { from: 0x0102, paused: true }.encoded(), [4, 0, 0, 0, 0x08, 2, 1, 1]);
+    assert_eq!(Message::decode(&[0x08, 0, 0, 2]), Err(DecodeError::BadBool(2)));
+    let cleared = Message::StartState(WireStartState::cleared()).encoded();
+    assert_eq!(cleared.len(), 4 + 1 + 32 + 1 + 8 + 4);
+    assert_eq!(&cleared[..5], &[46, 0, 0, 0, 0x14]);
+    assert_eq!(&cleared[37..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // raw, state_len 0, no bytes
+    assert_eq!(max_message_length(0x14), MAX_MESSAGE_LENGTH, "a start state is a large message");
     assert_eq!(Message::Goodbye.encoded(), [1, 0, 0, 0, 0x22]);
     let stream = Message::Stream { from: 2, first_frame: 3, bytes: vec![9, 9] }.encoded();
     assert_eq!(stream, [17, 0, 0, 0, 0x10, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 9, 9]);
     // `from` sits right after the tag: what the host overwrites when relaying.
     assert_eq!(&stream[5..7], &[2, 0]);
+
+    // The link cable messages: `from` first, then `target`, both u16.
+    assert_eq!(Message::LinkRequest { from: 0x0102, target: 3, nonce: 7, console: 2 }.encoded(), [13, 0, 0, 0, 0x30, 2, 1, 3, 0, 7, 0, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(Message::LinkAccept { from: 3, target: 2, nonce: 7 }.encoded(), [9, 0, 0, 0, 0x31, 3, 0, 2, 0, 7, 0, 0, 0]);
+    assert_eq!(Message::LinkDecline { from: 3, target: 2, nonce: 7, reason: LinkDeclineReason::ConsoleMismatch }.encoded(), [13, 0, 0, 0, 0x32, 3, 0, 2, 0, 7, 0, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(
+        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 0x0100, input: [5u8].iter().copied().collect(), rtt_millis: 30, delay_setting: 4 }.encoded(),
+        [27, 0, 0, 0, 0x33, 2, 0, 3, 0, 7, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 30, 0, 0, 0, 4]
+    );
+    let frame = Message::LinkFrame { from: 2, target: 3, frame: 9, elapsed_millis: 0x0102, events: vec![0xF0], pair_hash_frame: 60, pair_hash: [0xEE; 32] }.encoded();
+    assert_eq!(&frame[..30], &[1 + 2 + 2 + 8 + 8 + 4 + 1 + 8 + 32, 0, 0, 0, 0x34, 2, 0, 3, 0, 9, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0xF0]);
+    assert_eq!(&frame[30..38], &[60, 0, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(&frame[38..], &[0xEE; 32]);
+    assert_eq!(Message::Unlink { from: 2, target: 3, reason: UnlinkReason::Unplugged }.encoded(), [9, 0, 0, 0, 0x35, 2, 0, 3, 0, 0, 0, 0, 0]);
+    assert_eq!(Message::PeerLinked { a: 2, b: 3 }.encoded(), [5, 0, 0, 0, 0x36, 2, 0, 3, 0]);
+    assert_eq!(Message::PeerUnlinked { a: 2, b: 3 }.encoded(), [5, 0, 0, 0, 0x37, 2, 0, 3, 0]);
+    for tag in 0x30..=0x37u8 {
+        assert_eq!(max_message_length(tag), MAX_SMALL_MESSAGE_LENGTH, "link messages are small");
+    }
+    // Unknown reasons decode to `Other` rather than failing: a newer peer may know more.
+    assert_eq!(Message::decode(&[0x32, 3, 0, 2, 0, 7, 0, 0, 0, 200, 0, 0, 0]), Ok(Message::LinkDecline { from: 3, target: 2, nonce: 7, reason: LinkDeclineReason::Other }));
+    assert_eq!(Message::decode(&[0x35, 2, 0, 3, 0, 0xFF, 0xFF, 0xFF, 0xFF]), Ok(Message::Unlink { from: 2, target: 3, reason: UnlinkReason::Other }));
+    assert_eq!(u32::from(LinkDeclineReason::Other), u32::MAX);
+    assert_eq!(u32::from(UnlinkReason::Other), u32::MAX);
 }
 
 #[test]
@@ -230,22 +297,23 @@ fn hostile_counts_strings_and_values() {
     p.extend_from_slice(&2u16.to_le_bytes());
     p.extend_from_slice(&1u64.to_le_bytes());
     p.extend(str_field(b"me"));
+    p.push(1); // your_color
     p.extend_from_slice(&u32::MAX.to_le_bytes());
     assert_eq!(Message::decode(&body(0x02, &p)), Err(DecodeError::TooMany { what: "participants", count: u32::MAX, max: MAX_PARTICIPANTS }));
     // Nine participants: over the cap even when they would fit.
-    let mut nine = Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: "a".into(), participants: (1..=8).map(|i| participant(i, "p")).collect() }.encoded();
-    // length (4) | tag (1) | your_peer_id (2) | session_id (8) | name (4 + 1) | count
-    nine[4 + 1 + 2 + 8 + 4 + 1..4 + 1 + 2 + 8 + 4 + 1 + 4].copy_from_slice(&9u32.to_le_bytes());
+    let mut nine = Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: "a".into(), your_color: 1, participants: (1..=8).map(|i| participant(i, "p")).collect() }.encoded();
+    // length (4) | tag (1) | your_peer_id (2) | session_id (8) | name (4 + 1) | your_color (1) | count
+    nine[4 + 1 + 2 + 8 + 4 + 1 + 1..4 + 1 + 2 + 8 + 4 + 1 + 1 + 4].copy_from_slice(&9u32.to_le_bytes());
     assert_eq!(Message::decode(&nine[4..]), Err(DecodeError::TooMany { what: "participants", count: 9, max: MAX_PARTICIPANTS }));
 
     // A 300-byte rom_name.
     let mut publisher = publisher_info(ReplayConsoleType::GameBoy);
     publisher.metadata.rom_name = "n".repeat(300);
-    let hello = Message::Hello { protocol_version: 1, replay_version: 6, app_version: String::new(), display_name: "a".into(), publisher }.encoded();
+    let hello = Message::Hello { protocol_version: 2, replay_version: 6, app_version: String::new(), display_name: "a".into(), color: 0, publisher }.encoded();
     assert_eq!(Message::decode(&hello[4..]), Err(DecodeError::FieldTooLong { what: "rom_name", len: 300, max: 255 }));
 
     // A 33-byte display name.
-    let hello = Message::Hello { protocol_version: 1, replay_version: 6, app_version: String::new(), display_name: "a".repeat(33), publisher: publisher_info(ReplayConsoleType::GameBoy) }.encoded();
+    let hello = Message::Hello { protocol_version: 2, replay_version: 6, app_version: String::new(), display_name: "a".repeat(33), color: 0, publisher: publisher_info(ReplayConsoleType::GameBoy) }.encoded();
     assert_eq!(Message::decode(&hello[4..]), Err(DecodeError::FieldTooLong { what: "display_name", len: 33, max: 32 }));
 
     // Non-UTF-8 text.
@@ -257,7 +325,7 @@ fn hostile_counts_strings_and_values() {
     let mut stream = Message::Stream { from: 2, first_frame: 0, bytes: vec![] }.encoded();
     stream[5..7].copy_from_slice(&[0, 0]);
     assert_eq!(Message::decode(&stream[4..]), Err(DecodeError::ZeroPeerId));
-    let mut welcome = Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: "a".into(), participants: vec![] }.encoded();
+    let mut welcome = Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: "a".into(), your_color: 1, participants: vec![] }.encoded();
     welcome[5..7].copy_from_slice(&[0, 0]);
     assert_eq!(Message::decode(&welcome[4..]), Err(DecodeError::ZeroPeerId));
     let mut left = Message::PeerLeft { peer_id: 2, reason: LeaveReason::Left }.encoded();
@@ -267,17 +335,25 @@ fn hostile_counts_strings_and_values() {
     assert!(Message::decode(&Message::RequestSnapshot { requester: 0, target: 0 }.encoded()[4..]).is_ok());
 
     // Zero speed.
-    let hello = Message::Hello { protocol_version: 1, replay_version: 6, app_version: String::new(), display_name: "a".into(), publisher: publisher_info(ReplayConsoleType::GameBoy) }.encoded();
+    let hello = Message::Hello { protocol_version: 2, replay_version: 6, app_version: String::new(), display_name: "a".into(), color: 0, publisher: publisher_info(ReplayConsoleType::GameBoy) }.encoded();
     let speed_at = hello.len() - 8 - 2;
     let mut zero_speed = hello.clone();
     zero_speed[speed_at..speed_at + 2].copy_from_slice(&[0, 0]);
     assert_eq!(Message::decode(&zero_speed[4..]), Err(DecodeError::BadSpeed));
 
     // console_type 999.
-    let console_at = 4 + 1 + 4 + 4 + 4 + 4 + 1;
+    let console_at = 4 + 1 + 4 + 4 + 4 + 4 + 1 + 1; // ... | app_version | display_name | color
     let mut bad_console = hello.clone();
     bad_console[console_at..console_at + 4].copy_from_slice(&999u32.to_le_bytes());
     assert_eq!(Message::decode(&bad_console[4..]), Err(DecodeError::BadEnum { what: "console type", value: 999 }));
+
+    // A colour outside the palette in an assignment.
+    let mut bad_color = Message::Welcome { your_peer_id: 2, session_id: 1, your_display_name: "a".into(), your_color: 1, participants: vec![] }.encoded();
+    let color_at = 4 + 1 + 2 + 8 + 4 + 1;
+    bad_color[color_at] = 0;
+    assert_eq!(Message::decode(&bad_color[4..]), Err(DecodeError::BadColor(0)));
+    bad_color[color_at] = 23;
+    assert_eq!(Message::decode(&bad_color[4..]), Err(DecodeError::BadColor(23)));
 
     // Unknown reasons and encodings.
     let mut p = 99u32.to_le_bytes().to_vec();
@@ -296,6 +372,23 @@ fn hostile_counts_strings_and_values() {
     assert_eq!(Message::decode(&big[4..]), Err(DecodeError::TooMany { what: "counters", count: 257, max: MAX_COUNTERS }));
     let big = Message::Snapshot(WireSnapshot::raw(&SnapshotData { input: (0..65u8).collect(), ..snapshot_at(0) }, 1, 0)).encoded();
     assert_eq!(Message::decode(&big[4..]), Err(DecodeError::FieldTooLong { what: "input", len: 65, max: MAX_INPUT_BYTES }));
+
+    // Link cable messages: a zero target, a delay over the limit, too many event bytes.
+    let mut request = Message::LinkRequest { from: 2, target: 3, nonce: 1, console: 1 }.encoded();
+    request[7..9].copy_from_slice(&[0, 0]);
+    assert_eq!(Message::decode(&request[4..]), Err(DecodeError::ZeroPeerId));
+    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 15 }.encoded();
+    let last = start.len() - 1;
+    start[last] = 16;
+    assert_eq!(Message::decode(&start[4..]), Err(DecodeError::BadEnum { what: "link delay setting", value: 16 }));
+    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: (0..65u8).collect(), rtt_millis: 0, delay_setting: 0 }.encoded();
+    assert_eq!(Message::decode(&start[4..]), Err(DecodeError::FieldTooLong { what: "input", len: 65, max: MAX_INPUT_BYTES }));
+    start.clear();
+    let frame = Message::LinkFrame { from: 2, target: 3, frame: 0, elapsed_millis: 0, events: vec![0; MAX_LINK_EVENT_BYTES + 1], pair_hash_frame: 0, pair_hash: [0; 32] }.encoded();
+    assert_eq!(Message::decode(&frame[4..]), Err(DecodeError::FieldTooLong { what: "link events", len: MAX_LINK_EVENT_BYTES as u32 + 1, max: MAX_LINK_EVENT_BYTES }));
+    let mut linked = Message::PeerLinked { a: 2, b: 3 }.encoded();
+    linked[5..7].copy_from_slice(&[0, 0]);
+    assert_eq!(Message::decode(&linked[4..]), Err(DecodeError::ZeroPeerId));
 }
 
 #[test]
@@ -330,6 +423,80 @@ fn packet_allow_list() {
     assert!(matches!(decode_packets(&bytes), Err(DecodeError::BadPacket(_))), "trailing garbage");
     let bytes = frames(2);
     assert!(matches!(decode_packets(&bytes[..bytes.len() - 1]), Err(DecodeError::BadPacket(_))), "truncated packet");
+
+    // A stream may carry SerialIn (a linked game's serial input, recorded per frame).
+    let mut bytes = Vec::new();
+    append_packet(&Packet::SerialIn { data: vec![1u8, 2, 3].into_iter().collect() }, &mut bytes);
+    assert!(decode_packets(&bytes).is_ok());
+}
+
+#[test]
+fn link_event_allow_list() {
+    let events = vec![
+        Packet::NoOp,
+        Packet::ChangeInput { data: [1u8].iter().copied().collect() },
+        Packet::WriteMemory { address: 0xC000, data: [1u8, 2, 3, 4].iter().copied().collect() },
+        Packet::ResetConsole,
+    ];
+    let bytes = encode_link_events(&events);
+    assert_eq!(decode_link_events(&bytes), Ok(events));
+    assert_eq!(decode_link_events(&[]), Ok(vec![]));
+    for (packet, name) in [
+        (Packet::NextFrame { timestamp_delta: TimestampMillis(16) }, "NextFrame"),
+        (Packet::ChangeSpeed { speed: Speed::from_multiplier_float(2.0) }, "ChangeSpeed"),
+        (Packet::LoadSaveState { state: vec![7u8; 10].into_iter().collect() }, "LoadSaveState"),
+        (Packet::IncrementCounter { name: "resets".to_owned(), delta: 1 }, "IncrementCounter"),
+        (Packet::SerialIn { data: vec![1u8].into_iter().collect() }, "SerialIn"),
+        (Packet::Keyframe { metadata: KeyframeMetadata::default(), state: vec![0u8; 16].into_iter().collect() }, "Keyframe"),
+        (Packet::BookmarkTable { table: Default::default() }, "BookmarkTable"),
+    ] {
+        let mut bytes = Vec::new();
+        append_packet(&Packet::NoOp, &mut bytes);
+        append_packet(&packet, &mut bytes);
+        assert_eq!(decode_link_events(&bytes), Err(DecodeError::ForbiddenPacket(name)));
+    }
+    let mut bytes = encode_link_events(&[Packet::ResetConsole]);
+    bytes.push(0xFF);
+    assert!(matches!(decode_link_events(&bytes), Err(DecodeError::BadPacket(_))));
+    // The link families.
+    assert_eq!(link_family(ReplayConsoleType::GameBoy), Some(LinkFamily::GameBoy));
+    assert_eq!(link_family(ReplayConsoleType::SuperGameBoy2), Some(LinkFamily::GameBoy));
+    assert_eq!(link_family(ReplayConsoleType::GameBoyAdvance), Some(LinkFamily::GameBoyAdvance));
+    assert_eq!(link_family(ReplayConsoleType::NintendoDS), None);
+    assert!(can_link(ReplayConsoleType::GameBoy, ReplayConsoleType::GameBoyColor));
+    assert!(!can_link(ReplayConsoleType::GameBoyColor, ReplayConsoleType::GameBoyAdvance));
+    assert!(!can_link(ReplayConsoleType::Unknown, ReplayConsoleType::Unknown));
+}
+
+#[test]
+fn start_state_decoding() {
+    let data = start_state(5000);
+    // Raw, compressed and cleared all decode back to the application's view.
+    assert_eq!(WireStartState::raw(&data).into_state(), Ok(Some(data.clone())));
+    let compressed = WireStartState::with_state(&data, StateEncoding::Zstd, compress_state(&data.state).unwrap());
+    assert!(compressed.state.len() < data.state.len());
+    assert_eq!(compressed.into_state(), Ok(Some(data.clone())));
+    assert_eq!(WireStartState::cleared().into_state(), Ok(None));
+    assert!(WireStartState::cleared().is_cleared());
+    assert!(!WireStartState::raw(&data).is_cleared());
+
+    // A raw state whose length disagrees with state_len, a state_len over the cap, and a zstd
+    // frame that disagrees with state_len are refused; the cap is checked at decode time before
+    // anything is allocated.
+    let mut wrong = WireStartState::raw(&data);
+    wrong.state_len = 4999;
+    assert!(matches!(wrong.into_state(), Err(DecodeError::BadState(_))));
+    let mut huge = WireStartState::raw(&data);
+    huge.state_len = MAX_STATE_LENGTH + 1;
+    assert_eq!(huge.clone().into_state(), Err(DecodeError::StateTooLarge(MAX_STATE_LENGTH + 1)));
+    let encoded = Message::StartState(huge).encoded();
+    assert_eq!(Message::decode(&encoded[4..]), Err(DecodeError::StateTooLarge(MAX_STATE_LENGTH + 1)));
+    let mut lying = WireStartState::with_state(&data, StateEncoding::Zstd, compress_state(&data.state).unwrap());
+    lying.state_len = 10;
+    assert!(matches!(lying.into_state(), Err(DecodeError::BadState(_))));
+    // An empty state that is not cleared (state_len > 0, no bytes) is a bad raw state, not None.
+    let empty = WireStartState { rom_checksum: [1; 32], encoding: StateEncoding::Raw, state_len: 3, state: Vec::new() };
+    assert!(matches!(empty.into_state(), Err(DecodeError::BadState(_))));
 }
 
 #[test]
@@ -492,6 +659,7 @@ fn fuzz_smoke() {
         your_peer_id: 4,
         session_id: 77,
         your_display_name: "Player (2)".to_owned(),
+        your_color: 3,
         participants: (1..=3).map(|i| participant(i, "p")).collect(),
     }
     .encoded();

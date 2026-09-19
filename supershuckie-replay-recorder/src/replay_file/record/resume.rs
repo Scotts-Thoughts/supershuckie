@@ -355,6 +355,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             LoadSaveState(ByteVec),
             Keyframe(ByteVec, TimestampMillis, UnsignedInteger),
             IncrementCounter(String, i64),
+            SerialIn(ByteVec),
             Skip,
         }
 
@@ -382,6 +383,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 Packet::IncrementCounter { name, delta } => {
                     Action::IncrementCounter(name.clone(), *delta)
                 }
+                Packet::SerialIn { data } => Action::SerialIn(data.clone()),
                 Packet::NoOp => Action::Skip,
                 Packet::DeltaKeyframe { .. }
                 | Packet::RegionDeltaKeyframe { .. }
@@ -450,6 +452,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                     .map_err(ReplayResumeError::Write)?;
                 let entry = counter_map.entry(name).or_insert(0);
                 *entry = entry.wrapping_add(delta);
+            }
+            Action::SerialIn(data) => {
+                recorder.serial_in(data).map_err(ReplayResumeError::Write)?;
             }
             Action::Skip => {}
         }

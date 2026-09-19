@@ -1,6 +1,6 @@
-//! Per-connection machinery shared by both roles: the bounded outbound queue, the writer thread
-//! that drains it (merging streams and compressing snapshots as it goes), and the state the
-//! reader and writer threads share.
+//! Per-connection machinery shared by both roles: the bounded outbound queue (with an urgent
+//! lane for link cable messages), the writer thread that drains it (merging streams and
+//! compressing snapshots as it goes), and the state the reader and writer threads share.
 //!
 //! This module is public so the queue's merging can be tested from outside the crate; the
 //! application does not use it.
@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{compress_state, Message, StateEncoding, WireSnapshot, MAX_MESSAGE_LENGTH, STREAM_MERGE_LIMIT};
-use crate::{PeerId, SnapshotData};
+use crate::protocol::{compress_state, Message, StateEncoding, WireSnapshot, WireStartState, MAX_MESSAGE_LENGTH, STREAM_MERGE_LIMIT};
+use crate::{PeerId, SnapshotData, StartStateData};
 
 /// Most bytes an [`OutboundQueue`] holds before it overflows.
 pub const MAX_QUEUE_BYTES: usize = 64 << 20;
@@ -24,6 +24,10 @@ pub const PING_IDLE: Duration = Duration::from_secs(1);
 /// How often a busy writer slips a `Ping` in anyway, so round-trip times keep updating while
 /// streams flow.
 pub const PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How many bytes of a batch the writer hands to the socket before it looks at the urgent lane
+/// again. A run ends on a message boundary, so a single larger message goes out whole.
+pub const WRITE_RUN: usize = 64 << 10;
 
 /// One thing waiting to be written.
 #[derive(Clone, Debug)]
@@ -43,6 +47,8 @@ pub enum Outbound {
         /// Who it is for (0 = everyone).
         target: PeerId,
     },
+    /// The host's start state; compressed on the writer thread.
+    StartState(Arc<StartStateItem>),
     /// An already-framed message (control messages, relays).
     Encoded(Arc<Vec<u8>>),
 }
@@ -53,6 +59,7 @@ impl Outbound {
         match self {
             Outbound::Stream { bytes, .. } => bytes.len() + 16,
             Outbound::Snapshot { snapshot, .. } => snapshot.data.state.len() + 64,
+            Outbound::StartState(item) => item.data.state.len() + 64,
             Outbound::Encoded(bytes) => bytes.len(),
         }
     }
@@ -88,6 +95,32 @@ impl SnapshotItem {
     }
 }
 
+/// A start state waiting to be sent, compressed at most once however many connections it goes
+/// to.
+#[derive(Debug)]
+pub struct StartStateItem {
+    /// The start state itself.
+    pub data: StartStateData,
+    compressed: OnceLock<Option<Vec<u8>>>,
+}
+
+impl StartStateItem {
+    /// Wrap a start state.
+    pub fn new(data: StartStateData) -> StartStateItem {
+        StartStateItem { data, compressed: OnceLock::new() }
+    }
+
+    /// The `StartState` message for this item, framed (the state zstd-compressed, or raw if
+    /// compression failed).
+    pub fn encode(&self) -> Vec<u8> {
+        let wire = match self.compressed.get_or_init(|| compress_state(&self.data.state)).as_deref() {
+            Some(state) => WireStartState::with_state(&self.data, StateEncoding::Zstd, state.to_vec()),
+            None => WireStartState::raw(&self.data),
+        };
+        Message::StartState(wire).encoded()
+    }
+}
+
 /// Why an item could not be queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushError {
@@ -102,6 +135,8 @@ pub enum PushError {
 
 struct QueueState {
     items: VecDeque<Outbound>,
+    /// Framed link cable messages, sent ahead of everything in `items`.
+    urgent: VecDeque<Arc<Vec<u8>>>,
     bytes: usize,
     closed: bool,
 }
@@ -111,11 +146,15 @@ struct QueueState {
 pub struct Drained {
     /// The items, in order.
     pub items: Vec<Outbound>,
+    /// The urgent lane's messages, in order; written before `items`.
+    pub urgent: Vec<Arc<Vec<u8>>>,
     /// Whether the queue is closed: these are the last items and the writer should stop.
     pub closed: bool,
 }
 
-/// A bounded FIFO between anyone who sends on a connection and its writer thread.
+/// A bounded FIFO between anyone who sends on a connection and its writer thread, plus an
+/// urgent lane the writer drains first: a link cable frame must not wait behind a snapshot
+/// for a third party, or the two linked games stall.
 pub struct OutboundQueue {
     state: Mutex<QueueState>,
     cv: Condvar,
@@ -132,7 +171,7 @@ impl OutboundQueue {
     /// An empty, open queue.
     pub fn new() -> OutboundQueue {
         OutboundQueue {
-            state: Mutex::new(QueueState { items: VecDeque::new(), bytes: 0, closed: false }),
+            state: Mutex::new(QueueState { items: VecDeque::new(), urgent: VecDeque::new(), bytes: 0, closed: false }),
             cv: Condvar::new(),
             queued_bytes: AtomicU64::new(0),
         }
@@ -157,18 +196,50 @@ impl OutboundQueue {
         Ok(())
     }
 
+    /// Queue an already-framed message on the urgent lane, ahead of everything queued so far
+    /// and of anything queued later on the ordinary lane. The same caps apply.
+    pub fn try_push_urgent(&self, bytes: Arc<Vec<u8>>) -> Result<(), PushError> {
+        let cost = bytes.len();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
+            return Err(PushError::Closed);
+        }
+        if state.bytes + cost > MAX_QUEUE_BYTES || state.items.len() + state.urgent.len() + 1 > MAX_QUEUE_ITEMS {
+            return Err(PushError::Full { queued_bytes: state.bytes as u64 });
+        }
+        state.bytes += cost;
+        state.urgent.push_back(bytes);
+        self.queued_bytes.store(state.bytes as u64, Ordering::Relaxed);
+        drop(state);
+        self.cv.notify_one();
+        Ok(())
+    }
+
     /// Wait up to `timeout` for something to send (or for the queue to close), then take
     /// everything.
     pub fn wait_drain(&self, timeout: Duration) -> Drained {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.items.is_empty() && !state.closed {
+        if state.items.is_empty() && state.urgent.is_empty() && !state.closed {
             let (guard, _) = self.cv.wait_timeout(state, timeout).unwrap_or_else(|e| e.into_inner());
             state = guard;
         }
         let items: Vec<Outbound> = state.items.drain(..).collect();
+        let urgent: Vec<Arc<Vec<u8>>> = state.urgent.drain(..).collect();
         state.bytes = 0;
         self.queued_bytes.store(0, Ordering::Relaxed);
-        Drained { items, closed: state.closed }
+        Drained { items, urgent, closed: state.closed }
+    }
+
+    /// Take whatever is on the urgent lane right now, without waiting.
+    pub fn take_urgent(&self) -> Vec<Arc<Vec<u8>>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.urgent.is_empty() {
+            return Vec::new();
+        }
+        let urgent: Vec<Arc<Vec<u8>>> = state.urgent.drain(..).collect();
+        state.bytes -= urgent.iter().map(|b| b.len()).sum::<usize>().min(state.bytes);
+        self.queued_bytes.store(state.bytes as u64, Ordering::Relaxed);
+        urgent
     }
 
     /// Close the queue: no more pushes; the writer sends what is left (unless `discard`) and
@@ -178,6 +249,7 @@ impl OutboundQueue {
         state.closed = true;
         if discard {
             state.items.clear();
+            state.urgent.clear();
             state.bytes = 0;
             self.queued_bytes.store(0, Ordering::Relaxed);
         }
@@ -203,8 +275,28 @@ pub struct EncodedBatch {
     pub bytes: Vec<u8>,
     /// How many messages `bytes` holds.
     pub messages: u64,
+    /// Where each message in `bytes` ends (one entry per message, ascending).
+    pub boundaries: Vec<usize>,
     /// Items that could not be sent (a snapshot too large for one message), described.
     pub dropped: Vec<String>,
+}
+
+impl EncodedBatch {
+    /// Split `bytes` into runs of about [`WRITE_RUN`] bytes that end on message boundaries
+    /// (a message longer than that is a run of its own). The writer looks at the urgent lane
+    /// between runs.
+    pub fn runs(&self) -> Vec<std::ops::Range<usize>> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+        for (i, end) in self.boundaries.iter().copied().enumerate() {
+            let last = i + 1 == self.boundaries.len();
+            if end - start >= WRITE_RUN || last {
+                runs.push(start..end);
+                start = end;
+            }
+        }
+        runs
+    }
 }
 
 /// Turn drained items into wire bytes: consecutive `Stream` items are merged into one `Stream`
@@ -218,6 +310,7 @@ pub fn encode_outbound(items: &[Outbound], from: PeerId) -> EncodedBatch {
         if let Some((first_frame, bytes)) = pending.take() {
             Message::Stream { from, first_frame, bytes }.encode(&mut batch.bytes);
             batch.messages += 1;
+            batch.boundaries.push(batch.bytes.len());
         }
     }
 
@@ -246,12 +339,25 @@ pub fn encode_outbound(items: &[Outbound], from: PeerId) -> EncodedBatch {
                 } else {
                     batch.bytes.extend_from_slice(&encoded);
                     batch.messages += 1;
+                    batch.boundaries.push(batch.bytes.len());
+                }
+            }
+            Outbound::StartState(item) => {
+                flush(&mut pending, from, &mut batch);
+                let encoded = item.encode();
+                if encoded.len() - 4 > MAX_MESSAGE_LENGTH as usize {
+                    batch.dropped.push(format!("a start state of {} bytes is too large to send", item.data.state.len()));
+                } else {
+                    batch.bytes.extend_from_slice(&encoded);
+                    batch.messages += 1;
+                    batch.boundaries.push(batch.bytes.len());
                 }
             }
             Outbound::Encoded(bytes) => {
                 flush(&mut pending, from, &mut batch);
                 batch.bytes.extend_from_slice(bytes);
                 batch.messages += 1;
+                batch.boundaries.push(batch.bytes.len());
             }
         }
     }
@@ -267,6 +373,8 @@ pub(crate) struct Stats {
     pub messages_in: AtomicU64,
     pub messages_out: AtomicU64,
     pub unknown_messages_skipped: AtomicU64,
+    pub link_frames_sent: AtomicU64,
+    pub link_frames_received: AtomicU64,
 }
 
 impl Stats {
@@ -320,6 +428,11 @@ impl ConnShared {
     /// Queue an already-framed message.
     pub(crate) fn send(&self, message: &Message) -> Result<(), PushError> {
         self.queue.try_push(Outbound::Encoded(Arc::new(message.encoded())))
+    }
+
+    /// Queue an already-framed link cable message on the urgent lane.
+    pub(crate) fn send_urgent(&self, bytes: Arc<Vec<u8>>) -> Result<(), PushError> {
+        self.queue.try_push_urgent(bytes)
     }
 
     /// Whether closing has begun.
@@ -410,17 +523,48 @@ fn writer_body<W: Write>(w: &mut W, conn: &ConnShared, on_warning: &dyn Fn(Strin
                 last_ping = now;
             }
         }
+        let mut wrote = write_urgent(w, conn, drained.urgent)?;
         if !batch.bytes.is_empty() {
-            write_all_polling(w, &batch.bytes, conn)?;
-            w.flush()?;
-            last_write = Instant::now();
+            // The ping (if any) was appended after the last boundary: it goes with the last run.
+            let mut runs = batch.runs();
+            match runs.last_mut() {
+                Some(last) => last.end = batch.bytes.len(),
+                None => runs.push(0..batch.bytes.len()),
+            }
+            for (i, run) in runs.into_iter().enumerate() {
+                if i > 0 {
+                    write_urgent(w, conn, conn.queue.take_urgent())?;
+                }
+                write_all_polling(w, &batch.bytes[run], conn)?;
+            }
             conn.stats.bytes_out.fetch_add(batch.bytes.len() as u64, Ordering::Relaxed);
             conn.stats.messages_out.fetch_add(batch.messages, Ordering::Relaxed);
+            wrote = true;
+        }
+        if wrote {
+            w.flush()?;
+            last_write = Instant::now();
         }
         if drained.closed {
             return Ok(());
         }
     }
+}
+
+/// Write the urgent lane's messages, in order. Whether anything was written.
+fn write_urgent<W: Write>(w: &mut W, conn: &ConnShared, urgent: Vec<Arc<Vec<u8>>>) -> io::Result<bool> {
+    if urgent.is_empty() {
+        return Ok(false);
+    }
+    let mut bytes = 0u64;
+    for message in &urgent {
+        write_all_polling(w, message, conn)?;
+        bytes += message.len() as u64;
+    }
+    conn.stats.bytes_out.fetch_add(bytes, Ordering::Relaxed);
+    conn.stats.messages_out.fetch_add(urgent.len() as u64, Ordering::Relaxed);
+    conn.stats.link_frames_sent.fetch_add(urgent.iter().filter(|m| m.get(4) == Some(&crate::protocol::TAG_LINK_FRAME)).count() as u64, Ordering::Relaxed);
+    Ok(true)
 }
 
 /// `write_all` that treats a socket write timeout as a failure only if the connection is

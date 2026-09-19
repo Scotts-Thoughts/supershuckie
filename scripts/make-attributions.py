@@ -318,12 +318,16 @@ def section_crates(repo: Path, out: Path, index: list, cargo: str, target: str):
     sameboy_dir = None
     problems = []
 
+    workspace_members = set(meta.get("workspace_members", []))
     for pkg in crates:
         name, version = pkg["name"], pkg["version"]
         manifest_dir = Path(pkg["manifest_path"]).parent
-        if pkg["source"] is None:
+        if pkg["id"] in workspace_members:
             # Workspace member: part of SuperShuckie, covered by supershuckie/COPYING.
             continue
+        # A crate vendored under third-party/ (a `[patch.crates-io]` path dependency, such as the
+        # patched safeboy) has no registry source but is still somebody else's code: listed like
+        # any other crate, from its vendored manifest directory.
         if name == "sameboy-sys":
             sameboy_dir = manifest_dir
 
