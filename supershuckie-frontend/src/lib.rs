@@ -134,6 +134,9 @@ pub struct SuperShuckieFrontend {
     config_dir: PathBuf,
     pokeabyte_error: Option<UTF8CString>,
 
+    /// The speed the core was last set to (base speed, turbo, or the link cable's).
+    current_speed: Speed,
+
     loaded_rom_data: Option<Vec<u8>>,
 
     current_input: Input,
@@ -255,6 +258,7 @@ impl SuperShuckieFrontend {
             recording_replay_file: None,
             current_replay_truncated: false,
             pokeabyte_error: None,
+            current_speed: Speed::default(),
             config_dir: config_dir.as_ref().to_owned(),
             web_server: None,
             external_commands_error: None,
@@ -1125,7 +1129,7 @@ impl SuperShuckieFrontend {
 
         self.force_refresh_screens();
         self.current_input = Input::default();
-        self.core.set_speed(Speed::from_multiplier_float(self.settings.emulation.base_speed_multiplier));
+        self.set_game_speed(Speed::from_multiplier_float(self.settings.emulation.base_speed_multiplier));
         if !was_transferred && self.settings.pokeabyte.enabled {
             let _ = self.set_pokeabyte_enabled(true);
         }
@@ -1720,7 +1724,7 @@ impl SuperShuckieFrontend {
                         let refuse_recording = replay_state == SuperShuckieReplayState::Recording && self.settings.replay.disable_speed_changes_when_recording;
                         let refuse_playback = self.core.is_playing_back() && !self.settings.replay.ignore_speed_changes_in_replays;
                         if self.is_game_running() && self.current_export.is_none() && !refuse_recording && !refuse_playback {
-                            self.core.set_speed(Speed::from_multiplier_float(speed));
+                            self.set_game_speed(Speed::from_multiplier_float(speed));
                             let _ = t.send(true);
                         }
                         else {
@@ -2870,7 +2874,24 @@ impl SuperShuckieFrontend {
         let base_speed = self.settings.emulation.base_speed_multiplier;
         let max_speed = self.settings.emulation.turbo_speed_multiplier * base_speed;
         let total_speed = base_speed + (max_speed - base_speed) * turbo;
-        self.core.set_speed(Speed::from_multiplier_float(total_speed));
+        self.set_game_speed(Speed::from_multiplier_float(total_speed));
+    }
+
+    /// The player's own speed controls: set the game's speed, unless a link cable is in and the
+    /// session host's speed rules (see [`play_together::link`]). As the host, the speed is also
+    /// told to the session, so every linked pair follows it.
+    fn set_game_speed(&mut self, speed: Speed) {
+        if self.link_speed_is_the_hosts() {
+            return
+        }
+        self.set_core_speed(speed);
+        self.push_link_speed_to_session();
+    }
+
+    /// Set the core's speed and remember it.
+    fn set_core_speed(&mut self, speed: Speed) {
+        self.current_speed = speed;
+        self.core.set_speed(speed);
     }
 
     #[inline]

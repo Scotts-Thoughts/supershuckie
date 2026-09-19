@@ -92,11 +92,16 @@ and stay identical. That is why:
   one-way trip through the host, 1 on a LAN, typically 2–5 over the internet. It is chosen from
   the ping automatically; **Play Together → Link cable input delay** sets a minimum (the larger
   of the two players' settings wins) if a connection is jittery.
-* Both games run at **1x**, and pausing either pauses both (the friend's window says
-  "Waiting for…" while the other side is paused or its frames are late).
-* **Save-state loads, replays, video exports, core reloads and other speeds are off** while
-  linked ("Unplug the link cable first"). Resets go through, delayed like inputs, and so do
-  RAM edits from the RAM tools and Poke-A-Byte.
+* Both games run at **the host's game speed** (the session host's base speed and turbo, whether
+  or not the host is one of the linked players), on both machines, so a fast-forwarding host
+  fast-forwards every linked pair. A client's own speed controls do nothing while its cable is
+  in and come back when it is unplugged. The input delay is sized for the trip at the host's
+  speed as the cable goes in; if the host then speeds up a lot, the pair may stall on late
+  frames until it slows down or the cable is re-plugged. Pausing either game pauses both (the
+  friend's window says "Waiting for…" while the other side is paused or its frames are late).
+* **Save-state loads, replays, video exports and core reloads are off** while linked ("Unplug
+  the link cable first"). Resets go through, delayed like inputs, and so do RAM edits from the
+  RAM tools and Poke-A-Byte.
 * If the two machines ever disagree about the pair (a desync), the other player leaves, or one
   stops hearing from the other for two minutes, the cable comes out by itself and both games go
   on alone; a message says why.
@@ -143,7 +148,7 @@ port belongs to whom: `GET http://127.0.0.1:30158/play-together` returns the ses
 * Open another ROM without leaving (Super Shuckie asks).
 * Play a Nintendo DS game together (not yet: a DS snapshot is 20 MB).
 * While a link cable is in: load a save state, load or seek a replay, export video, reload the
-  core, or run at another speed than 1x (unplug it first).
+  core, or (as a client) run at another speed than the host's (unplug it first).
 
 ## Checking it works
 
@@ -159,8 +164,9 @@ play_together_smoke --link [--gba] [--players 3]
 It fails when any player's own game drops below 90% of the requested speed, when a follower falls
 more than a second behind or desyncs, when a friend's screen never arrives, or when a saved
 friend replay does not play to its end. With `--link` it also plugs a link cable between the
-host and the first joiner (a declined request, the handshake, both games in lockstep at 1x, the
-refusals, a pause stalling the other side, an unplug from the other side, then a second cable
+host and the first joiner (a declined request, the handshake, both games in lockstep at the host's
+speed, the host's speed changes reaching both while the joiner's do nothing, the refusals, a pause
+stalling the other side, an unplug from the other side, then a second cable
 that stays in through a race start and the leave); with no ROM given it runs the link test ROM
 (`supershuckie_core::link::test_rom`, Game Boy or with `--gba` Game Boy Advance), which sends
 256 bytes each way over the cable, and checks the bytes on both machines' copies of both games.

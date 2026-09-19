@@ -795,13 +795,12 @@ impl SuperShuckieCore {
         self.core.as_ref()
     }
 
-    /// Set the speed multiplier of the game. Anything other than 1x is ignored while the console
-    /// is linked (the pair runs at the partner's pace).
+    /// Set the speed multiplier of the game. While the console is linked this paces the pair
+    /// (the partner is stepped in lockstep, unpaced), so whoever plugs the cable in has to set
+    /// the same speed on both machines: the frontend runs every linked pair at the session
+    /// host's speed.
     pub fn set_speed(&mut self, speed: Speed) {
         let multiplier = speed.into_multiplier_float();
-        if self.is_linked_any() && speed != Speed::from_multiplier_float(1.0) {
-            return
-        }
         self.game_speed = Speed::from_multiplier_float(multiplier);
         self.core.set_speed(multiplier);
         self.present_every = if multiplier >= 2.0 { (multiplier.floor() as u64).clamp(1, 16) } else { 1 };
@@ -1222,19 +1221,36 @@ impl SuperShuckieCore {
         self.bump_state_epoch();
         self.clear_audio();
 
-        if self.is_capturing() {
-            self.with_recorder(|r| r.load_save_state(state.into()));
-            self.with_publisher(|p| p.load_save_state(state.into()));
-        }
-        else {
-            // Draw one frame from the loaded state (so the screens show something), then reload it
-            // so the game does not appear to have run a frame it should not have.
-            self.run_unlocked();
-            self.finish_current_frame();
-            let _ = self.core.load_save_state(state);
-        }
+        self.with_recorder(|r| r.load_save_state(state.into()));
+        self.with_publisher(|p| p.load_save_state(state.into()));
+        self.draw_loaded_state(state);
         // See `hard_reset`.
         self.input_latched = false;
+    }
+
+    /// Draw one frame from `state`, which was just loaded, so the screens show it rather than
+    /// whatever they held before (a save state does not carry the picture), then load `state`
+    /// again so the console has not actually advanced.
+    ///
+    /// The frame runs on the emulator alone, outside [`Self::do_run_fn`]: the session's timer and
+    /// frame count, timed presses, a recording or a stream being published never see a frame
+    /// that, as far as they are concerned, never happened, so a state can be previewed while
+    /// recording or playing together without a frame reaching the file or the other players.
+    /// Its sound is dropped. The screens are marked newly drawn (see [`Self::run_serial`]) so a
+    /// paused console shows the state right away rather than on its next run.
+    fn draw_loaded_state(&mut self, state: &[u8]) {
+        self.core.set_skip_drawing(false);
+        self.core.run_unlocked();
+        // A core that steps in slices (the Game Boy) draws when the frame completes.
+        while self.core.is_mid_frame() {
+            self.core.run_unlocked();
+        }
+        self.audio_scratch.clear();
+        self.core.take_audio(&mut self.audio_scratch);
+        self.audio_scratch.clear();
+        let _ = self.core.load_save_state(state);
+        self.last_run = RunTime { frames: 0, presented: true };
+        self.run_serial = self.run_serial.wrapping_add(1);
     }
 
     /// Set the current toggled input.
@@ -3543,6 +3559,44 @@ mod tests {
         assert!(matches!(tail[1], StreamEvent::SyncHash(frame, _) if frame == n), "{tail:?}");
         assert!(matches!(tail[2], StreamEvent::Snapshot { frame, .. } if frame == n), "{tail:?}");
         assert_eq!(core.sync_hash(), match tail[1] { StreamEvent::SyncHash(_, hash) => Some(hash), _ => None }, "the hash is of the state after frame N");
+    }
+
+    /// Loading a save state while publishing (a Play Together start state arriving at a paused
+    /// client, say) draws the state so the screens show it, without the preview frame reaching
+    /// the stream, the frame count or the console itself.
+    #[test]
+    fn loading_a_state_while_publishing_draws_it_without_publishing_a_frame() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+        let publisher = VecStreamPublisher::default();
+        core.start_stream_publishing(Box::new(publisher.clone())).expect("start publishing");
+        for _ in 0..3 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        let state = core.create_save_state();
+        for _ in 0..3 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+
+        let events_before = publisher.events().len();
+        let frames_before = core.total_frames();
+        let runs_before = log.lock().unwrap().len();
+        let serial_before = core.run_serial();
+        core.load_save_state(&state);
+
+        assert_eq!(&publisher.events()[events_before..], &[StreamEvent::LoadState(state.clone())], "the stream sees the load and nothing else");
+        assert_eq!(core.total_frames(), frames_before, "the session did not advance");
+        assert_eq!(core.create_save_state(), state, "the console is at the loaded state");
+        assert_eq!(log.lock().unwrap().len(), runs_before + 1, "one frame was drawn from it");
+        assert_ne!(core.run_serial(), serial_before, "the screens are reported newly drawn");
+        assert!(core.last_frame_presented());
+
+        // Play goes on from the loaded state, and only now does the stream get a frame.
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        assert_eq!(core.total_frames(), frames_before + 1);
+        assert_eq!(publisher.count(|e| matches!(e, StreamEvent::NextFrame(_))), 7);
     }
 
     /// A publisher that is paused still answers a snapshot request from the idle path.

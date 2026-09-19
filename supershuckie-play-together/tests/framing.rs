@@ -115,14 +115,16 @@ fn samples() -> Vec<Message> {
         Message::LinkAccept { from: 3, target: 2, nonce: 7 },
         Message::LinkDecline { from: 3, target: 2, nonce: 7, reason: LinkDeclineReason::Busy },
         Message::LinkDecline { from: 0, target: 2, nonce: 0, reason: LinkDeclineReason::Other },
-        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 1234, input: (0..64u8).collect(), rtt_millis: 40, delay_setting: 15 },
-        Message::LinkStart { from: 0, target: 3, nonce: 7, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 0 },
+        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 1234, input: (0..64u8).collect(), rtt_millis: 40, delay_setting: 15, speed: Speed::default() },
+        Message::LinkStart { from: 0, target: 3, nonce: 7, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 0, speed: Speed::default() },
         Message::LinkFrame { from: 2, target: 3, frame: 99, elapsed_millis: 123_456, events: link_events(), pair_hash_frame: 60, pair_hash: [0xCD; 32] },
         Message::LinkFrame { from: 2, target: 3, frame: 0, elapsed_millis: 0, events: vec![], pair_hash_frame: 0, pair_hash: [0; 32] },
         Message::Unlink { from: 2, target: 3, reason: UnlinkReason::Desync },
         Message::Unlink { from: 0, target: 3, reason: UnlinkReason::Other },
         Message::PeerLinked { a: 2, b: 3 },
         Message::PeerUnlinked { a: 1, b: u16::MAX },
+        Message::LinkSpeed { speed: Speed::from_multiplier_float(4.0) },
+        Message::LinkSpeed { speed: Speed::from_multiplier_float(0.5) },
     ]
 }
 
@@ -186,8 +188,8 @@ fn wire_layout_matches_the_document() {
     assert_eq!(Message::LinkAccept { from: 3, target: 2, nonce: 7 }.encoded(), [9, 0, 0, 0, 0x31, 3, 0, 2, 0, 7, 0, 0, 0]);
     assert_eq!(Message::LinkDecline { from: 3, target: 2, nonce: 7, reason: LinkDeclineReason::ConsoleMismatch }.encoded(), [13, 0, 0, 0, 0x32, 3, 0, 2, 0, 7, 0, 0, 0, 2, 0, 0, 0]);
     assert_eq!(
-        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 0x0100, input: [5u8].iter().copied().collect(), rtt_millis: 30, delay_setting: 4 }.encoded(),
-        [27, 0, 0, 0, 0x33, 2, 0, 3, 0, 7, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 30, 0, 0, 0, 4]
+        Message::LinkStart { from: 2, target: 3, nonce: 7, frame: 0x0100, input: [5u8].iter().copied().collect(), rtt_millis: 30, delay_setting: 4, speed: Speed::default() }.encoded(),
+        [29, 0, 0, 0, 0x33, 2, 0, 3, 0, 7, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 30, 0, 0, 0, 4, 0, 1]
     );
     let frame = Message::LinkFrame { from: 2, target: 3, frame: 9, elapsed_millis: 0x0102, events: vec![0xF0], pair_hash_frame: 60, pair_hash: [0xEE; 32] }.encoded();
     assert_eq!(&frame[..30], &[1 + 2 + 2 + 8 + 8 + 4 + 1 + 8 + 32, 0, 0, 0, 0x34, 2, 0, 3, 0, 9, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0xF0]);
@@ -196,7 +198,8 @@ fn wire_layout_matches_the_document() {
     assert_eq!(Message::Unlink { from: 2, target: 3, reason: UnlinkReason::Unplugged }.encoded(), [9, 0, 0, 0, 0x35, 2, 0, 3, 0, 0, 0, 0, 0]);
     assert_eq!(Message::PeerLinked { a: 2, b: 3 }.encoded(), [5, 0, 0, 0, 0x36, 2, 0, 3, 0]);
     assert_eq!(Message::PeerUnlinked { a: 2, b: 3 }.encoded(), [5, 0, 0, 0, 0x37, 2, 0, 3, 0]);
-    for tag in 0x30..=0x37u8 {
+    assert_eq!(Message::LinkSpeed { speed: Speed::from_multiplier_float(2.0) }.encoded(), [3, 0, 0, 0, 0x38, 0, 2]);
+    for tag in 0x30..=0x38u8 {
         assert_eq!(max_message_length(tag), MAX_SMALL_MESSAGE_LENGTH, "link messages are small");
     }
     // Unknown reasons decode to `Other` rather than failing: a newer peer may know more.
@@ -377,11 +380,11 @@ fn hostile_counts_strings_and_values() {
     let mut request = Message::LinkRequest { from: 2, target: 3, nonce: 1, console: 1 }.encoded();
     request[7..9].copy_from_slice(&[0, 0]);
     assert_eq!(Message::decode(&request[4..]), Err(DecodeError::ZeroPeerId));
-    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 15 }.encoded();
-    let last = start.len() - 1;
+    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: InputBuffer::new(), rtt_millis: 0, delay_setting: 15, speed: Speed::default() }.encoded();
+    let last = start.len() - 3;
     start[last] = 16;
     assert_eq!(Message::decode(&start[4..]), Err(DecodeError::BadEnum { what: "link delay setting", value: 16 }));
-    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: (0..65u8).collect(), rtt_millis: 0, delay_setting: 0 }.encoded();
+    let mut start = Message::LinkStart { from: 2, target: 3, nonce: 1, frame: 0, input: (0..65u8).collect(), rtt_millis: 0, delay_setting: 0, speed: Speed::default() }.encoded();
     assert_eq!(Message::decode(&start[4..]), Err(DecodeError::FieldTooLong { what: "input", len: 65, max: MAX_INPUT_BYTES }));
     start.clear();
     let frame = Message::LinkFrame { from: 2, target: 3, frame: 0, elapsed_millis: 0, events: vec![0; MAX_LINK_EVENT_BYTES + 1], pair_hash_frame: 0, pair_hash: [0; 32] }.encoded();

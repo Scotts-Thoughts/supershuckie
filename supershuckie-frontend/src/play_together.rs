@@ -172,6 +172,9 @@ pub struct PlayTogetherSession {
     /// The host's start state, while one is set: the save state everyone's own game was loaded
     /// from, and is loaded from again at a race start.
     start_state: Option<Arc<Vec<u8>>>,
+    /// The session host's game speed, which every linked pair runs at (a client learns it from
+    /// the host; the host's own is kept here as it changes).
+    link_speed: supershuckie_core::Speed,
     /// Where this player stands with a link cable (see [`link`]).
     link: Option<link::LinkPhase>,
     /// Why the last link cable came out, or why a request came to nothing, for the UI.
@@ -648,6 +651,7 @@ impl SuperShuckieFrontend {
             paused_by: None,
             local_metadata,
             start_state: None,
+            link_speed: supershuckie_core::Speed::default(),
             link: None,
             last_link_reason: String::new(),
             local_rtt_ms: 0,
@@ -679,6 +683,7 @@ impl SuperShuckieFrontend {
         self.settings.play_together.host_port = bound_port;
         self.install_session(Arc::new(session), PlayTogetherRole::Host, code.clone(), display_name, color, local_metadata);
         self.push_sync_pause_to_session();
+        self.push_link_speed_to_session();
         Ok(code.into())
     }
 
@@ -767,6 +772,29 @@ impl SuperShuckieFrontend {
             s.note_error(format!("Could not set sync pause: {e}"));
         }
         s.bump();
+    }
+
+    /// Host only: tell the session (and every client) the host's game speed, which every linked
+    /// pair runs at. Nothing is sent when it has not changed.
+    pub(crate) fn push_link_speed_to_session(&mut self) {
+        let speed = self.current_speed;
+        let Some(s) = self.play_together.as_mut() else {
+            return
+        };
+        if s.role != PlayTogetherRole::Host || s.link_speed == speed {
+            return
+        }
+        s.link_speed = speed;
+        if let Err(e) = s.session.set_link_speed(speed) {
+            s.note_error(format!("Could not set the link cable speed: {e}"));
+        }
+        s.bump();
+    }
+
+    /// Whether the game's speed is the session host's to set right now: a client with a link
+    /// cable in runs its pair at the host's speed, and its own speed controls do nothing.
+    pub(crate) fn link_speed_is_the_hosts(&self) -> bool {
+        self.play_together.as_ref().is_some_and(|s| s.role != PlayTogetherRole::Host && s.link.as_ref().is_some_and(|l| l.is_plugged()))
     }
 
     /// Adopt a pause state the session agreed on (another player's pause, or the host's state
@@ -1446,6 +1474,14 @@ impl SuperShuckieFrontend {
                     session.paused_by = None;
                     session.bump();
                 }
+            }
+            SessionEvent::LinkSpeedChanged { speed } => {
+                session.link_speed = speed;
+                // The pair runs at the host's speed: applied right away while the cable is in.
+                if session.link.as_ref().is_some_and(|l| l.is_plugged()) {
+                    self.set_core_speed(speed);
+                }
+                session.bump();
             }
             // Only relayed by the host while sync pause is on, so it applies whether or not the
             // host's setting has been heard yet (a joiner's `SyncPauseChanged` follows it).

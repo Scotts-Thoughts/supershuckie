@@ -11,7 +11,7 @@
 use std::fmt;
 
 use supershuckie_replay_recorder::replay_file::REPLAY_VERSION;
-use supershuckie_replay_recorder::{append_packet, InputBuffer, Packet, PacketIO};
+use supershuckie_replay_recorder::{append_packet, InputBuffer, Packet, PacketIO, Speed};
 
 use crate::error::DecodeError;
 use crate::{Blake3Hash, PeerId};
@@ -178,6 +178,8 @@ pub enum LinkMessage {
         rtt_millis: u32,
         /// Our input-delay setting: 0 for automatic, else the frames we want at least.
         delay_setting: u8,
+        /// The host's game speed as we know it (see `Message::LinkStart`).
+        speed: Speed,
     },
     /// One lockstep frame's events.
     Frame {

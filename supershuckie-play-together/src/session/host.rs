@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayPatchFormat, REPLAY_VERSION};
+use supershuckie_replay_recorder::Speed;
 
 use crate::color::assign_color;
 use crate::compat::{dedupe_display_name, describe_incompatibility, follow_compatibility, link_family, sanitize_display_name, FollowCompatibility};
@@ -65,6 +66,8 @@ struct HostShared {
     /// Whether pausing is shared and, while it is, the session's pause state (what a joining
     /// client is told).
     sync_pause: Mutex<SyncPauseState>,
+    /// The host's game speed, which every linked pair runs at (what a joining client is told).
+    link_speed: Mutex<Speed>,
     /// The save state everyone's own game is loaded from, while one is set (sent to each joining
     /// client, whose game must then match the host's).
     start_state: Mutex<Option<Arc<StartStateItem>>>,
@@ -150,6 +153,7 @@ impl HostSession {
             race_counter: AtomicU32::new(1),
             conn_counter: AtomicUsize::new(1),
             sync_pause: Mutex::new(SyncPauseState::default()),
+            link_speed: Mutex::new(Speed::default()),
             start_state: Mutex::new(None),
             link_sinks: LinkSinks::default(),
         });
@@ -608,6 +612,7 @@ impl HostShared {
             // ahead of this `Welcome`.
             let _ = conn.shared.send(&welcome);
             let _ = conn.shared.send(&self.sync_pause_message());
+            let _ = conn.shared.send(&Message::LinkSpeed { speed: *self.link_speed.lock().unwrap_or_else(|e| e.into_inner()) });
             if let Some(item) = start_state {
                 let _ = conn.shared.queue.try_push(Outbound::StartState(item));
             }
@@ -664,6 +669,7 @@ impl HostShared {
             | Message::PeerLeft { .. }
             | Message::ResetAll { .. }
             | Message::SyncPause { .. }
+            | Message::LinkSpeed { .. }
             | Message::StartState(_)
             | Message::PeerLinked { .. }
             | Message::PeerUnlinked { .. } => self.protocol_error(conn, "only the host sends that message".to_owned()),
@@ -804,8 +810,8 @@ fn stamp_from(message: Message, id: PeerId) -> Message {
         Message::LinkRequest { target, nonce, console, .. } => Message::LinkRequest { from: id, target, nonce, console },
         Message::LinkAccept { target, nonce, .. } => Message::LinkAccept { from: id, target, nonce },
         Message::LinkDecline { target, nonce, reason, .. } => Message::LinkDecline { from: id, target, nonce, reason },
-        Message::LinkStart { target, nonce, frame, input, rtt_millis, delay_setting, .. } => {
-            Message::LinkStart { from: id, target, nonce, frame, input, rtt_millis, delay_setting }
+        Message::LinkStart { target, nonce, frame, input, rtt_millis, delay_setting, speed, .. } => {
+            Message::LinkStart { from: id, target, nonce, frame, input, rtt_millis, delay_setting, speed }
         }
         Message::LinkFrame { target, frame, elapsed_millis, events, pair_hash_frame, pair_hash, .. } => {
             Message::LinkFrame { from: id, target, frame, elapsed_millis, events, pair_hash_frame, pair_hash }
@@ -982,6 +988,15 @@ impl Session for HostSession {
         }
         *self.shared.sync_pause.lock().unwrap_or_else(|e| e.into_inner()) = SyncPauseState { enabled, paused };
         self.shared.broadcast(&Message::SyncPause { enabled, paused }, 0);
+        Ok(())
+    }
+
+    fn set_link_speed(&self, speed: Speed) -> Result<(), PlayTogetherError> {
+        if self.shared.left.load(Ordering::Acquire) {
+            return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
+        }
+        *self.shared.link_speed.lock().unwrap_or_else(|e| e.into_inner()) = speed;
+        self.shared.broadcast(&Message::LinkSpeed { speed }, 0);
         Ok(())
     }
 

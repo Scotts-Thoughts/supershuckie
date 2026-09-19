@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use supershuckie_replay_recorder::replay_file::REPLAY_VERSION;
+use supershuckie_replay_recorder::Speed;
 
 use crate::code::JoinCode;
 use crate::compat::sanitize_display_name;
@@ -337,6 +338,7 @@ impl ClientShared {
                 self.events.push(SessionEvent::ResetAll { race_id, deadline: Instant::now() + Duration::from_millis(u64::from(countdown_millis)) });
             }
             Message::SyncPause { enabled, paused } => self.events.push(SessionEvent::SyncPauseChanged { enabled, paused }),
+            Message::LinkSpeed { speed } => self.events.push(SessionEvent::LinkSpeedChanged { speed }),
             Message::StartState(wire) => match wire.into_state() {
                 Ok(state) => self.events.push(SessionEvent::StartStateChanged { state }),
                 Err(e) => self.protocol_error(conn, e.to_string()),
@@ -573,6 +575,10 @@ impl Session for ClientSession {
     }
 
     fn set_sync_pause(&self, _enabled: bool, _paused: bool) -> Result<(), PlayTogetherError> {
+        Err(PlayTogetherError::NotHost)
+    }
+
+    fn set_link_speed(&self, _speed: Speed) -> Result<(), PlayTogetherError> {
         Err(PlayTogetherError::NotHost)
     }
 

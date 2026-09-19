@@ -11,6 +11,7 @@
 #include <QMenu>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <cmath>
 #include <cstdio>
 
 using namespace SuperShuckie64;
@@ -137,6 +138,10 @@ void PeerWindow::update(const QJsonObject &participant, const QJsonObject &link)
         }
         else {
             sync = QString("\U0001F517 Linked · %1 frame%2 delay").arg(link["input_delay"].toInt()).arg(link["input_delay"].toInt() == 1 ? "" : "s");
+            auto speed = link["speed"].toDouble();
+            if(std::abs(speed - 1.0) > 0.01) {
+                sync += QString(" · %1x").arg(speed, 0, 'g', 3);
+            }
         }
     }
     else if(this->link_peer && link_phase == "starting") {
@@ -274,7 +279,7 @@ void PeerWindow::closeEvent(QCloseEvent *event) {
 void PeerWindow::contextMenuEvent(QContextMenuEvent *event) {
     QMenu menu(this);
     auto *scale_menu = menu.addMenu("Scale");
-    for(int scale = 1; scale <= 6; scale++) {
+    for(int scale = 1; scale <= static_cast<int>(MainWindow::PEER_SCALE_COUNT); scale++) {
         auto *action = scale_menu->addAction(QString("%1x").arg(scale));
         action->setCheckable(true);
         action->setChecked(static_cast<unsigned>(scale) == this->screen->scale());

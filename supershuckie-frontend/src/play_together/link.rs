@@ -13,18 +13,23 @@
 //! ```text
 //! request ──▶ LinkRequest ──▶ friend's UI asks ──▶ LinkAccept ──▶ both hold their game
 //!         ◀── LinkDecline (or the host declines: busy, other console)
-//! both send LinkStart { frame, input, rtt, delay setting } ──▶ both compute the same delay,
+//! both send LinkStart { frame, input, rtt, delay setting, host speed } ──▶ both compute the same delay,
 //! lend the follower, install the inbox sink, plug in ──▶ Linked (LinkFrames both ways)
 //! Unlink { reason } from either side, a departure, a desync or a stall ends it; the follower
 //! goes back to its own thread and asks for a fresh snapshot.
 //! ```
+//!
+//! Speed: every linked pair runs at the session host's game speed (`LinkSpeed` from the host,
+//! kept in `PlayTogetherSession::link_speed`), on both machines, so neither side stalls on the
+//! other and the input delay can be sized for the trip at that speed. A client's own speed
+//! controls do nothing while its cable is in; the host's keep working and drive everyone.
 //!
 //! Nothing here waits on a core thread from the tick: `link_hold`, `lend` and `unlink` are
 //! one-off calls made when the user acts or a message arrives; the status is polled.
 
 use super::*;
 use supershuckie_core::link::{LinkFailure, LinkFrame, LinkInbox, LinkPublisherFns, LinkSettings};
-use supershuckie_core::LinkStatus;
+use supershuckie_core::{LinkStatus, Speed};
 use supershuckie_play_together::{can_link, LinkDeclineReason, LinkEvent, LinkMessage, LinkSink, UnlinkReason, MAX_LINK_DELAY};
 
 /// How long a request waits for the other player's answer, and how long an incoming request
@@ -50,7 +55,8 @@ pub(super) struct PartnerStart {
     frame: u64,
     input: InputBuffer,
     rtt_millis: u32,
-    delay_setting: u8
+    delay_setting: u8,
+    speed: Speed
 }
 
 /// The cable is in (or going in): the inbox the friend's frames land in and the delay agreed.
@@ -110,6 +116,11 @@ impl LinkPhase {
         }
     }
 
+    /// Whether the cores are plugged together (running, or about to, in lockstep).
+    pub(super) fn is_plugged(&self) -> bool {
+        matches!(self, Self::Starting { plugged: Some(_), .. } | Self::Linked { .. })
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::Requesting { .. } => "requesting",
@@ -139,13 +150,15 @@ pub struct LinkView {
     pub since_ms: u64,
     /// Link frames run so far (linked only).
     pub link_frame: u64,
+    /// The speed multiplier the pair runs at: the session host's game speed.
+    pub speed: f64,
     /// Why the last cable came out, or the last request came to nothing (empty until then).
     pub last_reason: String
 }
 
 impl LinkView {
     pub(super) fn none(last_reason: String) -> LinkView {
-        LinkView { phase: "none", peer_id: 0, peer_name: String::new(), nonce: 0, input_delay: 0, stalled: false, since_ms: 0, link_frame: 0, last_reason }
+        LinkView { phase: "none", peer_id: 0, peer_name: String::new(), nonce: 0, input_delay: 0, stalled: false, since_ms: 0, link_frame: 0, speed: 1.0, last_reason }
     }
 }
 
@@ -183,12 +196,13 @@ impl LinkPublisherFns for SessionLinkPublisher {
     }
 }
 
-/// The input delay both sides agree on: enough frames to cover the one-way trip through the
-/// host plus one, or more if either player asked for more; at least 1, at most
-/// [`MAX_LINK_DELAY`].
-pub fn compute_link_delay(rtt_a_ms: u32, rtt_b_ms: u32, setting_a: u8, setting_b: u8) -> u64 {
+/// The input delay both sides agree on: enough frames, at `speed` times normal, to cover the
+/// one-way trip through the host plus one, or more if either player asked for more; at least
+/// 1, at most [`MAX_LINK_DELAY`].
+pub fn compute_link_delay(rtt_a_ms: u32, rtt_b_ms: u32, setting_a: u8, setting_b: u8, speed: f64) -> u64 {
     let one_way_ms = (rtt_a_ms as f64 + rtt_b_ms as f64) / 2.0;
-    let auto = (one_way_ms / LINK_FRAME_MS).ceil() as u64 + 1;
+    let frame_ms = LINK_FRAME_MS / speed.max(f64::MIN_POSITIVE);
+    let auto = (one_way_ms / frame_ms).ceil() as u64 + 1;
     auto.max(setting_a as u64).max(setting_b as u64).clamp(1, MAX_LINK_DELAY as u64)
 }
 
@@ -254,6 +268,7 @@ impl SuperShuckieFrontend {
             stalled,
             since_ms: phase.since().elapsed().as_millis().min(u64::MAX as u128) as u64,
             link_frame,
+            speed: s.link_speed.into_multiplier_float(),
             last_reason: s.last_link_reason.clone()
         }
     }
@@ -393,7 +408,8 @@ impl SuperShuckieFrontend {
                 // Their frames may arrive the moment they have our start: the inbox is ready first.
                 let inbox = Arc::new(LinkInbox::new());
                 session.session.set_link_sink(peer, Some(Box::new(InboxSink { inbox: Arc::clone(&inbox) })));
-                if let Err(e) = session.session.send_link(LinkMessage::Start { target: peer, nonce, frame: my_frame, input, rtt_millis: my_rtt, delay_setting }) {
+                let speed = session.link_speed;
+                if let Err(e) = session.session.send_link(LinkMessage::Start { target: peer, nonce, frame: my_frame, input, rtt_millis: my_rtt, delay_setting, speed }) {
                     self.core.link_release();
                     session.session.set_link_sink(peer, None);
                     session.link = None;
@@ -420,7 +436,10 @@ impl SuperShuckieFrontend {
             Some(LinkPhase::Starting { peer, my_frame, my_rtt, their: Some(their), plugged: None, inbox, .. }) => (*peer, *my_frame, *my_rtt, their.clone(), Arc::clone(inbox)),
             _ => return
         };
-        let delay = compute_link_delay(my_rtt, their.rtt_millis, self.settings.play_together.link_input_delay, their.delay_setting);
+        // The faster of the two reports of the host's speed, so both ends size the delay alike
+        // even if the host changed it mid-handshake (a later `LinkSpeed` reaches both anyway).
+        let delay_speed = session.link_speed.into_multiplier_float().max(their.speed.into_multiplier_float());
+        let delay = compute_link_delay(my_rtt, their.rtt_millis, self.settings.play_together.link_input_delay, their.delay_setting, delay_speed);
         let local_is_first = session.local_peer_id < peer;
 
         let lent = match session.peers.iter().find(|p| p.peer_id == peer).and_then(|p| p.core.as_ref()) {
@@ -439,8 +458,8 @@ impl SuperShuckieFrontend {
         // again when the cable comes out.
         session.session.unsubscribe(peer);
         let publisher = SessionLinkPublisher { session: Arc::clone(&session.session), target: peer, errors: Vec::new() };
-        // Both games at 1x: the lockstep paces them together.
-        self.core.set_speed(supershuckie_core::Speed::from_multiplier_float(1.0));
+        // Both machines run the pair at the host's speed: the lockstep paces them together.
+        self.set_core_speed(session.link_speed);
         self.core.link(
             lent,
             LinkSettings { delay_frames: delay, local_is_first, local_start_frame: my_frame, partner_start_frame: their.frame, partner_start_input: their.input },
@@ -560,9 +579,9 @@ impl SuperShuckieFrontend {
                     session.bump();
                 }
             }
-            LinkEvent::Started { from, nonce, frame, input, rtt_millis, delay_setting } => {
+            LinkEvent::Started { from, nonce, frame, input, rtt_millis, delay_setting, speed } => {
                 if let Some(LinkPhase::Starting { peer, nonce: ours, their, .. }) = session.link.as_mut() && *peer == from && *ours == nonce {
-                    *their = Some(PartnerStart { frame, input, rtt_millis, delay_setting });
+                    *their = Some(PartnerStart { frame, input, rtt_millis, delay_setting, speed });
                     self.plug_in(session);
                 }
             }
@@ -697,15 +716,20 @@ mod tests {
     #[test]
     fn the_delay_covers_the_trip_through_the_host() {
         // Two players on a LAN: a frame of slack over the (sub-frame) one-way time.
-        assert_eq!(compute_link_delay(2, 3, 0, 0), 2);
+        assert_eq!(compute_link_delay(2, 3, 0, 0, 1.0), 2);
         // 40 ms + 60 ms round trips: 50 ms one way is three frames, plus one.
-        assert_eq!(compute_link_delay(40, 60, 0, 0), 4);
+        assert_eq!(compute_link_delay(40, 60, 0, 0, 1.0), 4);
         // A player asking for more gets it; the larger setting wins.
-        assert_eq!(compute_link_delay(2, 3, 6, 0), 6);
-        assert_eq!(compute_link_delay(2, 3, 2, 8), 8);
+        assert_eq!(compute_link_delay(2, 3, 6, 0, 1.0), 6);
+        assert_eq!(compute_link_delay(2, 3, 2, 8, 1.0), 8);
         // Never below 1, never above the limit.
-        assert_eq!(compute_link_delay(0, 0, 0, 0), 1);
-        assert_eq!(compute_link_delay(5000, 5000, 0, 0), MAX_LINK_DELAY as u64);
-        assert_eq!(compute_link_delay(0, 0, 200, 0), MAX_LINK_DELAY as u64);
+        assert_eq!(compute_link_delay(0, 0, 0, 0, 1.0), 1);
+        assert_eq!(compute_link_delay(5000, 5000, 0, 0, 1.0), MAX_LINK_DELAY as u64);
+        assert_eq!(compute_link_delay(0, 0, 200, 0, 1.0), MAX_LINK_DELAY as u64);
+        // Faster games have shorter frames: the same 50 ms one way is 12 frames at 4x, plus one.
+        assert_eq!(compute_link_delay(40, 60, 0, 0, 4.0), 13);
+        assert_eq!(compute_link_delay(40, 60, 0, 0, 0.5), 3);
+        assert_eq!(compute_link_delay(40, 60, 0, 0, 8.0), MAX_LINK_DELAY as u64);
+        assert_eq!(compute_link_delay(0, 0, 0, 0, 0.0), 1);
     }
 }

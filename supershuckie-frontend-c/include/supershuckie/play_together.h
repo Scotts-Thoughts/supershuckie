@@ -36,7 +36,7 @@ struct SuperShuckieAudioOutputRaw;
  *     "link": {                           (the link cable; see below)
  *       "phase": "none" | "requesting" | "incoming" | "starting" | "linked",
  *       "peer_id": 2, "peer_name": "Ash", "nonce": 7, "input_delay": 3, "stalled": false,
- *       "since_ms": 1200, "link_frame": 3600, "last_reason": ""
+ *       "since_ms": 1200, "link_frame": 3600, "speed": 1.0, "last_reason": ""
  *     },
  *     "participants": [
  *       {"peer_id": 2, "name": "Ash", "rom_name": "crystal.gbc", "console": "Game Boy Color",
@@ -130,9 +130,10 @@ bool supershuckie_frontend_play_together_set_start_state(struct SuperShuckieFron
  * here and in sync: "can_link" in the state). The other player is asked; the answer shows up in the
  * state's "link" object: "requesting" until they answer, then "starting" (both games hold while
  * the cores plug in) and "linked", or back to "none" with "last_reason" set. While linked both games
- * run at 1x with an input delay of "input_delay" frames; pausing either pauses both ("stalled" is
- * set while waiting for the other side); save-state loads, replays, exports and core reloads are
- * refused ("Unplug the link cable first."); resets go through, delayed like inputs.
+ * run at the session host's game speed ("speed", a multiplier; a client's own speed controls do
+ * nothing until the cable is out) with an input delay of "input_delay" frames; pausing either pauses
+ * both ("stalled" is set while waiting for the other side); save-state loads, replays, exports and
+ * core reloads are refused ("Unplug the link cable first."); resets go through, delayed like inputs.
  *
  * An incoming request puts "incoming" in the state with the other player's "peer_name" and the
  * request's "nonce": answer with supershuckie_frontend_play_together_link_respond (accept plugs in).

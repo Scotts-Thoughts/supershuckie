@@ -2637,7 +2637,8 @@ void MainWindow::refresh_play_together_actions() {
         this->game_boy_settings->setEnabled(false);
     }
     // Two linked games have to stay in step: nothing that changes one of them behind the
-    // other's back, and no other speed than 1x (the frontend refuses these too).
+    // other's back (the frontend refuses these too; the speed is the host's, and a client's own
+    // speed controls simply do nothing while linked).
     if(linked) {
         for(auto &state : this->quick_load_save_states) {
             state->setEnabled(false);

@@ -340,7 +340,7 @@ Usage:
                    "video_scale": 2, "audio": false, "window_hidden": false, "pokeabyte_port": 55357,
                    "linked_with": null, "can_link": true}],
  "link": {"phase": "none", "peer_id": 0, "peer_name": "", "nonce": 0, "input_delay": 0, "stalled": false,
-          "since_ms": 0, "link_frame": 0, "last_reason": ""},
+          "since_ms": 0, "link_frame": 0, "speed": 1.0, "last_reason": ""},
  "errors": []}
 ```
 

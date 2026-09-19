@@ -1,4 +1,4 @@
-//! The wire protocol, version 4. The contract is `docs/play-together-protocol.md`; this module is
+//! The wire protocol, version 5. The contract is `docs/play-together-protocol.md`; this module is
 //! a direct transcription of it.
 
 use std::fmt;
@@ -26,7 +26,7 @@ use link::pair_hash_fields;
 use wire::{frame, Decoder, Encoder};
 
 /// The protocol version this crate speaks.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Longest display name, in bytes.
 pub const MAX_DISPLAY_NAME_BYTES: usize = 32;
@@ -70,6 +70,7 @@ pub(crate) const TAG_LINK_FRAME: u8 = 0x34;
 pub(crate) const TAG_UNLINK: u8 = 0x35;
 pub(crate) const TAG_PEER_LINKED: u8 = 0x36;
 pub(crate) const TAG_PEER_UNLINKED: u8 = 0x37;
+pub(crate) const TAG_LINK_SPEED: u8 = 0x38;
 
 /// Byte offset, in a whole frame (length prefix included), of the first `u16` peer-id field of
 /// `Stream`, `Snapshot`, `SyncHash`, `Pause`, every link cable message (`from`) and
@@ -415,6 +416,9 @@ pub enum Message {
         rtt_millis: u32,
         /// The sender's input-delay setting: 0 for automatic, else the frames it wants at least.
         delay_setting: u8,
+        /// The host's game speed as the sender knows it: the pair runs at the faster of the two
+        /// ends' reports, and the delay covers the trip at that speed.
+        speed: Speed,
     },
     /// One lockstep frame of `from`'s events for `target`.
     LinkFrame {
@@ -457,6 +461,12 @@ pub enum Message {
         /// The other.
         b: PeerId,
     },
+    /// Host → clients: the host's game speed, which every linked pair in the session runs at.
+    /// Sent right after `Welcome` and whenever the host's speed changes.
+    LinkSpeed {
+        /// The host's speed.
+        speed: Speed,
+    },
 }
 
 impl Message {
@@ -488,6 +498,7 @@ impl Message {
             Message::Unlink { .. } => TAG_UNLINK,
             Message::PeerLinked { .. } => TAG_PEER_LINKED,
             Message::PeerUnlinked { .. } => TAG_PEER_UNLINKED,
+            Message::LinkSpeed { .. } => TAG_LINK_SPEED,
         }
     }
 
@@ -524,8 +535,8 @@ impl Message {
             LinkMessage::Request { target, nonce, console } => Message::LinkRequest { from, target, nonce, console },
             LinkMessage::Accept { target, nonce } => Message::LinkAccept { from, target, nonce },
             LinkMessage::Decline { target, nonce, reason } => Message::LinkDecline { from, target, nonce, reason },
-            LinkMessage::Start { target, nonce, frame, input, rtt_millis, delay_setting } => {
-                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting }
+            LinkMessage::Start { target, nonce, frame, input, rtt_millis, delay_setting, speed } => {
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting, speed }
             }
             LinkMessage::Frame { target, frame, elapsed_millis, events, pair_hash } => {
                 let (pair_hash_frame, pair_hash) = pair_hash_fields(pair_hash);
@@ -638,7 +649,7 @@ impl Message {
                     e.u32(*nonce);
                     e.u32(u32::from(*reason));
                 }
-                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting } => {
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting, speed } => {
                     e.u16(*from);
                     e.u16(*target);
                     e.u32(*nonce);
@@ -646,6 +657,7 @@ impl Message {
                     e.bytes(input);
                     e.u32(*rtt_millis);
                     e.u8(*delay_setting);
+                    e.u16(speed.speed_over_256.get());
                 }
                 Message::LinkFrame { from, target, frame, elapsed_millis, events, pair_hash_frame, pair_hash } => {
                     e.u16(*from);
@@ -661,6 +673,7 @@ impl Message {
                     e.u16(*target);
                     e.u32(u32::from(*reason));
                 }
+                Message::LinkSpeed { speed } => e.u16(speed.speed_over_256.get()),
                 Message::PeerLinked { a, b } | Message::PeerUnlinked { a, b } => {
                     e.u16(*a);
                     e.u16(*b);
@@ -758,7 +771,8 @@ impl Message {
                 if delay_setting > MAX_LINK_DELAY {
                     return Err(DecodeError::BadEnum { what: "link delay setting", value: u32::from(delay_setting) });
                 }
-                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting }
+                let speed = speed(&mut d)?;
+                Message::LinkStart { from, target, nonce, frame, input, rtt_millis, delay_setting, speed }
             }
             TAG_LINK_FRAME => {
                 let from = d.u16()?;
@@ -773,6 +787,7 @@ impl Message {
             TAG_UNLINK => Message::Unlink { from: d.u16()?, target: peer_id(&mut d)?, reason: UnlinkReason::from(d.u32()?) },
             TAG_PEER_LINKED => Message::PeerLinked { a: peer_id(&mut d)?, b: peer_id(&mut d)? },
             TAG_PEER_UNLINKED => Message::PeerUnlinked { a: peer_id(&mut d)?, b: peer_id(&mut d)? },
+            TAG_LINK_SPEED => Message::LinkSpeed { speed: speed(&mut d)? },
             other => return Err(DecodeError::UnknownTag(other)),
         };
         d.finish()?;

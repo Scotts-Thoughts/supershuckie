@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use supershuckie_replay_recorder::{InputBuffer, Packet};
+use supershuckie_replay_recorder::{InputBuffer, Packet, Speed};
 
 use crate::conn::{Outbound, SnapshotItem, Stats};
 use crate::error::{DisconnectReason, PlayTogetherError, PublishError};
@@ -87,6 +87,12 @@ pub enum SessionEvent {
         /// The session's pause state to adopt (meaningful while `enabled`).
         paused: bool,
     },
+    /// Client only: the host's game speed, which every linked pair in the session runs at.
+    /// Arrives once on joining and again whenever the host's speed changes.
+    LinkSpeedChanged {
+        /// The host's speed.
+        speed: Speed,
+    },
     /// Another participant paused or unpaused everyone (sync pause is enabled): adopt `paused`.
     /// Never our own pause echoed back.
     PauseChanged {
@@ -162,6 +168,8 @@ pub enum LinkEvent {
         rtt_millis: u32,
         /// Its input-delay setting: 0 for automatic, else the frames it wants at least.
         delay_setting: u8,
+        /// The host's game speed as it knows it.
+        speed: Speed,
     },
     /// `from` unplugged the cable (or the host did, because `from` left). The link sink for
     /// `from`, if any, has been told `ended` and dropped.
@@ -306,6 +314,9 @@ pub trait Session: Send + Sync {
     /// Host only: set whether pausing is shared, and the pause state everyone adopts right now
     /// (the host's own). Told to every client, and to each client as it joins.
     fn set_sync_pause(&self, enabled: bool, paused: bool) -> Result<(), PlayTogetherError>;
+    /// Host only: the host's game speed, which every linked pair runs at. Told to every client
+    /// when it changes, and to each client as it joins.
+    fn set_link_speed(&self, speed: Speed) -> Result<(), PlayTogetherError>;
     /// We paused (or unpaused) everyone. The host relays it to everyone else while sync pause is
     /// enabled and drops it otherwise; nobody gets their own pause back.
     fn send_pause(&self, paused: bool) -> Result<(), PlayTogetherError>;
@@ -500,8 +511,8 @@ pub(crate) fn receive_link(events: &EventQueue, sinks: &LinkSinks, stats: &Stats
         Message::LinkRequest { from, nonce, console, .. } => events.push(SessionEvent::Link(LinkEvent::Requested { from, nonce, console })),
         Message::LinkAccept { from, nonce, .. } => events.push(SessionEvent::Link(LinkEvent::Accepted { from, nonce })),
         Message::LinkDecline { from, nonce, reason, .. } => events.push(SessionEvent::Link(LinkEvent::Declined { from, nonce, reason })),
-        Message::LinkStart { from, nonce, frame, input, rtt_millis, delay_setting, .. } => {
-            events.push(SessionEvent::Link(LinkEvent::Started { from, nonce, frame, input, rtt_millis, delay_setting }))
+        Message::LinkStart { from, nonce, frame, input, rtt_millis, delay_setting, speed, .. } => {
+            events.push(SessionEvent::Link(LinkEvent::Started { from, nonce, frame, input, rtt_millis, delay_setting, speed }))
         }
         Message::LinkFrame { from, frame, elapsed_millis, events: bytes, pair_hash_frame, pair_hash, .. } => {
             let decoded = decode_link_events(&bytes).map_err(|e| e.to_string())?;

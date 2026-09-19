@@ -58,11 +58,12 @@ a session; 0 means "none" or, as a target, "everyone".
 | 0x30 | LinkRequest | `from u16, target u16, nonce u32, console u32` | participant → host → target |
 | 0x31 | LinkAccept | `from u16, target u16, nonce u32` | target → host → requester |
 | 0x32 | LinkDecline | `from u16, target u16, nonce u32, reason u32` | target (or host) → requester |
-| 0x33 | LinkStart | `from u16, target u16, nonce u32, frame u64, input bytes, rtt_millis u32, delay_setting u8` | both ends, via the host |
+| 0x33 | LinkStart | `from u16, target u16, nonce u32, frame u64, input bytes, rtt_millis u32, delay_setting u8, speed u16` | both ends, via the host |
 | 0x34 | LinkFrame | `from u16, target u16, frame u64, elapsed_millis u64, events bytes, pair_hash_frame u64, pair_hash hash` | both ends, via the host, once per lockstep frame |
 | 0x35 | Unlink | `from u16, target u16, reason u32` | either end (or host) → the other |
 | 0x36 | PeerLinked | `a u16, b u16` | host → clients |
 | 0x37 | PeerUnlinked | `a u16, b u16` | host → clients |
+| 0x38 | LinkSpeed | `speed u16` | host → clients |
 
 `PublisherInfo` is `metadata, initial_input bytes, speed u16, frame u64`, where `metadata` is
 `console_type u32, rom_name string, rom_filename string, rom_checksum hash, bios_checksum hash,
@@ -138,7 +139,9 @@ The handshake, all relayed by the host (which overwrites `from` at the same offs
    at, the input held there, their last round-trip time to the host and their input-delay
    setting (0 = automatic, else 1–15 frames). From the two `LinkStart`s both ends compute the
    same delay: `max(ceil((rtt_a + rtt_b) / 2 / frame_ms) + 1, setting_a, setting_b)` clamped to
-   1..=15, where `frame_ms` is 1000 / 59.7275. Each end brings its follower of the other's game
+   1..=15, where `frame_ms` is 1000 / 59.7275 / `speed` and `speed` is the larger of the two
+   `LinkStart.speed` values (each end's latest word of the host's speed, so a change mid-handshake
+   still gives both the same delay). Each end brings its follower of the other's game
    exactly to the other's stopped frame from the stream it already has, then plugs the two
    consoles together; the first console of the pair is the lower peer id.
 4. While linked each end sends one `LinkFrame` per lockstep frame: `frame` is the link frame the
@@ -165,8 +168,17 @@ While linked, what each console received over the cable during a frame goes into
 its replay files as a `SerialIn` packet (replay format 7), so a third participant following a
 linked game, and a replay of one, reproduce the transfer without a partner.
 
+### Link speed
+
+Every linked pair runs at the host's game speed, on both machines, so neither end stalls on the
+other. The host sends `LinkSpeed` (`speed` as in `PublisherInfo`: the multiplier times 256) right
+after `SyncPause` on admission and again whenever its speed changes; a client applies it to its
+own game while its cable is in and otherwise only remembers it (for `LinkStart.speed`). A client
+that sends `LinkSpeed` is a protocol error at the host.
+
 ### Version history
 
+- 5: `LinkSpeed`, `LinkStart.speed`.
 - 4: the link cable messages `0x30`–`0x37`; `Stream.bytes` may carry `SerialIn` (replay format 7).
 - 3: `SyncPause`, `Pause`, `StartState`, `Refused.reason` 7.
 - 2: `Hello.color`, `Welcome.your_color`, `ParticipantInfo.color`.

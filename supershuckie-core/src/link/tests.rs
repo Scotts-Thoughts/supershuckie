@@ -676,8 +676,9 @@ fn refusals_while_held_and_linked() {
     let epoch = m1.local.state_epoch();
     m1.local.load_save_state(&state);
     assert_eq!(m1.local.state_epoch(), epoch, "a state load is refused while linked");
+    // Speed is pacing only: the frontend sets the session host's speed on both machines.
     m1.local.set_speed(Speed::from_multiplier_float(4.0));
-    assert_eq!(m1.local.game_speed, Speed::from_multiplier_float(1.0), "speed changes are refused while linked");
+    assert_eq!(m1.local.game_speed, Speed::from_multiplier_float(4.0), "speed changes pace the linked pair");
     assert!(m1.local.link_hold().is_err(), "cannot hold while linked");
     let player = ReplayFilePlayer::new(&m1.local_file.0.lock().unwrap().clone(), false);
     if let Ok(player) = player {

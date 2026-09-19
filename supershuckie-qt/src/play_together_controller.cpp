@@ -201,7 +201,7 @@ void PlayTogetherController::apply_link_state(const QJsonObject &link, bool acti
             box->setAttribute(Qt::WA_DeleteOnClose);
             box->setWindowTitle("Link cable");
             box->setIcon(QMessageBox::Icon::Question);
-            box->setText(QString("%1 wants to plug a link cable into your game.\n\nBoth games will run in step with a small input delay while linked; save states, replays and speed changes are off until it is unplugged.").arg(link["peer_name"].toString()));
+            box->setText(QString("%1 wants to plug a link cable into your game.\n\nBoth games will run in step with a small input delay while linked, at the host's game speed; save states and replays are off until it is unplugged.").arg(link["peer_name"].toString()));
             auto *plug = box->addButton("Plug in", QMessageBox::AcceptRole);
             box->addButton("Decline", QMessageBox::RejectRole);
             box->setDefaultButton(plug);

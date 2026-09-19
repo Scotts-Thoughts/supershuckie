@@ -13,7 +13,7 @@ use common::*;
 use supershuckie_play_together::protocol::Message;
 use supershuckie_play_together::*;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, REPLAY_VERSION};
-use supershuckie_replay_recorder::{append_packet, Packet, TimestampMillis};
+use supershuckie_replay_recorder::{append_packet, Packet, Speed, TimestampMillis};
 
 // ---------------------------------------------------------------------------------------------
 // Helpers
@@ -88,15 +88,15 @@ fn a_link_is_requested_accepted_started_framed_and_unplugged_through_the_host() 
 
     // Both hold and tell each other where.
     let input_a: supershuckie_replay_recorder::InputBuffer = [0x10u8, 0x20].iter().copied().collect();
-    a.send_link(LinkMessage::Start { target: 3, nonce: 11, frame: 1000, input: input_a.clone(), rtt_millis: 20, delay_setting: 0 }).expect("start");
-    b.send_link(LinkMessage::Start { target: 2, nonce: 11, frame: 990, input: Default::default(), rtt_millis: 35, delay_setting: 4 }).expect("start");
+    a.send_link(LinkMessage::Start { target: 3, nonce: 11, frame: 1000, input: input_a.clone(), rtt_millis: 20, delay_setting: 0, speed: Speed::default() }).expect("start");
+    b.send_link(LinkMessage::Start { target: 2, nonce: 11, frame: 990, input: Default::default(), rtt_millis: 35, delay_setting: 4, speed: Speed::default() }).expect("start");
     assert_eq!(
         wait_link(&b, &mut bl, "Started at B", |l| matches!(l, LinkEvent::Started { .. })),
-        LinkEvent::Started { from: 2, nonce: 11, frame: 1000, input: input_a, rtt_millis: 20, delay_setting: 0 }
+        LinkEvent::Started { from: 2, nonce: 11, frame: 1000, input: input_a, rtt_millis: 20, delay_setting: 0, speed: Speed::default() }
     );
     assert_eq!(
         wait_link(&a, &mut al, "Started at A", |l| matches!(l, LinkEvent::Started { .. })),
-        LinkEvent::Started { from: 3, nonce: 11, frame: 990, input: Default::default(), rtt_millis: 35, delay_setting: 4 }
+        LinkEvent::Started { from: 3, nonce: 11, frame: 990, input: Default::default(), rtt_millis: 35, delay_setting: 4, speed: Speed::default() }
     );
 
     // Frames go straight to the sinks, in order, with their pair hashes.
@@ -155,8 +155,8 @@ fn a_link_is_requested_accepted_started_framed_and_unplugged_through_the_host() 
     assert_eq!(wait_link(&b, &mut bl, "Accepted at B", |l| matches!(l, LinkEvent::Accepted { .. })), LinkEvent::Accepted { from: 1, nonce: 5 });
     assert_eq!(wait_link(&a, &mut al, "PeerLinked at A", |l| matches!(l, LinkEvent::PeerLinked { .. })), LinkEvent::PeerLinked { a: 1, b: 3 });
     assert_eq!(wait_link(&host, &mut hl, "PeerLinked at host", |l| matches!(l, LinkEvent::PeerLinked { .. })), LinkEvent::PeerLinked { a: 1, b: 3 });
-    host.send_link(LinkMessage::Start { target: 3, nonce: 5, frame: 7, input: Default::default(), rtt_millis: 0, delay_setting: 2 }).expect("start");
-    b.send_link(LinkMessage::Start { target: 1, nonce: 5, frame: 9, input: Default::default(), rtt_millis: 40, delay_setting: 0 }).expect("start");
+    host.send_link(LinkMessage::Start { target: 3, nonce: 5, frame: 7, input: Default::default(), rtt_millis: 0, delay_setting: 2, speed: Speed::default() }).expect("start");
+    b.send_link(LinkMessage::Start { target: 1, nonce: 5, frame: 9, input: Default::default(), rtt_millis: 40, delay_setting: 0, speed: Speed::default() }).expect("start");
     assert!(matches!(wait_link(&b, &mut bl, "Started at B", |l| matches!(l, LinkEvent::Started { .. })), LinkEvent::Started { from: 1, frame: 7, delay_setting: 2, .. }));
     assert!(matches!(wait_link(&host, &mut hl, "Started at host", |l| matches!(l, LinkEvent::Started { .. })), LinkEvent::Started { from: 3, frame: 9, rtt_millis: 40, .. }));
     let (rec_h, sink_h) = link_sink();
@@ -342,7 +342,7 @@ fn spoofed_unlinked_and_forbidden_link_messages_are_handled() {
     let (rec, sink) = link_sink();
     victim.set_link_sink(3, Some(sink));
     liar.send(&Message::LinkFrame { from: 1, target: 2, frame: 0, elapsed_millis: 7, events: Vec::new(), pair_hash_frame: 0, pair_hash: [0; 32] });
-    liar.send(&Message::LinkStart { from: 1, target: 2, nonce: 1, frame: 0, input: Default::default(), rtt_millis: 0, delay_setting: 0 });
+    liar.send(&Message::LinkStart { from: 1, target: 2, nonce: 1, frame: 0, input: Default::default(), rtt_millis: 0, delay_setting: 0, speed: Speed::default() });
     assert_no_event(&victim, &mut vl, Duration::from_millis(200), "start from a stranger", |e| matches!(e, SessionEvent::Link(_)));
     assert!(rec.lock().unwrap().frames.is_empty());
 

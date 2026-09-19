@@ -10,6 +10,7 @@ use common::*;
 use supershuckie_play_together::protocol::{Message, WireSnapshot, WireStartState};
 use supershuckie_play_together::*;
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, REPLAY_VERSION};
+use supershuckie_replay_recorder::Speed;
 
 struct Raw {
     stream: TcpStream,
@@ -253,9 +254,21 @@ fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
         SessionEvent::Left { peer_id, reason } => assert_eq!((peer_id, reason), (4, LeaveReason::ProtocolError)),
         other => panic!("{other:?}"),
     }
-    // The setting survives the attempts: a newcomer still hears it.
+    // The setting survives the attempts: a newcomer still hears it, and the host's speed after it.
     let (mut late, _) = Raw::handshake(host.local_addr(), "Late");
     assert_eq!(late.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: true }));
+    assert_eq!(late.read_until(|m| matches!(m, Message::LinkSpeed { .. })), Some(Message::LinkSpeed { speed: Speed::default() }));
+    host.set_link_speed(Speed::from_multiplier_float(3.0)).unwrap();
+    assert_eq!(late.read_until(|m| matches!(m, Message::LinkSpeed { .. })), Some(Message::LinkSpeed { speed: Speed::from_multiplier_float(3.0) }));
+    // A client claiming to set it is thrown out like the pause liar.
+    let (mut speeder, _) = Raw::handshake(host.local_addr(), "Speeder");
+    wait_joined(&host, &mut hl);
+    speeder.send(&Message::LinkSpeed { speed: Speed::from_multiplier_float(8.0) });
+    match speeder.read_until(|m| matches!(m, Message::Error { .. })) {
+        Some(Message::Error { text }) => assert!(text.contains("only the host"), "{text}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(speeder.eof());
 }
 
 #[test]

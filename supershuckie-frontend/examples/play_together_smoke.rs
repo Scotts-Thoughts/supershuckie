@@ -15,7 +15,8 @@
 //! that every follower got a port; the session is held for `--seconds`, long enough to point a
 //! real Poke-A-Byte at `/instances/<port + 1>/` meanwhile. `--link` plugs a link cable between
 //! the host and the first joiner after the measured stretch: the handshake, both games in
-//! lockstep at 1x, the refusals, an unplug from the other side, a declined request, and (with
+//! lockstep at the host's speed (the host's speed changes reach the pair, the joiner's do
+//! nothing), the refusals, an unplug from the other side, a declined request, and (with
 //! no ROM given) the link test ROM exchanging 256 bytes each way, checked on both machines'
 //! copies of both games; the friend replay files then carry the serial input and still play
 //! back to their end. `--gba` picks the Game Boy Advance test ROM (mGBA's lockstep) over the
@@ -44,15 +45,36 @@ use supershuckie_frontend::play_together::PeerId;
 use supershuckie_frontend::{ScreenInfo, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState};
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 
-/// Counts the screens each peer delivered.
+/// Counts the screens each peer delivered, and keeps a hash of the player's own latest picture.
 #[derive(Default)]
-struct PeerScreens(Arc<Mutex<BTreeMap<PeerId, u64>>>);
+struct PeerScreens {
+    peers: Arc<Mutex<BTreeMap<PeerId, u64>>>,
+    own: Arc<Mutex<OwnScreen>>
+}
+
+/// The player's own screen as last delivered: a hash of the pixels, and how many deliveries.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct OwnScreen {
+    hash: u64,
+    deliveries: u64
+}
 
 impl SuperShuckieFrontendCallbacks for PeerScreens {
-    fn refresh_screens(&mut self, _: &[ScreenData]) {}
+    fn refresh_screens(&mut self, screens: &[ScreenData]) {
+        // FNV-1a over every screen's pixels: cheap, and equal pictures hash equal.
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for screen in screens {
+            for pixel in &screen.pixels {
+                hash = (hash ^ u64::from(*pixel)).wrapping_mul(0x100000001b3);
+            }
+        }
+        let mut own = self.own.lock().unwrap();
+        own.hash = hash;
+        own.deliveries += 1;
+    }
     fn change_video_mode(&mut self, _: &[ScreenInfo], _: NonZeroU8) {}
     fn peer_refresh_screens(&mut self, peer: PeerId, _: &[ScreenData]) {
-        *self.0.lock().unwrap().entry(peer).or_default() += 1;
+        *self.peers.lock().unwrap().entry(peer).or_default() += 1;
     }
 }
 
@@ -60,6 +82,7 @@ struct Player {
     name: String,
     frontend: SuperShuckieFrontend,
     screens: Arc<Mutex<BTreeMap<PeerId, u64>>>,
+    own_screen: Arc<Mutex<OwnScreen>>,
     /// Per followed peer: every frames-behind sample taken.
     behind: BTreeMap<PeerId, Vec<u64>>,
     fps_samples: Vec<f64>,
@@ -219,10 +242,19 @@ fn check_sync_pause(players: &mut [Player]) -> bool {
     ok
 }
 
-/// The start-state round: the host sets one (everyone pauses on the very same state), a race
-/// start restarts everyone from it, then it is cleared. Leaves everyone unpaused with no start
-/// state. Returns whether it all held.
-fn check_start_state(players: &mut [Player], mixed_roms: bool) -> bool {
+/// What a player joining the session mid-run needs.
+struct LateJoin<'a> {
+    dir: &'a Path,
+    rom: &'a Path,
+    speed: f64,
+    join_code: &'a str
+}
+
+/// The start-state round: the host sets one (everyone pauses on the very same state, and shows
+/// it), a player joining while it is set lands on it too, a race start restarts everyone from
+/// it, then it is cleared. Leaves everyone unpaused with no start state. Returns whether it all
+/// held.
+fn check_start_state(players: &mut [Player], mixed_roms: bool, late_join: LateJoin) -> bool {
     let mut ok = true;
     let wait = Duration::from_secs(3);
 
@@ -273,6 +305,91 @@ fn check_start_state(players: &mut [Player], mixed_roms: bool) -> bool {
     else {
         println!("  every game is on the same state ({}…)", hashes[0]);
     }
+    // And everyone's screen shows it, still paused: the picture a joiner sees must be the
+    // host's, not the last frame of whatever they were playing before the state arrived.
+    let pictures: Vec<OwnScreen> = players.iter().map(|p| *p.own_screen.lock().unwrap()).collect();
+    if players.iter().any(|p| !p.frontend.is_paused()) {
+        println!("FAIL: someone unpaused before their screen was compared");
+        ok = false;
+    }
+    else if pictures.iter().any(|s| s.hash != pictures[0].hash) {
+        println!("FAIL: the screens do not all show the start state while paused: {:?}", pictures.iter().map(|s| format!("{:016x}", s.hash)).collect::<Vec<_>>());
+        ok = false;
+    }
+    else {
+        println!("  every screen shows the start state while paused ({:016x})", pictures[0].hash);
+    }
+
+    // Someone joining while it is set gets it right after the welcome: paused on the same state,
+    // and looking at it.
+    {
+        let everyone = players.len();
+        let mut joiner = make_player(late_join.dir, "Latecomer", late_join.rom, late_join.speed, None);
+        tick_all_for(std::slice::from_mut(&mut joiner), Duration::from_secs(1));
+        let started = Instant::now();
+        if let Err(e) = joiner.frontend.play_together_join(late_join.join_code, "Latecomer", 0) {
+            println!("FAIL: a late joiner could not join: {e}");
+            ok = false;
+        }
+        else {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut landed = false;
+            while Instant::now() < until {
+                tick_all(players);
+                tick_all(std::slice::from_mut(&mut joiner));
+                let state = joiner.frontend.play_together_state();
+                if state.start_state && joiner.frontend.is_paused() && state.participants.len() == everyone {
+                    landed = true;
+                    break
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if !landed {
+                println!("FAIL: the late joiner did not land on the start state, paused: {:?}", joiner.frontend.play_together_state().errors);
+                ok = false;
+            }
+            else {
+                println!("  a late joiner landed on the start state (paused) {} ms after joining", started.elapsed().as_millis());
+                // Their core applies the load on its own thread; give it a moment.
+                let until = Instant::now() + Duration::from_millis(300);
+                while Instant::now() < until {
+                    tick_all(players);
+                    tick_all(std::slice::from_mut(&mut joiner));
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let joiner_state = joiner.frontend.create_save_state_bytes().unwrap_or_default();
+                let joiner_hash = supershuckie_replay_recorder::replay_file::blake3_hash_to_ascii(supershuckie_replay_recorder::blake3_hash(&joiner_state))[..12].to_owned();
+                let joiner_picture = *joiner.own_screen.lock().unwrap();
+                if !joiner.frontend.is_paused() {
+                    println!("FAIL: the late joiner unpaused before their screen was compared");
+                    ok = false;
+                }
+                else if joiner_hash != hashes[0] {
+                    println!("FAIL: the late joiner is not on the host's state: {joiner_hash} vs {}", hashes[0]);
+                    ok = false;
+                }
+                else if joiner_picture.hash != pictures[0].hash {
+                    println!("FAIL: the late joiner's screen does not show the start state while paused: {:016x} vs the host's {:016x}", joiner_picture.hash, pictures[0].hash);
+                    ok = false;
+                }
+                else {
+                    println!("  the late joiner's screen shows the start state while paused");
+                }
+            }
+            joiner.frontend.play_together_leave();
+            let until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < until {
+                tick_all(players);
+                tick_all(std::slice::from_mut(&mut joiner));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let others = players.len() - 1;
+            if !tick_until_all(players, wait, |p| p.frontend.play_together_state().participants.len() == others) {
+                println!("FAIL: the late joiner's departure did not reach everyone");
+                ok = false;
+            }
+        }
+    }
 
     // A race start restarts everyone from it (and unpauses everyone).
     players[0].frontend.play_together_reset_all(1).expect("reset all");
@@ -303,6 +420,30 @@ fn check_start_state(players: &mut [Player], mixed_roms: bool) -> bool {
 /// With `test_rom`, the two games are the link test ROM: the host's is told to be the master
 /// and the joiner's the slave, and the 256 bytes each side receives are checked on both
 /// machines' copies of both games.
+/// Tick everyone for `window` and return each player's emulation fps over its last full second
+/// (the fps window is a second long and only turns over when polled; the first reading can
+/// straddle a speed change).
+fn linked_fps(players: &mut [Player], watchers: &mut [Player], window: Duration) -> Vec<f64> {
+    let started = Instant::now();
+    let mut fps: Vec<Vec<f64>> = vec![Vec::new(); players.len()];
+    let mut since_fps = Instant::now();
+    while started.elapsed() < window {
+        tick_all(players);
+        tick_all(watchers);
+        if since_fps.elapsed() >= Duration::from_secs(1) {
+            since_fps = Instant::now();
+            for (i, p) in players.iter_mut().enumerate() {
+                let f = p.frontend.get_emulation_fps();
+                if f > 0.0 {
+                    fps[i].push(f);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    fps.iter().map(|f| f.last().copied().unwrap_or(0.0)).collect()
+}
+
 fn check_link(all: &mut [Player], speed: f64, test_rom: Option<TestRom>) -> bool {
     let mut ok = true;
     let wait = Duration::from_secs(15);
@@ -414,7 +555,7 @@ fn check_link(all: &mut [Player], speed: f64, test_rom: Option<TestRom>) -> bool
         }
     }
 
-    // While linked: refusals, and both games at 1x whatever the speed setting.
+    // While linked: refusals.
     match players[0].frontend.load_save_state_if_exists("anything") {
         Err(e) if e.as_str().contains("link cable") => println!("  loading a save state is refused while linked: {e}"),
         other => {
@@ -482,29 +623,13 @@ fn check_link(all: &mut [Player], speed: f64, test_rom: Option<TestRom>) -> bool
     }
 
     // A stretch of lockstep: the link frames advance on both sides, nobody desyncs, and both
-    // games run at 1x (the speed setting is set aside while linked).
+    // games run at the host's speed (the speed every player was made with).
     let before: Vec<u64> = players.iter().map(|p| p.frontend.play_together_link_state().link_frame).collect();
-    let started = Instant::now();
-    let mut fps: Vec<Vec<f64>> = vec![Vec::new(); players.len()];
-    let mut since_fps = Instant::now();
-    while started.elapsed() < Duration::from_secs(4) {
-        tick_all(players);
-        tick_all(watchers);
-        if since_fps.elapsed() >= Duration::from_secs(1) {
-            since_fps = Instant::now();
-            for (i, p) in players.iter_mut().enumerate() {
-                let f = p.frontend.get_emulation_fps();
-                if f > 0.0 {
-                    fps[i].push(f);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let fps = linked_fps(players, watchers, Duration::from_secs(4));
     for (i, p) in players.iter().enumerate() {
         let view = p.frontend.play_together_link_state();
-        let avg = if fps[i].is_empty() { 0.0 } else { fps[i].iter().sum::<f64>() / fps[i].len() as f64 };
-        println!("  [{}] linked: {} link frames in 4 s, {avg:.1} fps, stalled: {}", p.name, view.link_frame.saturating_sub(before[i]), view.stalled);
+        let avg = fps[i];
+        println!("  [{}] linked: {} link frames in 4 s, {avg:.1} fps at the host's {}x, stalled: {}", p.name, view.link_frame.saturating_sub(before[i]), view.speed, view.stalled);
         if view.phase != "linked" {
             println!("FAIL: [{}] is no longer linked: {} ({})", p.name, view.phase, view.last_reason);
             ok = false;
@@ -513,17 +638,56 @@ fn check_link(all: &mut [Player], speed: f64, test_rom: Option<TestRom>) -> bool
             println!("FAIL: [{}] ran only {} link frames in 4 s", p.name, view.link_frame.saturating_sub(before[i]));
             ok = false;
         }
-        if speed >= 2.0 && avg > 90.0 {
-            println!("FAIL: [{}] ran at {avg:.1} fps while linked; linked games run at 1x", p.name);
+        if avg < speed * 60.0 * 0.8 {
+            println!("FAIL: [{}] ran at {avg:.1} fps while linked; linked games run at the host's {speed}x", p.name);
             ok = false;
         }
-        if avg < 50.0 {
-            println!("FAIL: [{}] ran at {avg:.1} fps while linked", p.name);
+        if (view.speed - speed).abs() > 0.01 {
+            println!("FAIL: [{}] reports the link at {}x, the host is at {speed}x", p.name, view.speed);
             ok = false;
         }
         for q in p.frontend.play_together_state().participants {
             if q.hash_mismatches > 0 {
                 println!("FAIL: [{}] desynced from {} while linked", p.name, q.name);
+                ok = false;
+            }
+        }
+    }
+
+    // The host's speed rules the pair: the host dropping to 1x slows both machines, the
+    // joiner's own setting does nothing, and the host going back up speeds both up again.
+    if speed >= 2.0 {
+        players[0].frontend.set_speed_settings(1.0, 2.0);
+        let fps = linked_fps(players, watchers, Duration::from_secs(3));
+        println!("  host at 1x: {:?} fps", fps.iter().map(|f| f.round()).collect::<Vec<_>>());
+        for (i, p) in players.iter().enumerate() {
+            if fps[i] > 90.0 || fps[i] < 50.0 {
+                println!("FAIL: [{}] ran at {:.1} fps after the host went to 1x", p.name, fps[i]);
+                ok = false;
+            }
+        }
+        players[1].frontend.set_speed_settings(speed, 2.0);
+        let fps = linked_fps(players, watchers, Duration::from_secs(3));
+        println!("  joiner asks for {speed}x: {:?} fps", fps.iter().map(|f| f.round()).collect::<Vec<_>>());
+        for (i, p) in players.iter().enumerate() {
+            if fps[i] > 90.0 || fps[i] < 50.0 {
+                println!("FAIL: [{}] ran at {:.1} fps after the joiner changed its own speed while linked", p.name, fps[i]);
+                ok = false;
+            }
+        }
+        players[0].frontend.set_speed_settings(speed, 2.0);
+        let fps = linked_fps(players, watchers, Duration::from_secs(3));
+        println!("  host back at {speed}x: {:?} fps", fps.iter().map(|f| f.round()).collect::<Vec<_>>());
+        for (i, p) in players.iter().enumerate() {
+            if fps[i] < speed * 60.0 * 0.8 {
+                println!("FAIL: [{}] ran at {:.1} fps after the host went back to {speed}x", p.name, fps[i]);
+                ok = false;
+            }
+        }
+        for p in players.iter() {
+            let view = p.frontend.play_together_link_state();
+            if view.phase != "linked" {
+                println!("FAIL: [{}] is no longer linked after the speed changes: {} ({})", p.name, view.phase, view.last_reason);
                 ok = false;
             }
         }
@@ -661,13 +825,15 @@ fn make_player(dir: &Path, name: &str, rom: &Path, speed: f64, pokeabyte_port: O
         user.join("settings.json"),
         r#"{"pokeabyte": POKEABYTE, "external_commands": {"enabled": false}, "play_together": {"display_name": "NAME", "bind_address": "127.0.0.1"}}"#.replace("NAME", name).replace("POKEABYTE", &pokeabyte)
     ).unwrap();
-    let screens = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut frontend = SuperShuckieFrontend::new(user.clone(), user.clone(), Box::new(PeerScreens(screens.clone())));
+    let callbacks = PeerScreens::default();
+    let screens = callbacks.peers.clone();
+    let own_screen = callbacks.own.clone();
+    let mut frontend = SuperShuckieFrontend::new(user.clone(), user.clone(), Box::new(callbacks));
     frontend.set_speed_settings(speed, 2.0);
     frontend.set_auto_pause_on_record_setting(false);
     frontend.load_rom(rom).expect("load rom");
     frontend.set_paused(false);
-    Player { name: name.to_owned(), frontend, screens, behind: BTreeMap::new(), fps_samples: Vec::new(), tick_times: Vec::new() }
+    Player { name: name.to_owned(), frontend, screens, own_screen, behind: BTreeMap::new(), fps_samples: Vec::new(), tick_times: Vec::new() }
 }
 
 fn main() {
@@ -954,7 +1120,7 @@ fn main() {
 
     // Start state: the host's save state lands everyone on the same state, paused; a race start
     // restarts everyone from it; clearing it reaches everyone.
-    failed |= !check_start_state(&mut players, peer_rom.is_some());
+    failed |= !check_start_state(&mut players, peer_rom.is_some(), LateJoin { dir: &dir, rom: &rom, speed, join_code: &join_code });
 
     // The link cable between the host and the first joiner.
     if link {
