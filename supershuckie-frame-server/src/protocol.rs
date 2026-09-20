@@ -25,6 +25,7 @@ const TAG_RUN: u8 = 0x04;
 const TAG_AUDIO: u8 = 0x05;
 const TAG_CANCEL: u8 = 0x06;
 const TAG_CLOSE: u8 = 0x07;
+const TAG_MEMORY: u8 = 0x08;
 
 // Reply tags (server -> client).
 const TAG_R_HELLO: u8 = 0x81;
@@ -33,7 +34,12 @@ const TAG_R_FRAME: u8 = 0x83;
 const TAG_R_DONE: u8 = 0x84;
 const TAG_R_AUDIO: u8 = 0x85;
 const TAG_R_CANCELLED: u8 = 0x86;
+const TAG_R_MEMORY: u8 = 0x87;
 const TAG_R_ERROR: u8 = 0x8F;
+
+/// The most a `Memory` request may ask for in all: more than any console has, so a block list
+/// adding up to more is a corrupt request rather than a big one.
+pub const MAX_MEMORY_BYTES: usize = 64 << 20;
 
 /// A request from the client.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +51,9 @@ pub enum Request {
     Audio { id: u32, first_frame: u64, frames: u32 },
     Cancel { id: u32 },
     Close,
+    /// The bytes at `(address, length)` blocks of the source's memory once picture `index` has
+    /// been produced: what a memory-reading tool sees of the state behind a frame.
+    Memory { id: u32, index: u64, blocks: Vec<(u32, u32)> },
 }
 
 /// The `Info` reply's payload.
@@ -77,6 +86,8 @@ pub enum Reply {
     /// `samples` is interleaved stereo (left, right, ...).
     Audio { id: u32, first_frame: u64, frames: u32, samples: Vec<i16> },
     Cancelled { id: u32 },
+    /// The blocks a `Memory` asked for, concatenated in the order asked.
+    Memory { id: u32, index: u64, data: Vec<u8> },
     Error { id: u32, message: String },
 }
 
@@ -177,6 +188,16 @@ impl Request {
                 e.u32(*id);
             }
             Request::Close => e.u8(TAG_CLOSE),
+            Request::Memory { id, index, blocks } => {
+                e.u8(TAG_MEMORY);
+                e.u32(*id);
+                e.u64(*index);
+                e.u32(blocks.len() as u32);
+                for (address, length) in blocks {
+                    e.u32(*address);
+                    e.u32(*length);
+                }
+            }
         });
     }
 
@@ -197,6 +218,23 @@ impl Request {
             TAG_AUDIO => Request::Audio { id: d.u32()?, first_frame: d.u64()?, frames: d.u32()? },
             TAG_CANCEL => Request::Cancel { id: d.u32()? },
             TAG_CLOSE => Request::Close,
+            TAG_MEMORY => {
+                let id = d.u32()?;
+                let index = d.u64()?;
+                let n = d.u32()? as usize;
+                // Each block is eight bytes; a count the payload cannot hold is refused before
+                // anything is allocated for it.
+                if d.bytes.len() < n.saturating_mul(8) {
+                    return Err(DecodeError::Truncated);
+                }
+                let mut blocks = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let address = d.u32()?;
+                    let length = d.u32()?;
+                    blocks.push((address, length));
+                }
+                Request::Memory { id, index, blocks }
+            }
             other => return Err(DecodeError::UnknownTag(other)),
         };
         d.finish()?;
@@ -286,6 +324,12 @@ impl Reply {
                 e.u8(TAG_R_CANCELLED);
                 e.u32(*id);
             }
+            Reply::Memory { id, index, data } => {
+                e.u8(TAG_R_MEMORY);
+                e.u32(*id);
+                e.u64(*index);
+                e.out.extend_from_slice(data);
+            }
             Reply::Error { id, message } => {
                 e.u8(TAG_R_ERROR);
                 e.u32(*id);
@@ -363,6 +407,12 @@ impl Reply {
                 Reply::Audio { id, first_frame, frames, samples }
             }
             TAG_R_CANCELLED => Reply::Cancelled { id: d.u32()? },
+            TAG_R_MEMORY => {
+                let id = d.u32()?;
+                let index = d.u64()?;
+                let data = d.rest().to_vec();
+                Reply::Memory { id, index, data }
+            }
             TAG_R_ERROR => Reply::Error { id: d.u32()?, message: d.string()? },
             other => return Err(DecodeError::UnknownTag(other)),
         };
@@ -496,6 +546,8 @@ mod tests {
         round_trip_request(Request::Audio { id: 11, first_frame: 3000, frames: 10 });
         round_trip_request(Request::Cancel { id: 9 });
         round_trip_request(Request::Close);
+        round_trip_request(Request::Memory { id: 12, index: 500, blocks: vec![(0x0200_0000, 0x4000), (0xC000, 2)] });
+        round_trip_request(Request::Memory { id: 13, index: 0, blocks: vec![] });
     }
 
     #[test]
@@ -534,6 +586,8 @@ mod tests {
         });
         round_trip_reply(Reply::Audio { id: 5, first_frame: 0, frames: 0, samples: vec![] });
         round_trip_reply(Reply::Cancelled { id: 6 });
+        round_trip_reply(Reply::Memory { id: 7, index: 500, data: vec![0xAB, 0, 0xCD] });
+        round_trip_reply(Reply::Memory { id: 7, index: 0, data: vec![] });
         round_trip_reply(Reply::Error { id: 0, message: "no such file".into() });
     }
 
@@ -569,6 +623,18 @@ mod tests {
         let mut bytes = Vec::new();
         Reply::Error { id: 0, message: "hi".into() }.encode(&mut bytes);
         assert_eq!(bytes, [11, 0, 0, 0, 0x8F, 0, 0, 0, 0, 2, 0, 0, 0, b'h', b'i']);
+
+        // Memory { id: 1, index: 2, blocks: [(0xC000, 3)] }: 1 + 4 + 8 + 4 + 8 = 25, as Cutter
+        // pins it on its side.
+        let mut bytes = Vec::new();
+        Request::Memory { id: 1, index: 2, blocks: vec![(0xC000, 3)] }.encode(&mut bytes);
+        assert_eq!(
+            bytes,
+            [25, 0, 0, 0, 0x08, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0x00, 0xC0, 0, 0, 3, 0, 0, 0]
+        );
+        let mut bytes = Vec::new();
+        Reply::Memory { id: 1, index: 2, data: vec![9, 8, 7] }.encode(&mut bytes);
+        assert_eq!(bytes, [16, 0, 0, 0, 0x87, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 9, 8, 7]);
     }
 
     #[test]
@@ -578,6 +644,11 @@ mod tests {
         assert_eq!(Request::decode(&[0x42]), Err(DecodeError::UnknownTag(0x42)));
         assert_eq!(Request::decode(&[0x07, 0]), Err(DecodeError::TrailingBytes(1)));
         assert_eq!(Request::decode(&[0x02, 1, 0, 0, 0, 0xFF]), Err(DecodeError::BadString));
+        // A block count the payload cannot hold is refused, not allocated.
+        assert_eq!(
+            Request::decode(&[0x08, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Err(DecodeError::Truncated)
+        );
         assert_eq!(Reply::decode(&[0x85, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 1, 2]), Err(DecodeError::Truncated));
 
         // Length claims more than there is.

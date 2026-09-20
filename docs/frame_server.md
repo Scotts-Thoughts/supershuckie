@@ -52,6 +52,13 @@ picture `n` is what the run that produced it emitted; `Audio` requests return in
   (`SuperShuckieCore::go_to_replay_keyframe`, the first half of `go_to_replay_frame`) and steps
   from there.
 
+`Memory` asks for the state behind a picture rather than the picture: `(address, length)` blocks
+of the core's memory once picture `n` has been produced, read exactly as the live Poke-A-Byte
+integration reads them (`EmulatorCore::read_ram`, a block the core cannot read left as zeros),
+concatenated in the order asked. It positions the core exactly as `Frame` does, so a `Frame` for
+the same picture afterwards costs nothing, and it is superseded and cancelled like one. This is
+how the editor serves a recording's memory to Poke-A-Byte as its playhead moves.
+
 Requests are parsed on a reader thread; the emulation loop checks for newer requests every eight
 hidden runs and between the frames of a `Run`, and abandons a walk that a newer `Frame`/`Run` or a
 `Cancel` has superseded (answering `Cancelled`). Speed changes recorded in the replay are ignored

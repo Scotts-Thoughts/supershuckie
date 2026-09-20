@@ -22,3 +22,7 @@ UserData/
 # Local packaging output (built exe / zips) - never commit binaries
 /dist
 /dist-static-test
+
+# Personal local build script (hardcodes this machine's paths)
+/scripts/build-standalone.ps1
+/scripts/build-standalone.md

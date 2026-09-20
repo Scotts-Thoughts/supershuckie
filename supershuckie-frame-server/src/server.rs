@@ -23,7 +23,7 @@ use supershuckie_core::{std_timestamp_provider, AudioOutput, ScreenLayout, Super
 use supershuckie_replay_recorder::blake3_hash;
 use supershuckie_replay_recorder::replay_file::ReplayConsoleType;
 
-use crate::protocol::{write_all_flushed, Info, Reply, Request, PROTOCOL_VERSION};
+use crate::protocol::{write_all_flushed, Info, Reply, Request, MAX_MEMORY_BYTES, PROTOCOL_VERSION};
 use crate::source::{console_names, geometry, layout_from_byte, open_replay, ReplaySummary};
 
 /// A `Frame` this far ahead of the current position (or nearer) is reached by stepping rather
@@ -185,6 +185,7 @@ impl Server {
                 Request::Frame { id, index } => self.frame(id, index)?,
                 Request::Run { id, from, to } => self.run(id, from, to)?,
                 Request::Audio { id, first_frame, frames } => self.audio(id, first_frame, frames)?,
+                Request::Memory { id, index, blocks } => self.memory(id, index, &blocks)?,
                 // A `Cancel` reaching here names a request that is no longer pending.
                 Request::Cancel { .. } => {}
                 Request::Close => return Ok(ExitCode::SUCCESS),
@@ -223,7 +224,7 @@ impl Server {
             }
         }
         Ok(self.pending.iter().any(|r| match r {
-            Request::Frame { .. } | Request::Run { .. } | Request::Close => true,
+            Request::Frame { .. } | Request::Run { .. } | Request::Memory { .. } | Request::Close => true,
             Request::Cancel { id: cancelled } => *cancelled == id,
             _ => false,
         }))
@@ -430,6 +431,44 @@ impl Server {
                 let got = ring.read(&mut samples);
                 samples.truncate(got * 2);
                 self.reply(&Reply::Audio { id, first_frame, frames, samples })
+            }
+            Err(Stop::Superseded) => self.reply(&Reply::Cancelled { id }),
+            Err(Stop::Failed(message)) => self.reply(&Reply::Error { id, message }),
+        }
+    }
+
+    /// The state behind picture `index`: each block read from the core's memory once the picture
+    /// has been produced, concatenated in the order asked. Positioning is exactly a `Frame`'s, so
+    /// a `Frame` for the same picture afterwards costs nothing; a block the core cannot read is
+    /// answered with zeros, as the live tool integration leaves it, since a tool's block list is
+    /// written for the game and not for the emulator.
+    fn memory(&mut self, id: u32, index: u64, blocks: &[(u32, u32)]) -> io::Result<()> {
+        if let Err(message) = self.usable() {
+            return self.reply(&Reply::Error { id, message });
+        }
+        if self.poll(id)? {
+            return self.reply(&Reply::Cancelled { id });
+        }
+        let frames = self.session.as_ref().map_or(0, |s| s.frames);
+        if index >= frames {
+            return self.reply(&Reply::Error { id, message: format!("frame {index} is past the end ({frames} frames)") });
+        }
+        let total: usize = blocks.iter().map(|(_, len)| *len as usize).sum();
+        if total > MAX_MEMORY_BYTES {
+            return self.reply(&Reply::Error { id, message: format!("memory request of {total} bytes is more than {MAX_MEMORY_BYTES}") });
+        }
+        match self.position_drawn(id, picture_of(index)) {
+            Ok(()) => {
+                let core = self.core().get_core();
+                let mut data = Vec::with_capacity(total);
+                for (address, length) in blocks {
+                    let start = data.len();
+                    data.resize(start + *length as usize, 0);
+                    if core.read_ram(*address, &mut data[start..]).is_err() {
+                        data[start..].fill(0);
+                    }
+                }
+                self.reply(&Reply::Memory { id, index, data })
             }
             Err(Stop::Superseded) => self.reply(&Reply::Cancelled { id }),
             Err(Stop::Failed(message)) => self.reply(&Reply::Error { id, message }),

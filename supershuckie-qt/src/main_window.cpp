@@ -1,5 +1,5 @@
 // FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.4.14stp"
+#define SUPERSHUCKIE_VERSION "0.4.15stp"
 
 #include <cstdio>
 #include <cstdint>
