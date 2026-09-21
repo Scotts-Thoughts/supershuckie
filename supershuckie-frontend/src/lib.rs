@@ -122,6 +122,29 @@ struct PresentPacer {
     /// close to a whole number of at least 2, else 1 (present as soon as a frame is available).
     refreshes_per_frame: u32,
     refreshes_since_present: u32,
+    cadence: PresentCadenceStats,
+}
+
+/// How evenly frames have reached the display since display sync was last switched on; see
+/// [`SuperShuckieFrontend::present_latest_frame`].
+///
+/// With a display that refreshes `refreshes_per_frame` times per drawn frame, an even cadence has
+/// nearly every frame in that bucket. The clocks never match exactly, so an occasional frame one
+/// refresh longer (display slightly fast) or shorter (slightly slow) is unavoidable; anything
+/// beyond that is a late present.
+#[derive(Copy, Clone, Default, Debug, PartialEq)]
+pub struct PresentCadenceStats {
+    /// Frames that stayed on screen for 1, 2, 3 and 4 or more refreshes. Gaps of
+    /// [`PresentCadenceStats::IGNORED_GAP`] refreshes or more (pauses, menus) are not counted.
+    pub shown_for_refreshes: [u64; 4],
+    /// Drawn frames that were replaced by a newer one before they could be shown.
+    pub frames_never_shown: u64,
+    /// The cadence being held; see `PresentPacer::refreshes_per_frame`. 0 until measured.
+    pub refreshes_per_frame: u32,
+}
+
+impl PresentCadenceStats {
+    const IGNORED_GAP: u32 = 16;
 }
 
 pub struct SuperShuckieFrontend {
@@ -1796,11 +1819,15 @@ impl SuperShuckieFrontend {
     /// between the two clocks periodically puts frame arrival right at the refresh boundary, where
     /// timing jitter alone decides whether a frame shows for one refresh or three, for as long as
     /// the drift takes to move past it. A frame is never held while a newer one is already waiting.
-    pub fn present_latest_frame(&mut self) {
+    ///
+    /// `refreshes` is how many display refreshes passed since the last call: 1 normally, more if
+    /// the UI missed some, so that the cadence keeps counting real refreshes rather than calls.
+    pub fn present_latest_frame(&mut self, refreshes: u32) {
         let now = Instant::now();
         let stats = self.core.get_elapsed_time();
         let pacer = &mut self.present_pacer;
-        pacer.refreshes_since_present = pacer.refreshes_since_present.saturating_add(1);
+        let refreshes = refreshes.max(1);
+        pacer.refreshes_since_present = pacer.refreshes_since_present.saturating_add(refreshes);
 
         // Measure display refreshes per drawn frame over the last second or so.
         match pacer.window_start {
@@ -1810,11 +1837,12 @@ impl SuperShuckieFrontend {
                 let ratio = if drawn > 0.0 { refreshes / drawn } else { 0.0 };
                 let rounded = ratio.round();
                 pacer.refreshes_per_frame = if rounded >= 2.0 && (ratio - rounded).abs() < 0.15 { rounded as u32 } else { 1 };
+                pacer.cadence.refreshes_per_frame = pacer.refreshes_per_frame;
                 pacer.window_start = Some(now);
                 pacer.window_refreshes = 0;
                 pacer.window_start_generation = stats.screen_generation;
             }
-            Some(_) => pacer.window_refreshes += 1,
+            Some(_) => pacer.window_refreshes += refreshes,
             None => {
                 pacer.window_start = Some(now);
                 pacer.window_refreshes = 0;
@@ -1832,8 +1860,20 @@ impl SuperShuckieFrontend {
             self.last_read_elapsed_time_stats = stats;
             return
         }
+        // The frame being replaced was on screen since the last present.
+        let shown_for = pacer.refreshes_since_present;
+        if shown_for < PresentCadenceStats::IGNORED_GAP {
+            pacer.cadence.shown_for_refreshes[(shown_for.clamp(1, 4) - 1) as usize] += 1;
+            pacer.cadence.frames_never_shown += (pending - 1) as u64;
+        }
         pacer.refreshes_since_present = 0;
         self.refresh_screen(false);
+    }
+
+    /// Cadence diagnostics for [`Self::present_latest_frame`], counted since display sync was
+    /// last switched on.
+    pub fn get_present_cadence_stats(&self) -> PresentCadenceStats {
+        self.present_pacer.cadence
     }
 
     /// Emulated frames per second, averaged over the last second or so (drawn or not). This is

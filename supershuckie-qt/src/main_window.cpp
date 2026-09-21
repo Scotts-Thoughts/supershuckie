@@ -434,7 +434,25 @@ void MainWindow::tick() {
         else {
             std::snprintf(detail, sizeof(detail), "Emulation: %.1f frames/s (display %.0f/s)\nFrame time: %.2f ms average, %.2f ms worst", this->current_fps, this->current_display_fps, average_us / 1000.0, max_us / 1000.0);
         }
-        this->status_bar_fps->setToolTip(detail);
+        QString tooltip = detail;
+        if(this->display_sync) {
+            std::uint64_t shown_for[4] = {};
+            std::uint64_t never_shown = 0;
+            std::uint32_t refreshes_per_frame = 0;
+            supershuckie_frontend_get_present_cadence_stats(this->frontend, shown_for, &never_shown, &refreshes_per_frame);
+            std::snprintf(
+                detail, sizeof(detail),
+                "\nDisplay sync: holding %u refresh(es) per frame\nFrames shown for 1 / 2 / 3 / 4+ refreshes: %llu / %llu / %llu / %llu (never shown: %llu)\nPresent after refresh: %.2f ms worst, %llu late",
+                refreshes_per_frame,
+                static_cast<unsigned long long>(shown_for[0]), static_cast<unsigned long long>(shown_for[1]),
+                static_cast<unsigned long long>(shown_for[2]), static_cast<unsigned long long>(shown_for[3]),
+                static_cast<unsigned long long>(never_shown),
+                this->worst_present_us / 1000.0,
+                static_cast<unsigned long long>(this->late_presents)
+            );
+            tooltip += detail;
+        }
+        this->status_bar_fps->setToolTip(tooltip);
 
         this->refresh_title();
     }
@@ -2227,6 +2245,9 @@ void MainWindow::do_toggle_sync_display() {
 
 void MainWindow::apply_display_sync(bool on) {
     supershuckie_frontend_set_present_on_demand(this->frontend, on);
+    this->render_widget->set_manual_present(on);
+    this->late_presents = 0;
+    this->worst_present_us = 0;
     if(on) {
         if(!this->display_sync) {
             this->display_sync = std::make_unique<DisplaySyncThread>();
@@ -2240,11 +2261,29 @@ void MainWindow::apply_display_sync(bool on) {
 }
 
 void MainWindow::present_frame() {
-    if(this->display_sync) {
-        this->display_sync->acknowledge();
+    if(!this->display_sync || this->frontend == nullptr) {
+        return;
     }
-    if(this->frontend != nullptr) {
-        supershuckie_frontend_present_latest_frame(this->frontend);
+
+    auto refreshes = this->display_sync->acknowledge();
+    auto frames_before = this->frames_in_last_second;
+    supershuckie_frontend_present_latest_frame(this->frontend, refreshes);
+    if(this->frames_in_last_second == frames_before) {
+        return;
+    }
+
+    // Paint now rather than from a queued paint event: the frame has to reach the compositor
+    // before the next refresh, and the event queue is shared with the 1 ms ticker.
+    this->render_widget->present_now();
+
+    // A frame that took most of a refresh to get from the vertical blank to the compositor has
+    // probably missed it, and shows up a refresh late.
+    auto took = this->display_sync->microseconds_since_vblank();
+    if(took > this->worst_present_us) {
+        this->worst_present_us = took;
+    }
+    if(took * 4 > this->display_sync->refresh_period_microseconds() * 3) {
+        this->late_presents++;
     }
 }
 

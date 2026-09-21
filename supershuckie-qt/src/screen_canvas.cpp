@@ -66,6 +66,18 @@ void ScreenCanvas::set_layout(unsigned screen_count, const SuperShuckieScreenDat
 
     this->setFixedSize(this->total_width * scale, this->total_height * scale);
     this->setScene(this->scene);
+
+    // Under set_manual_present() the view does not repaint for scene changes by itself.
+    this->viewport()->update();
+}
+
+void ScreenCanvas::set_manual_present(bool manual) {
+    this->setViewportUpdateMode(manual ? QGraphicsView::NoViewportUpdate : QGraphicsView::MinimalViewportUpdate);
+    this->viewport()->update();
+}
+
+void ScreenCanvas::present_now() {
+    this->viewport()->repaint();
 }
 
 QImage ScreenCanvas::capture() const {

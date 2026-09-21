@@ -207,6 +207,9 @@ private:
     // Runs while "Sync display to monitor refresh" is on; see DisplaySyncThread.
     std::unique_ptr<DisplaySyncThread> display_sync;
     void apply_display_sync(bool on);
+    // Diagnostics since display sync was last switched on; see present_frame().
+    std::uint64_t late_presents = 0;
+    std::int64_t worst_present_us = 0;
     QAction *enable_pokeabyte_integration;
     QAction *pokeabyte_port;
     QAction *pokeabyte_serve_friends;

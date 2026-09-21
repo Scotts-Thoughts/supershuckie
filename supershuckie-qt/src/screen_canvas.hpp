@@ -41,6 +41,17 @@ public:
     void refresh_screen(unsigned screen_count, const uint32_t *const *pixels);
 
     /**
+     * Choose who repaints after refresh_screen(): the view, whenever the event loop gets to it
+     * (false, the default), or the caller, with present_now() (true). A caller presenting on the
+     * display's refresh cannot afford the wait behind other queued events: a frame painted one
+     * refresh late is on screen a refresh too long and the next one a refresh too short.
+     */
+    void set_manual_present(bool manual);
+
+    /** Paint and flush the current frame before returning. */
+    void present_now();
+
+    /**
      * Composite the current frame into a native-resolution image (screens positioned exactly as
      * displayed). Returns a null QImage if no frame is available.
      */

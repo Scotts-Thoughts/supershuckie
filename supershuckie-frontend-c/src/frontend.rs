@@ -163,9 +163,29 @@ pub unsafe extern "C" fn supershuckie_frontend_set_present_on_demand(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn supershuckie_frontend_present_latest_frame(
-    frontend: &mut SuperShuckieFrontend
+    frontend: &mut SuperShuckieFrontend,
+    refreshes: u32
 ) {
-    frontend.present_latest_frame();
+    frontend.present_latest_frame(refreshes);
+}
+
+/// Present cadence diagnostics. Null pointers are skipped; `shown_for_refreshes` takes 4 values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_get_present_cadence_stats(
+    frontend: &SuperShuckieFrontend,
+    shown_for_refreshes: *mut u64,
+    frames_never_shown: *mut u64,
+    refreshes_per_frame: *mut u32
+) {
+    let stats = frontend.get_present_cadence_stats();
+    // SAFETY: the caller passes either null or valid, writable pointers (4 values for the first).
+    unsafe {
+        if !shown_for_refreshes.is_null() {
+            from_raw_parts_mut(shown_for_refreshes, 4).copy_from_slice(&stats.shown_for_refreshes);
+        }
+        if !frames_never_shown.is_null() { *frames_never_shown = stats.frames_never_shown; }
+        if !refreshes_per_frame.is_null() { *refreshes_per_frame = stats.refreshes_per_frame; }
+    }
 }
 
 #[unsafe(no_mangle)]

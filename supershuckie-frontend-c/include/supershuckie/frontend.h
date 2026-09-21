@@ -784,8 +784,26 @@ void supershuckie_frontend_set_present_on_demand(struct SuperShuckieFrontendRaw 
  * Hand the UI the newest drawn frame (through the refresh_screens callback) if one arrived since
  * the last one it was given. Meant to be called once per display refresh with on-demand
  * presenting on; harmless otherwise.
+ *
+ * refreshes is how many display refreshes passed since the last call (1 normally; more if the UI
+ * missed some), so that the cadence counts real refreshes rather than calls.
  */
-void supershuckie_frontend_present_latest_frame(struct SuperShuckieFrontendRaw *frontend);
+void supershuckie_frontend_present_latest_frame(struct SuperShuckieFrontendRaw *frontend, uint32_t refreshes);
+
+/**
+ * Get present cadence diagnostics, counted since on-demand presenting was last switched on. Any
+ * pointer may be null.
+ *
+ * shown_for_refreshes: 4 values; frames that stayed on screen for 1, 2, 3 and 4+ refreshes.
+ * frames_never_shown: drawn frames replaced by a newer one before they could be shown.
+ * refreshes_per_frame: the cadence being held (1 = present as soon as a frame is available).
+ */
+void supershuckie_frontend_get_present_cadence_stats(
+    const struct SuperShuckieFrontendRaw *frontend,
+    uint64_t *shown_for_refreshes,
+    uint64_t *frames_never_shown,
+    uint32_t *refreshes_per_frame
+);
 
 /**
  * Get all replays for the given rom, or the currently loaded ROM if no ROM passed in.

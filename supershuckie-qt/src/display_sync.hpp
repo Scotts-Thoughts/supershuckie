@@ -3,6 +3,7 @@
 
 #include <QThread>
 #include <atomic>
+#include <cstdint>
 
 /**
  * Wakes once per display refresh and asks the main window to present the newest emulated frame.
@@ -27,8 +28,18 @@ public:
     /** Ask the thread to finish and wait for it (at most about one refresh). */
     void stop();
 
-    /** The GUI thread calls this once it has handled a `vblank`, allowing the next one. */
-    void acknowledge() noexcept;
+    /**
+     * The GUI thread calls this once it has handled a `vblank`, allowing the next one. Returns
+     * how many refreshes passed since the last call: 1 normally, more if the GUI thread was too
+     * busy to be woken for some.
+     */
+    std::uint32_t acknowledge() noexcept;
+
+    /** Microseconds since the most recent refresh this thread woke for. */
+    std::int64_t microseconds_since_vblank() const noexcept;
+
+    /** Length of one refresh in microseconds, as reported by the primary screen. */
+    std::int64_t refresh_period_microseconds() const noexcept;
 
 signals:
     void vblank();
@@ -39,6 +50,10 @@ protected:
 private:
     std::atomic<bool> stopping { false };
     std::atomic<bool> outstanding { false };
+    std::atomic<std::uint64_t> refresh_count { 0 };
+    std::atomic<std::int64_t> last_vblank_microseconds { 0 };
+    std::atomic<std::int64_t> period_microseconds { 16667 };
+    std::uint64_t acknowledged_refresh_count = 0; // GUI thread only
 
     /** Block until the display's next refresh. Returns false if that is not possible here. */
     static bool wait_for_vblank();
