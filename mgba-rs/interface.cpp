@@ -16,6 +16,13 @@
 #define BUILD_STATIC
 #define M_CORE_GB
 #define M_CORE_GBA
+// mGBA's CMake defines USE_PTHREADS on every UNIX build (Windows takes the _WIN32 branch of
+// mgba-util/threading.h on both sides). Without it here, `Mutex` is a `void*` in this file but
+// a `pthread_mutex_t` in libmgba, so `GBASIOLockstepCoordinator` is 56 bytes shorter here and
+// the coordinator this file allocates is overrun by the library: heap corruption on link.
+#ifndef _WIN32
+#define USE_PTHREADS
+#endif
 
 #include <mgba/core/core.h>
 #include <mgba/core/log.h>

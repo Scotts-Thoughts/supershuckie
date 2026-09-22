@@ -100,7 +100,7 @@ fn simulate(frontend: &mut SuperShuckieFrontend, presented: &AtomicU64, hz: f64,
         next += period;
         refreshes += 1;
         if sync {
-            frontend.present_latest_frame();
+            frontend.present_latest_frame(1);
         }
         since_present += 1;
         let count = presented.load(Ordering::Relaxed);
