@@ -268,6 +268,7 @@ private:
     QAction *pt_start_state;
     QAction *pt_show_windows;
     QAction *pt_save_replays;
+    QAction *pt_record_everyone;
     QAction *pt_unlink;
     static const std::size_t LINK_DELAY_COUNT = 16;
     NumberedAction *pt_link_delay[LINK_DELAY_COUNT];
@@ -400,6 +401,7 @@ private slots:
     void do_play_together_show_windows();
     void do_play_together_unlink();
     void do_toggle_save_peer_replays();
+    void do_play_together_record_everyone();
 };
 
 class NumberedAction: public QAction {

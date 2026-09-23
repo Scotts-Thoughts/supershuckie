@@ -2622,7 +2622,13 @@ void MainWindow::set_up_play_together_menu() {
     this->pt_save_replays = this->play_together_menu->addAction("Save friends' games as replays");
     this->pt_save_replays->setObjectName("play-together-save-replays");
     this->pt_save_replays->setCheckable(true);
+    this->pt_save_replays->setToolTip("Write every friend's game to a replay file of its own from the moment it appears here");
     connect(this->pt_save_replays, SIGNAL(triggered()), this, SLOT(do_toggle_save_peer_replays()));
+
+    this->pt_record_everyone = this->play_together_menu->addAction("Record everyone's replay now");
+    this->pt_record_everyone->setObjectName("play-together-record-everyone");
+    this->pt_record_everyone->setToolTip("Start a replay of your own game and a fresh replay file for every friend's game at the same moment (any file already being written for them is finished first)");
+    connect(this->pt_record_everyone, SIGNAL(triggered()), this, SLOT(do_play_together_record_everyone()));
 }
 
 void MainWindow::set_link_input_delay(std::uint8_t frames) {
@@ -2657,6 +2663,13 @@ void MainWindow::refresh_play_together_actions() {
     this->pt_start_state->setEnabled(active && host);
     this->pt_reset_all->setText(this->pt_start_state->isChecked() ? "Restart everyone from the start state (race start)" : "Reset everyone (race start)");
     this->pt_show_windows->setEnabled(active);
+
+    // "Everyone" is recording once this game is and at least one friend's file is being written;
+    // the action then stops all of them together.
+    bool recording_own = supershuckie_frontend_get_replay_state(this->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Recording;
+    bool recording_everyone = recording_own && supershuckie_frontend_play_together_is_recording_peers(this->frontend);
+    this->pt_record_everyone->setEnabled(active && game_loaded && (recording_everyone || this->record_replay->isEnabled()));
+    this->pt_record_everyone->setText(recording_everyone ? "Stop recording everyone's replay" : "Record everyone's replay now");
 
     auto scale = supershuckie_frontend_play_together_get_video_scale(this->frontend);
     for(auto *action : this->pt_scale) {
@@ -2730,4 +2743,17 @@ void MainWindow::do_play_together_show_windows() {
 
 void MainWindow::do_toggle_save_peer_replays() {
     supershuckie_frontend_play_together_set_save_peer_replays(this->frontend, this->pt_save_replays->isChecked());
+}
+
+void MainWindow::do_play_together_record_everyone() {
+    char error[2048] = {};
+    bool recording_own = supershuckie_frontend_get_replay_state(this->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__Recording;
+    bool recording_everyone = recording_own && supershuckie_frontend_play_together_is_recording_peers(this->frontend);
+    bool ok = recording_everyone
+        ? supershuckie_frontend_play_together_stop_recording_everyone(this->frontend, reinterpret_cast<uint8_t *>(error), sizeof(error))
+        : supershuckie_frontend_play_together_start_recording_everyone(this->frontend, reinterpret_cast<uint8_t *>(error), sizeof(error));
+    if(!ok) {
+        this->show_error(recording_everyone ? "Stop recording everyone" : "Record everyone", "%s", error);
+    }
+    this->refresh_action_states();
 }

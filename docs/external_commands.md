@@ -332,7 +332,7 @@ Usage:
 
 ```json
 {"active": true, "role": "host", "code": "192.168.1.7:30170", "local_name": "Scott", "local_peer_id": 1,
- "reset_countdown_ms": 0, "save_peer_replays": true, "sync_pause": true, "paused_by": "Ash", "start_state": false,
+ "reset_countdown_ms": 0, "save_peer_replays": true, "recording_peers": false, "sync_pause": true, "paused_by": "Ash", "start_state": false,
  "participants": [{"peer_id": 2, "name": "Ash", "rom_name": "Emerald", "console": "Game Boy Advance",
                    "status": "following", "status_text": "", "frames_behind": 2, "waiting": false,
                    "snapshots_applied": 1, "hash_mismatches": 0, "fps": 60.0, "elapsed_frames": 12345,

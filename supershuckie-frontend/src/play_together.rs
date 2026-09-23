@@ -108,7 +108,10 @@ impl PeerStatus {
 struct PeerReplayFile {
     name: String,
     final_path: PathBuf,
-    temp_path: PathBuf
+    temp_path: PathBuf,
+    /// How many frames their follower had emulated when the file started, so a file that never
+    /// got a frame can be told apart from a following that had run before it.
+    frames_at_start: u64
 }
 
 /// Another player in the session and, when their ROM is on this machine, the core following
@@ -407,6 +410,9 @@ pub struct PlayTogetherStateView {
     pub local_peer_id: PeerId,
     pub reset_countdown_ms: u32,
     pub save_peer_replays: bool,
+    /// Whether a friend's game is being written to a replay file here (see each participant's
+    /// `replay_file`).
+    pub recording_peers: bool,
     /// Whether one player's pause pauses everyone: the host's setting while in a session, the
     /// local setting (for hosting) otherwise.
     pub sync_pause: bool,
@@ -520,6 +526,7 @@ impl SuperShuckieFrontend {
                 local_peer_id: 0,
                 reset_countdown_ms: 0,
                 save_peer_replays: self.settings.play_together.save_peer_replays,
+                recording_peers: false,
                 sync_pause: self.settings.play_together.sync_pause,
                 paused_by: String::new(),
                 start_state: false,
@@ -540,6 +547,7 @@ impl SuperShuckieFrontend {
             local_peer_id: s.local_peer_id,
             reset_countdown_ms: self.play_together_reset_countdown_ms(),
             save_peer_replays: self.settings.play_together.save_peer_replays,
+            recording_peers: s.peers.iter().any(|p| p.replay.is_some() && p.core.is_some()),
             sync_pause: s.sync_pause,
             paused_by: match s.paused_by {
                 Some(id) if s.sync_pause && s.synced_paused => if id == s.local_peer_id { String::from("you") } else { s.name_of(id) },
@@ -730,6 +738,57 @@ impl SuperShuckieFrontend {
         }
         let countdown = Duration::from_secs(countdown_seconds.min(60) as u64);
         s.session.send_reset_all(countdown).map(|_| ()).map_err(|e| UTF8CString::from(format!("{e}")))
+    }
+
+    /// Start recording everyone's replay at once: this player's own, and a new file for every
+    /// friend whose game is followed here (a file already being written for them is finished
+    /// first, so every file starts now). Fails if the local recording cannot start; a friend's
+    /// file failing is noted in the session's errors and named in the error, the rest go on.
+    pub fn play_together_start_recording_everyone(&mut self) -> Result<(), UTF8CString> {
+        let Some(mut session) = self.play_together.take() else {
+            return Err("Not in a Play Together session.".into())
+        };
+        let outcome = (|| {
+            self.start_recording_replay(None)?;
+            let errors_before = session.errors.len();
+            for index in 0..session.peers.len() {
+                Self::finish_peer_replay(&mut session.peers[index]);
+                // Their core is lent out for the call so the session can take the errors.
+                let (core, path, name, metadata) = {
+                    let peer = &mut session.peers[index];
+                    let (Some(core), Some(path)) = (peer.core.take(), peer.local_rom_path.clone()) else {
+                        continue
+                    };
+                    (core, path, peer.name.clone(), peer.info.publisher.metadata.clone())
+                };
+                let replay = self.start_peer_replay(&mut session, &core, &path, &name, &metadata);
+                let peer = &mut session.peers[index];
+                peer.core = Some(core);
+                peer.replay = replay;
+            }
+            let failed: Vec<String> = session.errors[errors_before..].to_vec();
+            if failed.is_empty() { Ok(()) } else { Err(UTF8CString::from(failed.join("\n"))) }
+        })();
+        session.bump();
+        self.play_together = Some(session);
+        outcome
+    }
+
+    /// Stop recording everyone's replay: this player's own and every friend's file being written.
+    pub fn play_together_stop_recording_everyone(&mut self) -> Result<(), UTF8CString> {
+        let Some(s) = self.play_together.as_mut() else {
+            return Err("Not in a Play Together session.".into())
+        };
+        for peer in s.peers.iter_mut() {
+            Self::finish_peer_replay(peer);
+        }
+        s.bump();
+        self.stop_recording_replay()
+    }
+
+    /// Whether a friend's game is being written to a replay file here.
+    pub fn play_together_is_recording_peers(&self) -> bool {
+        self.play_together.as_ref().is_some_and(|s| s.peers.iter().any(|p| p.replay.is_some() && p.core.is_some()))
     }
 
     /// Whether one player's pause pauses everyone: the host's setting while in a session, the
@@ -1185,8 +1244,6 @@ impl SuperShuckieFrontend {
     fn build_peer_core(&mut self, session: &mut PlayTogetherSession, peer_id: PeerId, rom: &[u8], path: PathBuf) {
         let save_replays = self.settings.play_together.save_peer_replays;
         let base_speed = self.settings.emulation.base_speed_multiplier;
-        let recorder_settings = self.recorder_settings();
-        let frames_per_keyframe = self.settings.replay.frames_per_keyframe;
 
         let Some(index) = session.peers.iter().position(|p| p.peer_id == peer_id) else {
             return
@@ -1215,33 +1272,7 @@ impl SuperShuckieFrontend {
             let mut core = core;
             core.attach_live_replay_source(source, metadata.clone(), false).map_err(|e| e.to_string())?;
 
-            let mut replay = None;
-            if save_replays {
-                match self.open_peer_replay_file(&path, &name) {
-                    Ok((file, final_file, temp_file)) => {
-                        let partial = PartialReplayRecordMetadata {
-                            rom_name: metadata.rom_name.clone(),
-                            rom_filename: metadata.rom_filename.clone(),
-                            settings: recorder_settings,
-                            patch_format: ReplayPatchFormat::Unpatched,
-                            patch_target_checksum: ReplayHeaderBlake3Hash::default(),
-                            patch_data: ByteVec::default(),
-                            frames_per_keyframe,
-                            final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
-                            temp_file: BufWriter::with_capacity(8 * 1024 * 1024, temp_file)
-                        };
-                        match core.start_recording_follower_replay(partial, metadata.clone()) {
-                            Ok(()) => replay = Some(file),
-                            Err(e) => {
-                                let _ = std::fs::remove_file(&file.final_path);
-                                let _ = std::fs::remove_file(&file.temp_path);
-                                session.note_error(format!("{name}'s replay file could not be started: {e}"));
-                            }
-                        }
-                    }
-                    Err(e) => session.note_error(format!("{name}'s replay file could not be created: {e}"))
-                }
-            }
+            let replay = if save_replays { self.start_peer_replay(session, &core, &path, &name, &metadata) } else { None };
 
             session.session.subscribe(peer_id, Box::new(FeederSink { feeder: feeder.clone() })).map_err(|e| e.to_string())?;
             core.start();
@@ -1396,9 +1427,66 @@ impl SuperShuckieFrontend {
                     return Err(format!("cannot create {}: {e}", temp_path.display()))
                 }
             };
-            return Ok((PeerReplayFile { name: format!("{name}.{REPLAY_EXTENSION}"), final_path, temp_path }, final_file, temp_file))
+            return Ok((PeerReplayFile { name: format!("{name}.{REPLAY_EXTENSION}"), final_path, temp_path, frames_at_start: 0 }, final_file, temp_file))
         }
         Err(String::from("too many replay files with that name"))
+    }
+
+    /// Start writing `core` (following `friend`'s game, whose ROM is at `rom_path`) to a replay
+    /// file of its own, from now. A failure is noted in the session's errors, not returned: their
+    /// game runs either way.
+    fn start_peer_replay(&mut self, session: &mut PlayTogetherSession, core: &ThreadedSuperShuckieCore, rom_path: &Path, friend: &str, metadata: &ReplayFileMetadata) -> Option<PeerReplayFile> {
+        let (mut file, final_file, temp_file) = match self.open_peer_replay_file(rom_path, friend) {
+            Ok(opened) => opened,
+            Err(e) => {
+                session.note_error(format!("{friend}'s replay file could not be created: {e}"));
+                return None
+            }
+        };
+        let partial = PartialReplayRecordMetadata {
+            rom_name: metadata.rom_name.clone(),
+            rom_filename: metadata.rom_filename.clone(),
+            settings: self.recorder_settings(),
+            patch_format: ReplayPatchFormat::Unpatched,
+            patch_target_checksum: ReplayHeaderBlake3Hash::default(),
+            patch_data: ByteVec::default(),
+            frames_per_keyframe: self.settings.replay.frames_per_keyframe,
+            final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
+            temp_file: BufWriter::with_capacity(8 * 1024 * 1024, temp_file)
+        };
+        file.frames_at_start = core.follower_stats().map(|s| s.emulated_frames).unwrap_or(0);
+        match core.start_recording_follower_replay(partial, metadata.clone()) {
+            Ok(()) => Some(file),
+            Err(e) => {
+                let _ = std::fs::remove_file(&file.final_path);
+                let _ = std::fs::remove_file(&file.temp_path);
+                session.note_error(format!("{friend}'s replay file could not be started: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Finish `peer`'s replay file while their game goes on being followed. A file that never
+    /// got a frame is deleted.
+    fn finish_peer_replay(peer: &mut PeerInstance) {
+        let Some(file) = peer.replay.take() else {
+            return
+        };
+        let Some(core) = peer.core.as_ref() else {
+            return
+        };
+        let frames = core.follower_stats().map(|s| s.emulated_frames).unwrap_or(0);
+        if core.stop_recording_replay() {
+            Self::clean_up_peer_replay(&file, frames);
+        }
+    }
+
+    /// Delete the finished file's temp sibling and, when nothing was recorded, the file itself.
+    fn clean_up_peer_replay(file: &PeerReplayFile, follower_frames: u64) {
+        let _ = std::fs::remove_file(&file.temp_path);
+        if follower_frames <= file.frames_at_start {
+            let _ = std::fs::remove_file(&file.final_path);
+        }
     }
 
     /// Stop following `peer`: finish their replay file and drop their core.
@@ -1412,10 +1500,7 @@ impl SuperShuckieFrontend {
         drop(core);
         if let Some(file) = peer.replay.take() {
             if alive {
-                let _ = std::fs::remove_file(&file.temp_path);
-                if frames == 0 {
-                    let _ = std::fs::remove_file(&file.final_path);
-                }
+                Self::clean_up_peer_replay(&file, frames);
             }
         }
         peer.snapshot_requests = None;

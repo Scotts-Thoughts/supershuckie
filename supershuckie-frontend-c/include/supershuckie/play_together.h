@@ -30,6 +30,7 @@ struct SuperShuckieAudioOutputRaw;
  *     "local_peer_id": 1,
  *     "reset_countdown_ms": 0,            (> 0 while a race-start countdown is running)
  *     "save_peer_replays": true,
+ *     "recording_peers": false,           (whether any friend's game is being written to a replay file here)
  *     "sync_pause": false,                (whether one player's pause pauses everyone: the host's setting in a session)
  *     "paused_by": "",                    (who paused everyone while sync pause holds the game paused: a name, "you", or empty)
  *     "start_state": false,               (whether the host's start state is set: everyone's game was loaded from it)
@@ -188,6 +189,18 @@ void supershuckie_frontend_play_together_set_window_hidden(struct SuperShuckieFr
 /** Whether other players' games are written to replay files of their own (applies to players who join from now on). */
 bool supershuckie_frontend_play_together_get_save_peer_replays(const struct SuperShuckieFrontendRaw *frontend);
 void supershuckie_frontend_play_together_set_save_peer_replays(struct SuperShuckieFrontendRaw *frontend, bool save);
+
+/**
+ * Record everyone's replay from the same moment: start this player's own recording (like
+ * supershuckie_frontend_start_recording_replay with no name) and a new `<friend> - <date>.replay`
+ * for every friend whose game is followed here, finishing any file already being written for them
+ * first. Fails, having done nothing, if the local recording cannot start; a friend's file failing
+ * is named in the error, the rest go on. Stopping finishes every file (the local one included).
+ * "recording_peers" in the state says whether any friend's file is being written.
+ */
+bool supershuckie_frontend_play_together_start_recording_everyone(struct SuperShuckieFrontendRaw *frontend, uint8_t *error, size_t error_len);
+bool supershuckie_frontend_play_together_stop_recording_everyone(struct SuperShuckieFrontendRaw *frontend, uint8_t *error, size_t error_len);
+bool supershuckie_frontend_play_together_is_recording_peers(const struct SuperShuckieFrontendRaw *frontend);
 
 /** The saved display name / colour / host port / last join code, to prefill a dialog. The string getters return the bytes needed including the NUL. */
 size_t supershuckie_frontend_play_together_get_display_name(const struct SuperShuckieFrontendRaw *frontend, uint8_t *out, size_t out_len);

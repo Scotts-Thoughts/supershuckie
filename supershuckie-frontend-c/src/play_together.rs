@@ -324,6 +324,41 @@ pub extern "C" fn supershuckie_frontend_play_together_set_window_hidden(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_play_together_start_recording_everyone(
+    frontend: &mut SuperShuckieFrontend,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.play_together_start_recording_everyone() {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_play_together_stop_recording_everyone(
+    frontend: &mut SuperShuckieFrontend,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.play_together_stop_recording_everyone() {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_play_together_is_recording_peers(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.play_together_is_recording_peers()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_play_together_get_save_peer_replays(frontend: &SuperShuckieFrontend) -> bool {
     frontend.get_play_together_save_peer_replays()
 }

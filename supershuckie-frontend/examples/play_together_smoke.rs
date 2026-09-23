@@ -810,6 +810,107 @@ fn read_own(p: &mut Player, address: u32, len: usize) -> Vec<u8> {
     p.frontend.memory_tools_mut().1.read_ram(address, len).unwrap_or_default()
 }
 
+/// The host starts everyone's replay at once, records for two seconds and stops everyone: its own
+/// file and a new file per followed friend must exist, start together (no reset in them: the race
+/// start was before) and be about as long as each other.
+fn check_record_everyone(players: &mut [Player], host_peer_rom: &Path, speed: f64) -> bool {
+    let mut ok = true;
+    let before: BTreeMap<PeerId, Option<String>> = players[0].frontend.play_together_state().participants.into_iter().map(|q| (q.peer_id, q.replay_file)).collect();
+    if let Err(e) = players[0].frontend.play_together_start_recording_everyone() {
+        println!("FAIL: record everyone: {e}");
+        return false
+    }
+    let own = match players[0].frontend.get_replay_file_info() {
+        Some(info) if players[0].frontend.get_replay_state() == SuperShuckieReplayState::Recording => info.final_replay_path.clone(),
+        _ => {
+            println!("FAIL: record everyone: the host's own recording did not start");
+            return false
+        }
+    };
+    let state = players[0].frontend.play_together_state();
+    if !state.recording_peers {
+        println!("FAIL: record everyone: recording_peers is not set");
+        ok = false;
+    }
+    let friend_dir = players[0].frontend.get_replays_dir_for_rom(host_peer_rom.file_name().unwrap().to_str().unwrap());
+    let mut friend_files = Vec::new();
+    for q in &state.participants {
+        match &q.replay_file {
+            Some(f) if before.get(&q.peer_id).cloned().flatten().as_ref() != Some(f) => friend_files.push((q.name.clone(), friend_dir.join(f))),
+            Some(f) => {
+                println!("FAIL: record everyone: {}'s file {f} was not started afresh", q.name);
+                ok = false;
+            }
+            None => {
+                println!("FAIL: record everyone: {} has no replay file", q.name);
+                ok = false;
+            }
+        }
+    }
+    tick_all_for(players, Duration::from_secs(2));
+
+    if let Err(e) = players[0].frontend.play_together_stop_recording_everyone() {
+        println!("FAIL: stop recording everyone: {e}");
+        ok = false;
+    }
+    tick_all_for(players, Duration::from_millis(200));
+    if players[0].frontend.get_replay_state() == SuperShuckieReplayState::Recording {
+        println!("FAIL: stop recording everyone: the host's own recording goes on");
+        ok = false;
+    }
+    let state = players[0].frontend.play_together_state();
+    if state.recording_peers || state.participants.iter().any(|q| q.replay_file.is_some()) {
+        println!("FAIL: stop recording everyone: a friend's file is still being written");
+        ok = false;
+    }
+
+    let mut lengths = Vec::new();
+    for (what, path) in std::iter::once((String::from("own game"), own)).chain(friend_files) {
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("FAIL: record everyone: {what}: cannot read {}: {e}", path.display());
+                ok = false;
+                continue;
+            }
+        };
+        let mut player = match ReplayFilePlayer::new(&bytes, false) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("FAIL: record everyone: {what}: cannot parse {}: {e:?}", path.display());
+                ok = false;
+                continue;
+            }
+        };
+        let total = player.get_total_frames();
+        player.set_keyframe_states_wanted(false);
+        let mut resets = 0;
+        while let Some(packet) = player.next_packet().expect("read packet") {
+            if matches!(packet, supershuckie_replay_recorder::Packet::ResetConsole) {
+                resets += 1;
+            }
+        }
+        println!("record everyone: {what}: {} is {total} frames, {resets} resets, {} bytes", path.file_name().unwrap().to_string_lossy(), bytes.len());
+        // Two seconds at `speed`, less the follower's lag.
+        if (total as f64) < 60.0 * speed {
+            println!("FAIL: record everyone: {what}: the file is too short for two seconds");
+            ok = false;
+        }
+        if resets != 0 {
+            println!("FAIL: record everyone: {what}: the race-start reset was before the file began, yet it holds {resets}");
+            ok = false;
+        }
+        lengths.push(total);
+    }
+    if let (Some(&min), Some(&max)) = (lengths.iter().min(), lengths.iter().max()) {
+        if max - min > (60.0 * speed) as u64 {
+            println!("FAIL: record everyone: the files' lengths differ by {} frames, more than a second", max - min);
+            ok = false;
+        }
+    }
+    ok
+}
+
 fn make_player(dir: &Path, name: &str, rom: &Path, speed: f64, pokeabyte_port: Option<u16>) -> Player {
     let user = dir.join(name);
     let _ = std::fs::remove_dir_all(&user);
@@ -1147,7 +1248,8 @@ fn main() {
     }
     tick_all_for(&mut players, Duration::from_secs(2));
 
-    // Leave, then play every saved friend replay back to its end.
+    // The friend replays that started when everyone joined (played back to their end below, after
+    // everyone leaves). Collected now: the host's are finished and replaced next.
     let replay_files: Vec<(String, PathBuf, u64)> = players.iter().enumerate().flat_map(|(i, p)| {
         let state = p.frontend.play_together_state();
         // A friend's replay lives with the local copy of *their* ROM.
@@ -1155,6 +1257,13 @@ fn main() {
         let dir = p.frontend.get_replays_dir_for_rom(followed_rom.file_name().unwrap().to_str().unwrap());
         state.participants.into_iter().filter_map(move |q| q.replay_file.map(|f| (format!("{} following {}", p.name, q.name), dir.join(f), q.elapsed_frames)))
     }).collect();
+
+    // The host records everyone from one moment: its own game and a new file per followed friend
+    // (a friend lent to a link cable keeps the file they had).
+    if link_test_rom.is_none() && !link {
+        failed |= !check_record_everyone(&mut players, peer_rom.as_ref().unwrap_or(&rom), speed);
+    }
+
     for p in players.iter_mut() {
         p.frontend.play_together_leave();
     }

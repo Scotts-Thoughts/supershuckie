@@ -98,7 +98,9 @@ pub struct SuperShuckieCore {
     replay_waiting: bool,
 
     /// The replay time a follower's own recording started at: its file counts time from zero
-    /// while [`Self::total_milliseconds`] is the publisher's. Zero for anything else.
+    /// while [`Self::total_milliseconds`] is the publisher's. Zero for anything else. Moved
+    /// (wrapping, so it may sit "below" zero) whenever the publisher's clock restarts, so the
+    /// file's clock never goes back.
     stream_time_origin: TimestampMillis,
 
     /// The current user-defined input.
@@ -1824,7 +1826,7 @@ impl SuperShuckieCore {
     /// follower's own file (see [`Self::stream_time_origin`]).
     #[inline]
     fn recording_millis(&self) -> TimestampMillis {
-        self.total_milliseconds.0.saturating_sub(self.stream_time_origin.0).into()
+        self.total_milliseconds.0.wrapping_sub(self.stream_time_origin.0).into()
     }
 
     /// A buffer to create a keyframe state into: a recycled one when available, since a fresh
@@ -3826,6 +3828,55 @@ mod tests {
         }
         assert_eq!(played_log.lock().unwrap().clone(), followed, "the file replays what the follower ran");
         assert_eq!(playback.create_save_state(), 83u32.to_le_bytes().to_vec(), "77 from the mid-file snapshot plus 6 frames");
+    }
+
+    /// The publisher's clock restarts when they start a recording of their own (a snapshot at
+    /// frame 0, time 0 follows); the follower's file goes on from where it was instead of
+    /// refusing the keyframe.
+    #[test]
+    fn follower_recording_survives_the_publisher_restarting_its_clock() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats, tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+
+        let final_buf = SharedSink::default();
+        core.start_recording_follower_replay(metadata(final_buf.clone(), SharedSink::default()), fake_gba_metadata()).expect("start the file");
+
+        feeder.push_packet(keyframe_packet(200, 5, 0));
+        for _ in 0..10 {
+            feeder.push_packet(next_frame_packet());
+        }
+        for _ in 0..10 {
+            core.run_unlocked_presenting(true);
+        }
+        assert_eq!(core.total_frames(), 210);
+        let file_millis = core.recording_millis();
+        assert!(file_millis.0 > 0);
+
+        // They started recording: their time is back at zero.
+        feeder.push_packet(keyframe_packet(0, 90, 1));
+        for _ in 0..10 {
+            feeder.push_packet(next_frame_packet());
+        }
+        for _ in 0..11 {
+            core.run_unlocked_presenting(true);
+        }
+        assert_eq!(core.total_frames(), 10);
+        assert!(core.poll_replay_recording_errors().is_empty(), "the file refused the keyframe");
+        let after = core.recording_millis();
+        assert!(after > file_millis, "the file's clock went back");
+        assert!(after.0 < file_millis.0 + 10_000, "the file's clock jumped rather than going on: {file_millis} -> {after}");
+
+        core.detach_live_source();
+        let bytes = final_buf.0.lock().unwrap().clone();
+        let player = ReplayFilePlayer::new(&bytes, false).expect("parse the follower's file");
+        assert_eq!(player.get_total_frames(), 20, "the file has both halves");
+        let stamps: Vec<u64> = player.all_keyframes().values().flatten().map(|k| k.elapsed_millis.0).collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]), "keyframe times are not monotonic: {stamps:?}");
     }
 
     /// Publishing and following are exclusive with each other and with a file replay.

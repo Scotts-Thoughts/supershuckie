@@ -642,8 +642,15 @@ impl SuperShuckieCore {
         // Save states do not carry the buttons held; restore what the publisher had pressed.
         self.core.set_input_encoded(metadata.input.as_slice());
         let previous_counters = self.replay_counters.take().unwrap_or_default();
+        let file_millis_before = self.recording_millis();
         self.total_frames = metadata.elapsed_frames;
         self.total_milliseconds = metadata.elapsed_millis;
+        // The publisher's clock restarts when they start a recording of their own; the file
+        // being written here keeps counting from where it was rather than refusing the keyframe
+        // (the difference is signed: the origin may already sit "below" zero).
+        if self.replay_file_recorder.is_some() && (self.recording_millis().0 as i64) < (file_millis_before.0 as i64) {
+            self.stream_time_origin = metadata.elapsed_millis.0.wrapping_sub(file_millis_before.0).into();
+        }
         self.replay_counters = Some(metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect());
         self.replay_playback_speed = metadata.speed;
         self.replay_frame_pending = false;

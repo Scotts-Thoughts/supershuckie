@@ -116,6 +116,15 @@ With **Save friends' games as replays** on (the default), every friend's game is
 a replay file named `<friend> - <date>.replay` in that ROM's replay folder, starting from the
 moment their game first appeared here. They play back like any replay.
 
+To have every replay start at the same moment instead — everyone gets ready, then the files
+begin together — use **Record everyone's replay now**: it starts a recording of your own game
+(as **Record replay** would) and a fresh file for every friend's game followed here, finishing
+any file already being written for them first. Turn **Save friends' games as replays** off if
+you only want the files that start this way. The same item becomes **Stop recording everyone's
+replay** while everyone is being recorded, and stops all the files together; your own recording
+can still be stopped on its own from the Replays menu. A friend whose ROM is not on this
+machine has no file (nothing runs here to record).
+
 ## Poke-A-Byte and friends' games
 
 Your own game is served to Poke-A-Byte the way it always was: on UDP port 55356 (change it under
