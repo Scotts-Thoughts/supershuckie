@@ -29,6 +29,7 @@ class SelectItemDialog;
 class ControlsSettingsWindow;
 class ReplayPlaybackControls;
 class NDSDateDialog;
+class GBPaletteDialog;
 class StringAction;
 class VideoExportDialog;
 class AudioOutput;
@@ -60,6 +61,7 @@ class MainWindow: public QMainWindow {
     friend ShortcutsSettingsWindow;
     friend ReplayPlaybackControls;
     friend NDSDateDialog;
+    friend GBPaletteDialog;
     friend StringAction;
     friend VideoExportDialog;
     friend MemoryToolsController;
@@ -113,6 +115,9 @@ private:
     QMenu *tools_menu;
     QMenu *settings_menu;
     QMenu *recent_roms_menu;
+    QMenu *favorite_roms_menu;
+    QAction *favorite_roms_none;
+    std::vector<QAction *> favorite_rom_actions;
 
     QAction *undo_load_save_state;
     QAction *redo_load_save_state;
@@ -132,6 +137,13 @@ private:
     QAction *save_new_game;
     QAction *reset_console;
     QAction *reload_core;
+    QMenu *nds_date_menu;
+    QAction *nds_date_no_presets;
+    // The first presets get fixed actions so shortcuts can be bound to them; any more are
+    // made (and remade) by rebuild_nds_date_menu().
+    static const std::size_t NDS_DATE_PRESET_SLOTS = 9;
+    QAction *nds_date_preset_slots[NDS_DATE_PRESET_SLOTS];
+    std::vector<QAction *> nds_date_preset_extras;
     QAction *pause;
     QAction *quit;
 
@@ -174,7 +186,10 @@ private:
 
     QAction *sgb_enabled;
     QMenu *game_boy_settings;
+    QMenu *gbc_mode_items;
     NumberedAction *gbc_mode[3];
+    QAction *gb_custom_colors;
+    void set_game_boy_hardware_settings_enabled(bool enabled);
 
     std::unique_ptr<AudioOutput> audio;
     QAction *audio_enabled;
@@ -284,6 +299,19 @@ private:
 
     void rebuild_recent_roms_menu() noexcept;
 
+    // The start screen's favorite ROMs, also listed in File so each can have a shortcut. Their
+    // shortcut bindings come and go with the favorites (see rebuild_favorite_roms_menu()).
+    void rebuild_favorite_roms_menu();
+    void open_favorite_rom(const QString &path, const QString &name);
+    QList<QKeySequence> favorite_rom_shortcuts(const QString &path) const;
+    void edit_favorite_rom_shortcut(const QString &path);
+    void clear_favorite_rom_shortcut(const QString &path);
+    void open_shortcuts_dialog(const QString &focus_id = QString());
+    void rebuild_nds_date_menu();
+    void refresh_nds_date_preset_states();
+    void apply_nds_date_preset(std::size_t index);
+    bool is_nds_game_running();
+
     void refresh_action_states();
     void set_quick_load_shortcuts();
 
@@ -364,6 +392,8 @@ private slots:
     void do_change_playback_time(int frames);
     void do_toggle_replay_keyboard_controls();
     void do_toggle_sgb();
+    void do_toggle_gb_custom_colors();
+    void do_open_gb_palette_dialog();
     void do_open_nds_date_dialog() noexcept;
     void do_toggle_horizontal_nds();
     void do_toggle_swap_nds_screens();

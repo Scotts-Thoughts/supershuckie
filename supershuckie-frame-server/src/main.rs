@@ -18,18 +18,32 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-usage: supershuckie-frame-server                       serve frames over stdin/stdout
+usage: supershuckie-frame-server [--gb-colors <colors>] serve frames over stdin/stdout
        supershuckie-frame-server --probe <replay> [--layout N]
        supershuckie-frame-server --version
+
+--gb-colors draws Game Boy games (and Game Boy games on a Game Boy Color) with custom colors
+instead of their own, as the app's Settings > Game Boy > Custom colors does: twelve RRGGBB values
+separated by commas, the four shades (lightest first) of the background palette, then of object
+palette 0, then of object palette 1.
 ";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        return server::serve();
+        return server::serve(server::ServeOptions::default());
     }
 
     match args[0].as_str() {
+        "--gb-colors" => {
+            if args.len() != 2 {
+                return usage_error("--gb-colors takes one argument, the twelve colors");
+            }
+            match server::parse_gb_colors(&args[1]) {
+                Ok(colors) => server::serve(server::ServeOptions { gb_colors: Some(colors) }),
+                Err(message) => usage_error(&message),
+            }
+        }
         "--version" | "-V" => {
             println!("{}, protocol {}", server::server_name(), protocol::PROTOCOL_VERSION);
             ExitCode::SUCCESS

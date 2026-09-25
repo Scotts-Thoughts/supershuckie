@@ -19,6 +19,7 @@
 #include <QImage>
 #include <QDateTime>
 #include <QDir>
+#include <QFileInfo>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -30,6 +31,7 @@
 #include "ask_for_text_dialog.hpp"
 #include "audio_output.hpp"
 #include "nds_date_dialog.hpp"
+#include "gb_palette_dialog.hpp"
 #include "select_item_dialog.hpp"
 #include "error.hpp"
 #include "game_speed_dialog.hpp"
@@ -65,6 +67,12 @@ static const char *KEYBOARD_REPLAY_CONTROLS_DISABLED = "qt__replay_controls_disa
 static const char *HORIZONTAL_NDS = "qt__horizontal_nds";
 static const char *BOOKMARK_WINDOW_STATE = "qt__bookmark_window";
 static const char *SHORTCUTS = "qt__shortcuts";
+
+// An action's name in the Shortcuts window when its menu text isn't it (see collect_shortcut_bindings()).
+static const char *SHORTCUT_NAME_PROPERTY = "shortcut_name";
+
+// Followed by the ROM's path; see rebuild_favorite_roms_menu().
+static const QString FAVORITE_ROM_SHORTCUT_PREFIX = "open-favorite-rom:";
 
 class SuperShuckie64::SuperShuckieTimestamp: public QWidget {
 public:
@@ -280,6 +288,11 @@ MainWindow::MainWindow(): QMainWindow() {
     this->auto_unpause_on_input->setChecked(supershuckie_frontend_get_auto_unpause_on_input_setting(this->frontend));
     this->auto_pause_on_record->setChecked(supershuckie_frontend_get_auto_pause_on_record_setting(this->frontend));
     this->sgb_enabled->setChecked(supershuckie_frontend_is_sgb_enabled(this->frontend));
+    {
+        SuperShuckieGBCustomColors colors = {};
+        supershuckie_frontend_get_gb_custom_colors(this->frontend, &colors);
+        this->gb_custom_colors->setChecked(colors.enabled);
+    }
     this->nds_jit->setChecked(supershuckie_frontend_get_nds_jit(this->frontend));
     this->swap_nds_screens->setChecked(supershuckie_frontend_get_swap_nds_screens(this->frontend));
     this->ignore_speed_changes_in_replay->setChecked(supershuckie_frontend_get_ignore_speed_changes_in_replay(this->frontend));
@@ -303,10 +316,13 @@ MainWindow::MainWindow(): QMainWindow() {
     this->sdl.frontend = this->frontend;
     this->render_widget->setFocus(Qt::OtherFocusReason);
     this->rebuild_recent_roms_menu();
+    this->rebuild_nds_date_menu();
 
     // The frontend exists now, so the favorites list can be read; the video-mode callback that
     // fired during supershuckie_frontend_new already chose which view to show.
     this->landing_widget->reload();
+    this->rebuild_favorite_roms_menu();
+    this->landing_widget->rebuild_tiles(); // again, now that their shortcuts are known
 
     this->memory_tools = new MemoryToolsController(this);
     this->memory_tools->restore_windows();
@@ -612,6 +628,10 @@ void MainWindow::set_up_file_menu() {
 
     this->recent_roms_menu = this->file_menu->addMenu("Open recent ROM");
 
+    this->favorite_roms_menu = this->file_menu->addMenu("Open favorite ROM");
+    this->favorite_roms_none = this->favorite_roms_menu->addAction("No favorites yet (add them on the start screen)");
+    this->favorite_roms_none->setEnabled(false);
+
     this->close_rom = this->file_menu->addAction("Close ROM");
     this->close_rom->setObjectName("close-rom");
     this->close_rom->setShortcut(QKeyCombination(Qt::ControlModifier, Qt::Key_W));
@@ -670,6 +690,25 @@ void MainWindow::set_up_gameplay_menu() {
     this->reload_core = this->gameplay_menu->addAction("Reload core");
     this->reload_core->setObjectName("reload-core");
     connect(this->reload_core, SIGNAL(triggered()), this, SLOT(do_reload_core()));
+
+    // DS only: each preset sets the date and reloads the core so the game sees it at once
+    // (see rebuild_nds_date_menu()).
+    this->nds_date_menu = this->gameplay_menu->addMenu("Reload core with date");
+    for(std::size_t i = 0; i < MainWindow::NDS_DATE_PRESET_SLOTS; i++) {
+        auto *slot = this->nds_date_menu->addAction(QString("Date preset %1").arg(i + 1));
+        slot->setObjectName(QString("nds-date-preset-%1").arg(i + 1));
+        // The menu shows the preset's name instead; the Shortcuts window lists the slot.
+        slot->setProperty(SHORTCUT_NAME_PROPERTY, slot->text());
+        slot->setCheckable(true);
+        slot->setVisible(false);
+        connect(slot, &QAction::triggered, this, [this, i]() { this->apply_nds_date_preset(i); });
+        this->nds_date_preset_slots[i] = slot;
+    }
+    this->nds_date_no_presets = this->nds_date_menu->addAction("No presets yet");
+    this->nds_date_no_presets->setEnabled(false);
+    this->nds_date_menu->addSeparator();
+    auto *edit_nds_date_presets = this->nds_date_menu->addAction("Edit presets…");
+    connect(edit_nds_date_presets, SIGNAL(triggered()), this, SLOT(do_open_nds_date_dialog()));
 
     this->pause = this->gameplay_menu->addAction("Pause");
     this->pause->setObjectName("pause");
@@ -1220,7 +1259,7 @@ void MainWindow::set_up_settings_menu() {
 
     this->game_boy_settings = this->settings_menu->addMenu("Game Boy");
 
-    auto *gbc_mode_items = this->game_boy_settings->addMenu("Game Boy Color mode");
+    this->gbc_mode_items = this->game_boy_settings->addMenu("Game Boy Color mode");
 
     this->gbc_mode[0] = new NumberedAction(this, "Always Game Boy Color", SuperShuckieGBCMode::SuperShuckieGBCMode__AlwaysGBC, &MainWindow::set_gbc_mode);
     this->gbc_mode[1] = new NumberedAction(this, "Game Boy Color games only", SuperShuckieGBCMode::SuperShuckieGBCMode__GBInGBMode, &MainWindow::set_gbc_mode);
@@ -1230,13 +1269,26 @@ void MainWindow::set_up_settings_menu() {
     for(auto m : this->gbc_mode) {
         m->setObjectName(QString("gbc-mode-%1").arg(m->number));
         m->setCheckable(true);
-        gbc_mode_items->addAction(m);
+        this->gbc_mode_items->addAction(m);
     }
 
     this->sgb_enabled = this->game_boy_settings->addAction("Enable SGB colors");
     this->sgb_enabled->setObjectName("enable-sgb-colors");
     connect(this->sgb_enabled, SIGNAL(triggered()), this, SLOT(do_toggle_sgb()));
     this->sgb_enabled->setCheckable(true);
+
+    this->game_boy_settings->addSeparator();
+
+    this->gb_custom_colors = this->game_boy_settings->addAction("Use custom colors");
+    this->gb_custom_colors->setObjectName("gb-use-custom-colors");
+    this->gb_custom_colors->setCheckable(true);
+    this->gb_custom_colors->setToolTip("Draw Game Boy games (and Game Boy games on a Game Boy Color) with the colors from Custom colors…");
+    connect(this->gb_custom_colors, SIGNAL(triggered()), this, SLOT(do_toggle_gb_custom_colors()));
+
+    auto *custom_colors = this->game_boy_settings->addAction("Custom colors…");
+    custom_colors->setObjectName("gb-custom-colors");
+    custom_colors->setToolTip("Choose the twelve colors a Game Boy game is drawn with");
+    connect(custom_colors, SIGNAL(triggered()), this, SLOT(do_open_gb_palette_dialog()));
 
     auto *nds_settings = this->settings_menu->addMenu("Nintendo DS");
 
@@ -1331,10 +1383,11 @@ void MainWindow::refresh_action_states() {
     this->export_video->setEnabled(game_loaded);
     this->convert_replay->setEnabled(true);
     this->convert_replay_folder->setEnabled(true);
-    this->game_boy_settings->setEnabled(true);
+    this->set_game_boy_hardware_settings_enabled(true);
 
     this->reload_core->setEnabled(game_loaded);
     this->reset_console->setEnabled(game_loaded);
+    this->nds_date_menu->menuAction()->setVisible(this->is_nds_game_running());
 
     for(auto &scale : this->change_video_scale) {
         scale->setEnabled(game_loaded);
@@ -1387,7 +1440,7 @@ void MainWindow::refresh_action_states() {
             this->current_state->setText("RECORDING");
             this->current_state->show();
             this->record_replay->setText("Stop recording replay");
-            this->game_boy_settings->setEnabled(false);
+            this->set_game_boy_hardware_settings_enabled(false);
             break;
 
         case SuperShuckieReplayState::SuperShuckieReplayState__Playback:
@@ -1407,7 +1460,7 @@ void MainWindow::refresh_action_states() {
             this->stop_playback->setEnabled(!replay_stopped);
             this->resume_playback->setEnabled(replay_stopped);
             this->go_to_resume_point->setEnabled(replay_stopped);
-            this->game_boy_settings->setEnabled(false);
+            this->set_game_boy_hardware_settings_enabled(false);
             break;
 
         case SuperShuckieReplayState::SuperShuckieReplayState__NoReplay:
@@ -1416,6 +1469,8 @@ void MainWindow::refresh_action_states() {
     }
 
     this->refresh_play_together_actions();
+
+    this->refresh_nds_date_preset_states();
 
     this->last_known_replay_state = replay_state;
     this->last_known_replay_stopped = replay_stopped;
@@ -1655,7 +1710,8 @@ void MainWindow::collect_shortcut_bindings(QMenu *menu, const QStringList &path)
         ShortcutBinding binding;
         binding.id = action->objectName();
         binding.path = path;
-        binding.name = shortcut_function_name(action->text());
+        auto name = action->property(SHORTCUT_NAME_PROPERTY);
+        binding.name = name.isValid() ? name.toString() : shortcut_function_name(action->text());
         binding.action = action;
         binding.defaults = action->shortcuts();
         this->shortcut_bindings.push_back(std::move(binding));
@@ -1746,7 +1802,14 @@ QAction *MainWindow::playback_action_for(const QKeyEvent *event) const {
 }
 
 void MainWindow::do_open_shortcuts_dialog() {
+    this->open_shortcuts_dialog();
+}
+
+void MainWindow::open_shortcuts_dialog(const QString &focus_id) {
     ShortcutsSettingsWindow dialog(this, this->shortcut_bindings);
+    if(!focus_id.isEmpty()) {
+        dialog.focus_binding(focus_id);
+    }
     if(dialog.exec() != QDialog::Accepted) {
         return;
     }
@@ -1757,6 +1820,9 @@ void MainWindow::do_open_shortcuts_dialog() {
     this->apply_shortcuts();
     this->save_shortcuts();
     supershuckie_frontend_write_settings(this->frontend);
+
+    // The start screen's tooltips show the favorites' shortcuts.
+    this->landing_widget->rebuild_tiles();
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
@@ -2430,6 +2496,30 @@ void MainWindow::do_toggle_sgb() {
     supershuckie_frontend_set_sgb_enabled(this->frontend, this->sgb_enabled->isChecked());
 }
 
+void MainWindow::do_toggle_gb_custom_colors() {
+    SuperShuckieGBCustomColors colors = {};
+    supershuckie_frontend_get_gb_custom_colors(this->frontend, &colors);
+    colors.enabled = this->gb_custom_colors->isChecked();
+    supershuckie_frontend_set_gb_custom_colors(this->frontend, &colors);
+}
+
+void MainWindow::do_open_gb_palette_dialog() {
+    auto *dialog = new GBPaletteDialog(this);
+    dialog->exec();
+    delete dialog;
+
+    SuperShuckieGBCustomColors colors = {};
+    supershuckie_frontend_get_gb_custom_colors(this->frontend, &colors);
+    this->gb_custom_colors->setChecked(colors.enabled);
+}
+
+// The Game Boy model settings would change the game under a recording, a replay or a Play
+// Together session; the custom colors only change how it is drawn and stay available.
+void MainWindow::set_game_boy_hardware_settings_enabled(bool enabled) {
+    this->gbc_mode_items->menuAction()->setEnabled(enabled);
+    this->sgb_enabled->setEnabled(enabled);
+}
+
 void MainWindow::set_gbc_mode(std::uint8_t mode) {
     supershuckie_frontend_set_gbc_mode(this->frontend, mode);
     this->refresh_action_states();
@@ -2491,6 +2581,78 @@ void MainWindow::do_open_nds_date_dialog() noexcept {
     auto *dialog = new NDSDateDialog(this);
     dialog->exec();
     delete dialog;
+    this->rebuild_nds_date_menu();
+}
+
+void MainWindow::rebuild_nds_date_menu() {
+    // deleteLater: this runs from inside the triggered() of the preset that was picked.
+    for(auto *action : this->nds_date_preset_extras) {
+        this->nds_date_menu->removeAction(action);
+        action->deleteLater();
+    }
+    this->nds_date_preset_extras.clear();
+
+    SuperShuckieNintendoDSDate current = {};
+    supershuckie_frontend_get_nds_date(this->frontend, &current);
+
+    auto presets = NDSDateDialog::load_presets(this->frontend);
+    for(std::size_t i = 0; i < presets.size() || i < MainWindow::NDS_DATE_PRESET_SLOTS; i++) {
+        QAction *action;
+        if(i < MainWindow::NDS_DATE_PRESET_SLOTS) {
+            action = this->nds_date_preset_slots[i];
+            action->setVisible(i < presets.size());
+            if(i >= presets.size()) {
+                continue;
+            }
+        }
+        else {
+            action = new QAction(this->nds_date_menu);
+            action->setCheckable(true);
+            connect(action, &QAction::triggered, this, [this, i]() { this->apply_nds_date_preset(i); });
+            this->nds_date_menu->insertAction(this->nds_date_no_presets, action);
+            this->nds_date_preset_extras.push_back(action);
+        }
+
+        action->setText(QString("%1 — %2").arg(QString(presets[i].name).replace("&", "&&"), NDSDateDialog::describe_date(presets[i].date)));
+        action->setChecked(NDSDateDialog::same_date(presets[i].date, current));
+    }
+    this->nds_date_no_presets->setVisible(presets.empty());
+
+    this->refresh_nds_date_preset_states();
+}
+
+void MainWindow::refresh_nds_date_preset_states() {
+    // A preset reloads the core, so it is available exactly when Reload core is. Checking for a DS
+    // game matters for the slots' shortcuts, which a hidden submenu doesn't turn off.
+    bool enabled = this->reload_core->isEnabled() && this->is_nds_game_running();
+    for(auto *action : this->nds_date_preset_slots) {
+        action->setEnabled(enabled);
+    }
+    for(auto *action : this->nds_date_preset_extras) {
+        action->setEnabled(enabled);
+    }
+}
+
+bool MainWindow::is_nds_game_running() {
+    return this->is_game_running() && supershuckie_frontend_get_emulator_type(this->frontend) == SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
+}
+
+void MainWindow::apply_nds_date_preset(std::size_t index) {
+    if(!this->reload_core->isEnabled() || !this->is_nds_game_running()) {
+        return;
+    }
+
+    SuperShuckieNintendoDSDate date = {};
+    const char *name = supershuckie_frontend_get_nds_date_preset(this->frontend, index, &date);
+    if(name == nullptr) {
+        return;
+    }
+
+    auto message = QString("Reloaded core with date preset %1 (%2)").arg(QString::fromUtf8(name), NDSDateDialog::describe_date(date));
+    supershuckie_frontend_set_nds_date(this->frontend, &date);
+    supershuckie_frontend_reload_core(this->frontend);
+    this->set_title(message.toUtf8().constData());
+    this->rebuild_nds_date_menu();
 }
 
 void MainWindow::do_toggle_horizontal_nds() {
@@ -2525,6 +2687,79 @@ void MainWindow::rebuild_recent_roms_menu() noexcept {
     auto *clear = this->recent_roms_menu->addAction("Clear list");
     connect(clear, SIGNAL(triggered()), this, SLOT(do_clear_recent_roms()));
     clear->setEnabled(!menu.empty());
+}
+
+void MainWindow::rebuild_favorite_roms_menu() {
+    // Bindings first: they point at the actions about to go.
+    std::erase_if(this->shortcut_bindings, [](const ShortcutBinding &binding) {
+        return binding.id.startsWith(FAVORITE_ROM_SHORTCUT_PREFIX);
+    });
+    // deleteLater: this can run from inside a favorite's own triggered(), e.g. one that failed to load.
+    for(auto *action : this->favorite_rom_actions) {
+        this->favorite_roms_menu->removeAction(action);
+        action->deleteLater();
+    }
+    this->favorite_rom_actions.clear();
+
+    QStringList path = { shortcut_function_name(this->file_menu->title()), shortcut_function_name(this->favorite_roms_menu->title()) };
+    for(const auto &favorite : this->landing_widget->favorites) {
+        auto *action = new QAction(QString(favorite.name).replace("&", "&&"), this->favorite_roms_menu);
+        // Keyed by path so a shortcut survives renaming and reordering.
+        action->setObjectName(FAVORITE_ROM_SHORTCUT_PREFIX + favorite.path);
+        connect(action, &QAction::triggered, this, [this, rom = favorite.path, name = favorite.name]() {
+            this->open_favorite_rom(rom, name);
+        });
+        this->favorite_roms_menu->insertAction(this->favorite_roms_none, action);
+        this->favorite_rom_actions.push_back(action);
+
+        ShortcutBinding binding;
+        binding.id = action->objectName();
+        binding.path = path;
+        binding.name = favorite.name;
+        binding.action = action;
+        this->shortcut_bindings.push_back(std::move(binding));
+    }
+    this->favorite_roms_none->setVisible(this->favorite_rom_actions.empty());
+
+    this->load_shortcuts();
+    this->apply_shortcuts();
+}
+
+void MainWindow::open_favorite_rom(const QString &path, const QString &name) {
+    // Loading the game that's already running would restart it, which a stray shortcut shouldn't do.
+    if(this->is_game_running()) {
+        auto recent = wrap_array_std(supershuckie_frontend_get_recent_roms(this->frontend));
+        if(!recent.empty() && QFileInfo(QString::fromStdString(recent.front())).absoluteFilePath() == QFileInfo(path).absoluteFilePath()) {
+            this->set_title(QString("Already playing %1").arg(name).toUtf8().constData());
+            return;
+        }
+    }
+    this->load_rom(std::filesystem::path(path.toStdU16String()));
+}
+
+QList<QKeySequence> MainWindow::favorite_rom_shortcuts(const QString &path) const {
+    for(const auto &binding : this->shortcut_bindings) {
+        if(binding.id == FAVORITE_ROM_SHORTCUT_PREFIX + path) {
+            return binding.current;
+        }
+    }
+    return {};
+}
+
+void MainWindow::edit_favorite_rom_shortcut(const QString &path) {
+    this->open_shortcuts_dialog(FAVORITE_ROM_SHORTCUT_PREFIX + path);
+}
+
+void MainWindow::clear_favorite_rom_shortcut(const QString &path) {
+    for(auto &binding : this->shortcut_bindings) {
+        if(binding.id == FAVORITE_ROM_SHORTCUT_PREFIX + path && binding.custom.has_value()) {
+            binding.custom.reset();
+            this->apply_shortcuts();
+            this->save_shortcuts();
+            supershuckie_frontend_write_settings(this->frontend);
+            return;
+        }
+    }
 }
 
 void MainWindow::do_clear_recent_roms() {
@@ -2708,7 +2943,7 @@ void MainWindow::refresh_play_together_actions() {
     if(active) {
         this->play_replay->setEnabled(false);
         this->continue_last_replay->setEnabled(false);
-        this->game_boy_settings->setEnabled(false);
+        this->set_game_boy_hardware_settings_enabled(false);
     }
     // Two linked games have to stay in step: nothing that changes one of them behind the
     // other's back (the frontend refuses these too; the speed is the host's, and a client's own

@@ -1,5 +1,5 @@
 use crate::emulator::link::{GbSerialEvent, GbSerialEvents, LinkError, LinkPort};
-use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
+use crate::emulator::{locate_memory, read_ram_from_regions, EmulatorCore, GbPaletteOverride, Input, MemoryRegionInfo, RunTime, ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use safeboy::rgb_encoder::encode_a8r8g8b8;
-use safeboy::{BorderMode, DirectAccessRegion, Gameboy, GameboyCallbacks, InputButton, RtcMode, RunnableInstanceFunctions, RunningGameboy, TurboMode, VBlankType};
+use safeboy::{BorderMode, DirectAccessRegion, Gameboy, GameboyCallbacks, InputButton, RenderedDmgPalettes, RtcMode, RunnableInstanceFunctions, RunningGameboy, TurboMode, VBlankType};
 pub use safeboy::Model;
 use spin::Lazy;
 use supershuckie_replay_recorder::blake3_hash;
@@ -88,7 +88,18 @@ struct GameBoyCallbackData {
     screen: UnsafeCell<ScreenData>,
     /// The link port's state; only ever touched from the thread stepping the core (by
     /// [`GameBoyColor`] itself and by the serial callbacks it triggers, including the partner's).
-    link: UnsafeCell<GbLinkState>
+    link: UnsafeCell<GbLinkState>,
+
+    /// The colors to draw with instead of the game's own (see
+    /// [`EmulatorCore::set_gb_palette_override`]), already in the pixel format. SameBoy recomputes
+    /// its colors whenever the palettes change, so this is written over them again at every
+    /// vblank. Only touched from the thread stepping the core.
+    palette_override: UnsafeCell<Option<RenderedDmgPalettes>>,
+
+    /// Frames left in which the override is also applied before every step: after a reset the
+    /// boot ROM writes the palettes (and switches a Game Boy Color to Game Boy mode) somewhere
+    /// inside a frame, which the vblank alone would leave showing for that one frame.
+    palette_override_force_frames: AtomicU32
 }
 
 unsafe impl Send for GameBoyCallbackData {}
@@ -320,7 +331,9 @@ impl GameBoyColor {
         let callback_data = Arc::new(GameBoyCallbackData {
             run_frames: AtomicU32::new(0),
             screen: UnsafeCell::new(screen_data),
-            link: UnsafeCell::new(GbLinkState::new())
+            link: UnsafeCell::new(GbLinkState::new()),
+            palette_override: UnsafeCell::new(None),
+            palette_override_force_frames: AtomicU32::new(0)
         });
 
         core.set_callbacks(Some(Box::new(CallbackHandler { callback_data: callback_data.clone() })));
@@ -364,8 +377,28 @@ impl GameBoyColor {
         unsafe { &*self.callback_data.link.get() }
     }
 
+    /// Write the palette override, if any, over SameBoy's colors again (after something made it
+    /// recompute them).
+    fn reapply_palette_override(&mut self) {
+        apply_palette_override(&mut self.core, &self.callback_data);
+    }
+
+    /// After a reset: apply the override now and keep applying it before every step for a few
+    /// frames, until the boot ROM is done with the palettes (see `palette_override_force_frames`).
+    fn arm_palette_override(&mut self) {
+        // SAFETY: the core is not running (this takes `&mut self`), so no callback reads it.
+        if unsafe { (*self.callback_data.palette_override.get()).is_some() } {
+            self.callback_data.palette_override_force_frames.store(PALETTE_OVERRIDE_FORCE_FRAMES, Ordering::Relaxed);
+            self.reapply_palette_override();
+        }
+    }
+
     /// Step the emulated instance once and keep the shadow, if any, in lockstep with it.
     fn step(&mut self) -> RunTime {
+        if self.callback_data.palette_override_force_frames.load(Ordering::Relaxed) > 0 {
+            self.reapply_palette_override();
+        }
+
         let link_mode = self.link().mode;
         debug_assert!(
             link_mode != LinkMode::Live || !self.link().partner.is_null(),
@@ -497,6 +530,13 @@ impl GameboyCallbacks for CallbackHandler {
 
         screen.pixels.copy_from_slice(instance.get_pixel_buffer_pixels());
         self.callback_data.run_frames.fetch_add(1, Ordering::Relaxed);
+
+        // The colors for the next frame: SameBoy may have recomputed its own during this one.
+        apply_palette_override(instance, &self.callback_data);
+        let force = &self.callback_data.palette_override_force_frames;
+        if force.load(Ordering::Relaxed) > 0 {
+            force.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     fn serial_transfer_bit_start(&mut self, _instance: &mut RunningGameboy, bit: bool) {
@@ -544,6 +584,35 @@ impl GameboyCallbacks for CallbackHandler {
             LinkMode::Off => true
         }
     }
+}
+
+/// Write the override, if any, into the instance's rendered palettes where it applies (see
+/// [`EmulatorCore::set_gb_palette_override`]).
+fn apply_palette_override(instance: &mut impl RunnableInstanceFunctions, data: &GameBoyCallbackData) {
+    // SAFETY: only the thread stepping the core touches this (see the field).
+    let Some(colors) = (unsafe { *data.palette_override.get() }) else {
+        return
+    };
+    if palette_override_applies(instance) {
+        instance.set_rendered_dmg_palettes(&colors);
+    }
+}
+
+/// Whether the game is drawn with the Game Boy palettes the override replaces: not a Game Boy
+/// Color game (it sets its own palettes as it runs) and not on the Super Game Boy (its colors come
+/// from the SNES side, through other tables).
+fn palette_override_applies(instance: &impl RunnableInstanceFunctions) -> bool {
+    !instance.is_cgb_in_cgb_mode() && !instance.is_hle_sgb()
+}
+
+/// `0xRRGGBB` to the pixel format.
+fn encode_rgb(color: u32) -> u32 {
+    encode_a8r8g8b8((color >> 16) as u8, (color >> 8) as u8, color as u8)
+}
+
+/// The pixel format to `0xRRGGBB`.
+fn decode_rgb(pixel: u32) -> u32 {
+    pixel & 0x00FF_FFFF
 }
 
 impl LinkPort for GameBoyColor {
@@ -815,9 +884,48 @@ impl EmulatorCore for GameBoyColor {
 
     fn load_save_state(&mut self, state: &[u8]) -> Result<(), String> {
         let r = self.core.load_save_state(state).map_err(|e| alloc::format!("{e:?}"));
+        // Loading a state makes SameBoy recompute its colors from the state's palettes.
+        self.reapply_palette_override();
         self.resync_shadow();
         self.mid_frame = false;
         r
+    }
+
+    fn set_gb_palette_override(&mut self, colors: Option<GbPaletteOverride>) {
+        let rendered = colors.map(|colors| RenderedDmgPalettes {
+            background: colors.background.map(encode_rgb),
+            objects_0: colors.objects_0.map(encode_rgb),
+            objects_1: colors.objects_1.map(encode_rgb)
+        });
+        // SAFETY: the core is not running (this takes `&mut self`), so no callback reads it.
+        unsafe { *self.callback_data.palette_override.get() = rendered };
+        match rendered {
+            Some(_) => self.arm_palette_override(),
+            // Setting the encoder again makes SameBoy recompute its own colors right away.
+            None => self.core.set_rgb_encoder(encode_a8r8g8b8)
+        }
+    }
+
+    fn gb_palettes(&mut self) -> Option<GbPaletteOverride> {
+        if !palette_override_applies(&self.core) {
+            return None
+        }
+        // SAFETY: as in `set_gb_palette_override`.
+        let overridden = unsafe { (*self.callback_data.palette_override.get()).is_some() };
+        if overridden {
+            // SameBoy's own colors for a moment; nothing is drawn in between.
+            self.core.set_rgb_encoder(encode_a8r8g8b8);
+        }
+        let palettes = self.core.get_rendered_dmg_palettes();
+        if overridden {
+            self.reapply_palette_override();
+        }
+        let palettes = palettes?;
+        Some(GbPaletteOverride {
+            background: palettes.background.map(decode_rgb),
+            objects_0: palettes.objects_0.map(decode_rgb),
+            objects_1: palettes.objects_1.map(decode_rgb)
+        })
     }
 
     fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
@@ -883,6 +991,7 @@ impl EmulatorCore for GameBoyColor {
             }
         }
 
+        self.arm_palette_override();
         self.resync_shadow();
         self.mid_frame = false;
     }
@@ -940,6 +1049,124 @@ impl EmulatorCore for GameBoyColor {
 /// The seed every reset starts SameBoy's random number generator from (see `hard_reset`).
 const RESET_RANDOM_SEED: u64 = 0x5375_7065_7253_6875;
 
+/// How many frames after a reset the palette override is applied before every step, not just at
+/// vblank (see `GameBoyCallbackData::palette_override_force_frames`); the stub boot ROMs are done
+/// well within this.
+const PALETTE_OVERRIDE_FORCE_FRAMES: u32 = 16;
+
 static GB_VERSION_WITH_HACKS: Lazy<String> = Lazy::new(|| {
     alloc::format!("{} with SGB intro skipped", safeboy::GB_VERSION)
 });
+
+#[cfg(test)]
+mod palette_override_tests {
+    use super::*;
+    use alloc::vec;
+
+    const DMG_BOOT: &[u8] = include_bytes!("../../../bootrom/dmg/dmg.bin");
+    const CGB_BOOT: &[u8] = include_bytes!("../../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin");
+
+    const NINTENDO_LOGO: [u8; 48] = [
+        0xCE, 0xED, 0x66, 0x66, 0xCC, 0x0D, 0x00, 0x0B, 0x03, 0x73, 0x00, 0x83, 0x00, 0x0C, 0x00, 0x0D,
+        0x00, 0x08, 0x11, 0x1F, 0x88, 0x89, 0x00, 0x0E, 0xDC, 0xCC, 0x6E, 0xE6, 0xDD, 0xDD, 0xD9, 0x99,
+        0xBB, 0xBB, 0x67, 0x63, 0x6E, 0x0E, 0xEC, 0xCC, 0xDD, 0xDC, 0x99, 0x9F, 0xBB, 0xB9, 0x33, 0x3E
+    ];
+
+    /// A 32 KiB ROM that clears VRAM, sets `BGP` to the identity mapping and turns the LCD on, so
+    /// every pixel is shade 0 of the background palette. `cgb_flag` is header byte 0x143.
+    fn test_rom(cgb_flag: u8) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x8000];
+        rom[0x100..0x104].copy_from_slice(&[0x00, 0xC3, 0x50, 0x01]); // nop; jp $0150
+        rom[0x104..0x134].copy_from_slice(&NINTENDO_LOGO);
+        rom[0x134..0x140].copy_from_slice(b"PALETTE TEST");
+        rom[0x143] = cgb_flag;
+        rom[0x14A] = 0x01;
+        let mut checksum = 0u8;
+        for byte in &rom[0x134..=0x14C] {
+            checksum = checksum.wrapping_sub(*byte).wrapping_sub(1);
+        }
+        rom[0x14D] = checksum;
+        rom[0x150..0x16B].copy_from_slice(&[
+            0xF3,             // di
+            0xAF,             // xor a
+            0xE0, 0x40,       // ldh [rLCDC], a      ; LCD off
+            0x21, 0x00, 0x80, // ld hl, $8000
+            0x01, 0x00, 0x20, // ld bc, $2000
+            0xAF,             // .clear: xor a
+            0x22,             // ld [hl+], a
+            0x0B,             // dec bc
+            0x78,             // ld a, b
+            0xB1,             // or c
+            0x20, 0xF9,       // jr nz, .clear
+            0x3E, 0xE4,       // ld a, %11100100
+            0xE0, 0x47,       // ldh [rBGP], a
+            0x3E, 0x91,       // ld a, LCD on | tile data at $8000 | BG on
+            0xE0, 0x40,       // ldh [rLCDC], a
+            0x18, 0xFE        // jr @
+        ]);
+        rom
+    }
+
+    fn run_frames(core: &mut GameBoyColor, frames: usize) {
+        for _ in 0..frames {
+            while core.run().frames == 0 {}
+        }
+    }
+
+    fn pixel(core: &GameBoyColor) -> u32 {
+        core.get_screens()[0].pixels[72 * 160 + 80]
+    }
+
+    #[test]
+    fn override_recolors_a_game_boy_game() {
+        for (model, boot) in [(Model::DmgB, DMG_BOOT), (Model::Cgb0, CGB_BOOT)] {
+            let mut core = GameBoyColor::new_from_rom(&test_rom(0x00), boot, None, model);
+            run_frames(&mut core, 60);
+            let own = pixel(&core);
+            let own_palettes = core.gb_palettes().expect("the Game Boy palettes are reachable");
+            assert_eq!(decode_rgb(own), own_palettes.background[0], "{model:?}: shade 0 of the background is on screen");
+
+            let colors = GbPaletteOverride {
+                background: [0x123456, 0x234567, 0x345678, 0x456789],
+                objects_0: [0x111111, 0x222222, 0x333333, 0x444444],
+                objects_1: [0x555555, 0x666666, 0x777777, 0x888888]
+            };
+            core.set_gb_palette_override(Some(colors));
+            run_frames(&mut core, 2);
+            assert_eq!(pixel(&core), 0xFF12_3456, "{model:?}: drawn with the override");
+            assert_eq!(core.gb_palettes(), Some(own_palettes), "{model:?}: the game's own colors are still reported");
+            assert_eq!(pixel(&core), 0xFF12_3456, "{model:?}: reading them did not disturb the override");
+            let rendered = core.core.get_rendered_dmg_palettes().expect("reachable");
+            assert_eq!((rendered.objects_0[1], rendered.objects_1[3]), (0xFF22_2222, 0xFF88_8888), "{model:?}: the object palettes are overridden too");
+
+            // What makes SameBoy recompute its colors does not shake the override off.
+            let state = core.create_save_state();
+            core.load_save_state(&state).unwrap();
+            run_frames(&mut core, 2);
+            assert_eq!(pixel(&core), 0xFF12_3456, "{model:?}: after a save state load");
+            core.hard_reset();
+            run_frames(&mut core, 60);
+            assert_eq!(pixel(&core), 0xFF12_3456, "{model:?}: after a reset");
+
+            core.set_gb_palette_override(None);
+            run_frames(&mut core, 2);
+            assert_eq!(pixel(&core), own, "{model:?}: the game's own colors are back, without a reset");
+            assert_eq!(core.gb_palettes(), Some(own_palettes));
+        }
+    }
+
+    #[test]
+    fn game_boy_color_games_keep_their_own_colors() {
+        let mut core = GameBoyColor::new_from_rom(&test_rom(0x80), CGB_BOOT, None, Model::Cgb0);
+        run_frames(&mut core, 60);
+        let own = pixel(&core);
+        assert_eq!(core.gb_palettes(), None, "a Game Boy Color game has no Game Boy palettes to report");
+
+        core.set_gb_palette_override(Some(GbPaletteOverride { background: [0x123456; 4], objects_0: [0; 4], objects_1: [0; 4] }));
+        run_frames(&mut core, 2);
+        assert_eq!(pixel(&core), own, "the override is not applied to a Game Boy Color game");
+        core.hard_reset();
+        run_frames(&mut core, 60);
+        assert_eq!(pixel(&core), own, "nor after a reset");
+    }
+}

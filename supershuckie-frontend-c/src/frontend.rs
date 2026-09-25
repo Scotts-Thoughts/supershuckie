@@ -6,7 +6,7 @@ use std::sync::Arc;
 use supershuckie_core::emulator::{ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use supershuckie_core::AudioOutput;
 use supershuckie_frontend::{ConnectedControllerIndex, ScreenInfo, SuperShuckieEmulatorType, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState, UserInput};
-use supershuckie_frontend::settings::{GameBoyMode, NintendoDSDate};
+use supershuckie_frontend::settings::{GameBoyCustomColors, GameBoyMode, NintendoDSDate, NintendoDSDatePreset};
 use supershuckie_frontend::util::UTF8CString;
 use crate::control_settings::SuperShuckieControlSettings;
 use crate::string_array::SuperShuckieStringArray;
@@ -1256,6 +1256,27 @@ pub extern "C" fn supershuckie_frontend_set_sgb_enabled(frontend: &mut SuperShuc
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_gb_custom_colors(frontend: &SuperShuckieFrontend, colors: &mut GameBoyCustomColors) {
+    *colors = frontend.get_gb_custom_colors();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_gb_custom_colors(frontend: &mut SuperShuckieFrontend, colors: &GameBoyCustomColors) {
+    frontend.set_gb_custom_colors(*colors);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_gb_palettes(frontend: &SuperShuckieFrontend, colors: &mut GameBoyCustomColors) -> bool {
+    match frontend.get_gb_palettes() {
+        Some(palettes) => {
+            *colors = palettes;
+            true
+        }
+        None => false
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_set_touch(frontend: &mut SuperShuckieFrontend, enabled: bool, x: u8, y: u8) {
     frontend.set_touch(enabled.then_some((x, y)))
 }
@@ -1268,6 +1289,34 @@ pub extern "C" fn supershuckie_frontend_get_nds_date(frontend: &SuperShuckieFron
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_set_nds_date(frontend: &mut SuperShuckieFrontend, date: &NintendoDSDate) {
     frontend.set_nds_date(*date);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_nds_date_preset_count(frontend: &SuperShuckieFrontend) -> usize {
+    frontend.get_nds_date_presets().len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_nds_date_preset(frontend: &SuperShuckieFrontend, index: usize, date: &mut NintendoDSDate) -> *const c_char {
+    let Some(preset) = frontend.get_nds_date_presets().get(index) else {
+        return null()
+    };
+    *date = preset.date.get_cleaned();
+    preset.name.as_c_str().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_set_nds_date_presets(
+    frontend: &mut SuperShuckieFrontend,
+    names: *const *const c_char,
+    dates: *const NintendoDSDate,
+    count: usize
+) {
+    let presets = (0..count).map(|i| NintendoDSDatePreset {
+        name: UTF8CString::from(unsafe { CStr::from_ptr(*names.add(i)) }.to_string_lossy().into_owned()),
+        date: unsafe { *dates.add(i) }
+    }).collect();
+    frontend.set_nds_date_presets(presets);
 }
 
 

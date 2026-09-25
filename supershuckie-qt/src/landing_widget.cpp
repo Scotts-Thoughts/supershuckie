@@ -74,8 +74,8 @@ LandingWidget::LandingWidget(MainWindow *window, QWidget *parent): QWidget(paren
     hint_layout->setSpacing(8);
     this->hint = new QLabel(
         "Click a game to play it. Drag games to reorder them. Right-click a game to give it a picture, "
-        "rename it, or remove it. Drop a ROM anywhere here to open it, or drop a picture on a game to "
-        "use it as that game's icon.",
+        "rename it, give it a keyboard shortcut, or remove it. Drop a ROM anywhere here to open it, or "
+        "drop a picture on a game to use it as that game's icon.",
         this->hint_row
     );
     this->hint->setWordWrap(true);
@@ -182,6 +182,8 @@ void LandingWidget::save_favorites() {
 
     // Persist immediately so a crash later on doesn't lose the edit.
     supershuckie_frontend_write_settings(this->main_window->frontend);
+
+    this->main_window->rebuild_favorite_roms_menu();
 }
 
 bool LandingWidget::looks_like_image(const QString &path) {
@@ -294,7 +296,12 @@ void LandingWidget::rebuild_tiles() {
         tile->setFixedSize(TILE_WIDTH, TILE_HEIGHT);
         tile->setIcon(QIcon(this->icon_for(favorite)));
         tile->setText(metrics.elidedText(favorite.name, Qt::ElideRight, TILE_WIDTH - 12));
-        tile->setToolTip(favorite.name + "\n" + QDir::toNativeSeparators(favorite.path));
+        auto tooltip = favorite.name + "\n" + QDir::toNativeSeparators(favorite.path);
+        auto shortcuts = this->main_window->favorite_rom_shortcuts(favorite.path);
+        if(!shortcuts.isEmpty()) {
+            tooltip += "\nShortcut: " + shortcuts.first().toString(QKeySequence::NativeText);
+        }
+        tile->setToolTip(tooltip);
         tile->setCursor(Qt::PointingHandCursor);
         tile->setContextMenuPolicy(Qt::CustomContextMenu);
         tile->setFocusPolicy(Qt::NoFocus);
@@ -494,6 +501,8 @@ void LandingWidget::remove_favorite(std::size_t index) {
     if(!favorite.image.isEmpty()) {
         QFile::remove(QDir(this->icons_dir()).filePath(favorite.image));
     }
+    // Otherwise the shortcut would stay saved and come back if the game is added again.
+    this->main_window->clear_favorite_rom_shortcut(favorite.path);
     this->favorites.erase(this->favorites.begin() + index);
     this->save_favorites();
     this->rebuild_tiles();
@@ -543,6 +552,12 @@ void LandingWidget::show_tile_menu(std::size_t index, const QPoint &global_pos) 
     auto *clear_picture = menu.addAction("Use default picture");
     clear_picture->setEnabled(!this->favorites[index].image.isEmpty());
     auto *rename = menu.addAction("Rename…");
+    auto shortcuts = this->main_window->favorite_rom_shortcuts(this->favorites[index].path);
+    auto *set_shortcut = menu.addAction(shortcuts.isEmpty()
+        ? QString("Set shortcut…")
+        : QString("Change shortcut (%1)…").arg(shortcuts.first().toString(QKeySequence::NativeText)));
+    auto *clear_shortcut = menu.addAction("Remove shortcut");
+    clear_shortcut->setEnabled(!shortcuts.isEmpty());
     menu.addSeparator();
     auto *move_up = menu.addAction("Move earlier");
     move_up->setEnabled(index > 0);
@@ -586,6 +601,13 @@ void LandingWidget::show_tile_menu(std::size_t index, const QPoint &global_pos) 
     }
     else if(chosen == rename) {
         this->rename_favorite(index);
+    }
+    else if(chosen == set_shortcut) {
+        this->main_window->edit_favorite_rom_shortcut(this->favorites[index].path);
+    }
+    else if(chosen == clear_shortcut) {
+        this->main_window->clear_favorite_rom_shortcut(this->favorites[index].path);
+        this->rebuild_tiles();
     }
     else if(chosen == move_up) {
         this->move_favorite(index, -1);

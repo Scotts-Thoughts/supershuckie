@@ -64,6 +64,9 @@ public:
     ShortcutsSettingsWindow(MainWindow *parent, std::vector<ShortcutBinding> bindings);
     int exec() override;
     void reject() override;
+
+    /** Select the binding with this id, ready to record its shortcut. */
+    void focus_binding(const QString &id);
 protected:
     bool eventFilter(QObject *object, QEvent *event) override;
 private:

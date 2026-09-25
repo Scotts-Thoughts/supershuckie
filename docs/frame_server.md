@@ -18,10 +18,18 @@ that protocol can drive this binary; nothing below changes it.
 ## Modes
 
 ```text
-supershuckie-frame-server                            serve on stdin/stdout
+supershuckie-frame-server [--gb-colors <colors>]     serve on stdin/stdout
 supershuckie-frame-server --probe <replay> [--layout N]
 supershuckie-frame-server --version
 ```
+
+`--gb-colors` draws Game Boy games (and Game Boy games on a Game Boy Color, which get the boot
+ROM's colors for them) with custom colors instead of their own, as the app does with
+**Settings › Game Boy › Custom colors…** switched on: twelve `RRGGBB` values separated by commas,
+the four shades (lightest first) of the background palette, then of object palette 0, then of
+object palette 1. Game Boy Color games and Super Game Boy colors are unaffected. It changes how
+the pictures are drawn and nothing else; the app keeps its own colors in `settings.json` under
+`game_boy_settings.custom_colors`, so a caller can pass exactly what the app shows.
 
 `--probe` reads only the replay's header and index (no ROM, no emulation, blobs stay compressed)
 and prints one JSON object: console, geometry for the layout, native frame rate, frame count,

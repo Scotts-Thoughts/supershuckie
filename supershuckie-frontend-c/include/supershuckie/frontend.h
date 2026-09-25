@@ -145,6 +145,35 @@ void supershuckie_frontend_set_sgb_enabled(struct SuperShuckieFrontendRaw *front
  */
 bool supershuckie_frontend_is_sgb_enabled(const struct SuperShuckieFrontendRaw *frontend);
 
+/**
+ * Custom Game Boy colors (Settings › Game Boy › Custom colors…): while `enabled`, a game running on
+ * a Game Boy, or on a Game Boy Color in Game Boy mode, is drawn with these instead of its own
+ * palettes. 0xRRGGBB per shade, from 0 (the lightest) to 3 (the darkest).
+ */
+struct SuperShuckieGBCustomColors {
+    bool enabled;
+    uint32_t background[4];
+    uint32_t objects_0[4];
+    uint32_t objects_1[4];
+};
+
+/**
+ * Get the custom Game Boy colors.
+ */
+void supershuckie_frontend_get_gb_custom_colors(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieGBCustomColors *colors);
+
+/**
+ * Set the custom Game Boy colors; a running game is drawn with them from its next frame.
+ */
+void supershuckie_frontend_set_gb_custom_colors(struct SuperShuckieFrontendRaw *frontend, const struct SuperShuckieGBCustomColors *colors);
+
+/**
+ * Get the colors the running game's own palettes draw with (also while custom colors are on),
+ * with `enabled` as in the setting. Returns false, leaving `colors` alone, if the game has no Game
+ * Boy palettes: a Game Boy Color game, the Super Game Boy, another console, or no game.
+ */
+bool supershuckie_frontend_get_gb_palettes(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieGBCustomColors *colors);
+
 enum SuperShuckieGBCMode {
     SuperShuckieGBCMode__AlwaysGBC = 0,
     SuperShuckieGBCMode__GBInGBMode = 1,
@@ -917,6 +946,25 @@ void supershuckie_frontend_get_nds_date(const struct SuperShuckieFrontendRaw *fr
  * Set the Nintendo DS date
  */
 void supershuckie_frontend_set_nds_date(struct SuperShuckieFrontendRaw *frontend, const struct SuperShuckieNintendoDSDate *date);
+
+/**
+ * Get the number of Nintendo DS date presets.
+ */
+size_t supershuckie_frontend_get_nds_date_preset_count(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Get the Nintendo DS date preset at `index` (in menu order), writing its date to `date` and
+ * returning its name, or null if `index` is out of range.
+ *
+ * The name is valid until the presets are next set.
+ */
+const char *supershuckie_frontend_get_nds_date_preset(const struct SuperShuckieFrontendRaw *frontend, size_t index, struct SuperShuckieNintendoDSDate *date);
+
+/**
+ * Replace the Nintendo DS date presets with `count` presets, the Nth named `names[N]` (UTF-8)
+ * with the date `dates[N]`.
+ */
+void supershuckie_frontend_set_nds_date_presets(struct SuperShuckieFrontendRaw *frontend, const char *const *names, const struct SuperShuckieNintendoDSDate *dates, size_t count);
 
 /**
  * Get if JIT is enabled for the DS.

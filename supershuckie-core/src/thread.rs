@@ -1,4 +1,4 @@
-use crate::emulator::{EmulatorCore, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
+use crate::emulator::{EmulatorCore, GbPaletteOverride, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
 use crate::link::{LinkFailure, LinkInbox, LinkPublisherFns, LinkRunOutcome, LinkSettings};
 use crate::live_replay::{FollowerStats, FollowerStatsSnapshot, LiveReplaySource};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
@@ -1000,6 +1000,25 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::SetAudioMuteWhenSpedUp(mute));
     }
 
+    /// Draw a Game Boy game with `colors` instead of its own palettes, or with its own again
+    /// (`None`); see `EmulatorCore::set_gb_palette_override`. Shows on the next frame drawn.
+    #[inline]
+    pub fn set_gb_palette_override(&self, colors: Option<GbPaletteOverride>) {
+        let _ = self.send(ThreadCommand::SetGbPaletteOverride(colors));
+    }
+
+    /// The colors the game's own palettes draw with right now (see `EmulatorCore::gb_palettes`);
+    /// `None` where there are none, or if the thread is gone.
+    ///
+    /// NOTE: This is blocking.
+    pub fn gb_palettes(&self) -> Option<GbPaletteOverride> {
+        let (sender, receiver) = channel();
+        self.send(ThreadCommand::GetGbPalettes(sender)).ok()?;
+        // A paused thread parks for up to 100 ms between command checks.
+        self.wake();
+        receiver.recv().ok()?
+    }
+
     /// Read `len` bytes of console memory at `address` (see `EmulatorCore::read_ram`); `None`
     /// when unmapped or the thread is gone.
     ///
@@ -1217,6 +1236,8 @@ enum ThreadCommand {
     SetAudioOutput(Option<Arc<AudioOutput>>),
     SetAudioEnabled(bool),
     SetAudioMuteWhenSpedUp(bool),
+    SetGbPaletteOverride(Option<GbPaletteOverride>),
+    GetGbPalettes(Sender<Option<GbPaletteOverride>>),
     TransferPokeAByteIntegrationExternal(Sender<bool>, Sender<ThreadCommand>),
     TransferPokeAByteIntegrationInternal(Sender<bool>, PokeAByteIntegrationServer, ReplayConsoleType, ReplayHeaderBlake3Hash),
     Rendezvous(Sender<()>),
@@ -2370,6 +2391,12 @@ impl CoreLoop {
             },
             ThreadCommand::SetAudioEnabled(enabled) => {
                 self.core.set_audio_enabled(enabled)
+            },
+            ThreadCommand::SetGbPaletteOverride(colors) => {
+                self.core.set_gb_palette_override(colors)
+            },
+            ThreadCommand::GetGbPalettes(sender) => {
+                let _ = sender.send(self.core.gb_palettes());
             },
             ThreadCommand::SetAudioMuteWhenSpedUp(mute) => {
                 self.core.set_audio_mute_when_sped_up(mute)

@@ -16,4 +16,11 @@ selects this copy over the crates.io release with `[patch.crates-io]` in the roo
   `slice::from_raw_parts_mut` must not be given), and adds `safeboy::seed_random`
   (`GB_random_seed`), so a reset's RAM garbage can be made reproducible.
 
-To regenerate the patch after editing: `diff -ruN <registry copy>/src src`.
+- `0002-rendered-dmg-palettes.patch` — `RunnableInstanceFunctions::get_rendered_dmg_palettes` /
+  `set_rendered_dmg_palettes` and the `RenderedDmgPalettes` type: read and overwrite the colors
+  SameBoy's renderer draws the background palette and object palettes 0 and 1 with (its internal
+  `background_palettes_rgb` / `object_palettes_rgb` tables, reached through the bindings' struct
+  layout and only after that layout is checked against fields the API sets). A presentation-only
+  override; `supershuckie-core`'s Game Boy core uses it for custom Game Boy colors.
+
+To regenerate a patch after editing (`0002` is the diff from the tree with `0001` applied): `diff -ruN <registry copy>/src src`.

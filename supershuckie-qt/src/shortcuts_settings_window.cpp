@@ -467,6 +467,17 @@ void ShortcutsSettingsWindow::apply_filter() {
     }
 }
 
+void ShortcutsSettingsWindow::focus_binding(const QString &id) {
+    for(std::size_t i = 0; i < this->bindings.size(); i++) {
+        if(this->bindings[i].id == id) {
+            this->tree->setCurrentItem(this->items[i]);
+            this->tree->scrollToItem(this->items[i]);
+            this->edits[0]->setFocus(Qt::OtherFocusReason);
+            return;
+        }
+    }
+}
+
 void ShortcutsSettingsWindow::select_first_visible() {
     for(auto *item : this->items) {
         if(!item->isHidden()) {

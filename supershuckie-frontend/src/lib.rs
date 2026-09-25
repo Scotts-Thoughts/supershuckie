@@ -1395,6 +1395,18 @@ impl SuperShuckieFrontend {
         self.settings.nintendo_ds_settings.date = date;
     }
 
+    /// Get the Nintendo DS date presets, in menu order.
+    #[inline]
+    pub fn get_nds_date_presets(&self) -> &[NintendoDSDatePreset] {
+        &self.settings.nintendo_ds_settings.date_presets
+    }
+
+    /// Replace the Nintendo DS date presets.
+    #[inline]
+    pub fn set_nds_date_presets(&mut self, presets: Vec<NintendoDSDatePreset>) {
+        self.settings.nintendo_ds_settings.date_presets = presets;
+    }
+
     /// Get the Nintendo DS date.
     #[inline]
     pub fn get_jit_enabled(&self) -> bool {
@@ -2796,6 +2808,7 @@ impl SuperShuckieFrontend {
         self.core.set_audio_output(Some(self.audio_output.clone()));
         self.core.set_audio_mute_when_sped_up(self.settings.audio.mute_when_sped_up);
         self.core.set_audio_enabled(self.settings.audio.enabled);
+        self.apply_gb_custom_colors();
 
         self.update_video_mode();
         // A reloaded game is still the one being played together; the followers get a snapshot.
@@ -3089,6 +3102,41 @@ impl SuperShuckieFrontend {
     pub fn set_sgb_enabled(&mut self, enabled: bool) {
         self.settings.game_boy_settings.sgb = enabled;
         self.reload_game_boy_if_needed();
+    }
+
+    /// The custom Game Boy colors (Settings › Game Boy › Custom colors…).
+    #[inline]
+    pub fn get_gb_custom_colors(&self) -> GameBoyCustomColors {
+        self.settings.game_boy_settings.custom_colors
+    }
+
+    /// Set the custom Game Boy colors; a running game is drawn with them from its next frame.
+    pub fn set_gb_custom_colors(&mut self, mut colors: GameBoyCustomColors) {
+        colors.clamp();
+        if self.settings.game_boy_settings.custom_colors == colors {
+            return
+        }
+        self.settings.game_boy_settings.custom_colors = colors;
+        self.mark_settings_dirty();
+        self.apply_gb_custom_colors();
+    }
+
+    /// The colors the running game's own palettes draw with (also while custom colors are on),
+    /// with `enabled` as in the setting; `None` if the game has no Game Boy palettes: a Game Boy
+    /// Color game, the Super Game Boy, another console, or no game.
+    pub fn get_gb_palettes(&self) -> Option<GameBoyCustomColors> {
+        let palettes = self.core.gb_palettes()?;
+        Some(GameBoyCustomColors {
+            enabled: self.settings.game_boy_settings.custom_colors.enabled,
+            background: palettes.background,
+            objects_0: palettes.objects_0,
+            objects_1: palettes.objects_1
+        })
+    }
+
+    /// Hand the core the custom colors, or none.
+    fn apply_gb_custom_colors(&self) {
+        self.core.set_gb_palette_override(self.settings.game_boy_settings.custom_colors.palette_override());
     }
 
     #[inline]

@@ -20,6 +20,7 @@ class MainWindow;
  *
  * Holds a user-curated grid of "favorite" ROMs. Clicking a tile loads that ROM immediately; a
  * tile can be given a custom picture (copied, scaled, into `<app dir>/favorite-icons/`), renamed,
+ * given a keyboard shortcut (kept with the other shortcuts; see MainWindow::rebuild_favorite_roms_menu()),
  * reordered, or removed from its context menu. Dropping a ROM anywhere on the widget loads it,
  * just as dropping one on the game view does; dropping an image on a tile sets that tile's icon.
  * Tiles can also be dragged onto one another (or past the last one) to reorder them.

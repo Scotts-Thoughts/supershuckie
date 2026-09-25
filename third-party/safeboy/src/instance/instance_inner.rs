@@ -7,6 +7,7 @@ use core::marker::PhantomPinned;
 use core::mem::transmute;
 use core::ops::{Shl, ShlAssign};
 use sameboy_sys::{GB_alloc, GB_apu_set_sample_callback, GB_connect_printer, GB_dealloc, GB_gameboy_t, GB_get_clock_rate, GB_get_direct_access, GB_get_palette, GB_get_registers, GB_get_rom_title, GB_get_sample_rate, GB_get_save_state_size, GB_get_screen_height, GB_get_screen_width, GB_get_unmultiplied_clock_rate, GB_get_usual_frame_rate, GB_init, GB_is_background_rendering_disabled, GB_is_cgb, GB_is_cgb_in_cgb_mode, GB_is_hle_sgb, GB_is_object_rendering_disabled, GB_is_odd_frame, GB_is_sgb, GB_load_battery_from_buffer, GB_load_boot_rom_from_buffer, GB_load_rom_from_buffer, GB_load_state_from_buffer, GB_model_t, GB_palette_t, GB_palette_t_GB_color_s, GB_quick_reset, GB_reset, GB_rewind_pop, GB_rewind_reset, GB_run, GB_run_frame, GB_save_battery_size, GB_save_battery_to_buffer, GB_save_state_to_buffer, GB_set_allow_illegal_inputs, GB_set_background_rendering_disabled, GB_set_boot_rom_load_callback, GB_set_border_mode, GB_set_clock_multiplier, GB_set_color_correction_mode, GB_set_execution_callback, GB_set_infrared_callback, GB_set_input_callback, GB_set_key_mask, GB_set_key_state, GB_set_light_temperature, GB_set_log_callback, GB_set_object_rendering_disabled, GB_set_palette, GB_set_pixels_output, GB_set_read_memory_callback, GB_set_rendering_disabled, GB_set_rewind_length, GB_set_rgb_encode_callback, GB_set_rtc_mode, GB_set_rumble_callback, GB_set_sample_rate, GB_set_serial_transfer_bit_end_callback, GB_set_serial_transfer_bit_start_callback, GB_serial_get_data_bit, GB_serial_set_data_bit, GB_set_infrared_input, GB_set_turbo_mode, GB_set_update_input_hint_callback, GB_set_user_data, GB_set_vblank_callback, GB_set_write_memory_callback, GB_switch_model_and_reset};
+use sameboy_sys::GB_gameboy_internal_s;
 
 pub(crate) mod callback_wrapper;
 mod callbacks;
@@ -57,6 +58,33 @@ impl RunningGameboy {
         self.screen_height = u16::try_from(unsafe { GB_get_screen_height(self.gb) }).expect("screen height does not fit into a u16");
         self.pixel_buffer.resize(self.screen_width as usize * self.screen_height as usize, 0);
         unsafe { GB_set_pixels_output(self.gb, self.pixel_buffer.as_mut_ptr()) };
+    }
+
+    /// SameBoy's `background_palettes_rgb` and `object_palettes_rgb`: the colors the renderer
+    /// copies into the pixel buffer, indexed `palette * 4 + shade`.
+    ///
+    /// No API reads or writes them, so they are reached through the layout of `GB_gameboy_t` in
+    /// the bindings (`GB_gameboy_internal_s`, which is what `GB_gameboy_s` is when SameBoy itself
+    /// is compiled). The bindings are pregenerated on one platform, so before they are trusted two
+    /// fields of the same section that SameBoy's API does set are compared with what the API
+    /// says: `screen` (`GB_set_pixels_output`, the field right before the tables) and `ram`
+    /// (`GB_get_direct_access`). `None` if either differs: a layout the bindings got wrong means
+    /// "not available", never a write to the wrong place.
+    fn rendered_palette_tables(&self) -> Option<(*mut [u32; 32], *mut [u32; 32])> {
+        // SAFETY: `self.gb` was allocated by `GB_alloc`, i.e. it is a `GB_gameboy_s` of
+        // `sizeof(struct GB_gameboy_internal_s)` bytes with that struct's alignment. The fields
+        // read are plain data inside it, and nothing is written unless the checks pass.
+        unsafe {
+            let internal = self.gb as *mut GB_gameboy_internal_s;
+            let unsaved = &raw mut (*internal).__bindgen_anon_11.__bindgen_anon_1;
+            let mut size = 0usize;
+            let mut bank = 0u16;
+            let ram = GB_get_direct_access(self.gb, DirectAccessRegion::RAM as _, &mut size, &mut bank) as *mut u8;
+            if (*unsaved).screen != self.pixel_buffer.as_ptr().cast_mut() || (*unsaved).ram != ram {
+                return None
+            }
+            Some((&raw mut (*unsaved).background_palettes_rgb, &raw mut (*unsaved).object_palettes_rgb))
+        }
     }
 
     pub(crate) fn set_callbacks(&mut self, callbacks: Option<Box<dyn GameboyCallbacks>>) {
@@ -348,6 +376,25 @@ pub trait RunnableInstanceFunctions {
     /// Get the palette for monochrome models.
     fn get_palette(&self) -> MonochromePalette;
 
+    /// The colors the renderer is drawing the background palette and object palettes 0 and 1
+    /// with right now (see [`RenderedDmgPalettes`]), or `None` if they cannot be reached in this
+    /// build (see [`RunnableInstanceFunctions::set_rendered_dmg_palettes`]).
+    fn get_rendered_dmg_palettes(&self) -> Option<RenderedDmgPalettes>;
+
+    /// Overwrite the colors the renderer draws the background palette and object palettes 0 and 1
+    /// with, in the format of the RGB encoder (see [`RunnableInstanceFunctions::set_rgb_encoder`]).
+    ///
+    /// This only changes what is drawn: emulation, save states and the palette registers are
+    /// untouched. SameBoy recomputes these colors from its palettes whenever they change (a
+    /// palette register write, a reset, a save state load, a new RGB encoder or color correction
+    /// mode), which drops the override; callers apply it again, e.g. from the vblank callback.
+    /// Calling [`RunnableInstanceFunctions::set_rgb_encoder`] restores SameBoy's own colors.
+    ///
+    /// Returns `false` (and writes nothing) if the colors cannot be reached: they are internal
+    /// to SameBoy and are found through the struct layout the bindings were generated with,
+    /// which is checked against fields SameBoy's own API sets before anything is written.
+    fn set_rendered_dmg_palettes(&mut self, palettes: &RenderedDmgPalettes) -> bool;
+
     // TODO
     // fn convert_rgb15
 
@@ -574,6 +621,16 @@ impl RunnableInstanceFunctions for Gameboy {
     #[inline]
     fn get_palette(&self) -> MonochromePalette {
         self.inner.get_palette()
+    }
+
+    #[inline]
+    fn get_rendered_dmg_palettes(&self) -> Option<RenderedDmgPalettes> {
+        self.inner.get_rendered_dmg_palettes()
+    }
+
+    #[inline]
+    fn set_rendered_dmg_palettes(&mut self, palettes: &RenderedDmgPalettes) -> bool {
+        self.do_with_inner_mut(|inner| inner.set_rendered_dmg_palettes(palettes))
     }
 
     #[inline]
@@ -835,6 +892,32 @@ impl RunnableInstanceFunctions for RunningGameboy {
     #[inline]
     fn get_palette(&self) -> MonochromePalette {
         MonochromePalette::from_gb(unsafe { *GB_get_palette(self.gb) })
+    }
+
+    fn get_rendered_dmg_palettes(&self) -> Option<RenderedDmgPalettes> {
+        let (background, objects) = self.rendered_palette_tables()?;
+        // SAFETY: `rendered_palette_tables` only hands out the instance's own tables.
+        let (background, objects) = unsafe { (&*background, &*objects) };
+        Some(RenderedDmgPalettes {
+            background: [background[0], background[1], background[2], background[3]],
+            objects_0: [objects[0], objects[1], objects[2], objects[3]],
+            objects_1: [objects[4], objects[5], objects[6], objects[7]]
+        })
+    }
+
+    fn set_rendered_dmg_palettes(&mut self, palettes: &RenderedDmgPalettes) -> bool {
+        let Some((background, objects)) = self.rendered_palette_tables() else {
+            return false
+        };
+        // SAFETY: as in `get_rendered_dmg_palettes`; the instance is not running (this takes
+        // `&mut self`), so the renderer is not reading the tables meanwhile.
+        unsafe {
+            let (background, objects) = (&mut *background, &mut *objects);
+            background[..4].copy_from_slice(&palettes.background);
+            objects[..4].copy_from_slice(&palettes.objects_0);
+            objects[4..8].copy_from_slice(&palettes.objects_1);
+        }
+        true
     }
 
     #[inline]
@@ -1119,6 +1202,24 @@ impl<'a> From<DirectAccessDataMut<'a>> for DirectAccessData<'a> {
             bank: value.bank
         }
     }
+}
+
+/// The colors a Game Boy game is drawn with: the four shades of the background palette and of
+/// object palettes 0 and 1, in the RGB encoder's format, indexed by shade (0 is the lightest and
+/// 3 the darkest, the way the `BGP`/`OBP0`/`OBP1` registers map to them). On a Game Boy Color
+/// running a Game Boy game these are the boot ROM's colors for it; on a monochrome model they
+/// come from the [`MonochromePalette`].
+///
+/// See [`RunnableInstanceFunctions::get_rendered_dmg_palettes`] and
+/// [`RunnableInstanceFunctions::set_rendered_dmg_palettes`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct RenderedDmgPalettes {
+    /// The background palette (`BGP`).
+    pub background: [u32; 4],
+    /// Object palette 0 (`OBP0`).
+    pub objects_0: [u32; 4],
+    /// Object palette 1 (`OBP1`).
+    pub objects_1: [u32; 4]
 }
 
 /// Specifies a monochrome palette for setting/getting from the emulator.

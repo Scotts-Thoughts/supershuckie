@@ -23,6 +23,19 @@ use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettin
 /// Sample rate, in Hz, at which every core delivers audio through [`EmulatorCore::take_audio`].
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
+/// Custom colors for a game running on a Game Boy, or on a Game Boy Color in Game Boy mode (see
+/// [`EmulatorCore::set_gb_palette_override`]): the four shades of the background palette and of
+/// object palettes 0 and 1 as `0xRRGGBB`, from shade 0 (the lightest) to 3 (the darkest).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct GbPaletteOverride {
+    /// The background palette (`BGP`).
+    pub background: [u32; 4],
+    /// Object palette 0 (`OBP0`).
+    pub objects_0: [u32; 4],
+    /// Object palette 1 (`OBP1`).
+    pub objects_1: [u32; 4]
+}
+
 /// A contiguous block of console memory the RAM tools can inspect.
 ///
 /// Addresses are the ones [`EmulatorCore::read_ram`] and [`EmulatorCore::write_ram`] accept (the
@@ -160,6 +173,23 @@ pub trait EmulatorCore: Send + 'static {
     /// samples entirely. Like [`set_skip_drawing`](Self::set_skip_drawing), this is a
     /// presentation setting: it must never affect emulation, timing or save states.
     fn set_audio_enabled(&mut self, _enabled: bool) {}
+
+    /// Draw the game with `colors` instead of its own palettes, or with its own again (`None`).
+    ///
+    /// Only for consoles with Game Boy palettes, and only while the game runs on a Game Boy or on
+    /// a Game Boy Color in Game Boy mode (a Game Boy Color game sets its own colors as it runs and
+    /// keeps them; so does the Super Game Boy, whose colors come from the SNES side). This changes
+    /// what is drawn and nothing else: emulation, save states and replays are exactly as without
+    /// it. Cores without Game Boy palettes ignore it.
+    fn set_gb_palette_override(&mut self, _colors: Option<GbPaletteOverride>) {}
+
+    /// The colors the game's own palettes draw with right now, where
+    /// [`EmulatorCore::set_gb_palette_override`] applies; `None` elsewhere (and in a build where
+    /// the palettes cannot be reached). With an override set, this is still what the game itself
+    /// asks for.
+    fn gb_palettes(&mut self) -> Option<GbPaletteOverride> {
+        None
+    }
 
     /// Append every interleaved stereo `i16` sample (left, right, …) at [`AUDIO_SAMPLE_RATE`]
     /// produced since the previous call, then forget them.

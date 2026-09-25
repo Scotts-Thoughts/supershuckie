@@ -6,7 +6,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use crate::emulator::{EmulatorCore, Input, PartialReplayRecordMetadata, RunTime};
+use crate::emulator::{EmulatorCore, GbPaletteOverride, Input, PartialReplayRecordMetadata, RunTime};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::format;
@@ -700,6 +700,19 @@ impl SuperShuckieCore {
         self.audio_enabled = enabled;
         self.core.set_audio_enabled(enabled);
         self.clear_audio();
+    }
+
+    /// Draw a Game Boy game with `colors` instead of its own palettes, or with its own again
+    /// (`None`); see [`EmulatorCore::set_gb_palette_override`].
+    #[inline]
+    pub fn set_gb_palette_override(&mut self, colors: Option<GbPaletteOverride>) {
+        self.core.set_gb_palette_override(colors)
+    }
+
+    /// The colors the game's own palettes draw with right now; see [`EmulatorCore::gb_palettes`].
+    #[inline]
+    pub fn gb_palettes(&mut self) -> Option<GbPaletteOverride> {
+        self.core.gb_palettes()
     }
 
     /// Whether the core is rendering audio.

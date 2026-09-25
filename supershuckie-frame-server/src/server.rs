@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
-use supershuckie_core::emulator::{EmulatorCore, GameBoyAdvance, GameBoyColor, Model, NintendoDS, AUDIO_SAMPLE_RATE};
+use supershuckie_core::emulator::{EmulatorCore, GameBoyAdvance, GameBoyColor, GbPaletteOverride, Model, NintendoDS, AUDIO_SAMPLE_RATE};
 use supershuckie_core::export::{composite_screens, output_geometry};
 use supershuckie_core::{std_timestamp_provider, AudioOutput, ScreenLayout, SuperShuckieCore};
 use supershuckie_replay_recorder::blake3_hash;
@@ -69,7 +69,44 @@ struct Session {
     audio: Option<Arc<AudioOutput>>,
 }
 
+/// What the command line asks of a serving instance.
+#[derive(Copy, Clone, Default, Debug)]
+pub struct ServeOptions {
+    /// `--gb-colors`: draw Game Boy games with these colors instead of their own (see
+    /// [`EmulatorCore::set_gb_palette_override`]), as the app does with its custom colors on.
+    pub gb_colors: Option<GbPaletteOverride>,
+}
+
+/// Parse a `--gb-colors` argument: twelve `RRGGBB` colors separated by commas (a leading `#` is
+/// fine), the four shades of the background palette from the lightest, then of object palette 0,
+/// then of object palette 1.
+pub fn parse_gb_colors(list: &str) -> Result<GbPaletteOverride, String> {
+    let mut colors = [0u32; 12];
+    let mut count = 0;
+    for item in list.split(',') {
+        let hex = item.trim().trim_start_matches('#');
+        let value = match (hex.len(), u32::from_str_radix(hex, 16)) {
+            (6, Ok(value)) => value,
+            _ => return Err(format!("--gb-colors: {:?} is not a color like RRGGBB", item.trim())),
+        };
+        if count == colors.len() {
+            return Err("--gb-colors takes exactly twelve colors".into());
+        }
+        colors[count] = value;
+        count += 1;
+    }
+    if count != colors.len() {
+        return Err(format!("--gb-colors takes exactly twelve colors, not {count}"));
+    }
+    Ok(GbPaletteOverride {
+        background: [colors[0], colors[1], colors[2], colors[3]],
+        objects_0: [colors[4], colors[5], colors[6], colors[7]],
+        objects_1: [colors[8], colors[9], colors[10], colors[11]],
+    })
+}
+
 struct Server {
+    options: ServeOptions,
     rx: Receiver<Inbound>,
     out: BufWriter<File>,
     /// Requests taken off the channel while polling, still to be handled in arrival order.
@@ -107,7 +144,7 @@ fn claim_stdout() -> io::Result<File> {
 }
 
 /// Run the server on this process's stdin/stdout until `Close` or end of input.
-pub fn serve() -> ExitCode {
+pub fn serve(options: ServeOptions) -> ExitCode {
     let protocol = match claim_stdout() {
         Ok(file) => file,
         Err(e) => {
@@ -140,6 +177,7 @@ pub fn serve() -> ExitCode {
         .expect("spawn stdin reader");
 
     let mut server = Server {
+        options,
         rx,
         out: BufWriter::with_capacity(1 << 20, protocol),
         pending: VecDeque::new(),
@@ -267,7 +305,9 @@ impl Server {
         (info.width, info.height) = geometry(summary.console, layout);
 
         let core = if rom_ok {
-            let emulator = build_core(summary.console, &rom_bytes)?;
+            let mut emulator = build_core(summary.console, &rom_bytes)?;
+            // Only how a Game Boy game is drawn; a core for another console ignores it.
+            emulator.set_gb_palette_override(self.options.gb_colors);
             info.core_running = emulator.core_name().to_string();
             info.fps_num = emulator.frame_rate().0;
             info.fps_den = emulator.frame_rate().1;
@@ -598,4 +638,23 @@ fn build_core(console: ReplayConsoleType, rom: &[u8]) -> Result<Box<dyn Emulator
         ReplayConsoleType::NintendoDS => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false)?),
         ReplayConsoleType::Unknown => return Err("the recording's console type is unknown".into()),
     })
+}
+
+#[cfg(test)]
+mod gb_colors_tests {
+    use super::parse_gb_colors;
+
+    #[test]
+    fn parses_twelve_colors_and_rejects_anything_else() {
+        let colors = parse_gb_colors("#FFFFFF,aaaaaa, 555555 ,000000,f8e0c0,c08050,804020,100800,123456,234567,345678,456789").unwrap();
+        assert_eq!(colors.background, [0xFFFFFF, 0xAAAAAA, 0x555555, 0x000000]);
+        assert_eq!(colors.objects_0, [0xF8E0C0, 0xC08050, 0x804020, 0x100800]);
+        assert_eq!(colors.objects_1, [0x123456, 0x234567, 0x345678, 0x456789]);
+
+        let twelve = |color: &str| (0..12).map(|_| color).collect::<Vec<_>>().join(",");
+        assert!(parse_gb_colors("FFFFFF,AAAAAA,555555,000000").unwrap_err().contains("twelve"));
+        assert!(parse_gb_colors(&(twelve("FFFFFF") + ",FFFFFF")).unwrap_err().contains("twelve"));
+        assert!(parse_gb_colors(&twelve("FFFFFF").replacen("FFFFFF", "blue", 1)).unwrap_err().contains("\"blue\""));
+        assert!(parse_gb_colors(&twelve("FFFFFF").replacen("FFFFFF", "FFFFFFF", 1)).unwrap_err().contains("FFFFFFF"));
+    }
 }

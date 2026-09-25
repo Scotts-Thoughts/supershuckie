@@ -9,7 +9,7 @@ use std::hint::unreachable_unchecked;
 use std::num::{NonZeroIsize, NonZeroU32, NonZeroU64, NonZeroU8, NonZeroUsize};
 use std::path::Path;
 use std::path::PathBuf;
-use supershuckie_core::emulator::Input;
+use supershuckie_core::emulator::{GbPaletteOverride, Input};
 use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
 use supershuckie_replay_recorder::Speed;
 
@@ -326,6 +326,7 @@ impl Settings {
         self.recent_roms.clamp();
         self.play_together.clamp();
         self.pokeabyte.clamp();
+        self.game_boy_settings.custom_colors.clamp();
     }
 }
 
@@ -769,7 +770,10 @@ pub struct GameBoySettings {
     pub video_scale: NonZeroU8,
 
     #[serde(default = "Controls::default")]
-    pub controls: Controls
+    pub controls: Controls,
+
+    #[serde(default = "GameBoyCustomColors::default")]
+    pub custom_colors: GameBoyCustomColors
 }
 
 impl GameBoySettings {
@@ -782,8 +786,88 @@ impl Default for GameBoySettings {
             gbc_mode: GameBoyMode::default(),
             sgb: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
-            controls: Controls::default()
+            controls: Controls::default(),
+            custom_colors: GameBoyCustomColors::default()
         }
+    }
+}
+
+/// Custom Game Boy colors (Settings › Game Boy › Custom colors…): while `enabled`, a game running
+/// on a Game Boy, or on a Game Boy Color in Game Boy mode, is drawn with these instead of its own
+/// palettes. `0xRRGGBB` per shade, from 0 (the lightest) to 3 (the darkest); `"#RRGGBB"` strings
+/// in the settings file, where a string that is not one keeps that shade's default gray. Only how
+/// the game is drawn changes: replays and save states are unaffected.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(C)]
+pub struct GameBoyCustomColors {
+    #[serde(default = "bool::default")]
+    pub enabled: bool,
+
+    /// The background palette (`BGP`).
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub background: [u32; 4],
+
+    /// Object palette 0 (`OBP0`).
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub objects_0: [u32; 4],
+
+    /// Object palette 1 (`OBP1`).
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub objects_1: [u32; 4]
+}
+
+impl GameBoyCustomColors {
+    /// The Game Boy's four grays, white to black.
+    pub const DEFAULT_SHADES: fn() -> [u32; 4] = || [0xFFFFFF, 0xAAAAAA, 0x555555, 0x000000];
+
+    /// Bring out-of-range values from the config file (or a caller) back into range.
+    pub(crate) fn clamp(&mut self) {
+        for palette in [&mut self.background, &mut self.objects_0, &mut self.objects_1] {
+            for color in palette.iter_mut() {
+                *color &= 0xFF_FFFF;
+            }
+        }
+    }
+
+    /// What the core is to draw with: the colors while enabled, else nothing.
+    pub fn palette_override(&self) -> Option<GbPaletteOverride> {
+        self.enabled.then_some(GbPaletteOverride {
+            background: self.background,
+            objects_0: self.objects_0,
+            objects_1: self.objects_1
+        })
+    }
+}
+
+impl Default for GameBoyCustomColors {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            background: Self::DEFAULT_SHADES(),
+            objects_0: Self::DEFAULT_SHADES(),
+            objects_1: Self::DEFAULT_SHADES()
+        }
+    }
+}
+
+/// `[u32; 4]` colors as `"#RRGGBB"` strings in the settings file.
+mod hex_colors {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(colors: &[u32; 4], serializer: S) -> Result<S::Ok, S::Error> {
+        colors.map(|color| format!("#{:06X}", color & 0xFF_FFFF)).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<[u32; 4], D::Error> {
+        let strings: [String; 4] = Deserialize::deserialize(deserializer)?;
+        let mut colors = super::GameBoyCustomColors::DEFAULT_SHADES();
+        for (color, string) in colors.iter_mut().zip(strings.iter()) {
+            let hex = string.trim().trim_start_matches('#');
+            if let (6, Ok(value)) = (hex.len(), u32::from_str_radix(hex, 16)) {
+                *color = value;
+            }
+        }
+        Ok(colors)
     }
 }
 
@@ -814,6 +898,10 @@ pub struct NintendoDSSettings {
     #[serde(default = "NintendoDSDate::default")]
     pub date: NintendoDSDate,
 
+    /// Named dates the user can switch [`Self::date`] to in one step, in menu order.
+    #[serde(default = "Vec::new")]
+    pub date_presets: Vec<NintendoDSDatePreset>,
+
     #[serde(default = "bool::default")]
     pub jit: bool,
 
@@ -836,6 +924,7 @@ impl Default for NintendoDSSettings {
     fn default() -> Self {
         Self {
             date: NintendoDSDate::default(),
+            date_presets: Vec::new(),
             jit: false,
             swap_screens: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
@@ -886,6 +975,12 @@ impl NintendoDSDate {
 
         cleaned
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NintendoDSDatePreset {
+    pub name: UTF8CString,
+    pub date: NintendoDSDate
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, Serialize, Deserialize, Default, TryFromPrimitive)]
@@ -1249,5 +1344,40 @@ mod tests {
         assert_eq!(date(2024).get_cleaned().day, 29, "2024 is a leap year");
         assert_eq!(date(2023).get_cleaned().day, 28, "2023 is not a leap year");
         assert_eq!(date(2100).get_cleaned().day, 28, "2100 is not a leap year (divisible by 100, not 400)");
+    }
+
+    #[test]
+    fn nintendo_ds_date_presets_round_trip_and_default_to_empty() {
+        let older: NintendoDSSettings = serde_json::from_str(r#"{"jit": true}"#).unwrap();
+        assert!(older.date_presets.is_empty(), "settings saved before presets existed have none");
+
+        let mut settings = NintendoDSSettings::default();
+        settings.date_presets = vec![
+            NintendoDSDatePreset { name: "Night".into(), date: NintendoDSDate { year: 2026, month: 9, day: 21, hour: 22, minute: 0, second: 0 } },
+            NintendoDSDatePreset { name: "Friday ☀".into(), date: NintendoDSDate { year: 2026, month: 9, day: 25, hour: 12, minute: 30, second: 5 } },
+        ];
+        let reloaded: NintendoDSSettings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(reloaded.date_presets, settings.date_presets, "presets keep their names, dates and order");
+    }
+
+    #[test]
+    fn game_boy_custom_colors_round_trip_and_default_to_grays() {
+        let older: GameBoySettings = serde_json::from_str(r#"{"sgb": true}"#).unwrap();
+        assert_eq!(older.custom_colors, GameBoyCustomColors::default(), "settings saved before custom colors existed have the grays, off");
+        assert_eq!(older.custom_colors.palette_override(), None);
+
+        let mut colors = GameBoyCustomColors::default();
+        colors.enabled = true;
+        colors.background = [0xF8E0C0, 0xC08050, 0x804020, 0x100800];
+        colors.objects_1[0] = 0x123456;
+        let json = serde_json::to_string(&colors).unwrap();
+        assert!(json.contains(r##""#F8E0C0""##) && json.contains(r##""#123456""##), "colors are written as #RRGGBB: {json}");
+        let reloaded: GameBoyCustomColors = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded, colors);
+        assert_eq!(reloaded.palette_override().unwrap().background, colors.background);
+
+        let lenient: GameBoyCustomColors = serde_json::from_str(r##"{"background": ["ff0000", "#00FF00", "blue", "#0000FF"]}"##).unwrap();
+        assert_eq!(lenient.background, [0xFF0000, 0x00FF00, 0x555555, 0x0000FF], "a string that is not a color keeps that shade's gray");
+        assert!(!lenient.enabled);
     }
 }
