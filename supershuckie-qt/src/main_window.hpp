@@ -114,7 +114,6 @@ private:
     QMenu *settings_menu;
     QMenu *recent_roms_menu;
 
-    QMenu *quick_slots;
     QAction *undo_load_save_state;
     QAction *redo_load_save_state;
 

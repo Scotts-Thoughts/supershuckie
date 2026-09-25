@@ -119,10 +119,10 @@ edits and freezes made while recording are part of the replay. See
 
 ## Replay bookmarks
 
-While recording or playing back a replay, **Replays → Add bookmark** (Ctrl+B) marks the current
-frame, **Add keyframe bookmark** (Ctrl+Shift+B) marks it so playback can jump back without
-re-emulating, and **Start/end range bookmark** (Ctrl+Alt+B) marks a stretch. **Bookmarks…**
-(Ctrl+Alt+Shift+B) lists them; clicking a row during playback jumps there, and bookmark types
+While recording or playing back a replay, **Replays → Bookmarks → Add bookmark** (Ctrl+B) marks
+the current frame, **Add keyframe bookmark** (Ctrl+Shift+B) marks it so playback can jump back
+without re-emulating, and **Start/end range bookmark** (Ctrl+Alt+B) marks a stretch. **Show
+bookmarks…** (Ctrl+Alt+Shift+B) lists them; clicking a row during playback jumps there, and bookmark types
 with colors of your choosing are managed from the same window. The REST API adds, changes,
 deletes and seeks to bookmarks as well (see [docs/external_commands.md](docs/external_commands.md)).
 
@@ -144,7 +144,7 @@ and the trade or battle is in everyone's replays. See
 [docs/play-together-protocol.md](docs/play-together-protocol.md).
 
 Poke-A-Byte can read every game in the session at once: your own is served on the Poke-A-Byte
-port (55356 unless changed under **Settings → Poke-A-Byte port…**) and each friend's game on the
+port (55356 unless changed under **Settings → Poke-A-Byte → Port…**) and each friend's game on the
 next free port above it, which a single Poke-A-Byte reaches through its `/instances/<port>/`
 routes. See "Poke-A-Byte and friends' games" in [docs/play_together.md](docs/play_together.md).
 

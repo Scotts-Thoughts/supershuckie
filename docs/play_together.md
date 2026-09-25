@@ -13,7 +13,7 @@ Everything is in the **Play Together** menu.
 One player hosts:
 
 1. Load your game.
-2. **Play Together → Host or join a session…** (Ctrl+Shift+P), **Host** tab, pick a name and a
+2. **Play Together → Host or join a session…** (Ctrl+Shift+H), **Host** tab, pick a name and a
    colour, click **Start hosting**.
 3. Share the code (`address:port`) it shows.
 
@@ -128,8 +128,8 @@ machine has no file (nothing runs here to record).
 ## Poke-A-Byte and friends' games
 
 Your own game is served to Poke-A-Byte the way it always was: on UDP port 55356 (change it under
-**Settings → Poke-A-Byte port…**; Poke-A-Byte's `POKEAPROTOCOL_PORT` setting must match if you
-do). With **Settings → Serve friends' games to Poke-A-Byte** on (the default), every friend's game
+**Settings → Poke-A-Byte → Port…**; Poke-A-Byte's `POKEAPROTOCOL_PORT` setting must match if you
+do). With **Settings → Poke-A-Byte → Serve friends' games** on (the default), every friend's game
 that runs on your machine is served too, each on the lowest free port above yours: the first
 friend on 55357, the next on 55358, and so on. Right-click a friend's window to see their port
 (**Poke-A-Byte integration (port N)**), or to turn it off or on for that one friend.
