@@ -300,10 +300,10 @@ void PeerWindow::contextMenuEvent(QContextMenuEvent *event) {
 
     auto *frontend = this->controller->main_window()->frontend;
     auto pokeabyte_port = supershuckie_frontend_play_together_get_peer_pokeabyte_port(frontend, this->id);
-    auto *pokeabyte_action = menu.addAction(pokeabyte_port == 0 ? QString("Poke-A-Byte integration") : QString("Poke-A-Byte integration (port %1)").arg(pokeabyte_port));
+    auto *pokeabyte_action = menu.addAction(pokeabyte_port == 0 ? QString("Enable integration") : QString("Enable integration (port %1)").arg(pokeabyte_port));
     pokeabyte_action->setCheckable(true);
     pokeabyte_action->setChecked(pokeabyte_port != 0);
-    pokeabyte_action->setToolTip("Serve this game to Poke-A-Byte on its own UDP port (Poke-A-Byte reads it through /instances/<port>/)");
+    pokeabyte_action->setToolTip("Serve this game for integration on its own UDP port (read through /instances/<port>/)");
     connect(pokeabyte_action, &QAction::triggered, this, [this, frontend](bool on) {
         char error[512] = {};
         if(!supershuckie_frontend_play_together_set_peer_pokeabyte_enabled(frontend, this->id, on, reinterpret_cast<uint8_t *>(error), sizeof(error))) {

@@ -244,7 +244,7 @@ MainWindow::MainWindow(): QMainWindow() {
     else if(buf[0] != 0) {
         this->show_error("Failed to automatically start Poke-A-Byte integration", "An error occurred on startup when trying to enable Poke-A-Byte integration:\n\n%s", buf);
     }
-    this->pokeabyte_port->setText(QString("Port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
+    this->pokeabyte_port->setText(QString("Connection Port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
     this->pokeabyte_serve_friends->setChecked(supershuckie_frontend_get_pokeabyte_serve_friends(this->frontend));
     if(supershuckie_frontend_get_external_commands_enabled(this->frontend, buf, sizeof(buf))) {
         this->enable_external_commands->setChecked(true);
@@ -1321,15 +1321,15 @@ void MainWindow::set_up_settings_menu() {
     connect(this->enable_pokeabyte_integration, SIGNAL(triggered()), this, SLOT(do_toggle_pokeabyte()));
 
     // Once a frontend is loaded the label also shows the current port (see the setText calls).
-    this->pokeabyte_port = pokeabyte_menu->addAction("Port…");
+    this->pokeabyte_port = pokeabyte_menu->addAction("Connection Port…");
     this->pokeabyte_port->setObjectName("pokeabyte-port");
-    this->pokeabyte_port->setToolTip("The UDP port this game is served to Poke-A-Byte on (Poke-A-Byte connects to 55356 unless told otherwise)");
+    this->pokeabyte_port->setToolTip("The UDP port this game is served on for integration (55356 by default)");
     connect(this->pokeabyte_port, SIGNAL(triggered()), this, SLOT(do_set_pokeabyte_port()));
 
     this->pokeabyte_serve_friends = pokeabyte_menu->addAction("Serve friends' games");
     this->pokeabyte_serve_friends->setObjectName("pokeabyte-serve-friends");
     this->pokeabyte_serve_friends->setCheckable(true);
-    this->pokeabyte_serve_friends->setToolTip("In a Play Together session, serve each friend's game on its own port above the Poke-A-Byte port (right-click a friend's window to see which)");
+    this->pokeabyte_serve_friends->setToolTip("In a Play Together session, serve each friend's game on its own port above the connection port (right-click a friend's window to see which)");
     connect(this->pokeabyte_serve_friends, SIGNAL(triggered()), this, SLOT(do_toggle_pokeabyte_serve_friends()));
 
     this->enable_external_commands = this->settings_menu->addAction("Enable external commands");
@@ -2401,7 +2401,7 @@ void MainWindow::do_set_pokeabyte_port() {
     if(!supershuckie_frontend_set_pokeabyte_port(this->frontend, static_cast<uint16_t>(port), err, sizeof(err))) {
         this->show_error("Failed to change the Poke-A-Byte port", "An error occurred when moving the Poke-A-Byte integration to port %d:\n\n%s", port, err);
     }
-    this->pokeabyte_port->setText(QString("Port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
+    this->pokeabyte_port->setText(QString("Connection Port (%1)…").arg(supershuckie_frontend_get_pokeabyte_port(this->frontend)));
 }
 
 void MainWindow::do_toggle_pokeabyte_serve_friends() {
