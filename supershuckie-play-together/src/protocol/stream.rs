@@ -58,6 +58,8 @@ fn forbidden_kind(packet: &Packet) -> Option<&'static str> {
         Packet::Keyframe { .. } => Some("Keyframe"),
         Packet::DeltaKeyframe { .. } => Some("DeltaKeyframe"),
         Packet::RegionDeltaKeyframe { .. } => Some("RegionDeltaKeyframe"),
+        Packet::StoredKeyframe { .. } => Some("StoredKeyframe"),
+        Packet::Thumbnail { .. } => Some("Thumbnail"),
         Packet::CompressedBlob { .. } => Some("CompressedBlob"),
         Packet::Bookmark { .. } => Some("Bookmark"),
         Packet::BookmarkTable { .. } => Some("BookmarkTable"),

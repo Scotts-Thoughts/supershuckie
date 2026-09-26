@@ -61,7 +61,7 @@ pub fn link_family(console: ReplayConsoleType) -> Option<LinkFamily> {
     match console {
         ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor => Some(LinkFamily::GameBoy),
         ReplayConsoleType::GameBoyAdvance => Some(LinkFamily::GameBoyAdvance),
-        ReplayConsoleType::Unknown | ReplayConsoleType::NintendoDS => None,
+        ReplayConsoleType::Unknown | ReplayConsoleType::NintendoDS | ReplayConsoleType::Nintendo3DS => None,
     }
 }
 

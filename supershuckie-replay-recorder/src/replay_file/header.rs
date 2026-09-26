@@ -39,6 +39,14 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 ///   for byte a v6 file apart from the version, and reading v6 files is untouched.
 pub const REPLAY_VERSION: u32 = 7;
 
+/// Format version of Nintendo 3DS files: `StoredKeyframe` packets (0xFB) whose zstd frames
+/// follow them in the stream and are read on demand, no blobs, two delta levels. Files of every
+/// other console keep writing [`REPLAY_VERSION`] and are byte for byte unchanged.
+pub const REPLAY_VERSION_NINTENDO_3DS: u32 = 8;
+
+/// Newest format version this build reads.
+pub const REPLAY_VERSION_MAX_SUPPORTED: u32 = REPLAY_VERSION_NINTENDO_3DS;
+
 /// First format version with [`ReplayHeaderRaw::packet_stream_end`] and a bookmark section.
 pub const REPLAY_VERSION_BOOKMARK_SECTION: u32 = 5;
 
@@ -259,8 +267,8 @@ impl ReplayHeaderRaw {
         if signature_end != SIGNATURE_END {
             return Err(format!("Unrecognized signature_end {signature_end:X?}"));
         }
-        if self.replay_version < REPLAY_VERSION_MINIMUM_SUPPORTED || self.replay_version > REPLAY_VERSION {
-            return Err(format!("Unrecognized replay format version {replay_version} (not in {REPLAY_VERSION_MINIMUM_SUPPORTED}..={REPLAY_VERSION})"));
+        if self.replay_version < REPLAY_VERSION_MINIMUM_SUPPORTED || self.replay_version > REPLAY_VERSION_MAX_SUPPORTED {
+            return Err(format!("Unrecognized replay format version {replay_version} (not in {REPLAY_VERSION_MINIMUM_SUPPORTED}..={REPLAY_VERSION_MAX_SUPPORTED})"));
         }
 
         fn parse_string_buffer(what: &ReplayHeaderString, name: &str) -> Result<String, String> {
@@ -308,7 +316,7 @@ impl ReplayFileMetadata {
 
         Ok(ReplayHeaderRaw {
             signature_start: SIGNATURE_START,
-            replay_version: REPLAY_VERSION,
+            replay_version: if self.console_type == ReplayConsoleType::Nintendo3DS { REPLAY_VERSION_NINTENDO_3DS } else { REPLAY_VERSION },
             console_type: MaybeEnum::new(self.console_type),
             rom_name: into_str_bytes(&self.rom_name, "rom_name")?,
             rom_filename: into_str_bytes(&self.rom_filename, "rom_filename")?,
@@ -381,7 +389,10 @@ pub enum ReplayConsoleType {
     GameBoyAdvance,
 
     /// Nintendo DS
-    NintendoDS
+    NintendoDS,
+
+    /// Nintendo 3DS (Azahar); keyframes are Azahar raw states, see replay-3ds-spec.md
+    Nintendo3DS
 }
 
 impl ReplayConsoleType {
@@ -393,7 +404,8 @@ impl ReplayConsoleType {
             Self::SuperGameBoy2 => "Super Game Boy 2",
             Self::GameBoyColor => "Game Boy Color",
             Self::GameBoyAdvance => "Game Boy Advance",
-            Self::NintendoDS => "Nintendo DS"
+            Self::NintendoDS => "Nintendo DS",
+            Self::Nintendo3DS => "Nintendo 3DS"
         }
     }
 }

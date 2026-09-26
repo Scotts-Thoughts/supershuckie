@@ -320,6 +320,12 @@ pub enum PacketDiscriminator {
     /// What the console received over its link cable this frame (format v7)
     SerialIn = 0xFA,
 
+    /// A 3DS keyframe whose zstd frame follows the packet (format v8).
+    StoredKeyframe = 0xFB,
+
+    /// A picture of both screens for the timeline (format v8).
+    Thumbnail = 0xFC,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -404,7 +410,9 @@ impl Packet {
             Packet::CompressedBlob { keyframe_offsets, .. } if keyframe_offsets.is_empty() => PacketDiscriminator::CompressedBlob as u8,
             Packet::CompressedBlob { .. } => PacketDiscriminator::IndexedCompressedBlob as u8,
             Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8,
-            Packet::SerialIn { .. } => PacketDiscriminator::SerialIn as u8
+            Packet::SerialIn { .. } => PacketDiscriminator::SerialIn as u8,
+            Packet::StoredKeyframe { .. } => PacketDiscriminator::StoredKeyframe as u8,
+            Packet::Thumbnail { .. } => PacketDiscriminator::Thumbnail as u8
         }
     }
 }
@@ -511,6 +519,24 @@ impl PacketIO<'_> for Packet {
 
             Packet::SerialIn { data } => {
                 commands.extend(data.write_packet_instructions());
+            },
+            Packet::StoredKeyframe { metadata, level, state_len, uncompressed_len, frame_len, .. } => {
+                // The frame's bytes are not part of these instructions: the recorder writes them
+                // right after (see `ReplayFileRecorder::write_direct`).
+                commands.extend(metadata.write_packet_instructions());
+                commands.extend(level.write_packet_instructions());
+                commands.extend(state_len.write_packet_instructions());
+                commands.extend(uncompressed_len.write_packet_instructions());
+                commands.extend(frame_len.write_packet_instructions());
+            },
+            Packet::Thumbnail { elapsed_frames, top_width, top_height, bottom_width, bottom_height, top, bottom } => {
+                commands.extend(elapsed_frames.write_packet_instructions());
+                commands.extend(top_width.write_packet_instructions());
+                commands.extend(top_height.write_packet_instructions());
+                commands.extend(bottom_width.write_packet_instructions());
+                commands.extend(bottom_height.write_packet_instructions());
+                commands.extend(top.write_packet_instructions());
+                commands.extend(bottom.write_packet_instructions());
             }
         }
 
@@ -572,6 +598,29 @@ impl PacketIO<'_> for Packet {
                 state_len: UnsignedInteger::read_all(from, version)?,
                 control: ByteVec::read_all(from, version)?,
                 data: ByteVec::read_all(from, version)?
+            }),
+            PacketDiscriminator::StoredKeyframe => {
+                let metadata = KeyframeMetadata::read_all(from, version)?;
+                let level = u8::read_all(from, version)?;
+                let state_len = UnsignedInteger::read_all(from, version)?;
+                let uncompressed_len = UnsignedInteger::read_all(from, version)?;
+                let frame_len = UnsignedInteger::read_all(from, version)?;
+                // The frame itself is left in the file: skip it. The caller records where it was.
+                let skip = usize::try_from(frame_len).map_err(|_| PacketReadError::NotEnoughData)?;
+                let Some(rest) = from.get(skip..) else {
+                    return Err(PacketReadError::NotEnoughData);
+                };
+                *from = rest;
+                Ok(Packet::StoredKeyframe { metadata, level, state_len, uncompressed_len, frame_len, frame_offset: 0 })
+            },
+            PacketDiscriminator::Thumbnail => Ok(Packet::Thumbnail {
+                elapsed_frames: UnsignedInteger::read_all(from, version)?,
+                top_width: UnsignedInteger::read_all(from, version)?,
+                top_height: UnsignedInteger::read_all(from, version)?,
+                bottom_width: UnsignedInteger::read_all(from, version)?,
+                bottom_height: UnsignedInteger::read_all(from, version)?,
+                top: ByteVec::read_all(from, version)?,
+                bottom: ByteVec::read_all(from, version)?
             }),
             PacketDiscriminator::Bookmark => Ok(Packet::Bookmark { metadata: BookmarkMetadata::read_all(from, version)? }),
             PacketDiscriminator::BookmarkTable => Ok(Packet::BookmarkTable { table: crate::BookmarkTable::read_all(from, version)? }),
@@ -743,6 +792,29 @@ mod tests {
     }
 
     #[test]
+    fn stored_keyframe_skips_its_frame_when_read() {
+        let metadata = KeyframeMetadata { input: ib(&[1]), speed: Speed::default(), elapsed_frames: 9, elapsed_millis: 10.into(), counters: vec![] };
+        let packet = Packet::StoredKeyframe { metadata, level: 2, state_len: 1000, uncompressed_len: 40, frame_len: 5, frame_offset: 0 };
+        let mut bytes = serialize(&packet);
+        assert_eq!(bytes[0], PacketDiscriminator::StoredKeyframe as u8);
+        bytes.extend_from_slice(&[9, 8, 7, 6, 5]); // the frame
+        bytes.push(PacketDiscriminator::NoOp as u8);
+        let mut from = bytes.as_slice();
+        assert_eq!(Packet::read_all(&mut from, REPLAY_VERSION).unwrap(), packet);
+        assert_eq!(from, &[PacketDiscriminator::NoOp as u8]);
+        // A truncated frame is not enough data.
+        let mut short = &bytes[..bytes.len() - 3];
+        assert!(matches!(Packet::read_all(&mut short, REPLAY_VERSION), Err(PacketReadError::NotEnoughData)));
+    }
+
+    #[test]
+    fn thumbnail_round_trips() {
+        let packet = Packet::Thumbnail { elapsed_frames: 600, top_width: 200, top_height: 120, bottom_width: 160, bottom_height: 120, top: bv(&[1, 2, 3]), bottom: bv(&[4, 5]) };
+        assert_eq!(serialize(&packet)[0], PacketDiscriminator::Thumbnail as u8);
+        assert_eq!(round_trip(&packet, REPLAY_VERSION), packet);
+    }
+
+    #[test]
     fn all_packet_kinds_round_trip() {
         let metadata = KeyframeMetadata { input: ib(&[1]), speed: Speed::default(), elapsed_frames: 9, elapsed_millis: 10.into(), counters: vec![] };
         let packets = vec![
@@ -804,7 +876,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xFB, 0, 0];
+        let mut slice: &[u8] = &[0xFD, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 

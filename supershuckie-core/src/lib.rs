@@ -16,7 +16,7 @@ use core::fmt::{Display, Formatter};
 use core::num::NonZeroU64;
 use alloc::collections::BTreeMap;
 use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
-use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError};
+use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError, ReplayThumbnail};
 use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
 use supershuckie_replay_recorder::{blake3_hash_slices, BookmarkTable, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, SignedInteger, TimestampMillis, UnsignedInteger, KEYFRAME_BOOKMARK_LEAD_FRAMES};
@@ -182,6 +182,9 @@ pub struct SuperShuckieCore {
     ignore_speed_changes_in_replays: bool,
     auto_resync_keyframes_in_replays: bool,
 
+    /// Frame of the replay keyframe the last seek loaded (see `seek_in_replay`).
+    replay_keyframe_loaded: UnsignedInteger,
+
     /// What the last `run`/`run_unlocked` reported.
     last_run: RunTime,
 
@@ -199,6 +202,10 @@ pub struct SuperShuckieCore {
 
     /// Save-state buffers handed back by the recorder, reused for the next keyframe.
     state_buffers: Vec<Vec<u8>>,
+    /// Keyframe buffers being made ahead of a 3DS recording's first keyframes on another thread
+    /// (see [`Self::prime_state_buffers`]); `None` once they have all arrived.
+    #[cfg(feature = "std")]
+    primed_state_buffers: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
 
     /// Where audible frames' samples go, if anyone is listening.
     #[cfg(feature = "std")]
@@ -252,6 +259,16 @@ impl Display for BookmarkAnchorError {
 struct QueuedWrite {
     address: u32,
     data: ByteVec
+}
+
+/// What a seek does when it lands on a frame still missing output that a keyframe with stale
+/// buffers left out (see [`SuperShuckieCore::shows_stale_output`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum SeekSettle {
+    /// Seek again from the keyframe before: the frame asked for, as playback shows it.
+    Exact,
+    /// Run on a few frames until it is whole (a timeline being dragged).
+    Coarse
 }
 
 /// A press made via [`SuperShuckieCore::press_for_frames`]: its buttons and how many more frames
@@ -342,12 +359,15 @@ impl SuperShuckieCore {
             timestamp_provider,
             ignore_speed_changes_in_replays: false,
             auto_resync_keyframes_in_replays: false,
+            replay_keyframe_loaded: 0,
             last_run: RunTime::NONE,
             run_serial: 0,
             state_epoch: 0,
             replay_write_failures: 0,
             present_every: 1,
             state_buffers: Vec::new(),
+            #[cfg(feature = "std")]
+            primed_state_buffers: None,
             #[cfg(feature = "std")]
             audio_output: None,
             audio_scratch: Vec::new(),
@@ -576,7 +596,11 @@ impl SuperShuckieCore {
 
     /// Run the emulator core for the shortest amount of time.
     pub fn run(&mut self) {
-        let skip = self.present_every > 1 && !self.core.is_mid_frame() && self.total_frames % self.present_every != 0;
+        // Draw the frames that will be presented, and the ones just before them that the core
+        // needs drawn for those pictures to be complete (see `EmulatorCore::draw_lead_frames`).
+        let lead = self.core.draw_lead_frames().min(self.present_every);
+        let skip = self.present_every > 1 && !self.core.is_mid_frame()
+            && !(0..=lead).any(|k| (self.total_frames + k) % self.present_every == 0);
         self.core.set_skip_drawing(skip);
         self.do_run_fn(EmulatorCore::run, true);
     }
@@ -588,6 +612,13 @@ impl SuperShuckieCore {
     pub fn run_unlocked(&mut self) {
         self.core.set_skip_drawing(false);
         self.do_run_fn(EmulatorCore::run_unlocked, false);
+    }
+
+    /// Frames before a frame that will be looked at which must be run drawn, not hidden, for its
+    /// picture to be complete (see `EmulatorCore::draw_lead_frames`; every frame on the 3DS,
+    /// else 0).
+    pub fn draw_lead_frames(&self) -> u64 {
+        self.core.draw_lead_frames()
     }
 
     /// Like [`Self::run_unlocked`], but the frame need not be drawn (used while catching up to a
@@ -933,8 +964,8 @@ impl SuperShuckieCore {
         match self.core.replay_console_type() {
             // 4194304 Hz / 70224 cycles per frame = 59.7275 Hz (the GBA's refresh is the same)
             Some(ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor | ReplayConsoleType::GameBoyAdvance) => 16_743,
-            // 59.8261 Hz
-            Some(ReplayConsoleType::NintendoDS) => 16_715,
+            // 59.8261 Hz (the 3DS refresh is the same: 268111856 Hz / 4481136 cycles)
+            Some(ReplayConsoleType::NintendoDS | ReplayConsoleType::Nintendo3DS) => 16_715,
             _ => 16_667
         }
     }
@@ -1040,7 +1071,9 @@ impl SuperShuckieCore {
             }
             // The player materialises every delta variant into a Keyframe before handing it out;
             // these arms are unreachable in practice.
-            Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } => {},
+            Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. } => {},
+            // Timeline pictures: the player serves them on request (`replay_thumbnail`).
+            Packet::Thumbnail { .. } => {},
             Packet::CompressedBlob { .. } => unreachable!("compressed blob"),
             Packet::IncrementCounter { name, delta } => {
                 self.change_replay_counter_map(name, *delta);
@@ -1107,6 +1140,7 @@ impl SuperShuckieCore {
         self.run_serial = self.run_serial.wrapping_add(1);
         self.do_frame_timekeeping(time);
         self.push_keyframe_if_needed(time);
+        self.push_thumbnail_if_needed(time);
         self.service_stream(time);
     }
 
@@ -1373,6 +1407,8 @@ impl SuperShuckieCore {
         self.frames_per_keyframe = partial_replay_record_metadata.frames_per_keyframe.get();
         self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(recorder));
+        #[cfg(feature = "std")]
+        self.prime_state_buffers();
         self.replay_counters = Some(BTreeMap::new());
         // Record the input with the first frame rather than rely on the header's initial input.
         self.input_latched = false;
@@ -1476,6 +1512,8 @@ impl SuperShuckieCore {
         // Install the resumed recorder.
         self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(NonBlockingReplayFileRecorder::new(recorder)));
+        #[cfg(feature = "std")]
+        self.prime_state_buffers();
         self.frames_per_keyframe = partial.frames_per_keyframe.get();
 
         // Restore speed (recorder dedups identical speed, so no spurious ChangeSpeed packet).
@@ -1669,6 +1707,7 @@ impl SuperShuckieCore {
             Some(ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor) => &["WRAM", "WRAMX", "HRAM"],
             Some(ReplayConsoleType::GameBoyAdvance) => &["EWRAM", "IWRAM"],
             Some(ReplayConsoleType::NintendoDS) => &["MAIN", "SWRAM", "WRAM7"],
+            Some(ReplayConsoleType::Nintendo3DS) => &["HEAP"],
             _ => &[]
         }
     }
@@ -1806,10 +1845,46 @@ impl SuperShuckieCore {
             return
         }
 
+        if (self.full_keyframe_pending || self.frames_since_last_keyframe >= self.frames_per_keyframe)
+            && !self.core.save_state_possible()
+        {
+            // Not this frame (see `EmulatorCore::save_state_possible`); a requested full keyframe
+            // stays requested and the interval keeps counting.
+            return
+        }
+
         let full = core::mem::take(&mut self.full_keyframe_pending);
         if full || self.frames_since_last_keyframe >= self.frames_per_keyframe {
             self.write_keyframe(full);
         }
+    }
+
+    /// Frames between the timeline pictures a 3DS recording stores (one a second).
+    const THUMBNAIL_INTERVAL_FRAMES: u64 = 60;
+
+    /// Store a picture of both screens once a second while recording a Nintendo 3DS game (see
+    /// `Packet::Thumbnail`); other consoles' files are unchanged.
+    fn push_thumbnail_if_needed(&mut self, time: &RunTime) {
+        if time.frames == 0 || !time.presented || self.core.is_mid_frame() || self.replay_file_recorder.is_none()
+            || self.core.replay_console_type() != Some(ReplayConsoleType::Nintendo3DS)
+            || self.total_frames % Self::THUMBNAIL_INTERVAL_FRAMES != 0
+        {
+            return
+        }
+        let screens = self.core.get_screens();
+        let (Some(top), Some(bottom)) = (screens.first(), screens.get(1)) else {
+            return
+        };
+        let (top, bottom) = (thumbnail_of(top), thumbnail_of(bottom));
+        if let Some(recorder) = self.replay_file_recorder.as_mut() {
+            let _ = recorder.thumbnail(top, bottom);
+        }
+    }
+
+    /// The timeline picture of the attached replay nearest at or before `frame` (Nintendo 3DS
+    /// replays store one a second), or `None`.
+    pub fn replay_thumbnail(&self, frame: UnsignedInteger) -> Option<ReplayThumbnail> {
+        self.replay_player.as_ref()?.thumbnail_at_or_before(frame)
     }
 
     /// Write a keyframe of the current state into the recording (always stored in full if `full`)
@@ -1842,9 +1917,62 @@ impl SuperShuckieCore {
         self.total_milliseconds.0.wrapping_sub(self.stream_time_origin.0).into()
     }
 
+    /// Bytes a 3DS keyframe buffer is made with: a state is about 150 MB and drifts by a few
+    /// bytes between saves.
+    #[cfg(feature = "std")]
+    const NINTENDO_3DS_STATE_BUFFER_BYTES: usize = 180 << 20;
+
+    /// Make the first keyframe buffers of a 3DS recording on another thread, every page touched.
+    /// A 3DS state is 150 MB, and the first write into a fresh allocation is tens of thousands
+    /// of page faults: 40-60 ms on the emulation thread for each of the first few keyframes.
+    /// After that the buffers cycle through the recorder and come back mapped, and a keyframe
+    /// into one only copies the memory pages written since it last held a state.
+    #[cfg(feature = "std")]
+    fn prime_state_buffers(&mut self) {
+        if self.core.replay_console_type() != Some(ReplayConsoleType::Nintendo3DS) || self.primed_state_buffers.is_some() {
+            return
+        }
+        let wanted = (Self::STATE_BUFFER_POOL + 1).saturating_sub(self.state_buffers.len());
+        if wanted == 0 {
+            return
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name(String::from("keyframe buffers")).spawn(move || {
+            for _ in 0..wanted {
+                let mut buffer: Vec<u8> = Vec::with_capacity(Self::NINTENDO_3DS_STATE_BUFFER_BYTES);
+                // SAFETY: writing zeros over the allocation's own capacity; the length stays 0.
+                unsafe { core::ptr::write_bytes(buffer.as_mut_ptr(), 0, buffer.capacity()) };
+                if sender.send(buffer).is_err() {
+                    break
+                }
+            }
+        });
+        // Without the thread, buffers are made on demand as before.
+        if spawned.is_ok() {
+            self.primed_state_buffers = Some(receiver);
+        }
+    }
+
     /// A buffer to create a keyframe state into: a recycled one when available, since a fresh
     /// multi-megabyte allocation costs milliseconds of page faults and a reused one is a plain copy.
     fn take_state_buffer(&mut self) -> Vec<u8> {
+        #[cfg(feature = "std")]
+        if let Some(primed) = self.primed_state_buffers.take() {
+            let mut finished = false;
+            loop {
+                match primed.try_recv() {
+                    Ok(buffer) => self.state_buffers.push(buffer),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break
+                    }
+                }
+            }
+            if !finished {
+                self.primed_state_buffers = Some(primed);
+            }
+        }
         while self.state_buffers.len() < Self::STATE_BUFFER_POOL
             && let Some(buffer) = self.replay_file_recorder.as_mut().and_then(|r| r.take_free_state_buffer())
         {
@@ -1908,7 +2036,7 @@ impl SuperShuckieCore {
         self.replay_playback_stopped = false;
         self.restart_timer();
 
-        if let Err(e) = self.go_to_replay_frame_inner(0, 0) {
+        if let Err(e) = self.go_to_replay_frame_inner(0, 0, SeekSettle::Exact) {
             self.detach_replay_player();
             return Err(ReplayPlayerAttachError::Failed { description: e })
         }
@@ -1999,11 +2127,26 @@ impl SuperShuckieCore {
     /// ([`KEYFRAME_BOOKMARK_LEAD_FRAMES`]), so a seek to one loads exactly that keyframe.
     ///
     /// A keyframe loaded from the middle of a delta chain may hold its chain restart's stale copy
-    /// of regenerated output buffers (see [`transient_ranges`]); the game rebuilds them on its next
-    /// frame (or the one after, for games that only resubmit 3D geometry every other frame), so a
-    /// seek always emulates at least this many frames past the keyframe before a frame is shown.
-    /// A consumer stepping from [`Self::go_to_replay_keyframe`] itself must do the same.
+    /// of regenerated output buffers (see [`transient_ranges`]), which the emulator does not show
+    /// (see [`EmulatorCore::load_save_state_with_stale_output`]); the game rebuilds them within a
+    /// frame or two, so a seek always emulates at least this many frames past the keyframe before
+    /// a frame is shown, and seeks again from an earlier keyframe in the rare case the frame still
+    /// lacks them (see [`Self::go_to_replay_frame`]). A consumer stepping from
+    /// [`Self::go_to_replay_keyframe`] itself must do the same (see [`Self::shows_stale_output`]).
     pub const POST_LOAD_FRAMES: u64 = 3;
+
+    /// How many frames past [`Self::coarse_replay_frame`] a coarse seek
+    /// ([`Self::go_to_replay_frame_coarse`]) runs at most while the picture still lacks output
+    /// that a stale keyframe left out. A Nintendo DS game drawing 3D at 30 fps needs one or two;
+    /// a static 3D scene the game does not resubmit can need more, and is then shown as it is.
+    pub const MAX_COARSE_SETTLE_FRAMES: u64 = 12;
+
+    /// How many keyframes before the one it loaded an exact seek ([`Self::go_to_replay_frame`])
+    /// starts again from, in turn, while the target frame still lacks output a stale keyframe
+    /// left out: the one before (enough unless the game stopped resubmitting its 3D scene), then
+    /// the fourth before (about 8 seconds back: a static scene behind a menu, say), at the cost
+    /// of emulating that far once more.
+    const STALE_FALLBACK_KEYFRAMES: [usize; 2] = [1, 4];
 
     const _KEYFRAME_BOOKMARKS_MATCH_SEEKS: () = assert!(Self::POST_LOAD_FRAMES == KEYFRAME_BOOKMARK_LEAD_FRAMES);
 
@@ -2016,6 +2159,10 @@ impl SuperShuckieCore {
     /// duration of the seek: afterwards the user is back in control at the new frame, which
     /// becomes the resume point.
     ///
+    /// When the target turns out to lie so soon after a keyframe with stale output buffers that
+    /// the game has not rebuilt them yet (see [`Self::shows_stale_output`]), the seek is done
+    /// again from the keyframe before, so the picture is the one playback shows.
+    ///
     /// Returns an error (and leaves the core stalled, unless stopped) if the replay could not be
     /// read at the target; see [`Self::load_replay_keyframe_at_or_before`].
     pub fn go_to_replay_frame(&mut self, frame: UnsignedInteger) -> Result<(), String> {
@@ -2023,7 +2170,35 @@ impl SuperShuckieCore {
         // before the target has been emulated so that the target itself is the one rendered.
         let keyframe_hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
         let desired = frame.saturating_sub(1);
-        self.go_to_replay_frame_inner(keyframe_hint, desired)
+        self.go_to_replay_frame_inner(keyframe_hint, desired, SeekSettle::Exact)
+    }
+
+    /// A seek for a timeline being dragged: to [`Self::coarse_replay_frame`] of `frame`, then, if
+    /// that picture still lacks output a stale keyframe left out (see
+    /// [`Self::shows_stale_output`]), on by up to [`Self::MAX_COARSE_SETTLE_FRAMES`] frames until
+    /// it does not, instead of seeking again from an earlier keyframe. Afterwards
+    /// [`Self::total_frames`] is the frame shown, which may differ from `frame` either way.
+    ///
+    /// Errors as [`Self::go_to_replay_frame`] does.
+    pub fn go_to_replay_frame_coarse(&mut self, frame: UnsignedInteger) -> Result<(), String> {
+        let frame = self.coarse_replay_frame(frame);
+        let keyframe_hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
+        let desired = frame.saturating_sub(1);
+        self.go_to_replay_frame_inner(keyframe_hint, desired, SeekSettle::Coarse)
+    }
+
+    /// Whether the frame last run was shown without some of the output a keyframe with stale
+    /// output buffers left out (see [`EmulatorCore::shows_stale_output`]): the game had not yet
+    /// rebuilt them since the keyframe was loaded. [`Self::go_to_replay_frame`] never ends on such
+    /// a frame when an earlier keyframe avoids it; a consumer stepping from
+    /// [`Self::go_to_replay_keyframe`] itself can check this and load the keyframe before.
+    pub fn shows_stale_output(&self) -> bool {
+        self.core.shows_stale_output()
+    }
+
+    /// Frame of the replay keyframe the last seek or [`Self::go_to_replay_keyframe`] loaded.
+    pub fn replay_keyframe_loaded(&self) -> UnsignedInteger {
+        self.replay_keyframe_loaded
     }
 
     /// The frame to hand [`Self::go_to_replay_frame`] instead of `frame` for a coarse seek: the
@@ -2044,46 +2219,94 @@ impl SuperShuckieCore {
         }
     }
 
-    fn go_to_replay_frame_inner(&mut self, frame: UnsignedInteger, desired: UnsignedInteger) -> Result<(), String> {
+    fn go_to_replay_frame_inner(&mut self, frame: UnsignedInteger, desired: UnsignedInteger, settle: SeekSettle) -> Result<(), String> {
         if self.replay_player.is_none() {
             return Ok(())
         }
 
         if !self.replay_playback_stopped {
-            return self.seek_in_replay(frame, desired)
+            return self.seek_in_replay(frame, desired, settle)
         }
 
         self.replay_playback_stopped = false;
-        let result = self.seek_in_replay(frame, desired);
+        let result = self.seek_in_replay(frame, desired, settle);
         // Back to the user at the new position, keeping whatever they hold pressed (unlike an
         // explicit stop, nothing about their input changed).
         self.stop_replay_playback_here();
         result
     }
 
-    /// The seek itself, with the replay driving; see [`Self::go_to_replay_frame`].
-    fn seek_in_replay(&mut self, frame: UnsignedInteger, desired: UnsignedInteger) -> Result<(), String> {
+    /// The seek itself, with the replay driving; see [`Self::go_to_replay_frame`] and
+    /// [`Self::go_to_replay_frame_coarse`] for what `settle` does.
+    fn seek_in_replay(&mut self, frame: UnsignedInteger, desired: UnsignedInteger, settle: SeekSettle) -> Result<(), String> {
         let Some(p) = self.replay_player.as_mut() else {
             return Ok(())
         };
 
-        let desired = desired.min(p.get_total_frames().saturating_sub(1));
-        if desired >= p.get_total_frames() {
+        let total = p.get_total_frames();
+        let desired = desired.min(total.saturating_sub(1));
+        if desired >= total {
             return Ok(())
         }
 
         self.load_replay_keyframe_at_or_before(frame)?;
+        self.run_replay_to(desired);
 
-        // Only the target frame is looked at; the ones on the way there need not be drawn.
+        if !self.core.shows_stale_output() {
+            return Ok(())
+        }
+
+        let keyframe = self.replay_keyframe_loaded;
+        match settle {
+            // The game had not rebuilt what the keyframe's stale buffers left out by the target:
+            // start from an earlier keyframe, far enough back that it has. The one before is
+            // almost always enough; a static 3D scene the game does not resubmit can need more,
+            // and past the last fallback the frame is shown as it is.
+            SeekSettle::Exact => {
+                for back in Self::STALE_FALLBACK_KEYFRAMES {
+                    if !self.core.shows_stale_output() {
+                        break
+                    }
+                    let earlier = self.replay_player.as_ref().and_then(|p| p.all_keyframes().range(..keyframe).rev().nth(back - 1).map(|(&f, _)| f));
+                    let Some(earlier) = earlier else {
+                        break
+                    };
+                    if self.load_replay_keyframe_at_or_before(earlier).is_err() {
+                        // Unreadable: settle for the picture the first keyframe gave.
+                        self.load_replay_keyframe_at_or_before(keyframe)?;
+                        self.run_replay_to(desired);
+                        break
+                    }
+                    self.run_replay_to(desired);
+                }
+            },
+            // A drag step: a few frames further on is as good as the frame asked for, and far
+            // cheaper than a keyframe interval of emulation.
+            SeekSettle::Coarse => {
+                for _ in 0..Self::MAX_COARSE_SETTLE_FRAMES {
+                    if !self.core.shows_stale_output() || self.replay_stalled || self.total_frames >= total {
+                        break
+                    }
+                    self.run_unlocked();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the replay until `desired` has been emulated and the frame after it drawn, drawing
+    /// only that last frame (nobody looks at the ones on the way) and the few before it the core
+    /// needs drawn for it (see [`Self::draw_lead_frames`]).
+    fn run_replay_to(&mut self, desired: UnsignedInteger) {
+        let lead = self.core.draw_lead_frames();
         while self.total_frames <= desired && !self.replay_stalled {
-            if self.total_frames < desired {
+            if self.total_frames.saturating_add(lead) < desired {
                 self.run_unlocked_hidden();
             }
             else {
                 self.run_unlocked();
             }
         }
-        Ok(())
     }
 
     /// Load the attached replay's nearest keyframe at or before `frame` without emulating
@@ -2142,10 +2365,19 @@ impl SuperShuckieCore {
         let counters = metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
         let input = metadata.input.clone();
 
-        if let Err(e) = self.core.load_save_state(p.current_keyframe_state()) {
+        // A masked delta keyframe's regenerated output buffers are its chain restart's; the
+        // emulator must not show them (see `transient_ranges`).
+        let loaded = if p.current_keyframe_has_stale_transients() {
+            self.core.load_save_state_with_stale_output(p.current_keyframe_state())
+        }
+        else {
+            self.core.load_save_state(p.current_keyframe_state())
+        };
+        if let Err(e) = loaded {
             self.replay_stalled = true;
             return Err(format!("replay file is broken (cannot load the save state at frame {frame}): {e}"))
         }
+        self.replay_keyframe_loaded = elapsed_frames;
         self.state_epoch = self.state_epoch.wrapping_add(1);
         // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
         // next ChangeInput packet may be far away, so restore the input recorded with the
@@ -2418,12 +2650,20 @@ mod tests {
         bios_checksum: ReplayHeaderBlake3Hash,
         /// A tiny fixed screen so consumers that need real geometry (e.g. video export) have
         /// something to composite; no test asserts on its pixel content.
-        screens: Vec<ScreenData>
+        screens: Vec<ScreenData>,
+        /// How many frames after a state load show stale output (see
+        /// `EmulatorCore::shows_stale_output`), like a Nintendo DS masked keyframe; 0 = none.
+        stale_frames_after_load: u32,
+        stale_frames_left: u32,
+        stale_shown: bool
     }
 
     impl FakePacedCore {
         fn new(clock: FakeClock, period_micros: u64) -> Self {
             Self {
+                stale_frames_after_load: 0,
+                stale_frames_left: 0,
+                stale_shown: false,
                 clock,
                 period_micros,
                 last_frame_micros: 0,
@@ -2470,6 +2710,8 @@ mod tests {
             self.counter = self.counter.wrapping_add(1);
             self.counter_bytes = self.counter.to_le_bytes();
             self.frame_inputs.lock().unwrap().push(self.input_byte);
+            self.stale_shown = self.stale_frames_left > 0;
+            self.stale_frames_left = self.stale_frames_left.saturating_sub(1);
             RunTime::ONE_FRAME
         }
 
@@ -2503,7 +2745,13 @@ mod tests {
             let bytes: [u8; 4] = state.try_into().map_err(|_| String::from("bad state"))?;
             self.counter = u32::from_le_bytes(bytes);
             self.counter_bytes = bytes;
+            self.stale_frames_left = self.stale_frames_after_load;
+            self.stale_shown = false;
             Ok(())
+        }
+
+        fn shows_stale_output(&self) -> bool {
+            self.stale_shown
         }
 
         fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
@@ -3175,6 +3423,66 @@ mod tests {
         let player = ReplayFilePlayer::new(bytes, false).expect("parse the recorded replay");
         core.attach_replay_player(player, true).expect("attach");
         (core, clock, played_log)
+    }
+
+    /// A seek never ends on a frame that still shows output a stale keyframe left out (a masked
+    /// Nintendo DS keyframe's 3D, here a fake core showing stale output for a few frames after
+    /// every load): an exact seek starts again from an earlier keyframe, a coarse one (a timeline
+    /// drag) runs on until the picture is whole; both give up after a bounded amount of work.
+    #[test]
+    fn seeks_do_not_end_on_frames_showing_stale_output() {
+        // Keyframes at 0, 10, ..., 50.
+        let clock = FakeClock::new();
+        let mut recorder = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        recorder.start_recording_replay(PartialReplayRecordMetadata {
+            frames_per_keyframe: NonZeroU64::new(10).unwrap(),
+            ..metadata(final_buf.clone(), SharedSink::default())
+        }).expect("start recording");
+        for _ in 0..60 {
+            run_one_frame(&mut recorder, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(recorder.stop_recording_replay(), Some(true));
+        let bytes = final_buf.0.lock().unwrap().clone();
+
+        let playback = |stale_frames_after_load: u32| {
+            let clock = FakeClock::new();
+            let mut fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+            fake.stale_frames_after_load = stale_frames_after_load;
+            let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock));
+            core.attach_replay_player(ReplayFilePlayer::new(&bytes, false).expect("parse"), true).expect("attach");
+            core
+        };
+
+        // The first four frames after a load are stale.
+        let mut core = playback(4);
+        // Frame 26 is six frames past keyframe 20: whole.
+        core.go_to_replay_frame(26).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.shows_stale_output()), (26, 20, false));
+        // Frame 23 is three frames past it: seek again from keyframe 10.
+        core.go_to_replay_frame(23).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.shows_stale_output()), (23, 10, false));
+        // A drag to 29 lands on keyframe 20 + POST_LOAD_FRAMES = 23 and runs on to 25.
+        core.go_to_replay_frame_coarse(29).expect("coarse seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.shows_stale_output()), (25, 20, false));
+
+        // Output that never comes back whole: the frame asked for (exact, after trying the
+        // earlier keyframes there are), or the settle limit (coarse), never past the end.
+        let mut core = playback(u32::MAX);
+        core.go_to_replay_frame(43).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.shows_stale_output()), (43, 0, true));
+        core.go_to_replay_frame_coarse(29).expect("coarse seek");
+        assert_eq!(core.total_frames(), 23 + SuperShuckieCore::MAX_COARSE_SETTLE_FRAMES);
+        let total = ReplayFilePlayer::new(&bytes, false).expect("parse").get_total_frames();
+        core.go_to_replay_frame_coarse(total).expect("coarse seek");
+        assert_eq!(core.total_frames(), total, "a coarse seek stops at the replay's last frame");
+
+        // Without stale output nothing changes: keyframe + POST_LOAD_FRAMES from that keyframe.
+        let mut core = playback(0);
+        core.go_to_replay_frame(23).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded()), (23, 20));
+        core.go_to_replay_frame_coarse(29).expect("coarse seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded()), (23, 20));
     }
 
     /// Stopping a replay keeps it attached but hands the emulator to the user: their input is
@@ -3913,4 +4221,25 @@ mod tests {
         assert!(core.start_stream_publishing(Box::new(VecStreamPublisher::default())).is_err(), "a replay's console is not the player's to publish");
         assert!(core.has_replay_attached());
     }
+}
+
+/// Half-size RGB565 picture of a screen (2x2 box filter), the timeline thumbnail encoding.
+fn thumbnail_of(screen: &crate::emulator::ScreenData) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (screen.width / 2, screen.height / 2);
+    let mut out = Vec::with_capacity(w * h * 2);
+    for y in 0..h {
+        for x in 0..w {
+            let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let p = screen.pixels.get((y * 2 + dy) * screen.width + x * 2 + dx).copied().unwrap_or(0);
+                r += (p >> 16) & 0xFF;
+                g += (p >> 8) & 0xFF;
+                b += p & 0xFF;
+            }
+            let (r, g, b) = (r / 4, g / 4, b / 4);
+            let rgb565 = (((r >> 3) & 0x1F) << 11 | ((g >> 2) & 0x3F) << 5 | ((b >> 3) & 0x1F)) as u16;
+            out.extend_from_slice(&rgb565.to_le_bytes());
+        }
+    }
+    (w as u32, h as u32, out)
 }

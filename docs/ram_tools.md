@@ -89,6 +89,18 @@ Little-endian; ARM9 addresses.
 | Shared WRAM | `SWRAM` | `0x03000000`-`0x03007FFF` | Which CPU sees which half depends on WRAMCNT |
 | ARM7 WRAM | `WRAM7` | `0x03800000`-`0x0380FFFF` | |
 
+### Nintendo 3DS
+
+Little-endian; the game's virtual addresses (what Citra/Azahar cheat codes and Poke-A-Byte mappers use).
+
+| Region | Short name | Addresses | Notes |
+|---|---|---|---|
+| Process heap | `HEAP` | `0x08000000`-`0x0FFFFFFF` | Game state; Pokémon X/Y keep the live party around `0x08CE1CE8` |
+| Linear heap | `LINEAR` | `0x14000000`-`0x1BFFFFFF` | GPU-visible buffers (textures, framebuffers) |
+
+Poke-A-Byte reads any mapped address, not only these two regions, but at most 16 MB in 128 blocks
+at a time, so a 3DS mapper should declare the `<memory>` ranges it needs.
+
 ## RAM viewer
 
 * Click a region tab (or press Ctrl+1 to Ctrl+9, or Ctrl+PgUp/PgDn) to switch regions. Each region

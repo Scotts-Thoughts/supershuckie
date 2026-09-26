@@ -24,6 +24,8 @@ unsafe extern "C" {
     fn melonds_rs_core_get_sram(core: *const MelonDSCoreHolderRaw, size: &mut usize) -> *const u8;
     fn melonds_rs_core_create_save_state(core: *mut MelonDSCoreHolderRaw, data: *mut u8, data_size: usize) -> usize;
     fn melonds_rs_core_load_save_state(core: *mut MelonDSCoreHolderRaw, data: *const u8, data_size: usize) -> bool;
+    fn melonds_rs_core_load_save_state_discarding_geometry(core: *mut MelonDSCoreHolderRaw, data: *const u8, data_size: usize) -> bool;
+    fn melonds_rs_core_shows_discarded_geometry(core: *const MelonDSCoreHolderRaw) -> bool;
     fn melonds_rs_core_get_ram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x400000];
     fn melonds_rs_core_get_shared_wram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x8000];
     fn melonds_rs_core_get_arm7_wram(core: *mut MelonDSCoreHolderRaw) -> *mut [u8; 0x10000];
@@ -170,6 +172,23 @@ impl Core {
     #[inline]
     pub fn load_save_state(&mut self, state: &[u8]) -> bool {
         unsafe { melonds_rs_core_load_save_state(self.inner, state.as_ptr(), state.len()) }
+    }
+
+    /// Like [`load_save_state`](Self::load_save_state), for a state whose 3D polygon and vertex
+    /// RAM may be a stale copy from another state (a masked replay keyframe): nothing is drawn
+    /// from the polygons it restores, only from those the game submits afterwards. Whether a
+    /// frame still shows the gap is [`shows_discarded_geometry`](Self::shows_discarded_geometry).
+    #[inline]
+    pub fn load_save_state_discarding_geometry(&mut self, state: &[u8]) -> bool {
+        unsafe { melonds_rs_core_load_save_state_discarding_geometry(self.inner, state.as_ptr(), state.len()) }
+    }
+
+    /// Whether the frame last run showed a 3D picture missing geometry that
+    /// [`load_save_state_discarding_geometry`](Self::load_save_state_discarding_geometry)
+    /// discarded: the game had not yet flushed and shown a frame's worth of polygons of its own.
+    #[inline]
+    pub fn shows_discarded_geometry(&self) -> bool {
+        unsafe { melonds_rs_core_shows_discarded_geometry(self.inner) }
     }
 
     #[inline]

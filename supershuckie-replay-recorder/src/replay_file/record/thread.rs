@@ -182,6 +182,11 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let _ = self.sender.send(ThreadedReplayFileRecorderCommand::SerialIn { data });
     }
 
+    /// Store a timeline picture (see [`ReplayFileRecorder::thumbnail`]).
+    pub fn thumbnail(&mut self, top: (u32, u32, Vec<u8>), bottom: (u32, u32, Vec<u8>)) {
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::Thumbnail { top, bottom });
+    }
+
     /// Check for errors, if any.
     pub fn poll_errors(&mut self) -> Vec<ReplayFileWriteError> {
         let mut errors = Vec::new();
@@ -330,6 +335,9 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::SerialIn { data } => {
                 recorder.serial_in(data)
             }
+            ThreadedReplayFileRecorderCommand::Thumbnail { top, bottom } => {
+                recorder.thumbnail((top.0, top.1, top.2.as_slice()), (bottom.0, bottom.1, bottom.2.as_slice()))
+            }
             ThreadedReplayFileRecorderCommand::MarkStart { timer_offset } => {
                 recorder.mark_start(timer_offset)
             }
@@ -352,6 +360,7 @@ enum ThreadedReplayFileRecorderCommand {
     WriteMemory { address: UnsignedInteger, data: ByteVec },
     LoadSaveState { state: ByteVec },
     SerialIn { data: ByteVec },
+    Thumbnail { top: (u32, u32, Vec<u8>), bottom: (u32, u32, Vec<u8>) },
     IncrementCounter { name: String, delta: SignedInteger },
     MarkStart { timer_offset: TimestampMillis },
     MarkEnd,
@@ -431,6 +440,11 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
         Ok(())
     }
 
+    fn thumbnail(&mut self, top: (u32, u32, Vec<u8>), bottom: (u32, u32, Vec<u8>)) -> Result<(), ReplayFileWriteError> {
+        self.thumbnail(top, bottom);
+        Ok(())
+    }
+
     #[inline]
     fn get_errors(&mut self) -> Vec<ReplayFileWriteError> {
         self.poll_errors()
@@ -474,6 +488,8 @@ mod tests {
             max_frames_per_blob: 0,
             compression_level: crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
             mask_transient_buffers: true,
+            stored_keyframe_levels: (15, 15),
+            stored_keyframe_compression_level: 3,
         }
     }
 

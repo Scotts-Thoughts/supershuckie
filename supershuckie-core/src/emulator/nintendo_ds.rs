@@ -211,6 +211,21 @@ impl EmulatorCore for NintendoDS {
             .ok_or_else(|| "failed to load nds save state".to_owned())
     }
 
+    fn load_save_state_with_stale_output(&mut self, state: &[u8]) -> Result<(), String> {
+        // The masked buffers are the GP3D polygon/vertex banks, while the render list and the
+        // polygons pending for the next flush are the keyframe's own: drawing them would show
+        // geometry from the chain's restart keyframe, and a slot that was empty there has no
+        // vertices at all.
+        self.core
+            .load_save_state_discarding_geometry(state)
+            .then_some(())
+            .ok_or_else(|| "failed to load nds save state".to_owned())
+    }
+
+    fn shows_stale_output(&self) -> bool {
+        self.core.shows_discarded_geometry()
+    }
+
     fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
         let mut value = 0u32;
 

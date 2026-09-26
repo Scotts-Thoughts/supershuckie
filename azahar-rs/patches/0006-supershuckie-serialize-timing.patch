@@ -1,0 +1,258 @@
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index bd148e4..f5e4b68 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -2,6 +2,9 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <utility>
+ #include <boost/serialization/array.hpp>
+@@ -921,15 +924,31 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
+             Init(*m_emu_window, m_secondary_window, mem_mode, num_cores);
+     }
+ 
++    // Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 in the environment prints where a save
++    // state's time goes (the replay recorder takes one every few seconds on the emulation thread).
++    static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++    auto timing_start = std::chrono::steady_clock::now();
++    auto mark = [&](const char* what) {
++        if (!timing_wanted) return;
++        const auto now = std::chrono::steady_clock::now();
++        std::fprintf(stderr, "serialize %s: %.2f ms\n", what,
++                     std::chrono::duration<double, std::milli>(now - timing_start).count());
++        timing_start = now;
++    };
+     // Flush on save, don't flush on load
+     const bool should_flush = !Archive::is_loading::value;
+     gpu->ClearAll(should_flush);
++    mark("gpu flush");
+     ar&* timing.get();
++    mark("timing");
+     for (u32 i = 0; i < num_cores; i++) {
+         ar&* cpu_cores[i].get();
++        mark("cpu core");
+     }
+     ar&* service_manager.get();
++    mark("services");
+     ar&* archive_manager.get();
++    mark("archives");
+ 
+     // NOTE: DSP doesn't like being destroyed and recreated. So instead we do an inline
+     // serialization; this means that the DSP Settings need to match for loading to work.
+@@ -940,10 +959,15 @@ void System::serialize(Archive& ar, const unsigned int file_version) {
+         throw std::runtime_error("LLE audio not supported for save states");
+     }
+ 
++    mark("dsp");
+     ar&* memory.get();
++    mark("memory");
+     ar&* kernel.get();
++    mark("kernel");
+     ar&* gpu.get();
++    mark("gpu");
+     ar & movie;
++    mark("movie");
+ 
+     // This needs to be set from somewhere - might as well be here!
+     if (Archive::is_loading::value) {
+diff --git a/src/core/hle/service/apt/applet_manager.h b/src/core/hle/service/apt/applet_manager.h
+index f93318b..ea54f5b 100644
+--- a/src/core/hle/service/apt/applet_manager.h
++++ b/src/core/hle/service/apt/applet_manager.h
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <array>
+ #include <limits>
+ #include <memory>
+@@ -569,30 +572,64 @@ private:
+ 
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int file_version) {
++        // Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 prints where this object's save time goes.
++        static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++        auto timing_start = std::chrono::steady_clock::now();
++        auto mark = [&](const char* what) {
++            if (!timing_wanted) return;
++            const auto now = std::chrono::steady_clock::now();
++            const double ms = std::chrono::duration<double, std::milli>(now - timing_start).count();
++            if (ms >= 0.2) std::fprintf(stderr, "serialize       applets %s: %.2f ms\n", what, ms);
++            timing_start = now;
++        };
+         ar & next_parameter;
++        mark("next_parameter");
+         ar & app_jump_parameters;
++        mark("app_jump_parameters");
+         ar & delayed_parameter;
++        mark("delayed_parameter");
+         ar & app_start_parameters;
++        mark("app_start_parameters");
+         ar & deliver_arg;
++        mark("deliver_arg");
+         ar & sys_menu_arg;
++        mark("sys_menu_arg");
+         ar & home_menu_tid_to_start;
++        mark("home_menu_tid_to_start");
+         ar & capture_info_suspended_app;
++        mark("capture_info_suspended_app");
+         ar & capture_info;
++        mark("capture_info");
+         ar & framebuffer_backup;
++        mark("framebuffer_backup");
+         ar & active_slot;
++        mark("active_slot");
+         ar & last_library_launcher_slot;
++        mark("last_library_launcher_slot");
+         ar & last_prepared_library_applet;
++        mark("last_prepared_library_applet");
+         ar & last_system_launcher_slot;
++        mark("last_system_launcher_slot");
+         ar & last_jump_to_home_slot;
++        mark("last_jump_to_home_slot");
+         ar & ordered_to_close_sys_applet;
++        mark("ordered_to_close_sys_applet");
+         ar & ordered_to_close_application;
++        mark("ordered_to_close_application");
+         ar & application_cancelled;
++        mark("application_cancelled");
+         ar & application_close_target;
++        mark("application_close_target");
+         ar & new_3ds_mode_blocked;
++        mark("new_3ds_mode_blocked");
+         ar & lock;
++        mark("lock");
+         ar & applet_slots;
++        mark("applet_slots");
+         ar & library_applet_closing_command;
++        mark("library_applet_closing_command");
+         ar & next_app_mediatype;
++        mark("next_app_mediatype");
+ 
+         if (Archive::is_loading::value) {
+             LoadInputDevices();
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index e40bd9c..52c3be9 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -2,6 +2,9 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/vector.hpp>
+ #include "common/archives.h"
+@@ -45,12 +48,25 @@ constexpr u32 max_wireless_reboot_info_size = 0x10;
+ template <class Archive>
+ void Module::serialize(Archive& ar, const unsigned int file_version) {
+     DEBUG_SERIALIZATION_POINT;
++    // Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 prints where this module's save time goes.
++    static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++    auto timing_start = std::chrono::steady_clock::now();
++    auto mark = [&](const char* what) {
++        if (!timing_wanted) return;
++        const auto now = std::chrono::steady_clock::now();
++        std::fprintf(stderr, "serialize     apt %s: %.2f ms\n", what,
++                     std::chrono::duration<double, std::milli>(now - timing_start).count());
++        timing_start = now;
++    };
+     ar & shared_font_mem;
++    mark("shared_font_mem");
+     ar & shared_font_loaded;
+     ar & shared_font_relocated;
+     ar & screen_capture_post_permission;
+     ar & applet_manager;
++    mark("applet_manager");
+     ar & wireless_reboot_info;
++    mark("wireless_reboot_info");
+ }
+ 
+ SERIALIZE_IMPL(Module)
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+index d90c638..3b32b70 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <type_traits>
+ #include <boost/container/small_vector.hpp>
+ #include <boost/range/iterator_range.hpp>
+@@ -23,6 +26,22 @@
+ 
+ namespace VideoCore {
+ 
++// Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 prints what a save state's flush downloads.
++struct FlushTiming {
++    static inline bool wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++    static inline std::size_t surfaces = 0;
++    static inline std::size_t bytes = 0;
++    static inline double download_ms = 0;
++    static inline double encode_ms = 0;
++    static void Reset() {
++        surfaces = 0;
++        bytes = 0;
++        download_ms = 0;
++        encode_ms = 0;
++    }
++};
++
++
+ MICROPROFILE_DECLARE(RasterizerCache_CopySurface);
+ MICROPROFILE_DECLARE(RasterizerCache_UploadSurface);
+ MICROPROFILE_DECLARE(RasterizerCache_DownloadSurface);
+@@ -1153,7 +1172,9 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
+         .texture_rect = surface.GetSubRect(flush_info),
+         .texture_level = surface.LevelOf(flush_start),
+     };
++    const auto download_start = std::chrono::steady_clock::now();
+     surface.Download(download, staging);
++    const auto download_end = std::chrono::steady_clock::now();
+ 
+     MemoryRef dest_ptr = memory.GetPhysicalRef(flush_start);
+     if (!dest_ptr) [[unlikely]] {
+@@ -1163,6 +1184,12 @@ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval inter
+     const auto download_dest = dest_ptr.GetWriteBytes(flush_end - flush_start);
+     EncodeTexture(flush_info, flush_start, flush_end, staging.mapped, download_dest,
+                   runtime.NeedsConversion(surface));
++    if (FlushTiming::wanted) {
++        FlushTiming::surfaces++;
++        FlushTiming::bytes += flush_end - flush_start;
++        FlushTiming::download_ms += std::chrono::duration<double, std::milli>(download_end - download_start).count();
++        FlushTiming::encode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - download_end).count();
++    }
+ }
+ 
+ template <class T>
+@@ -1244,7 +1271,16 @@ void RasterizerCache<T>::ClearAll(bool flush) {
+     const auto flush_interval = PageMap::interval_type::right_open(0x0, 0xFFFFFFFF);
+     // Force flush all surfaces from the cache
+     if (flush) {
++        FlushTiming::Reset();
++        const auto flush_start = std::chrono::steady_clock::now();
+         FlushRegion(0x0, 0xFFFFFFFF);
++        if (FlushTiming::wanted) {
++            std::fprintf(stderr,
++                         "serialize       flush: %zu surface downloads, %.1f MB, gl download %.2f ms, encode %.2f ms, total %.2f ms\n",
++                         FlushTiming::surfaces, FlushTiming::bytes / 1048576.0, FlushTiming::download_ms,
++                         FlushTiming::encode_ms,
++                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flush_start).count());
++        }
+     }
+     // Unmark all of the marked pages
+     for (auto& pair : RangeFromInterval(cached_pages, flush_interval)) {

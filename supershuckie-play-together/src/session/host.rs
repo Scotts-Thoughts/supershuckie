@@ -570,6 +570,10 @@ impl HostShared {
             ReplayConsoleType::NintendoDS if !self.config.allow_nintendo_ds => {
                 return self.refuse(conn, RefusalReason::ConsoleUnsupported, "Nintendo DS is not supported by Play Together yet".to_owned());
             }
+            ReplayConsoleType::Nintendo3DS => {
+                // One 3DS per process (Azahar's core is a singleton): nobody can follow one yet.
+                return self.refuse(conn, RefusalReason::ConsoleUnsupported, "Nintendo 3DS is not supported by Play Together yet".to_owned());
+            }
             ReplayConsoleType::Unknown => {
                 return self.refuse(conn, RefusalReason::ConsoleUnsupported, "your session's console is unknown".to_owned());
             }

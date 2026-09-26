@@ -1,0 +1,604 @@
+diff --git a/src/common/memory_ref.h b/src/common/memory_ref.h
+index 72be3a4..a38561c 100644
+--- a/src/common/memory_ref.h
++++ b/src/common/memory_ref.h
+@@ -132,6 +132,16 @@ public:
+         return MemoryRef(backing_mem, offset + offset_by);
+     }
+ 
++    /// Super Shuckie: the block this references (for run-length page table serialization).
++    const std::shared_ptr<BackingMem>& GetBackingMem() const {
++        return backing_mem;
++    }
++
++    /// Super Shuckie: offset into the block.
++    u64 GetOffset() const {
++        return offset;
++    }
++
+ private:
+     std::shared_ptr<BackingMem> backing_mem{};
+     u64 offset{};
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index b5eb9b8..b9758f4 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -2,9 +2,24 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <csignal>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <deque>
++#include <thread>
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/binary_object.hpp>
+ #include "audio_core/dsp_interface.h"
+@@ -98,14 +113,287 @@ private:
+     }
+ };
+ 
++// Super Shuckie: the RAM regions in one block whose written pages the OS tracks, so a raw save
++// state copies only what changed since the buffer's previous state (see MemorySystem::RawRegionIo).
++namespace {
++
++constexpr std::size_t RAM_PAGE = 0x1000;
++
++class RamBlock {
++public:
++    static constexpr std::size_t FCRAM_OFFSET = 0;
++    static constexpr std::size_t VRAM_OFFSET = FCRAM_OFFSET + Memory::FCRAM_N3DS_SIZE;
++    static constexpr std::size_t N3DS_OFFSET = VRAM_OFFSET + Memory::VRAM_SIZE;
++    static constexpr std::size_t DSP_OFFSET = N3DS_OFFSET + Memory::N3DS_EXTRA_RAM_SIZE;
++    static constexpr std::size_t TOTAL = DSP_OFFSET + Memory::DSP_RAM_SIZE;
++    static constexpr std::size_t PAGES = TOTAL / RAM_PAGE;
++
++    RamBlock() {
++#ifdef _WIN32
++        base = static_cast<u8*>(VirtualAlloc(nullptr, TOTAL, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                                             PAGE_READWRITE));
++        tracked = base != nullptr;
++        if (!base) {
++            LOG_WARNING(HW_Memory, "write-watched RAM block unavailable; save states copy all of it");
++        }
++#endif
++        if (!base) {
++            fallback = std::make_unique<u8[]>(TOTAL);
++            base = fallback.get();
++        }
++    }
++
++    ~RamBlock() {
++#ifdef _WIN32
++        if (tracked) {
++            VirtualFree(base, 0, MEM_RELEASE);
++        }
++#endif
++    }
++
++    RamBlock(const RamBlock&) = delete;
++    RamBlock& operator=(const RamBlock&) = delete;
++
++    /// Page indexes (within the block) written since the previous call (or since the block was
++    /// made), and start a new interval. False when writes are not tracked here: every page may
++    /// have changed.
++    bool CollectWrittenPages(std::vector<u32>& pages) {
++        pages.clear();
++        if (!tracked) {
++            return false;
++        }
++#ifdef _WIN32
++        if (scratch.size() < PAGES) {
++            scratch.resize(PAGES);
++        }
++        ULONG_PTR count = scratch.size();
++        DWORD granularity = 0;
++        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, base, TOTAL, scratch.data(), &count, &granularity) != 0) {
++            LOG_WARNING(HW_Memory, "GetWriteWatch failed ({}); this state copies all RAM", GetLastError());
++            return false;
++        }
++        pages.reserve(count);
++        for (ULONG_PTR i = 0; i < count; i++) {
++            pages.push_back(static_cast<u32>((static_cast<u8*>(scratch[i]) - base) / RAM_PAGE));
++        }
++        return true;
++#else
++        return false;
++#endif
++    }
++
++    u8* base = nullptr;
++    bool tracked = false;
++
++private:
++    std::unique_ptr<u8[]> fallback;
++    std::vector<void*> scratch;
++};
++
++/// The block outlives the memory system: every save-state load builds a new MemorySystem, and
++/// reusing the block keeps its pages resident (a fresh 266 MB block costs tens of thousands of
++/// page faults on the first load into it) and keeps the written-page history. A new system that
++/// is not loading a state zeroes it, as fresh memory was zero before.
++std::unique_ptr<RamBlock> g_spare_ram_block;
++
++/// Which pages a state's generation changed, oldest first; see MemorySystem::RawRegionIo.
++struct RamGeneration {
++    u64 id;
++    bool all;              ///< every page may have changed (writes were not tracked)
++    std::vector<u64> bits; ///< one bit per block page otherwise
++};
++std::deque<RamGeneration> g_ram_generations;
++constexpr std::size_t RAM_GENERATIONS_KEPT = 512;
++std::atomic<u64> g_ram_generation_counter{0};
++
++MemorySystem::RawRegionIo* g_raw_region_io = nullptr;
++
++struct CopyChunk {
++    std::size_t src;
++    std::size_t dst;
++    std::size_t len;
++};
++
++/// memcpy the chunks on a few threads: one thread moves 128 MB in 10-12 ms, four in 3-4.
++void CopyChunks(const u8* src_base, u8* dst_base, const std::vector<CopyChunk>& chunks) {
++    std::size_t total = 0;
++    for (const CopyChunk& c : chunks) {
++        total += c.len;
++    }
++    const unsigned workers = total < (8u << 20) ? 1 : std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
++    if (workers == 1) {
++        for (const CopyChunk& c : chunks) {
++            std::memcpy(dst_base + c.dst, src_base + c.src, c.len);
++        }
++        return;
++    }
++    std::atomic<std::size_t> next{0};
++    auto work = [&] {
++        for (;;) {
++            const std::size_t i = next.fetch_add(1);
++            if (i >= chunks.size()) {
++                break;
++            }
++            std::memcpy(dst_base + chunks[i].dst, src_base + chunks[i].src, chunks[i].len);
++        }
++    };
++    std::vector<std::thread> threads;
++    for (unsigned w = 1; w < workers; w++) {
++        threads.emplace_back(work);
++    }
++    work();
++    for (std::thread& t : threads) {
++        t.join();
++    }
++}
++
++} // namespace
++
++std::size_t MemorySystem::RawRegionsSize() {
++    const bool n3ds = Settings::values.is_new_3ds.GetValue();
++    return (n3ds ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE) + Memory::VRAM_SIZE +
++           (n3ds ? Memory::N3DS_EXTRA_RAM_SIZE : 0) + Memory::DSP_RAM_SIZE;
++}
++
++void MemorySystem::SetRawRegionIo(RawRegionIo* io) {
++    g_raw_region_io = io;
++}
++
+ class MemorySystem::Impl {
+ public:
+-    // Visual Studio would try to allocate these on compile time
+-    // if they are std::array which would exceed the memory limit.
+-    std::unique_ptr<u8[]> fcram = std::make_unique<u8[]>(Memory::FCRAM_N3DS_SIZE);
+-    std::unique_ptr<u8[]> vram = std::make_unique<u8[]>(Memory::VRAM_SIZE);
+-    std::unique_ptr<u8[]> n3ds_extra_ram = std::make_unique<u8[]>(Memory::N3DS_EXTRA_RAM_SIZE);
+-    std::unique_ptr<u8[]> dsp_ram = std::make_unique<u8[]>(Memory::DSP_RAM_SIZE);
++    std::unique_ptr<RamBlock> ram_block = TakeRamBlock();
++    u8* fcram = ram_block->base + RamBlock::FCRAM_OFFSET;
++    u8* vram = ram_block->base + RamBlock::VRAM_OFFSET;
++    u8* n3ds_extra_ram = ram_block->base + RamBlock::N3DS_OFFSET;
++    u8* dsp_ram = ram_block->base + RamBlock::DSP_OFFSET;
++
++    static std::unique_ptr<RamBlock> TakeRamBlock() {
++        if (g_spare_ram_block) {
++            return std::move(g_spare_ram_block);
++        }
++        return std::make_unique<RamBlock>();
++    }
++
++    ~Impl() {
++        g_spare_ram_block = std::move(ram_block);
++    }
++
++    /// The raw-state regions in order: FCRAM (as configured), VRAM, New 3DS extra RAM (when
++    /// enabled), DSP RAM; each as (block offset, raw offset, length).
++    static std::vector<CopyChunk> RawRegionLayout() {
++        const bool n3ds = Settings::values.is_new_3ds.GetValue();
++        std::vector<CopyChunk> layout;
++        std::size_t raw = 0;
++        auto region = [&](std::size_t block_offset, std::size_t len) {
++            if (len) {
++                layout.push_back(CopyChunk{block_offset, raw, len});
++                raw += len;
++            }
++        };
++        region(RamBlock::FCRAM_OFFSET, n3ds ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
++        region(RamBlock::VRAM_OFFSET, Memory::VRAM_SIZE);
++        region(RamBlock::N3DS_OFFSET, n3ds ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
++        region(RamBlock::DSP_OFFSET, Memory::DSP_RAM_SIZE);
++        return layout;
++    }
++
++    /// Whole regions, in pieces small enough to spread over the copy threads.
++    static std::vector<CopyChunk> FullCopyChunks() {
++        std::vector<CopyChunk> chunks;
++        for (const CopyChunk& region : RawRegionLayout()) {
++            for (std::size_t off = 0; off < region.len; off += 16u << 20) {
++                chunks.push_back(CopyChunk{region.src + off, region.dst + off, std::min<std::size_t>(16u << 20, region.len - off)});
++            }
++        }
++        return chunks;
++    }
++
++    void SaveRawRegions(RawRegionIo& io) {
++        std::vector<u32> written;
++        const bool tracked = ram_block->CollectWrittenPages(written);
++        RamGeneration generation{++g_ram_generation_counter, !tracked, {}};
++        if (tracked) {
++            generation.bits.assign((RamBlock::PAGES + 63) / 64, 0);
++            for (u32 page : written) {
++                generation.bits[page / 64] |= u64(1) << (page % 64);
++            }
++        }
++        g_ram_generations.push_back(std::move(generation));
++        while (g_ram_generations.size() > RAM_GENERATIONS_KEPT) {
++            g_ram_generations.pop_front();
++        }
++
++        // Pages to copy: everything unless `dst` holds a generation whose successors are all
++        // still known, in which case their union.
++        bool partial = io.dst_generation != 0 && !g_ram_generations.empty() &&
++                       g_ram_generations.front().id <= io.dst_generation + 1 &&
++                       io.dst_generation < g_ram_generations.back().id;
++        std::vector<u64> union_bits;
++        if (partial) {
++            union_bits.assign((RamBlock::PAGES + 63) / 64, 0);
++            u64 expected = io.dst_generation + 1;
++            for (const RamGeneration& g : g_ram_generations) {
++                if (g.id <= io.dst_generation) {
++                    continue;
++                }
++                if (g.id != expected || g.all) {
++                    partial = false;
++                    break;
++                }
++                expected++;
++                for (std::size_t w = 0; w < union_bits.size(); w++) {
++                    union_bits[w] |= g.bits[w];
++                }
++            }
++        }
++
++        std::vector<CopyChunk> chunks;
++        if (!partial) {
++            chunks = FullCopyChunks();
++        } else {
++            // Written pages inside the raw regions, runs of neighbours as one chunk.
++            for (const CopyChunk& region : RawRegionLayout()) {
++                const std::size_t first_page = region.src / RAM_PAGE;
++                const std::size_t end_page = (region.src + region.len) / RAM_PAGE;
++                std::size_t p = first_page;
++                while (p < end_page) {
++                    if (!(union_bits[p / 64] & (u64(1) << (p % 64)))) {
++                        p++;
++                        continue;
++                    }
++                    std::size_t q = p + 1;
++                    while (q < end_page && (union_bits[q / 64] & (u64(1) << (q % 64)))) {
++                        q++;
++                    }
++                    const std::size_t src = p * RAM_PAGE;
++                    chunks.push_back(CopyChunk{src, region.dst + (src - region.src), (q - p) * RAM_PAGE});
++                    p = q;
++                }
++            }
++        }
++        std::size_t pages = 0;
++        for (const CopyChunk& c : chunks) {
++            pages += c.len / RAM_PAGE;
++        }
++        CopyChunks(ram_block->base, io.dst, chunks);
++        io.generation_out = g_ram_generations.back().id;
++        io.pages_copied = pages;
++        static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++        if (timing_wanted) {
++            std::fprintf(stderr, "serialize       ram regions: %s, %zu pages copied into generation %llu's buffer (now %llu)\n",
++                         partial ? "incremental" : "full", pages, static_cast<unsigned long long>(io.dst_generation),
++                         static_cast<unsigned long long>(io.generation_out));
++        }
++    }
++
++    void LoadRawRegions(const u8* src) {
++        // Chunks are (block offset, raw offset, len); copying raw -> block swaps the roles.
++        std::vector<CopyChunk> chunks;
++        for (const CopyChunk& c : FullCopyChunks()) {
++            chunks.push_back(CopyChunk{c.dst, c.src, c.len});
++        }
++        CopyChunks(src, ram_block->base, chunks);
++    }
+ 
+     Core::System& system;
+     std::shared_ptr<PageTable> current_page_table = nullptr;
+@@ -124,13 +412,13 @@ public:
+     const u8* GetPtr(Region r) const {
+         switch (r) {
+         case Region::VRAM:
+-            return vram.get();
++            return vram;
+         case Region::DSP:
+-            return dsp_ram.get();
++            return dsp_ram;
+         case Region::FCRAM:
+-            return fcram.get();
++            return fcram;
+         case Region::N3DS:
+-            return n3ds_extra_ram.get();
++            return n3ds_extra_ram;
+         default:
+             UNREACHABLE();
+         }
+@@ -139,13 +427,13 @@ public:
+     u8* GetPtr(Region r) {
+         switch (r) {
+         case Region::VRAM:
+-            return vram.get();
++            return vram;
+         case Region::DSP:
+-            return dsp_ram.get();
++            return dsp_ram;
+         case Region::FCRAM:
+-            return fcram.get();
++            return fcram;
+         case Region::N3DS:
+-            return n3ds_extra_ram.get();
++            return n3ds_extra_ram;
+         default:
+             UNREACHABLE();
+         }
+@@ -349,12 +637,21 @@ private:
+     void serialize(Archive& ar, const unsigned int file_version) {
+         bool save_n3ds_ram = Settings::values.is_new_3ds.GetValue();
+         ar & save_n3ds_ram;
+-        ar& boost::serialization::make_binary_object(vram.get(), Memory::VRAM_SIZE);
+-        ar& boost::serialization::make_binary_object(
+-            fcram.get(), save_n3ds_ram ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
+-        ar& boost::serialization::make_binary_object(
+-            n3ds_extra_ram.get(), save_n3ds_ram ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
+-        ar& boost::serialization::make_binary_object(dsp_ram.get(), Memory::DSP_RAM_SIZE);
++        if (RawRegionIo* io = g_raw_region_io) {
++            // Super Shuckie raw state: the regions go beside the archive, incrementally.
++            if constexpr (Archive::is_saving::value) {
++                SaveRawRegions(*io);
++            } else {
++                LoadRawRegions(io->src);
++            }
++        } else {
++            ar& boost::serialization::make_binary_object(vram, Memory::VRAM_SIZE);
++            ar& boost::serialization::make_binary_object(
++                fcram, save_n3ds_ram ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
++            ar& boost::serialization::make_binary_object(
++                n3ds_extra_ram, save_n3ds_ram ? Memory::N3DS_EXTRA_RAM_SIZE : 0);
++            ar& boost::serialization::make_binary_object(dsp_ram, Memory::DSP_RAM_SIZE);
++        }
+         ar & cache_marker;
+         ar & page_table_list;
+         // dsp is set from Core::System at startup
+@@ -398,7 +695,18 @@ MemorySystem::Impl::Impl(Core::System& system_)
+     : system{system_}, fcram_mem(std::make_shared<BackingMemImpl<Region::FCRAM>>(*this)),
+       vram_mem(std::make_shared<BackingMemImpl<Region::VRAM>>(*this)),
+       n3ds_extra_ram_mem(std::make_shared<BackingMemImpl<Region::N3DS>>(*this)),
+-      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {}
++      dsp_mem(std::make_shared<BackingMemImpl<Region::DSP>>(*this)) {
++    // A reused block holds the previous session's memory; a boot expects zeros, a save-state load
++    // overwrites everything it uses anyway.
++    if (system.GetSaveStateStatus() != Core::System::SaveStateStatus::LOADING) {
++        std::vector<CopyChunk> chunks;
++        for (std::size_t off = 0; off < RamBlock::TOTAL; off += 16u << 20) {
++            chunks.push_back(CopyChunk{0, off, std::min<std::size_t>(16u << 20, RamBlock::TOTAL - off)});
++        }
++        static const std::vector<u8> zeros(16u << 20, 0);
++        CopyChunks(zeros.data(), ram_block->base, chunks);
++    }
++}
+ 
+ MemorySystem::MemorySystem(Core::System& system) : impl(std::make_unique<Impl>(system)) {}
+ MemorySystem::~MemorySystem() = default;
+@@ -1268,18 +1576,18 @@ void MemorySystem::CopyBlock(const Kernel::Process& dest_process,
+ }
+ 
+ u32 MemorySystem::GetFCRAMOffset(const u8* pointer) const {
+-    ASSERT(pointer >= impl->fcram.get() && pointer <= impl->fcram.get() + Memory::FCRAM_N3DS_SIZE);
+-    return static_cast<u32>(pointer - impl->fcram.get());
++    ASSERT(pointer >= impl->fcram && pointer <= impl->fcram + Memory::FCRAM_N3DS_SIZE);
++    return static_cast<u32>(pointer - impl->fcram);
+ }
+ 
+ u8* MemorySystem::GetFCRAMPointer(std::size_t offset) {
+     ASSERT(offset <= Memory::FCRAM_N3DS_SIZE);
+-    return impl->fcram.get() + offset;
++    return impl->fcram + offset;
+ }
+ 
+ const u8* MemorySystem::GetFCRAMPointer(std::size_t offset) const {
+     ASSERT(offset <= Memory::FCRAM_N3DS_SIZE);
+-    return impl->fcram.get() + offset;
++    return impl->fcram + offset;
+ }
+ 
+ MemoryRef MemorySystem::GetFCRAMRef(std::size_t offset) const {
+@@ -1289,7 +1597,7 @@ MemoryRef MemorySystem::GetFCRAMRef(std::size_t offset) const {
+ 
+ u8* MemorySystem::GetDspMemory(std::size_t offset) const {
+     ASSERT(offset <= Memory::DSP_RAM_SIZE);
+-    return impl->dsp_ram.get() + offset;
++    return impl->dsp_ram + offset;
+ }
+ 
+ } // namespace Memory
+diff --git a/src/core/memory.h b/src/core/memory.h
+index f7045c1..7a3fe95 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -4,10 +4,15 @@
+ 
+ #pragma once
+ #include <array>
++#include <chrono>
+ #include <cstddef>
++#include <cstdio>
++#include <cstdlib>
+ #include <optional>
+ #include <string>
+ #include <boost/serialization/array.hpp>
++#include <boost/serialization/binary_object.hpp>
++#include <vector>
+ #include <boost/serialization/vector.hpp>
+ #include "common/common_types.h"
+ #include "common/memory_ref.h"
+@@ -131,13 +136,95 @@ struct PageTable {
+     void Clear();
+ 
+ private:
++    /// Super Shuckie: a run of consecutively mapped pages backed by consecutive bytes of one
++    /// block. A process maps a few dozen such ranges; serializing them instead of the 2^20
++    /// individual references (each a tracked shared_ptr) turns a 60 ms save into a fraction of
++    /// a millisecond. The replay recorder takes a save state every few seconds on the emulation
++    /// thread, which is why this matters.
++    struct PageRun {
++        u32 first_page{};
++        u32 page_count{};
++        MemoryRef start{};
++
++        template <class Archive>
++        void serialize(Archive& ar, const unsigned int) {
++            ar & first_page;
++            ar & page_count;
++            ar & start;
++        }
++    };
++
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int) {
+-        ar & pointers.refs;
+-        ar & attributes;
++        // Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 prints where this table's time goes.
++        static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++        auto timing_start = std::chrono::steady_clock::now();
++        auto mark = [&](const char* what) {
++            if (!timing_wanted) return;
++            const auto now = std::chrono::steady_clock::now();
++            std::fprintf(stderr, "serialize       page table %s: %.2f ms\n", what,
++                         std::chrono::duration<double, std::milli>(now - timing_start).count());
++            timing_start = now;
++        };
++        std::vector<PageRun> runs;
++        if constexpr (Archive::is_saving::value) {
++            // Walk the raw pointer array (a page continues a run when its host pointer is the
++            // previous page's plus one page); the references are only consulted at run
++            // boundaries, since touching 2^20 of them is itself milliseconds.
++            std::size_t i = 0;
++            while (i < PAGE_TABLE_NUM_ENTRIES) {
++                const u8* first = pointers.raw[i];
++                if (first == nullptr) {
++                    i++;
++                    continue;
++                }
++                std::size_t end = i + 1;
++                while (end < PAGE_TABLE_NUM_ENTRIES && pointers.raw[end] == first + (end - i) * CITRA_PAGE_SIZE) {
++                    end++;
++                }
++                // Host-contiguous pages are contiguous in one backing block in practice; a run
++                // that crossed blocks would fail the offset check below and is split there.
++                const MemoryRef& start = pointers.refs[i];
++                std::size_t k = 1;
++                while (i + k < end) {
++                    const MemoryRef& ref = pointers.refs[i + k];
++                    if (ref.GetBackingMem() != start.GetBackingMem() || ref.GetOffset() != start.GetOffset() + u64(k) * CITRA_PAGE_SIZE) {
++                        break;
++                    }
++                    k++;
++                }
++                runs.push_back(PageRun{static_cast<u32>(i), static_cast<u32>(k), start});
++                i += k;
++            }
++            if (timing_wanted) std::fprintf(stderr, "serialize       page table runs: %zu\n", runs.size());
++        }
++        mark("scan");
++        ar & runs;
++        mark("runs");
++        if constexpr (Archive::is_loading::value) {
++            for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
++                pointers.refs[i] = MemoryRef{};
++            }
++            for (const PageRun& run : runs) {
++                for (u32 k = 0; k < run.page_count; k++) {
++                    const std::size_t i = std::size_t(run.first_page) + k;
++                    if (i >= PAGE_TABLE_NUM_ENTRIES) {
++                        break;
++                    }
++                    pointers.refs[i] = k == 0 ? run.start : run.start + (k * CITRA_PAGE_SIZE);
++                }
++            }
++        }
++        // Page attributes are plain bytes: one block, not 2^20 tracked elements.
++        ar& boost::serialization::make_binary_object(attributes.data(), attributes.size() * sizeof(PageType));
++        mark("attributes");
+         ar & watchpoint_pages_map;
+-        for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
+-            pointers.raw[i] = pointers.refs[i].GetPtr();
++        mark("watchpoints");
++        if constexpr (Archive::is_loading::value) {
++            for (std::size_t i = 0; i < PAGE_TABLE_NUM_ENTRIES; i++) {
++                pointers.raw[i] = pointers.refs[i].GetPtr();
++            }
++            mark("raw pointers");
+         }
+     }
+     friend class boost::serialization::access;
+@@ -269,6 +356,23 @@ public:
+     explicit MemorySystem(Core::System& system);
+     ~MemorySystem();
+ 
++    // ---- Super Shuckie: raw save states copy the RAM regions incrementally ----
++    // The RAM regions (FCRAM, VRAM, New 3DS extra RAM, DSP RAM) live in one host block whose
++    // written pages the OS tracks where it can (Windows write watch). A raw state (savestate.cpp)
++    // holds the regions back to back in front of the boost archive; while a RawRegionIo is set,
++    // the archive part of this system's serialisation copies the regions to/from it instead of
++    // through the archive, and a copy into a buffer that still holds a recent state of this
++    // process copies only the pages written since.
++    struct RawRegionIo {
++        u8* dst = nullptr;         ///< saving: the regions go here (RawRegionsSize() bytes)
++        const u8* src = nullptr;   ///< loading: the regions come from here
++        u64 dst_generation = 0;    ///< saving: the generation `dst` still holds, 0 for unknown
++        u64 generation_out = 0;    ///< saving: the generation `dst` holds afterwards
++        std::size_t pages_copied = 0; ///< saving: how many 4 KB pages were copied
++    };
++    static std::size_t RawRegionsSize();
++    static void SetRawRegionIo(RawRegionIo* io);
++
+     /**
+      * Maps an allocated buffer onto a region of the emulated process address space.
+      *

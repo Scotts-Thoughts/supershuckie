@@ -24,9 +24,53 @@ using namespace melonDS;
 
 static u64 ms;
 
+// A replay keyframe may restore the 3D engine's polygon and vertex RAM from an earlier keyframe
+// (the recorder's transient-buffer masks, see supershuckie-replay-recorder/src/keyframe_masks.rs)
+// while the render list and the polygons already submitted for the next frame are this state's
+// own. Loading one with melonds_rs_core_load_save_state_discarding_geometry draws nothing from
+// the restored polygons (GPU3D::DiscardGeometryOnLoad) and follows, frame by frame, whether the
+// picture still lacks geometry because of it: until the game has flushed a frame's worth of
+// polygons all submitted after the load, and the picture rendered from them is on screen.
+struct DiscardedGeometry {
+    bool render_list = false; // the render list holds discarded polygons
+    bool pending = false;     // the polygons submitted so far for the next flush include discarded ones
+    bool rendered = false;    // the 3D picture last rendered came from a list holding discarded polygons
+    bool shown = false;       // the frame last run showed such a picture
+    u32 bank = 0;             // GPU3D::CurRAMBank, which flips at every flush
+
+    bool active() const { return render_list || pending || rendered; }
+};
+
 struct MelonDSCoreHolder {
     std::unique_ptr<NDS> nds;
+    DiscardedGeometry discarded;
 };
+
+// Advance `discarded` past the frame RunFrame just emulated. The frame showed the 3D picture
+// rendered during the frame before it (at VCount 215; right after the load for the first frame);
+// this frame's flush, if any, happened at VBlank, before this frame's own render.
+static void track_discarded_geometry(MelonDSCoreHolder *core) {
+    DiscardedGeometry &d = core->discarded;
+    if (!d.active()) {
+        d.shown = false;
+        return;
+    }
+
+    const GPU3D &gpu3d = core->nds->GPU.GPU3D;
+    const u32 dispcnt = core->nds->GPU.GPU2D_A.DispCnt;
+    const bool shows_3d = (dispcnt & (1 << 3)) && (dispcnt & (1 << 8)); // BG0 enabled, as 3D
+    d.shown = d.rendered && shows_3d;
+
+    if (gpu3d.CurRAMBank != d.bank) {
+        d.bank = gpu3d.CurRAMBank;
+        // With rendering off the flush swaps banks without building a new render list.
+        if (gpu3d.RenderingEnabled) {
+            d.render_list = d.pending;
+        }
+        d.pending = false;
+    }
+    d.rendered = d.render_list;
+}
 
 // Error codes handed back through `error_out` by melonds_rs_core_new on failure.
 enum MelonDSCoreNewError : std::uint32_t {
@@ -102,6 +146,13 @@ extern "C" void melonds_rs_core_free(MelonDSCoreHolder *core) {
 
 extern "C" void melonds_rs_core_run_frame(MelonDSCoreHolder *core) {
     core->nds->RunFrame();
+    track_discarded_geometry(core);
+}
+
+// Whether the frame last run showed a 3D picture missing geometry that a
+// melonds_rs_core_load_save_state_discarding_geometry load discarded.
+extern "C" bool melonds_rs_core_shows_discarded_geometry(const MelonDSCoreHolder *core) {
+    return core->discarded.shown;
 }
 
 // Presentation hint: when set, the 2D renderer does not composite frames (see GPU::SkipDrawing).
@@ -142,10 +193,34 @@ extern "C" std::size_t melonds_rs_core_create_save_state(MelonDSCoreHolder *core
 
 extern "C" bool melonds_rs_core_load_save_state(MelonDSCoreHolder *core, void *data, std::size_t data_size) {
     Savestate state(data, data_size, false);
+    core->discarded = {};
     return core->nds->DoSavestate(&state);
 }
 
+// Load a state whose polygon and vertex RAM may be a stale copy (see DiscardedGeometry): nothing
+// is drawn from the polygons it restores. The flag is consulted inside DoSavestate, before the
+// render thread is restarted on the loaded render list.
+extern "C" bool melonds_rs_core_load_save_state_discarding_geometry(MelonDSCoreHolder *core, void *data, std::size_t data_size) {
+    Savestate state(data, data_size, false);
+    GPU3D &gpu3d = core->nds->GPU.GPU3D;
+    gpu3d.DiscardGeometryOnLoad = true;
+    bool loaded = core->nds->DoSavestate(&state);
+    gpu3d.DiscardGeometryOnLoad = false;
+
+    DiscardedGeometry &d = core->discarded;
+    d = {};
+    if (loaded) {
+        d.render_list = gpu3d.RenderNumPolygons > 0;
+        d.pending = gpu3d.NumPolygons > 0;
+        // The load itself renders the (discarded) list for the first frame to show.
+        d.rendered = d.render_list;
+        d.bank = gpu3d.CurRAMBank;
+    }
+    return loaded;
+}
+
 extern "C" void melonds_rs_core_reset(MelonDSCoreHolder *core) {
+    core->discarded = {};
     core->nds->Reset();
     core->nds->LoadBIOS();
     core->nds->SetupDirectBoot("nds.rom");

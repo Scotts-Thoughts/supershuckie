@@ -1,0 +1,122 @@
+diff --git a/src/ARMJIT_Memory.cpp b/src/ARMJIT_Memory.cpp
+index 09bad07..1bb73d0 100644
+--- a/src/ARMJIT_Memory.cpp
++++ b/src/ARMJIT_Memory.cpp
+@@ -176,6 +176,15 @@ LONG ARMJIT_Memory::ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo)
+         return EXCEPTION_CONTINUE_SEARCH;
+     }
+ 
++    // Only a thread running an emulator can fault in JIT code. A fault anywhere else (the 3D
++    // render thread, a frontend thread) is not ours: dereferencing the null Current here would
++    // fault again inside this handler, recursively, until the stack overflows and the original
++    // fault is lost.
++    if (!NDS::Current)
++    {
++        return EXCEPTION_CONTINUE_SEARCH;
++    }
++
+     u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
+     FaultDescription desc {};
+     desc.EmulatedFaultAddr = (u8*)exceptionInfo->ExceptionRecord->ExceptionInformation[1] - curArea;
+@@ -211,16 +220,21 @@ void ARMJIT_Memory::SigsegvHandler(int sig, siginfo_t* info, void* rawContext)
+ 
+     ucontext_t* context = (ucontext_t*)rawContext;
+ 
+-    FaultDescription desc {};
+-    u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
++    // Only a thread running an emulator can fault in JIT code; hand anything else to the
++    // previous handler (see the Windows handler).
++    if (NDS::Current)
++    {
++        FaultDescription desc {};
++        u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
+ 
+-    desc.EmulatedFaultAddr = (u8*)info->si_addr - curArea;
+-    desc.FaultPC = (u8*)context->CONTEXT_PC;
++        desc.EmulatedFaultAddr = (u8*)info->si_addr - curArea;
++        desc.FaultPC = (u8*)context->CONTEXT_PC;
+ 
+-    if (FaultHandler(desc, *NDS::Current))
+-    {
+-        context->CONTEXT_PC = (u64)desc.FaultPC;
+-        return;
++        if (FaultHandler(desc, *NDS::Current))
++        {
++            context->CONTEXT_PC = (u64)desc.FaultPC;
++            return;
++        }
+     }
+ 
+     struct sigaction* oldSa;
+diff --git a/src/GPU3D.h b/src/GPU3D.h
+index 08c2208..ec3a7e1 100644
+--- a/src/GPU3D.h
++++ b/src/GPU3D.h
+@@ -273,6 +273,13 @@ public:
+ 
+     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
+ 
++    // Set by a frontend around a DoSavestate load whose polygon and vertex RAM may not belong
++    // with the rest of the state (Super Shuckie replays store them from an earlier state; see
++    // supershuckie-replay-recorder/src/keyframe_masks.rs): every polygon restored is marked
++    // degenerate, so no renderer draws from it, while polygons the game submits afterwards draw
++    // normally. Not part of the hardware state, don't serialize.
++    bool DiscardGeometryOnLoad = false;
++
+     bool AbortFrame = false;
+ 
+     u64 Timestamp = 0;
+diff --git a/src/GPU3D.cpp b/src/GPU3D.cpp
+index d4dcc33..4cbc1c1 100644
+--- a/src/GPU3D.cpp
++++ b/src/GPU3D.cpp
+@@ -445,7 +445,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
+             {
+                 u32 index = UINT32_MAX;
+                 file->Var32(&index);
+-                poly->Vertices[j] = index == UINT32_MAX ? nullptr : &VertexRAM[index];
++                poly->Vertices[j] = index < std::size(VertexRAM) ? &VertexRAM[index] : nullptr;
+             }
+         }
+ 
+@@ -481,9 +481,20 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
+ 
+         if (!file->Saving)
+         {
+-            poly->Degenerate = false;
++            // A submitted polygon always has its vertices. A slot restored without them (one
++            // that was never used, reached through a render list saved with other polygon RAM)
++            // must not reach a renderer, which reads vertices 0, 1, VTop, VBottom and the last.
++            bool drawable = poly->NumVertices >= 1 && poly->NumVertices <= 10
++                && poly->VTop < poly->NumVertices && poly->VBottom < poly->NumVertices;
++            for (u32 j = 0; drawable && j < std::max(poly->NumVertices, 2u); j++)
++            {
++                if (!poly->Vertices[j])
++                    drawable = false;
++            }
++
++            poly->Degenerate = !drawable || DiscardGeometryOnLoad;
+ 
+-            for (u32 j = 0; j < poly->NumVertices; j++)
++            for (u32 j = 0; !poly->Degenerate && j < poly->NumVertices; j++)
+             {
+                 if (poly->Vertices[j]->Position[3] == 0)
+                     poly->Degenerate = true;
+@@ -508,6 +519,17 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
+ 
+         CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
+         CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
++
++        if (DiscardGeometryOnLoad)
++        {
++            // VBlank splits the polygons submitted so far into the render list by their
++            // Translucent flags, placing them around NumOpaquePolygons. Restored from other
++            // polygon RAM the flags need not agree with that count, which would leave entries of
++            // the list unset or write past its end; these polygons are never drawn, so any
++            // assignment that agrees will do.
++            for (u32 i = 0; i < NumPolygons && i < 2048; i++)
++                CurPolygonRAM[i].Translucent = i >= NumOpaquePolygons;
++        }
+     }
+ 
+     file->Var32(&RenderNumPolygons);

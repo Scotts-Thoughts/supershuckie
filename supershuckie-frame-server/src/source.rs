@@ -93,6 +93,13 @@ pub fn geometry(console: ReplayConsoleType, layout: ScreenLayout) -> (u32, u32) 
             ScreenLayout::HorizontalStack => (512, 192),
             ScreenLayout::TopOnly | ScreenLayout::BottomOnly => (256, 192),
         },
+        // 400x240 over a 320x240 screen; the stack takes the wider one's width.
+        ReplayConsoleType::Nintendo3DS => match layout {
+            ScreenLayout::VerticalStack => (400, 480),
+            ScreenLayout::HorizontalStack => (720, 240),
+            ScreenLayout::TopOnly => (400, 240),
+            ScreenLayout::BottomOnly => (320, 240),
+        },
         ReplayConsoleType::Unknown => (0, 0),
     }
 }
@@ -106,6 +113,7 @@ pub fn frame_rate(console: ReplayConsoleType) -> (u32, u32) {
         | ReplayConsoleType::SuperGameBoy2
         | ReplayConsoleType::GameBoyAdvance => (4194304, 70224),
         ReplayConsoleType::NintendoDS => (33513982, 560190),
+        ReplayConsoleType::Nintendo3DS => (268111856, 4481136),
         ReplayConsoleType::Unknown => (60, 1),
     }
 }

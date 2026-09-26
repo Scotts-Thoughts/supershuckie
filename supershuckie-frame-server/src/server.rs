@@ -542,11 +542,36 @@ impl Server {
         if cur == target && drawn == Some(target) {
             return Ok(());
         }
-        if !(cur < target && target - cur <= STEP_LIMIT) {
+        let load = !(cur < target && target - cur <= STEP_LIMIT);
+        if load {
             self.load_keyframe_before(target)?;
         }
-        self.step_hidden_to(id, target - 1)?;
+        // The frames the core needs drawn before the target are left to draw_next.
+        let lead = self.core().draw_lead_frames();
+        self.step_hidden_to(id, (target - 1).saturating_sub(lead))?;
+        self.draw_next(target)?;
 
+        // So soon after a keyframe with stale output buffers that the game has not rebuilt them
+        // yet (see `SuperShuckieCore::shows_stale_output`): seek as `go_to_replay_frame` does,
+        // which starts again from earlier keyframes, so the picture is the one playback shows.
+        // Only for a keyframe this request loaded: when even the earlier ones did not help (a
+        // long static 3D scene the game does not resubmit), stepping on must not seek again for
+        // every picture.
+        if load && self.core().shows_stale_output() {
+            let session = self.session.as_mut().expect("checked by usable()");
+            let core = session.core.as_mut().expect("checked by usable()");
+            session.drawn = None;
+            core.go_to_replay_frame(target).map_err(Stop::Failed)?;
+            if core.total_frames() != target || !core.last_frame_presented() {
+                return Err(Stop::Failed(format!("the core did not draw frame {target}")));
+            }
+            session.drawn = Some(target);
+        }
+        Ok(())
+    }
+
+    /// Draw the frame that brings the core to `target` emulated frames (it is at `target - 1`).
+    fn draw_next(&mut self, target: u64) -> Result<(), Stop> {
         let session = self.session.as_mut().expect("checked by usable()");
         let core = session.core.as_mut().expect("checked by usable()");
         session.drawn = None;
@@ -636,6 +661,9 @@ fn build_core(console: ReplayConsoleType, rom: &[u8]) -> Result<Box<dyn Emulator
         ReplayConsoleType::GameBoyAdvance => Box::new(GameBoyAdvance::new_from_rom(rom, None, GBA_BIOS, std_timestamp_provider())?),
         // The JIT is not reproducible; recordings are only bit-exact under the interpreter.
         ReplayConsoleType::NintendoDS => Box::new(NintendoDS::new_from_rom(rom, None, std_timestamp_provider(), false)?),
+        // Azahar loads a game from its file, which the frame server does not have, and one
+        // 3DS core per process would conflict with the app's own.
+        ReplayConsoleType::Nintendo3DS => return Err("Nintendo 3DS recordings are not served by the frame server yet".into()),
         ReplayConsoleType::Unknown => return Err("the recording's console type is unknown".into()),
     })
 }

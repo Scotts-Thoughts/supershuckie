@@ -926,7 +926,7 @@ enum SuperShuckieReplayState supershuckie_frontend_get_replay_state(const struct
 /**
  * Set the touch
  */
-void supershuckie_frontend_set_touch(struct SuperShuckieFrontendRaw *frontend, bool enabled, uint8_t x, uint8_t y);
+void supershuckie_frontend_set_touch(struct SuperShuckieFrontendRaw *frontend, bool enabled, uint16_t x, uint16_t y);
 
 struct SuperShuckieNintendoDSDate {
     uint16_t year;

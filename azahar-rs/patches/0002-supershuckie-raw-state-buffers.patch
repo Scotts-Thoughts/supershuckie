@@ -1,0 +1,200 @@
+diff --git a/src/core/core.h b/src/core/core.h
+index 569b0e4..3cdca78 100644
+--- a/src/core/core.h
++++ b/src/core/core.h
+@@ -7,6 +7,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <memory>
++#include <span>
+ #include <mutex>
+ #include <string>
+ #include <boost/optional.hpp>
+@@ -374,6 +375,22 @@ public:
+ 
+     std::vector<u8> SaveStateBuffer() const;
+ 
++    /// Super Shuckie: serialize the state into `out` with no header and no compression (the
++    /// caller diffs and compresses it itself). `out` is cleared first; its capacity is reused.
++    void SaveStateRaw(std::vector<u8>& out);
++
++    /// Super Shuckie: the raw state into `buffer`, which holds `valid_len` bytes of a previous
++    /// raw state (or anything else). Returns the state's size; when that is more than `capacity`
++    /// the archive did not fit (grow the buffer, keeping its contents, and call again). The RAM
++    /// regions are copied incrementally when `buffer` still holds a recent state of this process
++    /// (see Memory::MemorySystem::RawRegionIo). `pages_copied`, when given, receives how many 4
++    /// KB pages the RAM copy moved.
++    std::size_t SaveStateRawInto(u8* buffer, std::size_t capacity, std::size_t valid_len,
++                                 std::size_t* pages_copied = nullptr);
++
++    /// Super Shuckie: load a state produced by SaveStateRaw (no copies of the buffer are made).
++    bool LoadStateRaw(std::span<const u8> raw);
++
+     bool LoadStateBuffer(std::vector<u8> buffer);
+ 
+     /// Applies any changes to settings to this core instance.
+diff --git a/src/core/savestate.cpp b/src/core/savestate.cpp
+index 16c3db6..357a316 100644
+--- a/src/core/savestate.cpp
++++ b/src/core/savestate.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
++#include <cstring>
+ #include <chrono>
+ #include <sstream>
+ #include <cryptopp/hex.h>
+@@ -320,4 +322,151 @@ bool System::LoadStateBuffer(std::vector<u8> buffer) {
+     return true;
+ }
+ 
++// Super Shuckie: raw (header-less, uncompressed) state buffers for the replay recorder, which
++// keeps its own delta codec and compression. Neither direction copies the state: the archive
++// writes straight into the caller's vector / reads straight from the caller's span.
++namespace {
++
++// Serialises into a caller-owned buffer of `capacity` bytes, counting past it instead of
++// growing, so the caller learns the size it needs when the buffer was too small.
++class BufferSink final : public std::streambuf {
++public:
++    BufferSink(u8* buffer, std::size_t capacity) : buffer(buffer), capacity(capacity) {}
++    std::size_t written = 0;
++
++protected:
++    std::streamsize xsputn(const char* s, std::streamsize n) override {
++        const std::size_t count = static_cast<std::size_t>(n);
++        if (written < capacity) {
++            std::memcpy(buffer + written, s, std::min(count, capacity - written));
++        }
++        written += count;
++        return n;
++    }
++    int overflow(int c) override {
++        if (c != traits_type::eof()) {
++            if (written < capacity) {
++                buffer[written] = static_cast<u8>(c);
++            }
++            written++;
++        }
++        return c;
++    }
++
++private:
++    u8* buffer;
++    std::size_t capacity;
++};
++
++// A raw state: this header, the RAM regions (Memory::MemorySystem::RawRegionsSize() bytes), the
++// boost archive of everything else.
++struct RawHeader {
++    char magic[8];
++    u64 generation;   ///< of the RAM regions (Memory::MemorySystem::RawRegionIo)
++    u64 regions_size; ///< bytes of RAM regions after the header
++    u64 total_size;   ///< header + regions + archive
++};
++constexpr char RAW_MAGIC[8] = {'S', 'S', 'R', 'A', 'W', '0', '0', '2'};
++
++class SpanSource final : public std::streambuf {
++public:
++    explicit SpanSource(std::span<const u8> data) {
++        char* begin = const_cast<char*>(reinterpret_cast<const char*>(data.data()));
++        setg(begin, begin, begin + data.size());
++    }
++};
++
++} // namespace
++
++std::size_t System::SaveStateRawInto(u8* buffer, std::size_t capacity, std::size_t valid_len,
++                                     std::size_t* pages_copied) {
++    const std::size_t regions_size = Memory::MemorySystem::RawRegionsSize();
++    const std::size_t archive_offset = sizeof(RawHeader) + regions_size;
++    if (capacity < archive_offset) {
++        // Not even the regions fit; the archive is a few MB on top.
++        return archive_offset + (32u << 20);
++    }
++    Memory::MemorySystem::RawRegionIo io;
++    io.dst = buffer + sizeof(RawHeader);
++    if (valid_len >= archive_offset && valid_len <= capacity) {
++        RawHeader previous;
++        std::memcpy(&previous, buffer, sizeof previous);
++        if (std::memcmp(previous.magic, RAW_MAGIC, sizeof RAW_MAGIC) == 0 && previous.regions_size == regions_size) {
++            io.dst_generation = previous.generation;
++        }
++    }
++    // The header is rewritten only once the regions are complete, so a save that stops early
++    // (or does not fit) leaves a header a retry can still trust.
++    std::memset(buffer, 0, sizeof(RawHeader));
++    Memory::MemorySystem::SetRawRegionIo(&io);
++    BufferSink sink{buffer + archive_offset, capacity - archive_offset};
++    try {
++        std::ostream stream{&sink};
++        {
++            oarchive oa{stream};
++            oa&* this;
++        }
++        stream.flush();
++    } catch (...) {
++        Memory::MemorySystem::SetRawRegionIo(nullptr);
++        throw;
++    }
++    Memory::MemorySystem::SetRawRegionIo(nullptr);
++    RawHeader header{};
++    std::memcpy(header.magic, RAW_MAGIC, sizeof RAW_MAGIC);
++    header.generation = io.generation_out;
++    header.regions_size = regions_size;
++    header.total_size = archive_offset + sink.written;
++    std::memcpy(buffer, &header, sizeof header);
++    if (pages_copied) {
++        *pages_copied = io.pages_copied;
++    }
++    return header.total_size;
++}
++
++void System::SaveStateRaw(std::vector<u8>& out) {
++    // `out` keeps its contents until the new state is complete: a buffer holding a recent state
++    // gets only the RAM pages written since. The vector is grown to its capacity before the
++    // state is written and shrunk after, since growing it afterwards would zero what was written.
++    for (;;) {
++        const std::size_t previous = out.size();
++        out.resize(out.capacity());
++        const std::size_t n = SaveStateRawInto(out.data(), out.size(), previous);
++        if (n <= out.size()) {
++            out.resize(n);
++            return;
++        }
++        out.resize(previous);
++        out.reserve(n + (1u << 20));
++    }
++}
++
++bool System::LoadStateRaw(std::span<const u8> raw) {
++    if (raw.size() < sizeof(RawHeader)) {
++        return false;
++    }
++    RawHeader header;
++    std::memcpy(&header, raw.data(), sizeof header);
++    const std::size_t archive_offset = sizeof(RawHeader) + header.regions_size;
++    if (std::memcmp(header.magic, RAW_MAGIC, sizeof RAW_MAGIC) != 0 ||
++        header.regions_size != Memory::MemorySystem::RawRegionsSize() || header.total_size > raw.size() ||
++        header.total_size < archive_offset) {
++        return false;
++    }
++    Memory::MemorySystem::RawRegionIo io;
++    io.src = raw.data() + sizeof(RawHeader);
++    Memory::MemorySystem::SetRawRegionIo(&io);
++    try {
++        SpanSource source{raw.subspan(archive_offset, header.total_size - archive_offset)};
++        std::istream stream{&source};
++        iarchive ia{stream};
++        ia&* this;
++    } catch (...) {
++        Memory::MemorySystem::SetRawRegionIo(nullptr);
++        throw;
++    }
++    Memory::MemorySystem::SetRawRegionIo(nullptr);
++    return true;
++}
++
+ } // namespace Core

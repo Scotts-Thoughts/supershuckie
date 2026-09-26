@@ -158,6 +158,39 @@ pub enum Packet {
         delta: SignedInteger
     },
 
+    /// A keyframe of a Nintendo 3DS file (format v8), whose bytes stay in the file until needed.
+    ///
+    /// The packet is followed in the stream by `frame_len` bytes: one zstd frame that decodes to
+    /// `uncompressed_len` bytes, which for `level` 0 is the whole state (`state_len` bytes) and
+    /// for levels 1 and 2 a [region diff](crate::util::region_diff_resizing) (`u64` control
+    /// length, control, data) against the state after the most recent keyframe of a level at
+    /// most `level`, compressed with that keyframe's own decoded payload as zstd prefix. The
+    /// reader skips the frame when parsing and notes where it is (`frame_offset`, which is not
+    /// stored), so a 4 GB file does not have to be in memory; see `replay-3ds-spec.md` §7.
+    #[allow(missing_docs)]
+    StoredKeyframe {
+        metadata: KeyframeMetadata,
+        level: u8,
+        state_len: UnsignedInteger,
+        uncompressed_len: UnsignedInteger,
+        frame_len: UnsignedInteger,
+        frame_offset: UnsignedInteger
+    },
+
+    /// A small picture of both screens at `elapsed_frames` (Nintendo 3DS files, once a second):
+    /// what the timeline shows while it is dragged, so a drag never has to seek (a seek costs up
+    /// to a second there). `top`/`bottom` are zstd frames of RGB565 pixels, row-major.
+    #[allow(missing_docs)]
+    Thumbnail {
+        elapsed_frames: UnsignedInteger,
+        top_width: UnsignedInteger,
+        top_height: UnsignedInteger,
+        bottom_width: UnsignedInteger,
+        bottom_height: UnsignedInteger,
+        top: ByteVec,
+        bottom: ByteVec
+    },
+
     /// Everything the console received over its link cable during the frame that the next
     /// [`Packet::NextFrame`] closes (format v7), so that a replay of a linked game reproduces the
     /// transfer without the other console. The bytes are console-specific (see the core's

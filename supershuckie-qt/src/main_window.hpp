@@ -26,6 +26,7 @@ class GameSpeedDialog;
 class SuperShuckieTimestamp;
 class AskForTextDialog;
 class SelectItemDialog;
+class SelectReplayDialog;
 class ControlsSettingsWindow;
 class ReplayPlaybackControls;
 class NDSDateDialog;
@@ -57,6 +58,7 @@ class MainWindow: public QMainWindow {
     friend GameSpeedDialog;
     friend AskForTextDialog;
     friend SelectItemDialog;
+    friend SelectReplayDialog;
     friend ControlsSettingsWindow;
     friend ShortcutsSettingsWindow;
     friend ReplayPlaybackControls;

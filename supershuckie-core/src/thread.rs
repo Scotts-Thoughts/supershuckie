@@ -23,7 +23,7 @@ use std::vec::Vec;
 use supershuckie_pokeabyte_integration::PokeAByteEmulatorCommand;
 #[cfg(feature = "pokeabyte")]
 use supershuckie_pokeabyte_integration::PokeAByteIntegrationServer;
-use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
+use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplayThumbnail};
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
 use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash};
 use supershuckie_replay_recorder::{BookmarkTable, ByteVec, InputBuffer, SignedInteger, TimestampMillis, UnsignedInteger};
@@ -1938,21 +1938,32 @@ impl CoreLoop {
         // frame -- both may be set in the same loop iteration (an app frame that both jumps and
         // steps), and applying only one used to silently drop the other.
         if frame != u32::MAX {
-            // While frozen (the timeline is being dragged) land on the nearest keyframe and
-            // remember the exact frame for when the drag ends; see `coarse_replay_frame`.
-            let target = if self.playback_frozen && self.coarse_seek_while_frozen {
-                let coarse = u32::try_from(self.core.coarse_replay_frame(frame as UnsignedInteger)).unwrap_or(frame);
-                self.pending_exact_frame = (coarse != frame).then_some(frame);
-                coarse
+            // While frozen (the timeline is being dragged) land near the frame cheaply and
+            // remember the exact frame for when the drag ends; see `go_to_replay_frame_coarse`.
+            let coarse = self.playback_frozen && self.coarse_seek_while_frozen;
+            // A replay with timeline pictures (Nintendo 3DS) shows the picture for the frame
+            // instead of seeking at all (a 3DS seek costs up to a second); the exact seek
+            // happens when the drag ends.
+            let thumbnail = if coarse { self.core.replay_thumbnail(frame as UnsignedInteger) } else { None };
+            if let Some(thumbnail) = thumbnail {
+                self.show_thumbnail(&thumbnail);
+                self.pending_exact_frame = Some(frame);
             }
             else {
-                self.pending_exact_frame = None;
-                frame
-            };
-            if let Err(e) = self.core.go_to_replay_frame(target as UnsignedInteger) {
-                self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                let result = if coarse {
+                    self.core.go_to_replay_frame_coarse(frame as UnsignedInteger)
+                }
+                else {
+                    self.core.go_to_replay_frame(frame as UnsignedInteger)
+                };
+                if let Err(e) = result {
+                    self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                }
+                // Wherever a coarse seek landed (a keyframe's frame, or a few frames past it
+                // while the picture settles), the exact frame is sought when the drag ends.
+                self.pending_exact_frame = (coarse && self.core.total_frames() != frame as UnsignedInteger).then_some(frame);
+                seeked = true;
             }
-            seeked = true;
         }
 
         if delta != 0 {
@@ -2029,6 +2040,36 @@ impl CoreLoop {
     /// Publish the most recently drawn frame to the screen buffer (or queue it if the reader
     /// holds the buffer right now). Frames that were emulated but not drawn only update the
     /// elapsed-time stats.
+    /// Put a replay's timeline picture on the screens the frontend shows (scaled up to the
+    /// console's screen size), in place of a frame the emulator would have drawn.
+    fn show_thumbnail(&mut self, thumbnail: &ReplayThumbnail) {
+        let Some(screen_data) = self.screens.upgrade() else {
+            return
+        };
+        let mut screens = screen_data.lock().unwrap_or_else(|p| p.into_inner());
+        for (screen, (w, h, pixels)) in screens.iter_mut().zip([&thumbnail.top, &thumbnail.bottom]) {
+            let (w, h) = (*w as usize, *h as usize);
+            if w == 0 || h == 0 || pixels.len() < w * h * 2 || screen.width == 0 || screen.height == 0 {
+                continue;
+            }
+            screen.pixels.resize(screen.width * screen.height, 0xFF000000);
+            for y in 0..screen.height {
+                let sy = y * h / screen.height;
+                for x in 0..screen.width {
+                    let sx = x * w / screen.width;
+                    let i = (sy * w + sx) * 2;
+                    let p = u16::from_le_bytes([pixels[i], pixels[i + 1]]) as u32;
+                    let r = ((p >> 11) & 0x1F) * 255 / 31;
+                    let g = ((p >> 5) & 0x3F) * 255 / 63;
+                    let b = (p & 0x1F) * 255 / 31;
+                    screen.pixels[y * screen.width + x] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                }
+            }
+        }
+        self.screen_generation = self.screen_generation.wrapping_add(1);
+        self.screen_ready_for_copy = false;
+    }
+
     fn refresh_screen_data(&mut self) {
         if self.is_running() && self.core.is_mid_frame() {
             return

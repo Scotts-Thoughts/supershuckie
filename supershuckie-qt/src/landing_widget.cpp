@@ -218,6 +218,10 @@ QPixmap LandingWidget::generated_icon(const Favorite &favorite) {
         base = QColor(0x4A, 0x4A, 0x52);
         label = "NDS";
     }
+    else if(suffix == "3ds" || suffix == "cci" || suffix == "cxi" || suffix == "3dsx") {
+        base = QColor(0xB8, 0x2E, 0x3A);
+        label = "3DS";
+    }
     else {
         base = QColor(0x80, 0x80, 0x80);
         label = "ROM";
@@ -413,10 +417,11 @@ void LandingWidget::do_add_rom() {
     QFileDialog rom_opener(this->main_window);
     rom_opener.setFileMode(QFileDialog::FileMode::ExistingFiles);
     rom_opener.setNameFilters(QStringList({
-        "All compatible ROM files (*.gb *.gbc *.gba *.nds)",
+        "All compatible ROM files (*.gb *.gbc *.gba *.nds *.3ds *.cci *.cxi *.3dsx)",
         "GB/GBC ROM dumps (*.gb *.gbc)",
         "GBA ROM dumps (*.gba)",
         "NDS ROM files (*.nds)",
+        "3DS ROM files (*.3ds *.cci *.cxi *.3dsx)",
         "Any files (*)"
     }));
     rom_opener.setWindowTitle("Select ROMs to add to the start screen");

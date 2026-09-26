@@ -166,6 +166,8 @@ fn count_packets(path: &std::path::Path) -> (u64, BTreeMap<&'static str, u64>, f
             Packet::CompressedBlob { .. } => "CompressedBlob",
             Packet::IncrementCounter { .. } => "IncrementCounter",
             Packet::SerialIn { .. } => "SerialIn",
+            Packet::StoredKeyframe { .. } => "StoredKeyframe",
+            Packet::Thumbnail { .. } => "Thumbnail",
         };
         *counts.entry(name).or_default() += 1;
         match packet {

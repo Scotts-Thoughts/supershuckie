@@ -23,3 +23,30 @@ identically (check with `nds_bench --verify`, see `supershuckie-core/examples/nd
 * `CmdFIFOEntry` is a `union { u64; struct { u32 Param; u8 Command; } }`, so three padding
   bytes per entry were uninitialised stack bytes that `DoSavestate` copied into every save state
   (and every replay keyframe). The two constructors now value-initialise the entry.
+
+## 0002 — loads with stale polygon RAM; JIT fault handler on foreign threads
+
+Masked replay keyframes (`supershuckie-replay-recorder/src/keyframe_masks.rs`) carry the chain
+restart's copy of `VertexRAM`/`PolygonRAM` while the render list and the polygons already
+submitted for the next flush are the keyframe's own. Loading one used to crash the 3D render
+thread (a render-list slot that was empty in the copy has no vertices; `SetupPolygon` read
+through a null vertex) and could crash VBlank or overrun `RenderPolygonRAM` (the copy's
+`Translucent` flags disagree with the live `NumOpaquePolygons`).
+
+* `GPU3D::DoSavestate` (load) keeps vertex indices in range and marks a polygon degenerate
+  when it has no vertices, more than ten, a `VTop`/`VBottom` past its vertices or a null vertex
+  the renderer would read. States melonDS itself writes never contain one.
+* `GPU3D::DiscardGeometryOnLoad` (not serialised): set around a load whose polygon RAM may be
+  stale. Every restored polygon is marked degenerate (nothing is drawn from them; polygons the
+  game submits afterwards draw normally), and the pending polygons' `Translucent` flags are
+  made to agree with `NumOpaquePolygons`. `melonds_rs_core_load_save_state_discarding_geometry`
+  sets it; `melonds-rs/interface.cpp` then follows, frame by frame, whether the picture still
+  lacks geometry (`melonds_rs_core_shows_discarded_geometry`).
+* `ARMJIT_Memory` fault handlers return early when `NDS::Current` is null. The Windows vectored
+  handler used to dereference it for an access violation on any thread that is not running an
+  emulator (the render thread, the UI), fault again inside itself and recurse until the stack
+  overflowed, so every such crash was reported as a stack overflow in `ExceptionHandler`.
+
+Emulation is unaffected (only non-serialised flags, and bytes of polygon RAM a masked keyframe
+already holds stale, change): `nds_bench --verify` from a stale keyframe and from boot, and
+`supershuckie-core/examples/scrub_check.rs` against plain playback.

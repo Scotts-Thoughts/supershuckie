@@ -66,6 +66,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "azahar-rs"
+version = "0.4.15"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -956,12 +963,14 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "supershuckie-core"
 version = "0.4.15"
 dependencies = [
+ "azahar-rs",
  "melonds-rs",
  "mgba-rs",
  "safeboy",
  "spin",
  "supershuckie-pokeabyte-integration",
  "supershuckie-replay-recorder",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -978,7 +987,9 @@ dependencies = [
 name = "supershuckie-frontend"
 version = "0.4.15"
 dependencies = [
+ "azahar-rs",
  "melonds-rs",
+ "memmap2",
  "mgba-rs",
  "num_enum",
  "serde",

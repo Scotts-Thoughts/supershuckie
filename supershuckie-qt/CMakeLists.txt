@@ -27,6 +27,7 @@ add_library(supershuckie-cpp-static STATIC
     src/game_speed_dialog.cpp
     src/ask_for_text_dialog.cpp
     src/select_item_dialog.cpp
+    src/select_replay_dialog.cpp
     src/controller_settings_window.cpp
     src/shortcuts_settings_window.cpp
     src/sdl_event_wrapper.cpp
@@ -119,6 +120,19 @@ if(SCRIPT_BUILD)
         PUBLIC ${MELONDS_TEAKRA}
         PUBLIC ${MGBA_CORE}
     )
+    # Azahar (3DS): one merged archive made by scripts/build-azahar-spike.ps1 (the azahar_bundle
+    # target of azahar-rs/spike/spike.cmake), plus what it calls into.
+    find_library(AZAHAR_CORE NAMES azahar PATHS ${CMAKE_BINARY_DIR}/azahar)
+    if(NOT AZAHAR_CORE)
+        message(FATAL_ERROR "libazahar.a not found under ${CMAKE_BINARY_DIR}/azahar; run scripts/build-azahar-spike.ps1 (it builds the azahar_bundle target)")
+    endif()
+    target_link_libraries(supershuckie-cpp-static PUBLIC ${AZAHAR_CORE})
+    if(${WIN32})
+        target_link_libraries(supershuckie-cpp-static PUBLIC
+            crypt32 ws2_32 iphlpapi gdi32 opengl32 winmm psapi imm32 version bcrypt ole32 oleaut32 uuid advapi32 winspool comdlg32)
+    else()
+        target_link_libraries(supershuckie-cpp-static PUBLIC GL)
+    endif()
     # scripts/build-melonds.* produce libcore.a with LTO (and PGO) objects; make sure the final
     # link actually runs the link-time optimiser over them rather than taking the fallback code.
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

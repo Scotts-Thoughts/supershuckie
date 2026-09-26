@@ -199,6 +199,104 @@ pub fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>,
     Ok(decompressed_data)
 }
 
+/// [`compress_data`] with `prefix` as zstd's reference prefix: matches may reach into those bytes
+/// as if they preceded `data`, and [`decompress_data_with_prefix`] must be given the same prefix.
+/// Always a 128 MiB window with long-distance matching: this is for 3DS keyframes, whose delta
+/// against the previous keyframe is tens of MB of bytes that mostly already occur in the
+/// previous keyframe's delta (double-buffered GPU data moving around), which is what makes a
+/// 44 MB payload a 2–3 MB frame.
+pub fn compress_data_with_prefix(data: &[u8], compression_level: i32, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    use core::ffi::c_void;
+    // SAFETY: pure function of its argument.
+    let bound = unsafe { zstd_sys::ZSTD_compressBound(data.len()) };
+    let mut v: Vec<u8> = Vec::new();
+    if v.try_reserve_exact(bound).is_err() {
+        return Err(Cow::Borrowed("failed to allocate RAM to compress"));
+    }
+    // SAFETY: creating a context has no preconditions; a null result is checked.
+    let cctx = unsafe { ZSTD_createCCtx() };
+    if cctx.is_null() {
+        return Err(Cow::Borrowed("ZSTD_createCCtx failed"));
+    }
+    let result = (|| -> Result<usize, Cow<'static, str>> {
+        let set = |parameter: ZSTD_cParameter, value: i32| -> Result<(), Cow<'static, str>> {
+            // SAFETY: cctx is a live context.
+            let r = unsafe { ZSTD_CCtx_setParameter(cctx, parameter, value) };
+            if unsafe { ZSTD_isError(r) } != 0 { Err(zstd_error(r)) } else { Ok(()) }
+        };
+        // SAFETY: pure functions.
+        let level = unsafe { compression_level.clamp(ZSTD_minCLevel() as i32, ZSTD_maxCLevel() as i32) };
+        set(ZSTD_cParameter::ZSTD_c_compressionLevel, level)?;
+        set(ZSTD_cParameter::ZSTD_c_windowLog, MAX_WINDOW_LOG as i32)?;
+        set(ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, 1)?;
+        if !prefix.is_empty() {
+            // SAFETY: the prefix outlives the compression (it is borrowed for this whole function).
+            let r = unsafe { zstd_sys::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr() as *const c_void, prefix.len()) };
+            if unsafe { ZSTD_isError(r) } != 0 { return Err(zstd_error(r)); }
+        }
+        // SAFETY: `v` has `bound` bytes of capacity; `data` is a valid slice.
+        let n = unsafe { ZSTD_compress2(cctx, v.as_mut_ptr() as *mut c_void, v.capacity(), data.as_ptr() as *const c_void, data.len()) };
+        if unsafe { ZSTD_isError(n) } != 0 { return Err(zstd_error(n)); }
+        Ok(n)
+    })();
+    // SAFETY: created above, not used afterwards.
+    unsafe { ZSTD_freeCCtx(cctx) };
+    let n = result?;
+    assert!(n <= bound);
+    // SAFETY: zstd wrote `n` bytes.
+    unsafe { v.set_len(n) };
+    Ok(v)
+}
+
+/// Decompress a frame made by [`compress_data_with_prefix`] with the same `prefix` (empty when
+/// it was compressed without one) into exactly `uncompressed_size` bytes.
+pub fn decompress_data_with_prefix(data: &[u8], uncompressed_size: usize, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    use core::ffi::c_void;
+    // SAFETY: `data` is a valid slice; only the frame header is inspected.
+    let claimed_size = unsafe { ZSTD_getFrameContentSize(data.as_ptr() as *const c_void, data.len()) };
+    if claimed_size == ZSTD_CONTENTSIZE_UNKNOWN {
+        return Err(Cow::Borrowed("zstd frame does not record its content size"));
+    }
+    if claimed_size == ZSTD_CONTENTSIZE_ERROR {
+        return Err(Cow::Borrowed("zstd frame header is malformed"));
+    }
+    if claimed_size != uncompressed_size as u64 {
+        return Err(Cow::Owned(format!("zstd frame claims {claimed_size} bytes but {uncompressed_size} were expected")));
+    }
+    let mut out: Vec<u8> = Vec::new();
+    if out.try_reserve_exact(uncompressed_size).is_err() {
+        return Err(Cow::Borrowed("failed to allocate RAM to decompress"));
+    }
+    // SAFETY: no preconditions; null checked.
+    let dctx = unsafe { ZSTD_createDCtx() };
+    if dctx.is_null() {
+        return Err(Cow::Borrowed("ZSTD_createDCtx failed"));
+    }
+    let result = (|| -> Result<(), Cow<'static, str>> {
+        // SAFETY: dctx is a live context.
+        let r = unsafe { ZSTD_DCtx_setParameter(dctx, ZSTD_dParameter::ZSTD_d_windowLogMax, MAX_WINDOW_LOG as i32) };
+        if unsafe { ZSTD_isError(r) } != 0 { return Err(zstd_error(r)); }
+        if !prefix.is_empty() {
+            // SAFETY: the prefix outlives the decompression.
+            let r = unsafe { zstd_sys::ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr() as *const c_void, prefix.len()) };
+            if unsafe { ZSTD_isError(r) } != 0 { return Err(zstd_error(r)); }
+        }
+        // SAFETY: `out` has the capacity; `data` is a valid slice.
+        let n = unsafe { zstd_sys::ZSTD_decompressDCtx(dctx, out.as_mut_ptr() as *mut c_void, uncompressed_size, data.as_ptr() as *const c_void, data.len()) };
+        if unsafe { ZSTD_isError(n) } != 0 { return Err(zstd_error(n)); }
+        if n != uncompressed_size {
+            return Err(Cow::Owned(format!("Uncompressed size is incorrect (expected {uncompressed_size} but was {n})")));
+        }
+        Ok(())
+    })();
+    // SAFETY: created above, not used afterwards.
+    unsafe { ZSTD_freeDCtx(dctx) };
+    result?;
+    // SAFETY: zstd wrote exactly `uncompressed_size` bytes.
+    unsafe { out.set_len(uncompressed_size) };
+    Ok(out)
+}
+
 /// Incremental decompression of one zstd frame (a compressed blob) straight into a caller-owned
 /// buffer, so a reader can stop once it has the bytes it needs.
 ///
@@ -451,6 +549,54 @@ pub fn region_diff(prev: &[u8], cur: &[u8]) -> Option<RegionDiff> {
     Some(RegionDiff { control, data, runs })
 }
 
+/// [`region_diff`] for states whose length may differ: the 3DS core's raw states vary by a few
+/// bytes from one keyframe to the next (Azahar serialises variable-size kernel bookkeeping), and
+/// a full 170 MB keyframe every time that happens is not an option.
+///
+/// The common prefix (whole words) is diffed exactly as [`region_diff`] would; whatever `cur`
+/// has past it is one final run. The player resizes its state to the keyframe's `state_len`
+/// (zero-extending or truncating) before applying, so a run may extend past `prev`'s length.
+/// For equal lengths the output is byte-for-byte what [`region_diff`] gives, which keeps every
+/// existing (fixed-size) console's files unchanged.
+#[must_use]
+pub fn region_diff_resizing(prev: &[u8], cur: &[u8]) -> RegionDiff {
+    if prev.len() == cur.len() {
+        return region_diff(prev, cur).expect("equal lengths");
+    }
+
+    let common_words = prev.len().min(cur.len()) / 4;
+    let common = common_words * 4;
+    let mut diff = region_diff(&prev[..common], &cur[..common]).expect("equal lengths");
+
+    let tail = &cur[common..];
+    if !tail.is_empty() {
+        let (tail_words, tail_extra) = tail.as_chunks::<4>();
+        let gap = common_words - control_end(&diff.control);
+        let len = tail_words.len() + usize::from(!tail_extra.is_empty());
+        write_leb128(&mut diff.control, gap as u64);
+        write_leb128(&mut diff.control, len as u64);
+        for word in tail_words {
+            diff.data.extend_from_slice(word);
+        }
+        if !tail_extra.is_empty() {
+            diff.data.extend_from_slice(&pad_word(tail_extra));
+        }
+        diff.runs += 1;
+    }
+    diff
+}
+
+/// The word position just past the last run of a valid `control` stream.
+fn control_end(control: &[u8]) -> usize {
+    let mut ctl = control;
+    let mut pos = 0usize;
+    while let Some(gap) = read_leb128(&mut ctl) {
+        let Some(len) = read_leb128(&mut ctl) else { break };
+        pos += gap as usize + len as usize;
+    }
+    pos
+}
+
 /// Parse `control`, checking that every run stays within `words` words and that `data` holds
 /// exactly the replacement bytes the runs need.
 fn validate_region_diff(words: usize, control: &[u8], data_len: usize) -> Option<()> {
@@ -511,6 +657,40 @@ pub fn apply_region_diff_in_place(state: &mut [u8], control: &[u8], data: &[u8])
     }
 
     true
+}
+
+/// Whether the [`RegionDiff`] `control` stream changes any whole 4-byte word inside the byte
+/// range `start..end` (words the range only partly covers are ignored, since a change to their
+/// other bytes says nothing about the range). A malformed stream counts as touching it.
+#[must_use]
+pub fn region_diff_touches(control: &[u8], start: usize, end: usize) -> bool {
+    let first_word = start.div_ceil(4);
+    let end_word = end / 4;
+    if first_word >= end_word {
+        return false;
+    }
+
+    let mut ctl = control;
+    let mut pos = 0usize;
+    while !ctl.is_empty() {
+        let (Some(gap), Some(len)) = (read_leb128(&mut ctl), read_leb128(&mut ctl)) else {
+            return true;
+        };
+        let Some(run_start) = usize::try_from(gap).ok().and_then(|gap| pos.checked_add(gap)) else {
+            return true;
+        };
+        if run_start >= end_word {
+            return false;
+        }
+        let Some(run_end) = usize::try_from(len).ok().and_then(|len| run_start.checked_add(len)) else {
+            return true;
+        };
+        if run_end > first_word {
+            return true;
+        }
+        pos = run_end;
+    }
+    false
 }
 
 /// Apply a [`RegionDiff`] (`control` + `data`) to `prev`, returning the new state.
@@ -794,6 +974,46 @@ mod tests {
     }
 
     #[test]
+    fn prefix_compression_round_trips_and_needs_its_prefix() {
+        let prefix: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        // Data that is mostly the prefix's bytes shifted: small with the prefix, large without.
+        let mut data = prefix[1000..].to_vec();
+        data.extend_from_slice(&prefix[..1000]);
+        let with = compress_data_with_prefix(&data, 3, &prefix).unwrap();
+        let without = compress_data_with_prefix(&data, 3, &[]).unwrap();
+        assert!(with.len() * 4 < without.len(), "{} vs {}", with.len(), without.len());
+        assert_eq!(decompress_data_with_prefix(&with, data.len(), &prefix).unwrap(), data);
+        assert!(decompress_data_with_prefix(&with, data.len(), &[]).is_err());
+        assert_eq!(decompress_data_with_prefix(&without, data.len(), &[]).unwrap(), data);
+    }
+
+    #[test]
+    fn resizing_diff_reconstructs_longer_and_shorter_states() {
+        let prev: Vec<u8> = (0..1003u32).map(|i| (i * 7) as u8).collect();
+        let mut longer = prev.clone();
+        longer[40] ^= 0xFF;
+        longer.extend_from_slice(&[9, 8, 7, 6, 5, 4, 3]);
+        let d = region_diff_resizing(&prev, &longer);
+        let mut state = prev.clone();
+        state.resize(longer.len(), 0);
+        assert!(apply_region_diff_in_place(&mut state, &d.control, &d.data));
+        assert_eq!(state, longer);
+
+        let mut shorter = prev[..990].to_vec();
+        shorter[2] ^= 1;
+        shorter[989] ^= 1;
+        let d = region_diff_resizing(&prev, &shorter);
+        let mut state = prev.clone();
+        state.truncate(shorter.len());
+        assert!(apply_region_diff_in_place(&mut state, &d.control, &d.data));
+        assert_eq!(state, shorter);
+
+        // Equal lengths: identical to the plain codec.
+        let same = region_diff(&prev, &longer[..prev.len()]).unwrap();
+        assert_eq!(region_diff_resizing(&prev, &longer[..prev.len()]), same);
+    }
+
+    #[test]
     fn adjacent_changes_merge_into_one_run() {
         let base = pseudo_random_bytes(3, 1024);
         let mut cur = base.clone();
@@ -945,5 +1165,35 @@ mod tests {
         let d = round_trip(&prev, &cur);
         // Words 0 | 1023-1024 | 2047 | 2063-2064 | 5120 (the partial word).
         assert_eq!(d.runs, 5);
+    }
+
+    #[test]
+    fn region_diff_touches_only_whole_words_inside_the_range() {
+        let prev = pseudo_random_bytes(5, 400);
+        let changed = |offsets: &[usize]| {
+            let mut cur = prev.clone();
+            for &o in offsets {
+                cur[o] ^= 0xA5;
+            }
+            region_diff(&prev, &cur).expect("equal lengths").control
+        };
+
+        // Range 101..301 covers whole words 26..=74 (bytes 104..300).
+        assert!(!region_diff_touches(&changed(&[]), 101, 301));
+        assert!(!region_diff_touches(&changed(&[0, 99, 350]), 101, 301));
+        // Bytes 101..104 and 300 share words with bytes outside the range: ignored.
+        assert!(!region_diff_touches(&changed(&[102, 300]), 101, 301));
+        assert!(region_diff_touches(&changed(&[104]), 101, 301));
+        assert!(region_diff_touches(&changed(&[299]), 101, 301));
+        assert!(region_diff_touches(&changed(&[0, 200, 399]), 101, 301));
+        // A run that starts before the range and reaches into it.
+        let mut cur = prev.clone();
+        for b in &mut cur[40..120] {
+            *b ^= 0xFF;
+        }
+        assert!(region_diff_touches(&region_diff(&prev, &cur).expect("equal lengths").control, 101, 301));
+        // Nothing whole inside, and a malformed stream.
+        assert!(!region_diff_touches(&changed(&[101, 102]), 101, 103));
+        assert!(region_diff_touches(&[0x80], 101, 301));
     }
 }

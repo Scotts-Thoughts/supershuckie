@@ -3,6 +3,7 @@
 mod game_boy_color;
 mod null;
 mod nintendo_ds;
+mod nintendo_3ds;
 mod game_boy_advance;
 pub mod link;
 
@@ -11,6 +12,7 @@ use alloc::string::String;
 pub use game_boy_color::*;
 pub use null::*;
 pub use nintendo_ds::*;
+pub use nintendo_3ds::*;
 pub use game_boy_advance::*;
 pub use link::{LinkError, LinkPort};
 
@@ -162,10 +164,27 @@ pub trait EmulatorCore: Send + 'static {
         into.extend_from_slice(&state);
     }
 
+    /// Whether a save state can be taken right now. Cores whose state is not serialisable at
+    /// every frame boundary (the 3DS core while an HLE file operation is mid-flight) return
+    /// `false`; periodic callers (keyframes) then try again after the next frame. Default: always.
+    fn save_state_possible(&self) -> bool {
+        true
+    }
+
     /// Presentation hint: when `skip` is set, frames run from now on need not be drawn because
     /// nobody will look at them. Cores that support it stop updating their screens (and report
     /// `presented: false` in [`RunTime`]); emulation itself is unaffected. Default: ignored.
     fn set_skip_drawing(&mut self, _skip: bool) {}
+
+    /// How many frames before a frame that will be looked at must also be drawn for its picture
+    /// to be complete; `u64::MAX` when every frame must be drawn for any picture to be right.
+    /// The 3DS shows a frame one VBlank after the game renders it, and games redraw a screen
+    /// only on some frames (Pokémon X's bottom screen): a frame that ran with drawing skipped
+    /// leaves a cleared framebuffer that stays on the screen until the game redraws it, so on
+    /// the 3DS drawing is never skipped while anyone watches. Default: 0.
+    fn draw_lead_frames(&self) -> u64 {
+        0
+    }
 
     /// Turn audio generation on or off. Off by default.
     ///
@@ -212,6 +231,25 @@ pub trait EmulatorCore: Send + 'static {
 
     /// Load a save state.
     fn load_save_state(&mut self, state: &[u8]) -> Result<(), String>;
+
+    /// Load a replay keyframe whose regenerated output buffers (see
+    /// [`transient_ranges`](supershuckie_replay_recorder::keyframe_masks::transient_ranges)) are a
+    /// stale copy from an earlier keyframe, as in every delta keyframe of a masked replay. The
+    /// emulator shows nothing from them: until the game has rebuilt them, frames lack that output
+    /// (see [`Self::shows_stale_output`]) rather than showing another moment of the game.
+    ///
+    /// Default: [`Self::load_save_state`], for cores whose stale buffers are never shown.
+    fn load_save_state_with_stale_output(&mut self, state: &[u8]) -> Result<(), String> {
+        self.load_save_state(state)
+    }
+
+    /// Whether the frame last run showed output missing because of a
+    /// [`Self::load_save_state_with_stale_output`] (Nintendo DS: 3D geometry the game had
+    /// submitted before the keyframe, until it has flushed and shown a frame's worth of its own).
+    /// Default: never.
+    fn shows_stale_output(&self) -> bool {
+        false
+    }
 
     /// Encode the input.
     ///
@@ -320,7 +358,19 @@ pub struct Input {
     pub x: bool,
     pub y: bool,
 
-    pub touch: Option<(u8, u8)>
+    /// Nintendo 3DS only: ZL / ZR.
+    pub zl: bool,
+    pub zr: bool,
+
+    /// Nintendo 3DS only: circle pad and C-stick, `-127..=127` each, positive = right / up.
+    /// A core without analog sticks ignores them; the 3DS core derives the circle pad from the
+    /// d-pad when this is `(0, 0)`.
+    pub circle: (i8, i8),
+    pub c_stick: (i8, i8),
+
+    /// Touch-screen point, in the bottom screen's pixels (256x192 on the DS, 320x240 on the
+    /// 3DS).
+    pub touch: Option<(u16, u16)>
 }
 
 impl Default for Input {
@@ -347,6 +397,10 @@ impl Input {
             r: false,
             x: false,
             y: false,
+            zl: false,
+            zr: false,
+            circle: (0, 0),
+            c_stick: (0, 0),
             touch: None,
         }
     }
@@ -366,6 +420,10 @@ impl Input {
         && !self.r
         && !self.x
         && !self.y
+        && !self.zl
+        && !self.zr
+        && self.circle.0 == 0 && self.circle.1 == 0
+        && self.c_stick.0 == 0 && self.c_stick.1 == 0
         && self.touch.is_none()
     }
 }
@@ -386,6 +444,11 @@ impl core::ops::BitOr<Input> for Input {
             r: self.r | rhs.r,
             x: self.x | rhs.x,
             y: self.y | rhs.y,
+            zl: self.zl | rhs.zl,
+            zr: self.zr | rhs.zr,
+            // Sticks are not bit sets: the first non-neutral one wins.
+            circle: if self.circle != (0, 0) { self.circle } else { rhs.circle },
+            c_stick: if self.c_stick != (0, 0) { self.c_stick } else { rhs.c_stick },
             touch: self.touch.or(rhs.touch),
         }
     }
@@ -407,6 +470,10 @@ impl core::ops::BitAnd<Input> for Input {
             r: self.r & rhs.r,
             x: self.x & rhs.x,
             y: self.y & rhs.y,
+            zl: self.zl & rhs.zl,
+            zr: self.zr & rhs.zr,
+            circle: if self.circle != (0, 0) && rhs.circle != (0, 0) { self.circle } else { (0, 0) },
+            c_stick: if self.c_stick != (0, 0) && rhs.c_stick != (0, 0) { self.c_stick } else { (0, 0) },
             touch: self.touch.and(rhs.touch),
         }
     }
@@ -429,6 +496,10 @@ impl core::ops::Not for Input {
             r: !self.r,
             x: !self.x,
             y: !self.y,
+            zl: !self.zl,
+            zr: !self.zr,
+            circle: (0, 0),
+            c_stick: (0, 0),
             touch: None
         }
     }

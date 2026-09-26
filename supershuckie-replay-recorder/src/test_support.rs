@@ -403,6 +403,8 @@ pub fn settings(max_frames_per_blob: u64, minimum_uncompressed_bytes_per_blob: u
         max_frames_per_blob,
         compression_level: crate::replay_file::record::DEFAULT_ZSTD_COMPRESSION_LEVEL_V4,
         mask_transient_buffers: true,
+        stored_keyframe_levels: (15, 15),
+        stored_keyframe_compression_level: 3,
     }
 }
 

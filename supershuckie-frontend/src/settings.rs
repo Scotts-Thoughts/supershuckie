@@ -67,6 +67,7 @@ pub(crate) fn try_to_init_data_dir_and_get_settings(data_dir: &Path, config_dir:
     };
 
     settings.clamp();
+    settings.inherit_3ds_settings_from_ds();
     (settings, warnings)
 }
 
@@ -89,6 +90,11 @@ pub struct Settings {
 
     #[serde(default = "NintendoDSSettings::default")]
     pub nintendo_ds_settings: NintendoDSSettings,
+
+    /// Absent from files written before the 3DS had settings of its own: those start from the
+    /// DS's (see [`Settings::inherit_3ds_settings_from_ds`]).
+    #[serde(default = "Nintendo3DSSettings::missing")]
+    pub nintendo_3ds_settings: Nintendo3DSSettings,
 
     #[serde(default = "BTreeMap::default")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -302,6 +308,21 @@ impl Default for AudioSettings {
 }
 
 impl Settings {
+    /// A settings file from before the 3DS had its own section: the 3DS starts from the DS's
+    /// scale, controls and screen arrangement (they were shared until then), and is written out
+    /// as its own section from here on.
+    pub fn inherit_3ds_settings_from_ds(&mut self) {
+        if self.nintendo_3ds_settings.inherit_from_ds {
+            let ds = &self.nintendo_ds_settings;
+            self.nintendo_3ds_settings = Nintendo3DSSettings {
+                swap_screens: ds.swap_screens,
+                video_scale: ds.video_scale,
+                controls: ds.controls.clone(),
+                inherit_from_ds: false
+            };
+        }
+    }
+
     pub(crate) fn get_rom_config_or_default(&mut self, rom: &str) -> &mut ROMConfig {
         if !self.rom_config.contains_key(rom) {
             self.rom_config.insert(rom.to_owned(), ROMConfig::default());
@@ -920,6 +941,45 @@ impl NintendoDSSettings {
     const DEFAULT_VIDEO_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(2) };
 }
 
+/// Nintendo 3DS settings: its own scale, controls and screen arrangement, so changing one for a
+/// 3DS game leaves the DS's alone.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct Nintendo3DSSettings {
+    /// Swap the on-screen positions of the top and bottom screens.
+    #[serde(default = "bool::default")]
+    pub swap_screens: bool,
+
+    #[serde(default = "Nintendo3DSSettings::DEFAULT_VIDEO_SCALE")]
+    pub video_scale: NonZeroU8,
+
+    #[serde(default = "Controls::default")]
+    pub controls: Controls,
+
+    /// Set only by [`Self::missing`]: the settings file had no 3DS section, so the DS's values
+    /// are copied in once the whole file is read.
+    #[serde(skip)]
+    inherit_from_ds: bool
+}
+
+impl Nintendo3DSSettings {
+    const DEFAULT_VIDEO_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(2) };
+
+    fn missing() -> Self {
+        Self { inherit_from_ds: true, ..Self::default() }
+    }
+}
+
+impl Default for Nintendo3DSSettings {
+    fn default() -> Self {
+        Self {
+            swap_screens: false,
+            video_scale: Self::DEFAULT_VIDEO_SCALE(),
+            controls: Controls::default(),
+            inherit_from_ds: false
+        }
+    }
+}
+
 impl Default for NintendoDSSettings {
     fn default() -> Self {
         Self {
@@ -1228,8 +1288,8 @@ impl Control {
 
     pub const fn is_available_for_emulator_type(self, emulator_type: SuperShuckieEmulatorType) -> bool {
         match self {
-            Control::L | Control::R => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::GameBoyAdvance),
-            Control::X | Control::Y | Control::SwapScreens => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS),
+            Control::L | Control::R => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::Nintendo3DS | SuperShuckieEmulatorType::GameBoyAdvance),
+            Control::X | Control::Y | Control::SwapScreens => matches!(emulator_type, SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::Nintendo3DS),
             _ => true
         }
     }
@@ -1237,6 +1297,22 @@ impl Control {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nintendo_3ds_settings_start_from_the_ds_ones_when_absent() {
+        let mut older: super::Settings = serde_json::from_str(r#"{"nintendo_ds_settings": {"video_scale": 3, "swap_screens": true}}"#).unwrap();
+        older.inherit_3ds_settings_from_ds();
+        assert_eq!(older.nintendo_3ds_settings.video_scale.get(), 3);
+        assert!(older.nintendo_3ds_settings.swap_screens);
+        assert!(!older.nintendo_3ds_settings.inherit_from_ds);
+
+        let mut own: super::Settings = serde_json::from_str(r#"{"nintendo_ds_settings": {"video_scale": 3}, "nintendo_3ds_settings": {"video_scale": 1}}"#).unwrap();
+        own.inherit_3ds_settings_from_ds();
+        assert_eq!(own.nintendo_3ds_settings.video_scale.get(), 1);
+
+        let fresh = super::Settings::default();
+        assert_eq!(fresh.nintendo_3ds_settings.video_scale.get(), 2);
+    }
+
     use super::*;
 
     fn temp_dirs(name: &str) -> (PathBuf, PathBuf) {

@@ -99,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
             max_frames_per_blob: chain_frames,
             compression_level: level,
             mask_transient_buffers: masks,
+            stored_keyframe_levels: (15, 15),
+            stored_keyframe_compression_level: 3,
         },
         allow_corruption,
     };

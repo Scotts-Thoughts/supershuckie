@@ -1,0 +1,45 @@
+diff --git a/src/core/hle/service/fs/file.cpp b/src/core/hle/service/fs/file.cpp
+index b37c19d..59e4f03 100644
+--- a/src/core/hle/service/fs/file.cpp
++++ b/src/core/hle/service/fs/file.cpp
+@@ -140,7 +140,11 @@ void File::Read(Kernel::HLERequestContext& ctx) {
+             }
+ 
+             const auto read_delay = static_cast<s64>(backend->GetReadDelayNs(async_data->length));
+-            if (!async_data->cache_ready) {
++            // Super Shuckie: in deterministic mode the emulated completion time must not
++            // depend on how long the host read took, or two machines replaying the same
++            // inputs see file reads finish at different emulated times and desync.
++            if (!async_data->cache_ready &&
++                !Settings::values.deterministic_async_operations.GetValue()) {
+                 const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - async_data->pre_timer)
+                                            .count();
+diff --git a/src/core/hle/service/fs/fs_user.cpp b/src/core/hle/service/fs/fs_user.cpp
+index 4f53840..765d338 100644
+--- a/src/core/hle/service/fs/fs_user.cpp
++++ b/src/core/hle/service/fs/fs_user.cpp
+@@ -106,6 +106,11 @@ void FS_USER::OpenFile(Kernel::HLERequestContext& ctx) {
+             async_data->file =
+                 archives.OpenFileFromArchive(async_data->archive_handle, async_data->file_path,
+                                              async_data->mode, async_data->attributes);
++            // Super Shuckie: see File::Read; the emulated delay must not depend on host time
++            // in deterministic mode.
++            if (Settings::values.deterministic_async_operations.GetValue()) {
++                return static_cast<s64>(async_data->file.second.count());
++            }
+             const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now() - async_data->pre_timer);
+             return static_cast<s64>(((async_data->file.second > time_took)
+@@ -219,6 +224,11 @@ void FS_USER::OpenFileDirectly(Kernel::HLERequestContext& ctx) {
+                 archives.OpenFileFromArchive(*async_data->archive_handle, async_data->file_path,
+                                              async_data->mode, async_data->attributes);
+             archives.CloseArchive(*async_data->archive_handle);
++            // Super Shuckie: see File::Read; the emulated delay must not depend on host time
++            // in deterministic mode.
++            if (Settings::values.deterministic_async_operations.GetValue()) {
++                return static_cast<s64>(async_data->file.second.count());
++            }
+             const auto time_took = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                 std::chrono::steady_clock::now() - async_data->pre_timer);
+             return static_cast<s64>(((async_data->file.second > time_took)

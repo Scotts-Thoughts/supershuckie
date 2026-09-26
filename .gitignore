@@ -26,3 +26,7 @@ UserData/
 # Personal local build script (hardcodes this machine's paths)
 /scripts/build-standalone.ps1
 /scripts/build-standalone.md
+
+# Azahar (3DS) spike: shallow clone and its measurement output
+third-party/azahar/
+azahar-spike-results/

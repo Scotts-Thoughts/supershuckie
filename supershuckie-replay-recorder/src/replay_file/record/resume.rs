@@ -376,7 +376,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 }
                 Packet::ResetConsole => Action::ResetConsole,
                 Packet::LoadSaveState { state } => Action::LoadSaveState(state.clone()),
-                Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => Action::Skip,
+                // Thumbnails before the resume point are not carried over (the timeline falls
+                // back to keyframe snapping there).
+                Packet::Bookmark { .. } | Packet::BookmarkTable { .. } | Packet::Thumbnail { .. } => Action::Skip,
                 Packet::Keyframe { metadata, state } => {
                     Action::Keyframe(state.clone(), metadata.elapsed_millis, metadata.elapsed_frames)
                 }
@@ -387,6 +389,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 Packet::NoOp => Action::Skip,
                 Packet::DeltaKeyframe { .. }
                 | Packet::RegionDeltaKeyframe { .. }
+                | Packet::StoredKeyframe { .. }
                 | Packet::CompressedBlob { .. } => {
                     return Err(ReplayResumeError::BadSource {
                         explanation: Cow::Borrowed(
@@ -492,6 +495,8 @@ mod tests {
             max_frames_per_blob: 0,
             compression_level: 1,
             mask_transient_buffers: true,
+            stored_keyframe_levels: (15, 15),
+            stored_keyframe_compression_level: 3,
         }
     }
 
@@ -752,7 +757,7 @@ mod tests {
     fn build_source_with_bookmarks(max_frames_per_blob: u64, table: &BookmarkTable) -> Vec<u8> {
         use crate::test_support::{bv, state_for as script_state};
 
-        let settings = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob, compression_level: 1, mask_transient_buffers: true };
+        let settings = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob, compression_level: 1, mask_transient_buffers: true, stored_keyframe_levels: (15, 15), stored_keyframe_compression_level: 3 };
         let mut recorder = ReplayFileRecorder::new_with_metadata(
             make_metadata(), ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&script_state(0)), Vec::<u8>::new(), Vec::<u8>::new()
         ).unwrap();

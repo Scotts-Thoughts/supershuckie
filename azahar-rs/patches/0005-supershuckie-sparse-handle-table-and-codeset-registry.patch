@@ -1,0 +1,214 @@
+diff --git a/src/core/hle/kernel/handle_table.cpp b/src/core/hle/kernel/handle_table.cpp
+index 622719c..f6d6006 100644
+--- a/src/core/hle/kernel/handle_table.cpp
++++ b/src/core/hle/kernel/handle_table.cpp
+@@ -2,6 +2,13 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <string>
++#include <stdexcept>
++#include <boost/serialization/binary_object.hpp>
+ #include <utility>
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/shared_ptr.hpp>
+@@ -101,8 +108,52 @@ void HandleTable::Clear() {
+ 
+ template <class Archive>
+ void HandleTable::serialize(Archive& ar, const unsigned int) {
+-    ar & objects;
+-    ar & generations;
++    // Super Shuckie: only the occupied slots (a few hundred of 4096) are written, each with its
++    // index, and the generations as one block; the replay recorder takes a save state every few
++    // seconds on the emulation thread, and the 4096 mostly-null tracked pointers were 4.5 ms.
++    u32 occupied = 0;
++    if constexpr (Archive::is_saving::value) {
++        for (const auto& object : objects) {
++            occupied += object != nullptr;
++        }
++    }
++    ar & occupied;
++    if constexpr (Archive::is_saving::value) {
++        static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++        std::map<std::string, std::pair<double, u32>> per_type;
++        for (u32 i = 0; i < static_cast<u32>(objects.size()); i++) {
++            if (objects[i]) {
++                const auto start = std::chrono::steady_clock::now();
++                ar & i;
++                ar & objects[i];
++                if (timing_wanted) {
++                    auto& entry = per_type[objects[i]->GetTypeName()];
++                    entry.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++                    entry.second++;
++                }
++            }
++        }
++        if (timing_wanted) {
++            for (const auto& [type, entry] : per_type) {
++                if (entry.first >= 0.05) {
++                    std::fprintf(stderr, "serialize           handle table %s x%u: %.2f ms\n", type.c_str(), entry.second, entry.first);
++                }
++            }
++        }
++    } else {
++        for (auto& object : objects) {
++            object = nullptr;
++        }
++        for (u32 n = 0; n < occupied; n++) {
++            u32 i = 0;
++            ar & i;
++            if (i >= objects.size()) {
++                throw std::runtime_error("handle table slot out of range");
++            }
++            ar & objects[i];
++        }
++    }
++    ar& boost::serialization::make_binary_object(generations.data(), generations.size() * sizeof(generations[0]));
+     ar & next_generation;
+     ar & next_free_slot;
+ }
+diff --git a/src/core/hle/kernel/process.cpp b/src/core/hle/kernel/process.cpp
+index e272bd5..e1a4feb 100644
+--- a/src/core/hle/kernel/process.cpp
++++ b/src/core/hle/kernel/process.cpp
+@@ -2,6 +2,13 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <mutex>
++#include <stdexcept>
++#include <unordered_map>
++#include <xxhash.h>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <algorithm>
+ #include <memory>
+ #include <boost/serialization/array.hpp>
+@@ -47,27 +54,57 @@ SERIALIZE_IMPL(AddressMapping)
+ 
+ template <class Archive>
+ void Process::serialize(Archive& ar, const unsigned int) {
++    // Super Shuckie: SUPERSHUCKIE_SERIALIZE_TIMING=1 prints where this object's save time goes.
++    static const bool timing_wanted = std::getenv("SUPERSHUCKIE_SERIALIZE_TIMING") != nullptr;
++    auto timing_start = std::chrono::steady_clock::now();
++    auto mark = [&](const char* what) {
++        if (!timing_wanted) return;
++        const auto now = std::chrono::steady_clock::now();
++        const double ms = std::chrono::duration<double, std::milli>(now - timing_start).count();
++        if (ms >= 0.2) std::fprintf(stderr, "serialize         process %s: %.2f ms\n", what, ms);
++        timing_start = now;
++    };
+     ar& boost::serialization::base_object<Object>(*this);
++    mark("base");
+     ar & handle_table;
++    mark("handle_table");
+     ar & codeset; // TODO: Replace with apploader reference
++    mark("codeset");
+     ar & resource_limit;
++    mark("resource_limit");
+     ar & svc_access_mask;
++    mark("svc_access_mask");
+     ar & handle_table_size;
++    mark("handle_table_size");
+     ar&(boost::container::vector<AddressMapping, boost::container::dtl::static_storage_allocator<
+                                                      AddressMapping, 8, 0, true>>&)address_mappings;
++    mark("address_mappings");
+     ar & flags.raw;
++    mark("flags.raw");
+     ar & no_thread_restrictions;
++    mark("no_thread_restrictions");
+     ar & kernel_version;
++    mark("kernel_version");
+     ar & ideal_processor;
++    mark("ideal_processor");
+     ar & status;
++    mark("status");
+     ar & process_id;
++    mark("process_id");
+     ar & creation_time_ticks;
++    mark("creation_time_ticks");
+     ar & vm_manager;
++    mark("vm_manager");
+     ar & memory_used;
++    mark("memory_used");
+     ar & memory_region;
++    mark("memory_region");
+     ar & holding_memory;
++    mark("holding_memory");
+     ar & holding_tls_memory;
++    mark("holding_tls_memory");
+     ar & tls_slots;
++    mark("tls_slots");
+ }
+ SERIALIZE_IMPL(Process)
+ 
+@@ -83,10 +120,38 @@ std::shared_ptr<CodeSet> KernelSystem::CreateCodeSet(std::string name, u64 progr
+ CodeSet::CodeSet(KernelSystem& kernel) : Object(kernel) {}
+ CodeSet::~CodeSet() {}
+ 
++// Super Shuckie: the program binaries loaded in this process, by content hash; a save state
++// stores the key, not the bytes (they never change after loading, and a keyframe every few
++// seconds cannot afford 4 ms and 30 MB for them). A state can therefore only be loaded in a
++// process that has loaded the same game, which is what the replay player guarantees.
++static std::unordered_map<u64, std::shared_ptr<const std::vector<u8>>> g_codeset_memory;
++static std::mutex g_codeset_memory_mutex;
++
++void CodeSet::RegisterMemoryForSaveStates() {
++    memory_key = XXH3_64bits(memory.data(), memory.size()) ^ (memory.size() << 1) ^ program_id;
++    std::scoped_lock lock{g_codeset_memory_mutex};
++    if (!g_codeset_memory.contains(memory_key)) {
++        g_codeset_memory.emplace(memory_key, std::make_shared<const std::vector<u8>>(memory));
++    }
++}
++
+ template <class Archive>
+ void CodeSet::serialize(Archive& ar, const unsigned int) {
+     ar& boost::serialization::base_object<Object>(*this);
+-    ar & memory;
++    if constexpr (Archive::is_saving::value) {
++        if (memory_key == 0) {
++            throw std::runtime_error("code set was not registered for save states");
++        }
++    }
++    ar & memory_key;
++    if constexpr (Archive::is_loading::value) {
++        std::scoped_lock lock{g_codeset_memory_mutex};
++        const auto found = g_codeset_memory.find(memory_key);
++        if (found == g_codeset_memory.end()) {
++            throw std::runtime_error("save state refers to a program binary this process has not loaded");
++        }
++        memory = *found->second;
++    }
+     ar & segments;
+     ar & entrypoint;
+     ar & name;
+@@ -106,6 +171,7 @@ std::shared_ptr<Process> KernelSystem::CreateProcess(std::shared_ptr<CodeSet> co
+     auto process{std::make_shared<Process>(*this)};
+ 
+     process->codeset = std::move(code_set);
++    process->codeset->RegisterMemoryForSaveStates();
+     process->flags.raw = 0;
+     process->flags.memory_region.Assign(MemoryRegion::APPLICATION);
+     process->status = ProcessStatus::Created;
+diff --git a/src/core/hle/kernel/process.h b/src/core/hle/kernel/process.h
+index 0ea2563..e2b2a7b 100644
+--- a/src/core/hle/kernel/process.h
++++ b/src/core/hle/kernel/process.h
+@@ -118,6 +118,12 @@ public:
+ 
+     std::vector<u8> memory;
+ 
++    /// Super Shuckie: identifies `memory` in the process-wide registry save states refer to
++    /// instead of carrying the program's binary (tens of MB) in every one. Set by
++    /// RegisterMemoryForSaveStates (called when the process is created).
++    u64 memory_key = 0;
++    void RegisterMemoryForSaveStates();
++
+     std::array<Segment, 3> segments;
+     VAddr entrypoint;
+ 

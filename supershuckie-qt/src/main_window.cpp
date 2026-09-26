@@ -33,6 +33,7 @@
 #include "nds_date_dialog.hpp"
 #include "gb_palette_dialog.hpp"
 #include "select_item_dialog.hpp"
+#include "select_replay_dialog.hpp"
 #include "error.hpp"
 #include "game_speed_dialog.hpp"
 #include "render_widget.hpp"
@@ -146,12 +147,14 @@ MainWindow::MainWindow(): QMainWindow() {
     layout->setHorizontalSpacing(0);
     this->setCentralWidget(center_widget);
 
+    // Centred: the window is never narrower than its menu bar (see the end of the
+    // constructor), and a small game view (a 1x 3DS is 400 px wide) sits in the middle of it.
     this->render_widget = new GameRenderWidget(this, center_widget);
-    layout->addWidget(this->render_widget, 0, 0);
+    layout->addWidget(this->render_widget, 0, 0, Qt::AlignHCenter);
 
     // Shares the game view's cell; exactly one of the two is visible at a time.
     this->landing_widget = new LandingWidget(this, center_widget);
-    layout->addWidget(this->landing_widget, 0, 0);
+    layout->addWidget(this->landing_widget, 0, 0, Qt::AlignHCenter);
     this->landing_widget->hide();
 
     this->playback_bar = new ReplayPlaybackControls(this, center_widget);
@@ -340,6 +343,10 @@ MainWindow::MainWindow(): QMainWindow() {
         this->bookmark_window->restore_state(bookmark_window_state_copy);
     }
     this->confirm_ram_writes->setChecked(supershuckie_frontend_memory_get_confirm_writes_while_recording(this->frontend));
+
+    // With every menu in the bar at once, whatever the game's scale; otherwise a narrow view
+    // (a 1x 3DS or Game Boy) pushes menus into the bar's overflow button.
+    this->centralWidget()->setMinimumWidth(this->menu_bar->sizeHint().width());
 
     this->ticker.start();
 }
@@ -1480,10 +1487,11 @@ void MainWindow::do_open_rom() {
     QFileDialog rom_opener(this);
     rom_opener.setFileMode(QFileDialog::FileMode::ExistingFile);
     rom_opener.setNameFilters(QStringList({
-        "All compatible ROM files (*.gb *.gbc *.gba *.nds)",
+        "All compatible ROM files (*.gb *.gbc *.gba *.nds *.3ds *.cci *.cxi *.3dsx)",
         "GB/GBC ROM dumps (*.gb *.gbc)",
         "GBA ROM dumps (*.gba)",
         "NDS ROM files (*.nds)",
+        "3DS ROM files (*.3ds *.cci *.cxi *.3dsx)",
         "Any files (*)"
     }));
     rom_opener.setWindowTitle("Select a ROM to open");
@@ -1947,8 +1955,7 @@ void MainWindow::do_resume_replay() {
     }
     else {
         // Not watching a replay: pick one and resume from its end.
-        auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
-        auto source = SelectItemDialog::ask(this, replays, "Resume from replay", "Select a replay to continue recording from its end.");
+        auto source = SelectReplayDialog::ask(this, "Resume from replay", "Select a replay to continue recording from its end.");
         if(source == std::nullopt) {
             return;
         }
@@ -2005,8 +2012,7 @@ void MainWindow::do_go_to_resume_point() {
 }
 
 void MainWindow::do_play_replay() {
-    auto replays = wrap_array_std(supershuckie_frontend_get_all_replays_for_rom(this->frontend, nullptr));
-    auto text = SelectItemDialog::ask(this, replays, "Select a replay", "Select a replay file to play.");
+    auto text = SelectReplayDialog::ask(this, "Select a replay", "Select a replay file to play.");
     if(text == std::nullopt) {
         return;
     }

@@ -157,7 +157,8 @@ pub fn transient_ranges(console: ReplayConsoleType, state: &[u8]) -> Vec<Range<u
         ReplayConsoleType::Unknown
         | ReplayConsoleType::GameBoy
         | ReplayConsoleType::SuperGameBoy2
-        | ReplayConsoleType::GameBoyColor => None,
+        | ReplayConsoleType::GameBoyColor
+        | ReplayConsoleType::Nintendo3DS => None,
     };
 
     range.into_iter().collect()

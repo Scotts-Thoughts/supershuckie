@@ -1277,7 +1277,7 @@ pub extern "C" fn supershuckie_frontend_get_gb_palettes(frontend: &SuperShuckieF
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn supershuckie_frontend_set_touch(frontend: &mut SuperShuckieFrontend, enabled: bool, x: u8, y: u8) {
+pub extern "C" fn supershuckie_frontend_set_touch(frontend: &mut SuperShuckieFrontend, enabled: bool, x: u16, y: u16) {
     frontend.set_touch(enabled.then_some((x, y)))
 }
 

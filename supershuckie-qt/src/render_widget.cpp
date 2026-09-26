@@ -134,20 +134,15 @@ void GameRenderWidget::mousePressEvent(QMouseEvent *event) {
     int x = pos.x() / this->current_scale;
     int y = pos.y() / this->current_scale;
 
-    bool horizontal_nds = this->main_window->horizontal_nds->isChecked();
-
     if(this->screens.size() == 2) {
         auto &screen = this->screens[1];
 
-        if(horizontal_nds) {
-            x -= screen.x;
-        }
-        else {
-            y -= screen.y;
-        }
+        // The screen's offset applies on both axes: side by side it is the x offset, stacked it
+        // is the y offset plus the centring of a narrower screen (the 3DS's bottom one).
+        x -= screen.x;
+        y -= screen.y;
 
-        // >= : x == screen.width (one pixel past the right/bottom edge) is out of bounds, but
-        // would otherwise wrap around to 0 when narrowed to the uint8_t x/y that set_touch takes.
+        // >= : x == screen.width (one pixel past the right/bottom edge) is out of bounds.
         if(x < 0 || x >= static_cast<int>(screen.width) || y < 0 || y >= static_cast<int>(screen.height)) {
             return;
         }

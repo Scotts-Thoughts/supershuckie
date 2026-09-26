@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+memmap2 = { workspace = true }
 supershuckie-core = { workspace = true }
 supershuckie-memory-tools = { workspace = true }
 supershuckie-replay-recorder = { workspace = true }
@@ -18,3 +19,4 @@ num_enum = { workspace = true }
 [dev-dependencies]
 melonds-rs = { workspace = true, features = ["link-cores"] }
 mgba-rs = { workspace = true, features = ["link-cores"] }
+azahar-rs = { workspace = true, features = ["link-cores"] }

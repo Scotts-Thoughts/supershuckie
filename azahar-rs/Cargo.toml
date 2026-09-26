@@ -1,0 +1,19 @@
+[package]
+name = "azahar-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+cc = { workspace = true }
+
+[features]
+# Links Azahar's bundled static library (build/azahar/libazahar.a, made by the azahar_bundle
+# target of azahar-rs/spike/spike.cmake) and the platform libraries it needs, so a plain
+# `cargo test`/`cargo build` of this crate's dependents can link without CMake around to
+# supply them. Same idea as melonds-rs's feature of the same name.
+link-cores = []

@@ -12,6 +12,7 @@ supershuckie-pokeabyte-integration = { workspace = true, optional = true }
 spin = { workspace = true }
 melonds-rs = { workspace = true }
 mgba-rs = { workspace = true }
+azahar-rs = { workspace = true }
 
 [features]
 default = ["std", "pokeabyte"]
@@ -21,3 +22,5 @@ std = []
 [dev-dependencies]
 melonds-rs = { workspace = true, features = ["link-cores"] }
 mgba-rs = { workspace = true, features = ["link-cores"] }
+azahar-rs = { workspace = true, features = ["link-cores"] }
+zstd-sys = { workspace = true }

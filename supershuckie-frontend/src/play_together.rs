@@ -487,6 +487,7 @@ fn emulator_type_for_console(console: ReplayConsoleType) -> Option<SuperShuckieE
         ReplayConsoleType::GameBoyColor => Some(SuperShuckieEmulatorType::GameBoyColor),
         ReplayConsoleType::GameBoyAdvance => Some(SuperShuckieEmulatorType::GameBoyAdvance),
         ReplayConsoleType::NintendoDS => Some(SuperShuckieEmulatorType::NintendoDS),
+        ReplayConsoleType::Nintendo3DS => Some(SuperShuckieEmulatorType::Nintendo3DS),
         ReplayConsoleType::Unknown => None
     }
 }

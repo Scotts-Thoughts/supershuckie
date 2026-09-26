@@ -24,7 +24,7 @@ use std::io::BufWriter;
 use std::borrow::Cow;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use num_enum::TryFromPrimitive;
-use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, PartialReplayRecordMetadata, ScreenData, ScreenDataEncoding, NullEmulatorCore, NintendoDS, GameBoyAdvance};
+use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, PartialReplayRecordMetadata, ScreenData, ScreenDataEncoding, NullEmulatorCore, NintendoDS, Nintendo3DS, Nintendo3DSSettings, GameBoyAdvance};
 use supershuckie_core::{std_timestamp_provider, AudioOutput, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
 use supershuckie_core::{ExportRange, ScreenLayout, VideoExportError, VideoExportHandle, VideoFrameSink};
 use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShuckieWebserver};
@@ -47,7 +47,8 @@ pub enum SuperShuckieEmulatorType {
     GameBoySGB2,
     GameBoyColor,
     GameBoyAdvance,
-    NintendoDS
+    NintendoDS,
+    Nintendo3DS
 }
 
 impl SuperShuckieEmulatorType {
@@ -61,6 +62,7 @@ impl SuperShuckieEmulatorType {
             SuperShuckieEmulatorType::GameBoyColor => true,
             SuperShuckieEmulatorType::GameBoyAdvance => false,
             SuperShuckieEmulatorType::NintendoDS => false,
+            SuperShuckieEmulatorType::Nintendo3DS => false,
         }
     }
 
@@ -80,7 +82,8 @@ impl SuperShuckieEmulatorType {
             SuperShuckieEmulatorType::GameBoySGB2 => c"Super Game Boy 2",
             SuperShuckieEmulatorType::GameBoyColor => c"Game Boy Color",
             SuperShuckieEmulatorType::GameBoyAdvance => c"Game Boy Advance",
-            SuperShuckieEmulatorType::NintendoDS => c"Nintendo DS"
+            SuperShuckieEmulatorType::NintendoDS => c"Nintendo DS",
+            SuperShuckieEmulatorType::Nintendo3DS => c"Nintendo 3DS"
         }
     }
 
@@ -92,7 +95,8 @@ impl SuperShuckieEmulatorType {
             SuperShuckieEmulatorType::GameBoySGB2 => ReplayConsoleType::SuperGameBoy2,
             SuperShuckieEmulatorType::GameBoyColor => ReplayConsoleType::GameBoyColor,
             SuperShuckieEmulatorType::GameBoyAdvance => ReplayConsoleType::GameBoyAdvance,
-            SuperShuckieEmulatorType::NintendoDS => ReplayConsoleType::NintendoDS
+            SuperShuckieEmulatorType::NintendoDS => ReplayConsoleType::NintendoDS,
+            SuperShuckieEmulatorType::Nintendo3DS => ReplayConsoleType::Nintendo3DS
         }
     }
 }
@@ -161,6 +165,9 @@ pub struct SuperShuckieFrontend {
     current_speed: Speed,
 
     loaded_rom_data: Option<Vec<u8>>,
+    /// The loaded ROM's file path and the Azahar user directory for it; the 3DS core loads the
+    /// game from the file itself (its saves live on Azahar's virtual SD card in that directory).
+    loaded_rom_path: Option<(String, PathBuf)>,
 
     current_input: Input,
     current_rapid_fire_input: Option<SuperShuckieRapidFire>,
@@ -265,6 +272,7 @@ impl SuperShuckieFrontend {
             rom_name: None,
             save_file: None,
             loaded_rom_data: None,
+            loaded_rom_path: None,
             current_rapid_fire_input: None,
             current_toggled_input: None,
             callbacks,
@@ -512,17 +520,10 @@ impl SuperShuckieFrontend {
             return Ok(false)
         }
 
-        let file = match std::fs::read(&replay_file) {
+        let mut player = match open_replay_player(&replay_file, override_errors) {
             Ok(n) => n,
             Err(e) => {
-                return Err(format!("Failed to read replay {name}:\n\n{e}").into())
-            }
-        };
-
-        let mut player = match ReplayFilePlayer::new(file, override_errors) {
-            Ok(n) => n,
-            Err(e) => {
-                return Err(format!("Failed to parse replay {name}:\n\n{e:?}").into())
+                return Err(format!("{e} ({name})").into())
             }
         };
 
@@ -840,7 +841,7 @@ impl SuperShuckieFrontend {
     }
 
     #[inline]
-    pub fn set_touch(&mut self, at: Option<(u8, u8)>) {
+    pub fn set_touch(&mut self, at: Option<(u16, u16)>) {
         self.current_input.touch = at;
         self.core.enqueue_input(self.current_input);
     }
@@ -997,12 +998,19 @@ impl SuperShuckieFrontend {
             "gb" | "gbc" => self.choose_for_game_boy(data.as_slice()),
             "gba" => SuperShuckieEmulatorType::GameBoyAdvance,
             "nds" => SuperShuckieEmulatorType::NintendoDS,
+            "cci" | "3ds" | "cxi" | "3dsx" => SuperShuckieEmulatorType::Nintendo3DS,
             unknown => return Err(format!("Unknown or unsupported ROM file type .{unknown}").into())
         };
 
         self.create_userdata_for_rom(filename)?;
         self.close_rom();
         self.loaded_rom_data = Some(data);
+        // One Azahar directory for every 3DS game, like one SD card: saves live under their title
+        // id inside it, so games share it naturally, and the path stays short. Windows refuses
+        // paths past 260 characters, the SD layout alone is 110 deep, and with a per-ROM
+        // directory a save file's path reached 251, at which point Azahar's delete (a rename to
+        // a longer name) failed and games hung writing their saves.
+        self.loaded_rom_path = Some((path_utf8.to_owned(), self.user_dir.join("azahar")));
         self.rom_name = Some(Arc::new(UTF8CString::from_str(filename)));
         self.emulator_type = Some(emulator_to_use);
         self.save_file = Some(Arc::new(self.get_current_save_file_name_for_rom(filename)));
@@ -1043,7 +1051,8 @@ impl SuperShuckieFrontend {
         match emulator_type {
             SuperShuckieEmulatorType::GameBoySGB2 | SuperShuckieEmulatorType::GameBoyColor | SuperShuckieEmulatorType::GameBoy => &self.settings.game_boy_settings.controls,
             SuperShuckieEmulatorType::GameBoyAdvance => &self.settings.game_boy_advance_settings.controls,
-            SuperShuckieEmulatorType::NintendoDS => &self.settings.nintendo_ds_settings.controls
+            SuperShuckieEmulatorType::NintendoDS => &self.settings.nintendo_ds_settings.controls,
+            SuperShuckieEmulatorType::Nintendo3DS => &self.settings.nintendo_3ds_settings.controls
         }
     }
 
@@ -1053,7 +1062,8 @@ impl SuperShuckieFrontend {
         *match emulator_type {
             SuperShuckieEmulatorType::GameBoySGB2 | SuperShuckieEmulatorType::GameBoyColor | SuperShuckieEmulatorType::GameBoy => &mut self.settings.game_boy_settings.controls,
             SuperShuckieEmulatorType::GameBoyAdvance => &mut self.settings.game_boy_advance_settings.controls,
-            SuperShuckieEmulatorType::NintendoDS => &mut self.settings.nintendo_ds_settings.controls
+            SuperShuckieEmulatorType::NintendoDS => &mut self.settings.nintendo_ds_settings.controls,
+            SuperShuckieEmulatorType::Nintendo3DS => &mut self.settings.nintendo_3ds_settings.controls
         } = controls;
     }
 
@@ -1179,6 +1189,17 @@ impl SuperShuckieFrontend {
         self.make_new_core_with_bios(rom_data, save_file, emulator_type, bios, self.settings.nintendo_ds_settings.jit)
     }
 
+    /// The keyframe interval a recording gets: the user's setting, except on the 3DS, whose
+    /// keyframes are 170 MB states and cost 2–3 MB each even as deltas (replay-3ds-spec.md:
+    /// 480 frames = 8 s keeps three hours under 5 GB).
+    fn frames_per_keyframe_for_recording(&self) -> NonZeroU64 {
+        if self.emulator_type == Some(SuperShuckieEmulatorType::Nintendo3DS) {
+            NonZeroU64::new(480).unwrap()
+        } else {
+            self.settings.replay.frames_per_keyframe
+        }
+    }
+
     /// Build a core for `emulator_type` with an explicit BIOS (and, for the Nintendo DS, JIT
     /// setting), e.g. one following another player's game with their BIOS.
     pub(crate) fn make_new_core_with_bios(&self, rom_data: &[u8], save_file: Option<Vec<u8>>, emulator_type: SuperShuckieEmulatorType, bios: Vec<u8>, nds_jit: bool) -> Result<Box<dyn EmulatorCore>, UTF8CString> {
@@ -1213,6 +1234,16 @@ impl SuperShuckieFrontend {
                 );
 
                 core
+            },
+            SuperShuckieEmulatorType::Nintendo3DS => {
+                let Some((rom_path, user_dir)) = self.loaded_rom_path.as_ref() else {
+                    return Err("the 3DS core needs the game's file path".into())
+                };
+                let user_dir = user_dir.to_str().ok_or("user directory is not UTF-8")?;
+                Box::new(
+                    Nintendo3DS::new_from_path(rom_path, rom_data, user_dir, std_timestamp_provider(), &Nintendo3DSSettings::default())
+                        .map_err(|e| format!("Azahar rejected the game: {e}"))?
+                )
             }
         };
 
@@ -1249,7 +1280,7 @@ impl SuperShuckieFrontend {
             SuperShuckieEmulatorType::GameBoy | SuperShuckieEmulatorType::GameBoySGB2 => include_bytes!("../../bootrom/dmg/dmg.bin").to_vec(),
             SuperShuckieEmulatorType::GameBoyColor => include_bytes!("../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin").to_vec(),
             SuperShuckieEmulatorType::GameBoyAdvance => Vec::new(),
-            SuperShuckieEmulatorType::NintendoDS => Vec::new()
+            SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::Nintendo3DS => Vec::new()
         }
     }
 
@@ -1346,7 +1377,8 @@ impl SuperShuckieFrontend {
                 | SuperShuckieEmulatorType::GameBoySGB2
                 | SuperShuckieEmulatorType::GameBoyColor => &mut self.settings.game_boy_settings.video_scale,
                 SuperShuckieEmulatorType::GameBoyAdvance => &mut self.settings.game_boy_advance_settings.video_scale,
-                SuperShuckieEmulatorType::NintendoDS => &mut self.settings.nintendo_ds_settings.video_scale
+                SuperShuckieEmulatorType::NintendoDS => &mut self.settings.nintendo_ds_settings.video_scale,
+                SuperShuckieEmulatorType::Nintendo3DS => &mut self.settings.nintendo_3ds_settings.video_scale
             }
         };
 
@@ -1459,19 +1491,30 @@ impl SuperShuckieFrontend {
     /// Get whether the DS top/bottom screens are swapped on-screen.
     #[inline]
     pub fn get_swap_nds_screens(&self) -> bool {
-        self.settings.nintendo_ds_settings.swap_screens
+        // The 3DS has its own setting; the name stays for the C API.
+        if self.emulator_type == Some(SuperShuckieEmulatorType::Nintendo3DS) {
+            self.settings.nintendo_3ds_settings.swap_screens
+        } else {
+            self.settings.nintendo_ds_settings.swap_screens
+        }
     }
 
-    /// Set whether the DS top/bottom screens are swapped on-screen.
+    /// Set whether the top/bottom screens of the two-screen console in use (DS, or 3DS when a
+    /// 3DS game is loaded) are swapped on-screen.
     ///
     /// Re-emits the video mode so the frontend can re-lay out the screens immediately.
     pub fn set_swap_nds_screens(&mut self, swap: bool) {
-        if self.settings.nintendo_ds_settings.swap_screens == swap {
+        let setting = if self.emulator_type == Some(SuperShuckieEmulatorType::Nintendo3DS) {
+            &mut self.settings.nintendo_3ds_settings.swap_screens
+        } else {
+            &mut self.settings.nintendo_ds_settings.swap_screens
+        };
+        if *setting == swap {
             return
         }
-        self.settings.nintendo_ds_settings.swap_screens = swap;
+        *setting = swap;
 
-        if self.emulator_type == Some(SuperShuckieEmulatorType::NintendoDS) {
+        if matches!(self.emulator_type, Some(SuperShuckieEmulatorType::NintendoDS | SuperShuckieEmulatorType::Nintendo3DS)) {
             self.update_video_mode();
         }
     }
@@ -1928,6 +1971,8 @@ impl SuperShuckieFrontend {
             compression_level: self.settings.replay.zstd_compression_level,
             max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
             mask_transient_buffers: self.settings.replay.mask_transient_buffers,
+            stored_keyframe_levels: (15, 15),
+            stored_keyframe_compression_level: 3,
         }
     }
 
@@ -2212,7 +2257,7 @@ impl SuperShuckieFrontend {
             patch_target_checksum: ReplayHeaderBlake3Hash::default(),
             patch_data: ByteVec::default(),
 
-            frames_per_keyframe: self.settings.replay.frames_per_keyframe,
+            frames_per_keyframe: self.frames_per_keyframe_for_recording(),
 
             // have a buffer so we don't destroy your SSD
             final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
@@ -2318,7 +2363,7 @@ impl SuperShuckieFrontend {
             patch_target_checksum: ReplayHeaderBlake3Hash::default(),
             patch_data: ByteVec::default(),
 
-            frames_per_keyframe: self.settings.replay.frames_per_keyframe,
+            frames_per_keyframe: self.frames_per_keyframe_for_recording(),
 
             // have a buffer so we don't destroy your SSD
             final_file: BufWriter::with_capacity(8 * 1024 * 1024, final_file),
@@ -2448,13 +2493,9 @@ impl SuperShuckieFrontend {
                 end_frame: Some(end as u64)
             },
             None => {
-                let bytes = match std::fs::read(&replay_path) {
+                let player = match open_replay_player(&replay_path, true) {
                     Ok(n) => n,
-                    Err(e) => return Err(format!("Failed to read replay {replay_name}:\n\n{e}").into())
-                };
-                let player = match ReplayFilePlayer::new(bytes, true) {
-                    Ok(n) => n,
-                    Err(e) => return Err(format!("Failed to parse replay {replay_name}:\n\n{e:?}").into())
+                    Err(e) => return Err(format!("{e} ({replay_name})").into())
                 };
                 let metadata = player.get_replay_metadata();
                 let start = metadata.crop_start.map(|c| c.0).unwrap_or(0);
@@ -2899,7 +2940,8 @@ impl SuperShuckieFrontend {
                 | SuperShuckieEmulatorType::GameBoySGB2
                 | SuperShuckieEmulatorType::GameBoyColor => self.settings.game_boy_settings.video_scale,
                 SuperShuckieEmulatorType::GameBoyAdvance => self.settings.game_boy_advance_settings.video_scale,
-                SuperShuckieEmulatorType::NintendoDS => self.settings.nintendo_ds_settings.video_scale
+                SuperShuckieEmulatorType::NintendoDS => self.settings.nintendo_ds_settings.video_scale,
+                SuperShuckieEmulatorType::Nintendo3DS => self.settings.nintendo_3ds_settings.video_scale
             }
         };
 
@@ -3603,4 +3645,28 @@ impl VideoFrameSink for FfmpegVideoSink {
         // Delete the partial output file.
         let _ = std::fs::remove_file(&self.output_path);
     }
+}
+
+/// Open a replay file for the player. A Nintendo 3DS file is memory-mapped: its keyframes (most
+/// of a multi-gigabyte file) stay on disk and are read as they are seeked to. Every other
+/// console's file is read whole, as before.
+fn open_replay_player(path: &Path, allow_some_corruption: bool) -> Result<ReplayFilePlayer, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Failed to read replay:\n\n{e}"))?;
+    let mut head = [0u8; 12];
+    let is_3ds = file.read_exact(&mut head).is_ok()
+        && u32::from_le_bytes(head[8..12].try_into().expect("4 bytes")) == ReplayConsoleType::Nintendo3DS as u32;
+    let parsed = if is_3ds {
+        // SAFETY: the file is opened read-only and a replay is not modified while it is open for
+        // playback (the recorder writes to a different path until it closes).
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("Failed to map replay:\n\n{e}"))?;
+        let source: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(map);
+        ReplayFilePlayer::new_shared(source, allow_some_corruption)
+    }
+    else {
+        drop(file);
+        let bytes = std::fs::read(path).map_err(|e| format!("Failed to read replay:\n\n{e}"))?;
+        ReplayFilePlayer::new(bytes, allow_some_corruption)
+    };
+    parsed.map_err(|e| format!("Failed to parse replay:\n\n{e:?}"))
 }

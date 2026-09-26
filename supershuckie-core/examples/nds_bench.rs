@@ -426,9 +426,16 @@ fn main() {
                         }
                         Packet::Keyframe { metadata, state } => {
                             if keyframes_seen == 0 {
-                                // The first keyframe is the recording's initial state.
-                                core.load_save_state(state.as_slice()).expect("load initial keyframe");
+                                // The first keyframe is the recording's initial state (or the
+                                // --start one), loaded as the app's seeks load it: a masked delta's
+                                // stale 3D banks are not drawn.
+                                let initial = state.as_slice().to_vec();
                                 frame = metadata.elapsed_frames;
+                                if p.current_keyframe_has_stale_transients() {
+                                    core.load_save_state_with_stale_output(&initial).expect("load initial keyframe");
+                                } else {
+                                    core.load_save_state(&initial).expect("load initial keyframe");
+                                }
                             } else if o.verify {
                                 let live = core.create_save_state();
                                 let ok = states_match(ReplayConsoleType::NintendoDS, &live, state.as_slice());

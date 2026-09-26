@@ -64,6 +64,14 @@ void ScreenCanvas::set_layout(unsigned screen_count, const SuperShuckieScreenDat
         screen.pixmap_item->setOffset(screen.x, screen.y);
     }
 
+    // Stacked screens of different widths (the 3DS: 400 over 320) sit centred, not left-aligned.
+    if(!horizontal) {
+        for(auto &screen : this->screens) {
+            screen.x = (this->total_width - screen.width) / 2;
+            screen.pixmap_item->setOffset(screen.x, screen.y);
+        }
+    }
+
     this->setFixedSize(this->total_width * scale, this->total_height * scale);
     this->setScene(this->scene);
 
