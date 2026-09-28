@@ -58,11 +58,14 @@ private:
     QWidget *tile_container;
     QGridLayout *tile_grid;
     std::vector<QToolButton *> tiles;
+    std::vector<QPixmap> tile_pictures; // per tile: the custom picture, or null for the generated icon
     QToolButton *add_tile = nullptr;
 
-    static constexpr int TILE_WIDTH = 120;
-    static constexpr int TILE_HEIGHT = 136;
-    static constexpr int ICON_SIZE = 88;
+    // Tiles stretch to fill each row exactly; a row holds as many tiles as fit at this width or
+    // wider (five at the 4x Game Boy scale).
+    static constexpr int MIN_TILE_WIDTH = 104;
+    static constexpr int TILE_ICON_MARGIN = 32; // tile width minus icon size
+    static constexpr int TILE_TEXT_HEIGHT = 48; // tile height minus icon size
     static constexpr int TILE_SPACING = 10;
     static constexpr int STORED_ICON_SIZE = 256;
 
@@ -70,11 +73,11 @@ private:
     void save_favorites();
     void rebuild_tiles();
     void relayout_tiles();
-    int columns() const;
 
     QString icons_dir() const;
-    QPixmap icon_for(const Favorite &favorite) const;
-    static QPixmap generated_icon(const Favorite &favorite);
+    QPixmap custom_icon(const Favorite &favorite) const;
+    static QPixmap generated_icon(const Favorite &favorite, int size);
+    QPixmap add_icon(int size) const;
     static bool looks_like_image(const QString &path);
 
     void add_rom(const QString &path);

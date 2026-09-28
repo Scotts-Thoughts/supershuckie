@@ -126,6 +126,7 @@ void LandingWidget::reload() {
 
 void LandingWidget::do_dismiss_hint() {
     this->hint_row->hide();
+    this->relayout_tiles(); // the tiles may fit without a scroll bar now
     if(this->main_window->frontend != nullptr) {
         supershuckie_frontend_set_custom_setting(this->main_window->frontend, LANDING_HINT_DISMISSED, "1");
         supershuckie_frontend_write_settings(this->main_window->frontend);
@@ -208,7 +209,7 @@ bool LandingWidget::looks_like_image(const QString &path) {
     return false;
 }
 
-QPixmap LandingWidget::generated_icon(const Favorite &favorite) {
+QPixmap LandingWidget::generated_icon(const Favorite &favorite, int size) {
     // A rounded "cartridge" tinted by console, labelled with the file type, so games without a
     // picture are still told apart at a glance.
     auto suffix = QFileInfo(favorite.path).suffix().toLower();
@@ -239,32 +240,35 @@ QPixmap LandingWidget::generated_icon(const Favorite &favorite) {
         label = "ROM";
     }
 
-    QPixmap pixmap(ICON_SIZE, ICON_SIZE);
+    QPixmap pixmap(size, size);
     pixmap.fill(Qt::transparent);
 
     QPainter painter(&pixmap);
     painter.setRenderHint(QPainter::Antialiasing);
 
-    QRectF body(4, 8, ICON_SIZE - 8, ICON_SIZE - 12);
-    painter.setPen(QPen(base.darker(140), 2));
+    // Drawn on an 88-pixel design grid, scaled to the requested size.
+    qreal k = size / 88.0;
+
+    QRectF body(4 * k, 8 * k, size - 8 * k, size - 12 * k);
+    painter.setPen(QPen(base.darker(140), 2 * k));
     painter.setBrush(base);
-    painter.drawRoundedRect(body, 10, 10);
+    painter.drawRoundedRect(body, 10 * k, 10 * k);
 
     // A lighter label area, like a cartridge sticker
-    QRectF sticker(body.adjusted(10, 12, -10, -22));
+    QRectF sticker(body.adjusted(10 * k, 12 * k, -10 * k, -22 * k));
     painter.setPen(Qt::NoPen);
     painter.setBrush(base.lighter(150));
-    painter.drawRoundedRect(sticker, 6, 6);
+    painter.drawRoundedRect(sticker, 6 * k, 6 * k);
 
     QFont font = painter.font();
     font.setBold(true);
-    font.setPixelSize(22);
+    font.setPixelSize(qMax(1, qRound(22 * k)));
     painter.setFont(font);
     painter.setPen(QColor(0xFF, 0xFF, 0xFF));
     painter.drawText(sticker, Qt::AlignCenter, label);
 
     // A first-letter monogram under the sticker
-    font.setPixelSize(13);
+    font.setPixelSize(qMax(1, qRound(13 * k)));
     painter.setFont(font);
     painter.setPen(QColor(0xFF, 0xFF, 0xFF, 0xCC));
     QString monogram = favorite.name.trimmed().left(1).toUpper();
@@ -274,14 +278,33 @@ QPixmap LandingWidget::generated_icon(const Favorite &favorite) {
     return pixmap;
 }
 
-QPixmap LandingWidget::icon_for(const Favorite &favorite) const {
-    if(!favorite.image.isEmpty()) {
-        QPixmap custom(this->icons_dir() + "/" + favorite.image);
-        if(!custom.isNull()) {
-            return custom;
-        }
+QPixmap LandingWidget::custom_icon(const Favorite &favorite) const {
+    if(favorite.image.isEmpty()) {
+        return QPixmap();
     }
-    return generated_icon(favorite);
+    return QPixmap(this->icons_dir() + "/" + favorite.image);
+}
+
+QPixmap LandingWidget::add_icon(int size) const {
+    // A big "+" in a dashed box
+    QPixmap pixmap(size, size);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    qreal k = size / 88.0;
+    QPen pen(this->palette().color(QPalette::Disabled, QPalette::Text), 2 * k, Qt::DashLine);
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(4 * k, 8 * k, size - 8 * k, size - 12 * k), 10 * k, 10 * k);
+    pen.setStyle(Qt::SolidLine);
+    pen.setWidthF(4 * k);
+    painter.setPen(pen);
+    qreal cx = size / 2.0;
+    qreal cy = size / 2.0 + 2 * k;
+    painter.drawLine(QPointF(cx - 16 * k, cy), QPointF(cx + 16 * k, cy));
+    painter.drawLine(QPointF(cx, cy - 16 * k), QPointF(cx, cy + 16 * k));
+    painter.end();
+    return pixmap;
 }
 
 void LandingWidget::rebuild_tiles() {
@@ -294,6 +317,7 @@ void LandingWidget::rebuild_tiles() {
         tile->deleteLater();
     }
     this->tiles.clear();
+    this->tile_pictures.clear();
     if(this->add_tile != nullptr) {
         this->tile_grid->removeWidget(this->add_tile);
         this->add_tile->hide();
@@ -301,17 +325,12 @@ void LandingWidget::rebuild_tiles() {
         this->add_tile = nullptr;
     }
 
-    QFontMetrics metrics(this->font());
-
+    // Sizes, icons and names are filled in by relayout_tiles(), which knows the tile width.
     for(std::size_t i = 0; i < this->favorites.size(); i++) {
         const auto &favorite = this->favorites[i];
 
         auto *tile = new QToolButton(this->tile_container);
         tile->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-        tile->setIconSize(QSize(ICON_SIZE, ICON_SIZE));
-        tile->setFixedSize(TILE_WIDTH, TILE_HEIGHT);
-        tile->setIcon(QIcon(this->icon_for(favorite)));
-        tile->setText(metrics.elidedText(favorite.name, Qt::ElideRight, TILE_WIDTH - 12));
         auto tooltip = favorite.name + "\n" + QDir::toNativeSeparators(favorite.path);
         auto shortcuts = this->main_window->favorite_rom_shortcuts(favorite.path);
         if(!shortcuts.isEmpty()) {
@@ -331,53 +350,58 @@ void LandingWidget::rebuild_tiles() {
         });
 
         this->tiles.push_back(tile);
+        this->tile_pictures.push_back(this->custom_icon(favorite));
     }
 
     this->add_tile = new QToolButton(this->tile_container);
     this->add_tile->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-    this->add_tile->setIconSize(QSize(ICON_SIZE, ICON_SIZE));
-    this->add_tile->setFixedSize(TILE_WIDTH, TILE_HEIGHT);
     this->add_tile->setText("Add ROM…");
     this->add_tile->setToolTip("Add a frequently played ROM to this screen");
     this->add_tile->setCursor(Qt::PointingHandCursor);
     this->add_tile->setFocusPolicy(Qt::NoFocus);
-    {
-        // A big "+" in a dashed box
-        QPixmap pixmap(ICON_SIZE, ICON_SIZE);
-        pixmap.fill(Qt::transparent);
-        QPainter painter(&pixmap);
-        painter.setRenderHint(QPainter::Antialiasing);
-        QPen pen(this->palette().color(QPalette::Disabled, QPalette::Text), 2, Qt::DashLine);
-        painter.setPen(pen);
-        painter.setBrush(Qt::NoBrush);
-        painter.drawRoundedRect(QRectF(4, 8, ICON_SIZE - 8, ICON_SIZE - 12), 10, 10);
-        pen.setStyle(Qt::SolidLine);
-        pen.setWidth(4);
-        painter.setPen(pen);
-        int cx = ICON_SIZE / 2;
-        int cy = ICON_SIZE / 2 + 2;
-        painter.drawLine(cx - 16, cy, cx + 16, cy);
-        painter.drawLine(cx, cy - 16, cx, cy + 16);
-        painter.end();
-        this->add_tile->setIcon(QIcon(pixmap));
-    }
     connect(this->add_tile, SIGNAL(clicked()), this, SLOT(do_add_rom()));
 
     this->relayout_tiles();
 }
 
-int LandingWidget::columns() const {
-    // Derived from our own width rather than the scroll viewport's: this runs from resizeEvent(),
-    // before the layout has handed the scroll area its new size. Always leave room for the
-    // vertical scroll bar so the column count doesn't flap as it appears and disappears.
-    auto margins = this->layout()->contentsMargins();
-    int available = this->width() - margins.left() - margins.right() - this->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
-    int count = (available + TILE_SPACING) / (TILE_WIDTH + TILE_SPACING);
-    return count < 1 ? 1 : count;
-}
-
 void LandingWidget::relayout_tiles() {
-    int cols = this->columns();
+    // Derived from our own size rather than the scroll viewport's: this runs from resizeEvent(),
+    // before the layout has handed the scroll area its new size.
+    auto margins = this->layout()->contentsMargins();
+    int inner_width = this->width() - margins.left() - margins.right();
+    int inner_height = this->height() - margins.top() - margins.bottom();
+    if(this->hint_row->isVisibleTo(this)) {
+        int hint_height = this->hint_row->hasHeightForWidth() ? this->hint_row->heightForWidth(inner_width) : this->hint_row->sizeHint().height();
+        inner_height -= hint_height + this->layout()->spacing();
+    }
+    int tile_count = static_cast<int>(this->tiles.size()) + 1; // + "Add ROM…"
+
+    // Fit as many columns as the minimum width allows, then widen the tiles to use up the row.
+    // Only give up room for the vertical scroll bar when the rows really overflow, so the tiles
+    // reach the right edge whenever they all fit.
+    auto fit = [tile_count, inner_height](int width, int &cols, int &tile_width, int &tile_height) {
+        cols = qMax(1, (width + TILE_SPACING) / (MIN_TILE_WIDTH + TILE_SPACING));
+        tile_width = qMax(1, (width - (cols - 1) * TILE_SPACING) / cols);
+        tile_height = tile_width - TILE_ICON_MARGIN + TILE_TEXT_HEIGHT;
+        int rows = (tile_count + cols - 1) / cols;
+        return rows * tile_height + (rows - 1) * TILE_SPACING <= inner_height;
+    };
+    int width = inner_width;
+    int cols, tile_width, tile_height;
+    if(!fit(width, cols, tile_width, tile_height)) {
+        width -= this->style()->pixelMetric(QStyle::PM_ScrollBarExtent);
+        fit(width, cols, tile_width, tile_height);
+    }
+    // Hand the leftover pixels of the integer division to the leading columns, one each.
+    int extra = width - cols * tile_width - (cols - 1) * TILE_SPACING;
+    int icon_size = qMax(16, tile_width - TILE_ICON_MARGIN);
+
+    QFontMetrics metrics(this->font());
+    auto size_tile = [&](QToolButton *tile, int index) {
+        int w = tile_width + ((index % cols) < extra ? 1 : 0);
+        tile->setFixedSize(w, tile_height);
+        tile->setIconSize(QSize(icon_size, icon_size));
+    };
 
     // Pull everything out of the grid, then re-add it in reading order with the new column count.
     while(this->tile_grid->count() > 0) {
@@ -386,9 +410,18 @@ void LandingWidget::relayout_tiles() {
 
     int index = 0;
     for(auto *tile : this->tiles) {
+        const auto &favorite = this->favorites[index];
+        const auto &picture = this->tile_pictures[index];
+        size_tile(tile, index);
+        tile->setIcon(QIcon(picture.isNull()
+            ? generated_icon(favorite, icon_size)
+            : picture.scaled(icon_size, icon_size, Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+        tile->setText(metrics.elidedText(favorite.name, Qt::ElideRight, tile->width() - 12));
         this->tile_grid->addWidget(tile, index / cols, index % cols);
         index++;
     }
+    size_tile(this->add_tile, index);
+    this->add_tile->setIcon(QIcon(this->add_icon(icon_size)));
     this->tile_grid->addWidget(this->add_tile, index / cols, index % cols);
 }
 
