@@ -117,11 +117,15 @@ running on a Game Boy and to Game Boy games running on a Game Boy Color, which a
 boot ROM's colors for them (the red and green Pokémon Red and Blue get); Game Boy Color games and
 Super Game Boy colors are left alone. Edits show in the game at once, *Use the game's colors*
 starts from what the game is drawn with by its own palettes, and **Use custom colors** in the same
-menu switches the whole thing on and off. Only how the game is drawn changes: replays, save states
+menu switches the whole thing on and off. **Save as…** in the dialog keeps the colors as a named
+preset; **Settings › Game Boy › Color presets** then switches to one in a single click (and switches
+custom colors on), and its first nine presets can be given keyboard shortcuts in the Shortcuts
+window. Only how the game is drawn changes: replays, save states
 and Play Together are exactly as without it, and a replay plays back with whatever colors are set
 while it is watched. Video export uses the colors; so does the frame server when started with
 `--gb-colors` (see [docs/frame_server.md](docs/frame_server.md)). They live in `settings.json` under
-`game_boy_settings.custom_colors` as `#RRGGBB` strings.
+`game_boy_settings.custom_colors` as `#RRGGBB` strings, and the presets under
+`game_boy_settings.color_presets`.
 
 ## RAM tools
 

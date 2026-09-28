@@ -203,10 +203,11 @@ fn request_fine_timer_resolution() {}
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let rom = std::path::absolute(args.next().expect("usage: record_pacing_smoke <rom> [--speed n] [--seconds n] [--coarse-timer]")).unwrap();
+    let rom = std::path::absolute(args.next().expect("usage: record_pacing_smoke <rom> [--speed n] [--seconds n] [--coarse-timer] [--draw-fewer]")).unwrap();
     let mut speed = 4.0f64;
     let mut seconds = 20.0f64;
     let mut coarse_timer = false;
+    let mut draw_fewer = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--speed" => speed = args.next().unwrap().parse().unwrap(),
@@ -214,6 +215,8 @@ fn main() {
             // Leave Windows at its default 15.6 ms timer granularity, to see what the pacing does
             // in a process that never asked for 1 ms.
             "--coarse-timer" => coarse_timer = true,
+            // The Nintendo DS "Draw fewer frames when sped up" setting.
+            "--draw-fewer" => draw_fewer = true,
             other => panic!("unexpected {other}"),
         }
     }
@@ -228,6 +231,7 @@ fn main() {
 
     let mut frontend = SuperShuckieFrontend::new(user.clone(), user.clone(), Box::new(NoScreen));
     frontend.set_speed_settings(speed, 2.0);
+    frontend.set_nds_draw_fewer_frames_when_sped_up(draw_fewer);
     frontend.set_auto_pause_on_record_setting(false);
     frontend.load_rom(&rom).expect("load rom");
     frontend.set_paused(false);

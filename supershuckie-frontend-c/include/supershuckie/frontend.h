@@ -175,6 +175,26 @@ void supershuckie_frontend_set_gb_custom_colors(struct SuperShuckieFrontendRaw *
  */
 bool supershuckie_frontend_get_gb_palettes(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieGBCustomColors *colors);
 
+/**
+ * Get the number of Game Boy color presets (Settings › Game Boy › Color presets).
+ */
+size_t supershuckie_frontend_get_gb_color_preset_count(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Get the Game Boy color preset at `index` (in menu order), writing its colors to `colors` with
+ * `enabled` set, so that passing them to supershuckie_frontend_set_gb_custom_colors switches to
+ * the preset, and returning its name, or null (leaving `colors` alone) if `index` is out of range.
+ *
+ * The name is valid until the presets are next set.
+ */
+const char *supershuckie_frontend_get_gb_color_preset(const struct SuperShuckieFrontendRaw *frontend, size_t index, struct SuperShuckieGBCustomColors *colors);
+
+/**
+ * Replace the Game Boy color presets with `count` presets, the Nth named `names[N]` (UTF-8) with
+ * the colors `colors[N]` (whose `enabled` is not kept).
+ */
+void supershuckie_frontend_set_gb_color_presets(struct SuperShuckieFrontendRaw *frontend, const char *const *names, const struct SuperShuckieGBCustomColors *colors, size_t count);
+
 enum SuperShuckieGBCMode {
     SuperShuckieGBCMode__AlwaysGBC = 0,
     SuperShuckieGBCMode__GBInGBMode = 1,
@@ -990,6 +1010,18 @@ const char *supershuckie_frontend_get_nds_date_preset(const struct SuperShuckieF
  * with the date `dates[N]`.
  */
 void supershuckie_frontend_set_nds_date_presets(struct SuperShuckieFrontendRaw *frontend, const char *const *names, const struct SuperShuckieNintendoDSDate *dates, size_t count);
+
+/**
+ * Get if the DS draws only about 60 frames a second when sped up.
+ */
+bool supershuckie_frontend_get_nds_draw_fewer_frames(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set if the DS draws only about 60 frames a second when sped up, instead of as many as the
+ * display can show (lighter on slower machines with high-refresh displays; less smooth there).
+ * Saved with the settings and applied at once.
+ */
+void supershuckie_frontend_set_nds_draw_fewer_frames(struct SuperShuckieFrontendRaw *frontend, bool fewer);
 
 /**
  * Get if JIT is enabled for the DS.

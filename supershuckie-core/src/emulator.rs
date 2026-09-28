@@ -176,6 +176,14 @@ pub trait EmulatorCore: Send + 'static {
     /// `presented: false` in [`RunTime`]); emulation itself is unaffected. Default: ignored.
     fn set_skip_drawing(&mut self, _skip: bool) {}
 
+    /// Whether frames are drawn only when asked: [`Self::set_skip_drawing`] is honoured and
+    /// drawing any single frame gives a complete picture ([`Self::draw_lead_frames`] is 0), so
+    /// which frame of a sped-up stretch gets drawn is free to choose (see
+    /// `SuperShuckieCore::shift_present_phase`). Default: `false`.
+    fn draws_on_request(&self) -> bool {
+        false
+    }
+
     /// Presentation hint for cores that draw every frame (see [`Self::draw_lead_frames`]): when
     /// `false`, the frames run from now on must still be drawn, but nobody will look at their
     /// pictures, so the core need not hand them out (the 3DS core then skips reading them back

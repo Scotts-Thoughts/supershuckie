@@ -297,6 +297,7 @@ MainWindow::MainWindow(): QMainWindow() {
         this->gb_custom_colors->setChecked(colors.enabled);
     }
     this->nds_jit->setChecked(supershuckie_frontend_get_nds_jit(this->frontend));
+    this->nds_draw_fewer_frames->setChecked(supershuckie_frontend_get_nds_draw_fewer_frames(this->frontend));
     this->swap_nds_screens->setChecked(supershuckie_frontend_get_swap_nds_screens(this->frontend));
     this->ignore_speed_changes_in_replay->setChecked(supershuckie_frontend_get_ignore_speed_changes_in_replay(this->frontend));
     this->auto_resync_keyframes_in_replay->setChecked(supershuckie_frontend_get_auto_resync_keyframes_in_replay(this->frontend));
@@ -319,6 +320,7 @@ MainWindow::MainWindow(): QMainWindow() {
     this->sdl.frontend = this->frontend;
     this->render_widget->setFocus(Qt::OtherFocusReason);
     this->rebuild_recent_roms_menu();
+    this->rebuild_gb_color_presets_menu();
     this->rebuild_nds_date_menu();
 
     // The frontend exists now, so the favorites list can be read; the video-mode callback that
@@ -1297,6 +1299,25 @@ void MainWindow::set_up_settings_menu() {
     custom_colors->setToolTip("Choose the twelve colors a Game Boy game is drawn with");
     connect(custom_colors, SIGNAL(triggered()), this, SLOT(do_open_gb_palette_dialog()));
 
+    // Each preset switches to its colors (and switches custom colors on); see
+    // rebuild_gb_color_presets_menu().
+    this->gb_color_presets_menu = this->game_boy_settings->addMenu("Color presets");
+    for(std::size_t i = 0; i < MainWindow::GB_COLOR_PRESET_SLOTS; i++) {
+        auto *slot = this->gb_color_presets_menu->addAction(QString("Color preset %1").arg(i + 1));
+        slot->setObjectName(QString("gb-color-preset-%1").arg(i + 1));
+        // The menu shows the preset's name instead; the Shortcuts window lists the slot.
+        slot->setProperty(SHORTCUT_NAME_PROPERTY, slot->text());
+        slot->setCheckable(true);
+        slot->setVisible(false);
+        connect(slot, &QAction::triggered, this, [this, i]() { this->apply_gb_color_preset(i); });
+        this->gb_color_preset_slots[i] = slot;
+    }
+    this->gb_color_no_presets = this->gb_color_presets_menu->addAction("No presets yet");
+    this->gb_color_no_presets->setEnabled(false);
+    this->gb_color_presets_menu->addSeparator();
+    auto *edit_gb_color_presets = this->gb_color_presets_menu->addAction("Edit presets…");
+    connect(edit_gb_color_presets, SIGNAL(triggered()), this, SLOT(do_open_gb_palette_dialog()));
+
     auto *nds_settings = this->settings_menu->addMenu("Nintendo DS");
 
     auto *set_nds_date = nds_settings->addAction("Set date…");
@@ -1317,6 +1338,13 @@ void MainWindow::set_up_settings_menu() {
     this->nds_jit->setObjectName("nds-enable-jit");
     this->nds_jit->setCheckable(true);
     connect(this->nds_jit, SIGNAL(triggered()), this, SLOT(do_toggle_nds_jit()));
+
+    this->nds_draw_fewer_frames = nds_settings->addAction("Draw fewer frames when sped up");
+    this->nds_draw_fewer_frames->setObjectName("nds-draw-fewer-frames");
+    this->nds_draw_fewer_frames->setCheckable(true);
+    this->nds_draw_fewer_frames->setToolTip("Draw about 60 frames a second at any speed instead of as many as the monitor shows. "
+                                            "Use it if the game cannot keep full speed when sped up; motion is less smooth on 120 Hz and faster monitors.");
+    connect(this->nds_draw_fewer_frames, SIGNAL(triggered()), this, SLOT(do_toggle_nds_draw_fewer_frames()));
 
     auto *n3ds_settings = this->settings_menu->addMenu("Nintendo 3DS");
 
@@ -2542,6 +2570,7 @@ void MainWindow::do_toggle_gb_custom_colors() {
     supershuckie_frontend_get_gb_custom_colors(this->frontend, &colors);
     colors.enabled = this->gb_custom_colors->isChecked();
     supershuckie_frontend_set_gb_custom_colors(this->frontend, &colors);
+    this->refresh_gb_color_preset_checks();
 }
 
 void MainWindow::do_open_gb_palette_dialog() {
@@ -2552,6 +2581,76 @@ void MainWindow::do_open_gb_palette_dialog() {
     SuperShuckieGBCustomColors colors = {};
     supershuckie_frontend_get_gb_custom_colors(this->frontend, &colors);
     this->gb_custom_colors->setChecked(colors.enabled);
+    this->rebuild_gb_color_presets_menu();
+}
+
+void MainWindow::rebuild_gb_color_presets_menu() {
+    // deleteLater: this runs from inside the triggered() of the preset that was picked.
+    for(auto *action : this->gb_color_preset_extras) {
+        this->gb_color_presets_menu->removeAction(action);
+        action->deleteLater();
+    }
+    this->gb_color_preset_extras.clear();
+
+    auto presets = GBPaletteDialog::load_presets(this->frontend);
+    for(std::size_t i = 0; i < presets.size() || i < MainWindow::GB_COLOR_PRESET_SLOTS; i++) {
+        QAction *action;
+        if(i < MainWindow::GB_COLOR_PRESET_SLOTS) {
+            action = this->gb_color_preset_slots[i];
+            action->setVisible(i < presets.size());
+            if(i >= presets.size()) {
+                continue;
+            }
+        }
+        else {
+            action = new QAction(this->gb_color_presets_menu);
+            action->setCheckable(true);
+            connect(action, &QAction::triggered, this, [this, i]() { this->apply_gb_color_preset(i); });
+            this->gb_color_presets_menu->insertAction(this->gb_color_no_presets, action);
+            this->gb_color_preset_extras.push_back(action);
+        }
+
+        action->setText(QString(presets[i].name).replace("&", "&&"));
+        action->setIcon(GBPaletteDialog::preview_icon(presets[i].colors));
+    }
+    this->gb_color_no_presets->setVisible(presets.empty());
+
+    this->refresh_gb_color_preset_checks();
+}
+
+void MainWindow::refresh_gb_color_preset_checks() {
+    // The preset (if any) the game is drawn with right now.
+    SuperShuckieGBCustomColors current = {};
+    supershuckie_frontend_get_gb_custom_colors(this->frontend, &current);
+    auto presets = GBPaletteDialog::load_presets(this->frontend);
+    for(std::size_t i = 0; i < presets.size(); i++) {
+        QAction *action = nullptr;
+        if(i < MainWindow::GB_COLOR_PRESET_SLOTS) {
+            action = this->gb_color_preset_slots[i];
+        }
+        else if(i - MainWindow::GB_COLOR_PRESET_SLOTS < this->gb_color_preset_extras.size()) {
+            action = this->gb_color_preset_extras[i - MainWindow::GB_COLOR_PRESET_SLOTS];
+        }
+        if(action != nullptr) {
+            action->setChecked(current.enabled && GBPaletteDialog::same_colors(presets[i].colors, current));
+        }
+    }
+}
+
+void MainWindow::apply_gb_color_preset(std::size_t index) {
+    SuperShuckieGBCustomColors colors = {};
+    const char *name = supershuckie_frontend_get_gb_color_preset(this->frontend, index, &colors);
+    if(name == nullptr) {
+        this->refresh_gb_color_preset_checks();
+        return;
+    }
+
+    // The preset's colors come back switched on.
+    auto message = QString("Using color preset %1").arg(QString::fromUtf8(name));
+    supershuckie_frontend_set_gb_custom_colors(this->frontend, &colors);
+    this->gb_custom_colors->setChecked(colors.enabled);
+    this->refresh_gb_color_preset_checks();
+    this->set_title(message.toUtf8().constData());
 }
 
 // The Game Boy model settings would change the game under a recording, a replay or a Play
@@ -2773,6 +2872,10 @@ void MainWindow::do_toggle_swap_nds_screens() {
 
 void MainWindow::do_toggle_nds_jit() {
     supershuckie_frontend_set_nds_jit(this->frontend, this->nds_jit->isChecked());
+}
+
+void MainWindow::do_toggle_nds_draw_fewer_frames() {
+    supershuckie_frontend_set_nds_draw_fewer_frames(this->frontend, this->nds_draw_fewer_frames->isChecked());
 }
 
 void MainWindow::rebuild_recent_roms_menu() noexcept {

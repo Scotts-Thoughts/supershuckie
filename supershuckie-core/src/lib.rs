@@ -212,6 +212,15 @@ pub struct SuperShuckieCore {
 
     /// Present (draw) one frame in this many while running paced; see [`Self::present_every`].
     present_every: u64,
+    /// Which frame of each `present_every` is drawn; see [`Self::shift_present_phase`].
+    present_phase: u64,
+    /// No frame run before this frame count is drawn (set when the phase moves later, so that
+    /// the frame right after the last drawn one does not match the new phase straight away).
+    present_not_before: u64,
+    /// See [`Self::set_display_refresh_hz`].
+    display_refresh_hz: Option<f64>,
+    /// See [`Self::set_draw_fewer_frames_when_sped_up`].
+    draw_fewer_frames_when_sped_up: bool,
 
     /// Save-state buffers handed back by the recorder, reused for the next keyframe.
     state_buffers: Vec<Vec<u8>>,
@@ -382,6 +391,10 @@ impl SuperShuckieCore {
             rom_reads_scratch: Vec::new(),
             transient_access_scratch: Vec::new(),
             present_every: 1,
+            present_phase: 0,
+            present_not_before: 0,
+            display_refresh_hz: None,
+            draw_fewer_frames_when_sped_up: false,
             state_buffers: Vec::new(),
             #[cfg(feature = "std")]
             primed_state_buffers: None,
@@ -399,11 +412,85 @@ impl SuperShuckieCore {
 
     /// Frames over which one frame is drawn while running paced at the current speed.
     ///
-    /// From 2x up nobody can see every frame (the display shows 60 a second), so only one frame
-    /// in `floor(speed)` is composited; the rest are emulated but not drawn, which is markedly
-    /// cheaper. Unpaced runs (seeks, export) always draw what they need to.
+    /// From 2x up the display cannot show every frame, so only one frame in `floor(speed)` is
+    /// composited; the rest are emulated but not drawn, which is markedly cheaper. When the
+    /// display's refresh rate is known (see [`Self::set_display_refresh_hz`]), the user has not
+    /// asked for fewer (see [`Self::set_draw_fewer_frames_when_sped_up`]) and the core can
+    /// hand out any frame's picture cheaply, one frame per display refresh is drawn when at least
+    /// [`Self::MIN_STEERABLE_PRESENT_EVERY`] frames fit in one (60 a second at 3x or 4x on a
+    /// 60 Hz display), and every frame otherwise: all 240 at 4x on a 144 Hz display, where 60
+    /// drawn frames could only alternate between 2 and 3 refreshes each. Unpaced runs (seeks,
+    /// export) always draw what they need to.
     pub fn present_every(&self) -> u64 {
         self.present_every
+    }
+
+    /// Tell the core how often the display showing it refreshes (`None` if unknown); see
+    /// [`Self::present_every`].
+    pub fn set_display_refresh_hz(&mut self, hz: Option<f64>) {
+        let hz = hz.filter(|hz| hz.is_finite() && *hz >= 1.0);
+        if self.display_refresh_hz != hz {
+            self.display_refresh_hz = hz;
+            self.update_present_every();
+        }
+    }
+
+    /// Draw only one frame in `floor(speed)` when sped up, whatever the display (about 60 a
+    /// second), instead of as many as the display can show (see [`Self::present_every`]). Less
+    /// work for a machine that cannot keep up drawing every frame at speed on a high-refresh
+    /// display, at the cost of uneven motion there. Off by default.
+    pub fn set_draw_fewer_frames_when_sped_up(&mut self, fewer: bool) {
+        if self.draw_fewer_frames_when_sped_up != fewer {
+            self.draw_fewer_frames_when_sped_up = fewer;
+            self.update_present_every();
+        }
+    }
+
+    /// Draw a different frame of each `present_every`: one frame earlier (`earlier`) or later
+    /// than now. The frame drawn next is then `present_every - 1` or `present_every + 1` frames
+    /// after the last one instead of `present_every`.
+    ///
+    /// Drawn frames arrive at a slightly different rate from the display's refreshes, so their
+    /// arrival slowly drifts through the refresh cycle. Whenever it drifts onto the moment the
+    /// display picks up its next picture, scheduling jitter alone decides for a second or two
+    /// whether each frame makes that refresh: frames alternately show twice and get skipped
+    /// (0, then 8 frames of movement per refresh at 4x on a 60 Hz display). The core thread uses
+    /// this to keep arrival away from that moment (see `CoreLoop::steer_present_phase`) at the
+    /// cost of a single slightly shorter or longer step.
+    pub fn shift_present_phase(&mut self, earlier: bool) {
+        let every = self.present_every.max(1);
+        self.present_phase = (self.present_phase + if earlier { 1 } else { every - 1 }) % every;
+        if !earlier {
+            // Just after drawn frame D the frame D + 1 now matches; the one wanted is D + 1 + every.
+            self.present_not_before = self.total_frames.wrapping_add(1);
+        }
+    }
+
+    /// The fewest frames per drawn frame at which the drawn one is steered (see
+    /// [`Self::shift_present_phase`]); with a display that fits fewer, every frame is drawn.
+    pub const MIN_STEERABLE_PRESENT_EVERY: u64 = 3;
+
+    fn update_present_every(&mut self) {
+        let multiplier = self.game_speed.into_multiplier_float();
+        let most = if multiplier >= 2.0 { (multiplier.floor() as u64).clamp(1, 16) } else { 1 };
+        let (numerator, denominator) = self.core.frame_rate();
+        // Only for a core that draws a frame only when asked (the 3DS draws every frame anyway
+        // and pays for each picture it hands out; Game Boy and GBA hand out every frame).
+        self.present_every = match self.display_refresh_hz {
+            Some(hz) if most > 1 && self.core.draws_on_request() && !self.draw_fewer_frames_when_sped_up && numerator > 0 && denominator > 0 => {
+                let fps = numerator as f64 / denominator as f64 * multiplier;
+                // 5 % slack: a 59.83 fps DS at 4x on a 59.95 Hz display is still 4, not 3.
+                let per_refresh = ((fps / (hz * 0.95)).floor() as u64).clamp(1, most);
+                // With fewer than 3 frames per refresh, which frame gets drawn cannot be steered
+                // finely enough to keep drawn frames clear of the refresh (see
+                // `shift_present_phase`): measured at 4x on a 120 Hz display, drawing 1 in 2
+                // still stuttered, while drawing every frame only moves the picture on by 1 or 3
+                // frames instead of 2 now and then.
+                if per_refresh >= Self::MIN_STEERABLE_PRESENT_EVERY { per_refresh } else { 1 }
+            }
+            _ => most
+        };
+        self.present_phase %= self.present_every;
     }
 
     /// Whether the screens hold a newly drawn frame from the last run.
@@ -616,14 +703,16 @@ impl SuperShuckieCore {
         // Draw the frames that will be presented, and the ones just before them that the core
         // needs drawn for those pictures to be complete (see `EmulatorCore::draw_lead_frames`).
         let lead = self.core.draw_lead_frames().min(self.present_every);
+        let drawn_at = self.total_frames.wrapping_add(self.present_phase);
+        let not_before = self.present_not_before;
         let skip = self.present_every > 1 && !self.core.is_mid_frame()
-            && !(0..=lead).any(|k| (self.total_frames + k) % self.present_every == 0);
+            && !(0..=lead).any(|k| (drawn_at + k) % self.present_every == 0 && self.total_frames + k >= not_before);
         self.core.set_skip_drawing(skip);
         // A core that draws every frame (the 3DS) still only has to hand out the pictures of the
         // frames other cores draw (one in `present_every`) and of the ones a recording keeps as
         // timeline pictures (see `push_thumbnail_if_needed`, which looks at the frame count
         // after the run).
-        let shown = self.present_every <= 1 || self.total_frames % self.present_every == 0;
+        let shown = self.present_every <= 1 || (drawn_at % self.present_every == 0 && self.total_frames >= not_before);
         let thumbnail = self.replay_file_recorder.is_some()
             && (self.total_frames + 1) % Self::THUMBNAIL_INTERVAL_FRAMES == 0;
         if !skip && !shown && !thumbnail {
@@ -882,7 +971,7 @@ impl SuperShuckieCore {
         let multiplier = speed.into_multiplier_float();
         self.game_speed = Speed::from_multiplier_float(multiplier);
         self.core.set_speed(multiplier);
-        self.present_every = if multiplier >= 2.0 { (multiplier.floor() as u64).clamp(1, 16) } else { 1 };
+        self.update_present_every();
         self.with_recorder(|r| r.set_speed(speed));
 
         #[cfg(feature = "std")]
@@ -2866,6 +2955,10 @@ mod tests {
             self.skip_drawing = skip;
         }
 
+        fn draws_on_request(&self) -> bool {
+            true
+        }
+
         fn seek_draw_tail_frames(&self) -> u64 {
             self.seek_tail
         }
@@ -3583,6 +3676,48 @@ mod tests {
         let player = ReplayFilePlayer::new(bytes, false).expect("parse the recorded replay");
         core.attach_replay_player(player, true).expect("attach");
         (core, clock, played_log)
+    }
+
+    /// Sped up, how many frames are drawn follows the display's refresh rate, and moving the
+    /// present phase draws the next frame one frame sooner or later than it would have been.
+    #[test]
+    fn drawn_frames_follow_the_display_and_the_present_phase() {
+        let clock = FakeClock::new();
+        let fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let drawn = fake.drawn.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock.clone()));
+        core.set_speed(Speed::from_multiplier_float(4.0));
+        assert_eq!(core.present_every(), 4, "display unknown: one frame in floor(speed)");
+        core.set_display_refresh_hz(Some(120.0));
+        assert_eq!(core.present_every(), 1, "fewer than 3 frames per refresh: all of them");
+        core.set_display_refresh_hz(Some(144.0));
+        assert_eq!(core.present_every(), 1);
+        core.set_draw_fewer_frames_when_sped_up(true);
+        assert_eq!(core.present_every(), 4, "asked for fewer: one frame in floor(speed) anyway");
+        core.set_draw_fewer_frames_when_sped_up(false);
+        assert_eq!(core.present_every(), 1);
+        core.set_display_refresh_hz(Some(59.94));
+        assert_eq!(core.present_every(), 4, "4 frames per refresh: one per refresh");
+
+        // The fake counts frames from 1, so the frame run from frame count N is drawn as N + 1.
+        for _ in 0..9 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(*drawn.lock().unwrap(), [1, 5, 9]);
+
+        // Right after drawing: one frame sooner (3 on), then every 4 again.
+        core.shift_present_phase(true);
+        for _ in 0..7 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(*drawn.lock().unwrap(), [1, 5, 9, 12, 16]);
+
+        // Right after drawing: one frame later (5 on), then every 4 again.
+        core.shift_present_phase(false);
+        for _ in 0..9 {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(*drawn.lock().unwrap(), [1, 5, 9, 12, 16, 21, 25]);
     }
 
     /// A seek that skipped drawing and left the picture incomplete (a 3DS game rendering into a

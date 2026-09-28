@@ -114,6 +114,10 @@ impl EmulatorCore for NintendoDS {
         RunTime::ONE_FRAME
     }
 
+    fn draws_on_request(&self) -> bool {
+        true
+    }
+
     fn set_skip_drawing(&mut self, skip: bool) {
         if self.skip_drawing != skip {
             self.skip_drawing = skip;

@@ -203,6 +203,8 @@ pub struct SuperShuckieFrontend {
     /// `screen_generation` of the last frame handed to the UI.
     last_presented_screen_generation: u32,
     present_pacer: PresentPacer,
+    /// See [`Self::set_display_clock_override`]; handed to every new core.
+    display_clock_override: Option<(Instant, Duration)>,
     last_emulation_fps: f64,
     last_read_replay_stats: Option<LastReadReplayCropData>,
 
@@ -286,6 +288,7 @@ impl SuperShuckieFrontend {
             present_on_demand: false,
             last_presented_screen_generation: 0,
             present_pacer: PresentPacer::default(),
+            display_clock_override: None,
             last_emulation_fps: 0.0,
             current_save_state_history_position: 0,
             recording_replay_file: None,
@@ -1483,6 +1486,22 @@ impl SuperShuckieFrontend {
         self.settings.nintendo_ds_settings.date_presets = presets;
     }
 
+    /// Whether the Nintendo DS draws only about 60 frames a second when sped up (see
+    /// [`Self::set_nds_draw_fewer_frames_when_sped_up`]).
+    #[inline]
+    pub fn get_nds_draw_fewer_frames_when_sped_up(&self) -> bool {
+        self.settings.nintendo_ds_settings.draw_fewer_frames_when_sped_up
+    }
+
+    /// Draw only about 60 frames a second on the Nintendo DS when sped up, instead of as many as
+    /// the display can show: lighter for a machine that cannot keep full speed drawing every
+    /// frame on a high-refresh display, at the cost of uneven motion there. Takes effect at once.
+    pub fn set_nds_draw_fewer_frames_when_sped_up(&mut self, fewer: bool) {
+        self.settings.nintendo_ds_settings.draw_fewer_frames_when_sped_up = fewer;
+        self.core.set_draw_fewer_frames_when_sped_up(fewer);
+        self.mark_settings_dirty();
+    }
+
     /// Get the Nintendo DS date.
     #[inline]
     pub fn get_jit_enabled(&self) -> bool {
@@ -1903,6 +1922,15 @@ impl SuperShuckieFrontend {
         self.present_pacer = PresentPacer::default();
     }
 
+    /// Replace the display timing the emulator steers its drawn frames by (normally the
+    /// system's) with a display that refreshed at `vblank` and every `period` since, for tools
+    /// that simulate one; `None` goes back to the system's. See
+    /// [`ThreadedSuperShuckieCore::set_display_clock_override`].
+    pub fn set_display_clock_override(&mut self, clock: Option<(Instant, Duration)>) {
+        self.display_clock_override = clock;
+        self.core.set_display_clock_override(clock);
+    }
+
     /// Whether frames wait for [`Self::present_latest_frame`]; see [`Self::set_present_on_demand`].
     pub fn present_on_demand(&self) -> bool {
         self.present_on_demand
@@ -2164,6 +2192,13 @@ impl SuperShuckieFrontend {
     #[inline]
     pub fn get_elapsed_frames(&self) -> u32 {
         self.last_read_elapsed_time_stats.frames
+    }
+
+    /// The frame count as of the frame the screens last handed to the UI show (for diagnostics:
+    /// while fast-forwarding, frames after it may have been emulated but not drawn).
+    #[inline]
+    pub fn get_screen_frame(&self) -> u32 {
+        self.last_read_elapsed_time_stats.screen_frame
     }
 
     /// Get the loaded replay's position: the frame being played back, or the frame playback
@@ -2890,6 +2925,12 @@ impl SuperShuckieFrontend {
             self.core.set_auto_resync_keyframes_in_replay(true);
         }
         self.core.set_coarse_seek_while_frozen(self.settings.replay.snap_timeline_drag_to_keyframes);
+        if self.display_clock_override.is_some() {
+            self.core.set_display_clock_override(self.display_clock_override);
+        }
+        if self.settings.nintendo_ds_settings.draw_fewer_frames_when_sped_up {
+            self.core.set_draw_fewer_frames_when_sped_up(true);
+        }
 
         // A new core is a new timeline; nothing the old one queued should be heard.
         self.audio_output.clear();
@@ -3221,6 +3262,18 @@ impl SuperShuckieFrontend {
             objects_0: palettes.objects_0,
             objects_1: palettes.objects_1
         })
+    }
+
+    /// Get the Game Boy color presets, in menu order.
+    #[inline]
+    pub fn get_gb_color_presets(&self) -> &[GameBoyColorPreset] {
+        &self.settings.game_boy_settings.color_presets
+    }
+
+    /// Replace the Game Boy color presets.
+    pub fn set_gb_color_presets(&mut self, presets: Vec<GameBoyColorPreset>) {
+        self.settings.game_boy_settings.color_presets = presets;
+        self.mark_settings_dirty();
     }
 
     /// Hand the core the custom colors, or none.

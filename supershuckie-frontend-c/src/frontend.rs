@@ -6,7 +6,7 @@ use std::sync::Arc;
 use supershuckie_core::emulator::{ScreenData, ScreenDataEncoding, AUDIO_SAMPLE_RATE};
 use supershuckie_core::AudioOutput;
 use supershuckie_frontend::{ConnectedControllerIndex, ScreenInfo, SuperShuckieEmulatorType, SuperShuckieFrontend, SuperShuckieFrontendCallbacks, SuperShuckieReplayState, UserInput};
-use supershuckie_frontend::settings::{GameBoyCustomColors, GameBoyMode, NintendoDSDate, NintendoDSDatePreset};
+use supershuckie_frontend::settings::{GameBoyColorPreset, GameBoyCustomColors, GameBoyMode, NintendoDSDate, NintendoDSDatePreset};
 use supershuckie_frontend::util::UTF8CString;
 use crate::control_settings::SuperShuckieControlSettings;
 use crate::string_array::SuperShuckieStringArray;
@@ -1277,6 +1277,34 @@ pub extern "C" fn supershuckie_frontend_get_gb_palettes(frontend: &SuperShuckieF
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_gb_color_preset_count(frontend: &SuperShuckieFrontend) -> usize {
+    frontend.get_gb_color_presets().len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_gb_color_preset(frontend: &SuperShuckieFrontend, index: usize, colors: &mut GameBoyCustomColors) -> *const c_char {
+    let Some(preset) = frontend.get_gb_color_presets().get(index) else {
+        return null()
+    };
+    *colors = preset.colors();
+    preset.name.as_c_str().as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_set_gb_color_presets(
+    frontend: &mut SuperShuckieFrontend,
+    names: *const *const c_char,
+    colors: *const GameBoyCustomColors,
+    count: usize
+) {
+    let presets = (0..count).map(|i| GameBoyColorPreset::new(
+        UTF8CString::from(unsafe { CStr::from_ptr(*names.add(i)) }.to_string_lossy().into_owned()),
+        unsafe { &*colors.add(i) }
+    )).collect();
+    frontend.set_gb_color_presets(presets);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_set_touch(frontend: &mut SuperShuckieFrontend, enabled: bool, x: u16, y: u16) {
     frontend.set_touch(enabled.then_some((x, y)))
 }
@@ -1339,6 +1367,16 @@ pub unsafe extern "C" fn supershuckie_frontend_set_nds_date_presets(
     frontend.set_nds_date_presets(presets);
 }
 
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_nds_draw_fewer_frames(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_nds_draw_fewer_frames_when_sped_up()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_nds_draw_fewer_frames(frontend: &mut SuperShuckieFrontend, fewer: bool) {
+    frontend.set_nds_draw_fewer_frames_when_sped_up(fewer)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_get_nds_jit(frontend: &SuperShuckieFrontend) -> bool {

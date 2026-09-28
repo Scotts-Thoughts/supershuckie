@@ -1,4 +1,4 @@
-use crate::emulator::{EmulatorCore, GbPaletteOverride, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
+﻿use crate::emulator::{EmulatorCore, GbPaletteOverride, Input, MemoryRegionInfo, PartialReplayRecordMetadata, ScreenData};
 use crate::link::{LinkFailure, LinkInbox, LinkPublisherFns, LinkRunOutcome, LinkSettings};
 use crate::live_replay::{FollowerStats, FollowerStatsSnapshot, LiveReplaySource};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
@@ -184,7 +184,10 @@ pub struct ElapsedTimeStats {
     /// Incremented every time a newly drawn frame is published to `read_screens`. Frames that
     /// were emulated but not drawn (fast-forward) do not change it, so compare this rather than
     /// `frames` to decide whether the screens need re-reading.
-    pub screen_generation: u32
+    pub screen_generation: u32,
+
+    /// The frame count (`frames`) right after the frame the published screens show was run.
+    pub screen_frame: u32
 }
 
 /// How long emulated frames are taking on the core thread, for diagnostics.
@@ -292,6 +295,8 @@ impl ThreadedSuperShuckieCore {
                     screens_queued: emulator_core.get_screens().to_vec(),
                     screen_ready_for_copy: false,
                     screen_generation: 0,
+                    screen_frame: 0,
+                    queued_screen_frame: 0,
                     published_run_serial: 0,
                     core: SuperShuckieCore::new(emulator_core, std_timestamp_provider()),
                     pokeabyte_integration: None,
@@ -306,6 +311,8 @@ impl ThreadedSuperShuckieCore {
                     playback_errors,
                     playback_frozen: false,
                     coarse_seek_while_frozen: true,
+                    display_clock: DisplayClock::default(),
+                    present_phase_error: None,
                     pending_exact_frame: None,
                     freezes: BTreeMap::new(),
                     last_pokeabyte_freeze: None,
@@ -989,6 +996,21 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::SetCoarseSeekWhileFrozen(coarse));
     }
 
+    /// See [`SuperShuckieCore::set_draw_fewer_frames_when_sped_up`].
+    #[inline]
+    pub fn set_draw_fewer_frames_when_sped_up(&self, fewer: bool) {
+        let _ = self.send(ThreadCommand::SetDrawFewerFramesWhenSpedUp(fewer));
+    }
+
+    /// Replace the display timing the core thread reads from the system (the compositor's
+    /// refresh clock on Windows) with a display that refreshed at `vblank` and every `period`
+    /// since; `None` goes back to the system's. For headless tools that simulate a display. See
+    /// `CoreLoop::steer_present_phase`.
+    #[inline]
+    pub fn set_display_clock_override(&self, clock: Option<(Instant, Duration)>) {
+        let _ = self.send(ThreadCommand::SetDisplayClockOverride(clock));
+    }
+
     /// Route the audio of audible frames to `output` (`None` to stop).
     #[inline]
     pub fn set_audio_output(&self, output: Option<Arc<AudioOutput>>) {
@@ -1189,6 +1211,8 @@ enum ThreadCommand {
     Pause(Sender<()>),
     SetPlaybackFrozen(bool),
     SetCoarseSeekWhileFrozen(bool),
+    SetDisplayClockOverride(Option<(Instant, Duration)>),
+    SetDrawFewerFramesWhenSpedUp(bool),
     SetPokeABytePort(Option<u16>, Sender<Result<(), String>>),
     StartRecordingReplay(PartialReplayRecordMetadata<std::io::BufWriter<File>, std::io::BufWriter<File>>, Sender<Result<(), ReplayFileWriteError>>),
     ResumeRecordingReplay {
@@ -1342,6 +1366,10 @@ struct CoreLoop {
     screen_ready_for_copy: bool,
     /// See [`ElapsedTimeStats::screen_generation`].
     screen_generation: u32,
+    /// See [`ElapsedTimeStats::screen_frame`].
+    screen_frame: UnsignedInteger,
+    /// The frame `screens_queued` holds while `screen_ready_for_copy`.
+    queued_screen_frame: UnsignedInteger,
     /// `SuperShuckieCore::run_serial` of the last run whose frame was handed to `screens` (or
     /// deliberately not, because it was not drawn).
     published_run_serial: u64,
@@ -1354,6 +1382,11 @@ struct CoreLoop {
     playback_frozen: bool,
     /// See [`ThreadedSuperShuckieCore::set_coarse_seek_while_frozen`].
     coarse_seek_while_frozen: bool,
+    /// The display's refresh cycle; see [`CoreLoop::steer_present_phase`].
+    display_clock: DisplayClock,
+    /// Smoothed distance of drawn frames' arrival from the target point of the refresh cycle,
+    /// in seconds; see [`CoreLoop::steer_present_phase`].
+    present_phase_error: Option<f64>,
     /// The exact frame the last coarse seek stood in for, sought once playback is unfrozen.
     pending_exact_frame: Option<u32>,
 
@@ -1775,6 +1808,7 @@ impl CoreLoop {
         self.handle_follower_errors();
         self.handle_link_errors();
         self.go_to_desired_frame();
+        self.update_display_refresh_rate();
         self.refresh_screen_data();
         self.update_queued_screens();
         self.handle_pokeabyte_integration();
@@ -2028,6 +2062,7 @@ impl CoreLoop {
         core::mem::swap(in_screens, &mut *out_screens);
 
         self.screen_generation = self.screen_generation.wrapping_add(1);
+        self.screen_frame = self.queued_screen_frame;
         self.update_elapsed_time();
     }
 
@@ -2037,7 +2072,8 @@ impl CoreLoop {
             frames: self.core.total_frames as u32,
             speed: self.core.game_speed,
             replay_frame: self.core.replay_position().0 as u32,
-            screen_generation: self.screen_generation
+            screen_generation: self.screen_generation,
+            screen_frame: self.screen_frame as u32
         };
     }
 
@@ -2078,6 +2114,78 @@ impl CoreLoop {
         self.screen_ready_for_copy = false;
     }
 
+    /// Hand the core the display's refresh rate (see `SuperShuckieCore::present_every`).
+    fn update_display_refresh_rate(&mut self) {
+        if !self.is_running() {
+            return
+        }
+        let hz = self.display_clock.sample().map(|(_, period)| 1.0 / period.as_secs_f64());
+        self.core.set_display_refresh_hz(hz);
+    }
+
+    /// Where in the display's refresh cycle drawn frames should reach the UI, as a fraction of
+    /// the cycle after a refresh. The picture then has most of a refresh to get through the UI
+    /// before the next one, and the other side of the cycle (the frame just missing a refresh)
+    /// is as far away as the steering allows.
+    const PRESENT_PHASE_TARGET: f64 = 0.4;
+
+    /// Keep drawn frames arriving at the same point of the display's refresh cycle (see
+    /// `SuperShuckieCore::shift_present_phase`, which says why), given that one arrived at
+    /// `arrived`.
+    ///
+    /// Only for a core that draws on request (the Nintendo DS), while running paced, drawing one
+    /// frame in at least
+    /// `SuperShuckieCore::MIN_STEERABLE_PRESENT_EVERY`, with a whole number of display refreshes
+    /// per drawn frame and at most about a third of a refresh between emulated frames: then
+    /// moving the drawn frame by one emulated frame moves its arrival by a small part of a
+    /// refresh, and holding arrival within about half an emulated frame of the target keeps it
+    /// clear of the refresh.
+    /// The error is smoothed over several frames so that one late frame (a keyframe capture)
+    /// does not move the cadence.
+    fn steer_present_phase(&mut self, arrived: Instant) {
+        let every = self.core.present_every();
+        let usable = self.is_running() && every >= SuperShuckieCore::MIN_STEERABLE_PRESENT_EVERY
+            && self.core.core.draws_on_request() && self.follower.is_none() && !self.playback_frozen;
+        let timing = self.core.core.frame_period_microseconds().zip(self.display_clock.sample());
+        let (Some((frame_us, (vblank, period))), true) = (timing, usable) else {
+            self.present_phase_error = None;
+            return
+        };
+        let refresh = period.as_secs_f64();
+        let frame = frame_us as f64 / 1_000_000.0;
+        let refreshes_per_drawn = frame * every as f64 / refresh;
+        if frame > refresh * 0.35 || (refreshes_per_drawn - refreshes_per_drawn.round()).abs() > 0.05 {
+            self.present_phase_error = None;
+            return
+        }
+
+        let phase = display_phase(arrived, vblank, period).as_secs_f64();
+        let mut error = phase - refresh * Self::PRESENT_PHASE_TARGET;
+        if error > refresh / 2.0 {
+            error -= refresh;
+        }
+        else if error <= -refresh / 2.0 {
+            error += refresh;
+        }
+        let smoothed = match self.present_phase_error {
+            Some(previous) => previous * 0.75 + error * 0.25,
+            None => error
+        };
+        let limit = frame * 0.6;
+        self.present_phase_error = Some(if smoothed > limit {
+            // Arriving late in the cycle: draw one frame earlier.
+            self.core.shift_present_phase(true);
+            smoothed - frame
+        }
+        else if smoothed < -limit {
+            self.core.shift_present_phase(false);
+            smoothed + frame
+        }
+        else {
+            smoothed
+        });
+    }
+
     fn refresh_screen_data(&mut self) {
         if self.is_running() && self.core.is_mid_frame() {
             return
@@ -2102,15 +2210,19 @@ impl CoreLoop {
 
         let mut out_screens_maybe = screen_data.try_lock();
 
+        self.steer_present_phase(Instant::now());
+
         let out_screens_result = match out_screens_maybe.as_mut() {
             Ok(n) => {
                 self.screen_ready_for_copy = false;
                 self.screen_generation = self.screen_generation.wrapping_add(1);
+                self.screen_frame = self.core.total_frames;
                 self.update_elapsed_time();
                 &mut *n
             },
             Err(TryLockError::WouldBlock) => {
                 self.screen_ready_for_copy = true;
+                self.queued_screen_frame = self.core.total_frames;
                 self.update_elapsed_time();
                 &mut self.screens_queued
             },
@@ -2145,6 +2257,7 @@ impl CoreLoop {
             .expect("can't get screens mutex force_get_screen_data");
 
         self.screen_generation = self.screen_generation.wrapping_add(1);
+        self.screen_frame = self.core.total_frames;
         self.published_run_serial = self.core.run_serial();
         self.update_elapsed_time();
         self.screen_ready_for_copy = false;
@@ -2358,6 +2471,13 @@ impl CoreLoop {
             ThreadCommand::SetCoarseSeekWhileFrozen(coarse) => {
                 self.coarse_seek_while_frozen = coarse;
             }
+            ThreadCommand::SetDrawFewerFramesWhenSpedUp(fewer) => {
+                self.core.set_draw_fewer_frames_when_sped_up(fewer);
+            }
+            ThreadCommand::SetDisplayClockOverride(clock) => {
+                self.display_clock = DisplayClock { fixed: clock, ..DisplayClock::default() };
+                self.present_phase_error = None;
+            }
             ThreadCommand::SaveSRAM(sender) => {
                 let _ = sender.send(self.core.save_sram());
             }
@@ -2567,6 +2687,100 @@ fn mark_thread_role(role: CoreThreadRole) {
 
 #[cfg(not(windows))]
 fn mark_thread_role(_role: CoreThreadRole) {}
+
+/// The refresh cycle of the display the emulator is shown on: `(a refresh, refresh period)`.
+#[derive(Default)]
+struct DisplayClock {
+    /// Set by [`ThreadedSuperShuckieCore::set_display_clock_override`].
+    fixed: Option<(Instant, Duration)>,
+    /// The system's clock as last read, and when it was read (or tried).
+    system: Option<(Instant, Duration)>,
+    system_read_at: Option<Instant>,
+}
+
+impl DisplayClock {
+    /// How often the system's clock is read again; in between, refreshes are extrapolated.
+    const RESAMPLE: Duration = Duration::from_secs(1);
+
+    fn sample(&mut self) -> Option<(Instant, Duration)> {
+        if self.fixed.is_some() {
+            return self.fixed
+        }
+        let now = Instant::now();
+        if self.system_read_at.is_none_or(|at| now.duration_since(at) >= Self::RESAMPLE) {
+            self.system_read_at = Some(now);
+            self.system = system_display_clock();
+        }
+        self.system
+    }
+}
+
+/// How long after the latest refresh (on a display that refreshed at `vblank` and every `period`
+/// since, or will) `at` is.
+fn display_phase(at: Instant, vblank: Instant, period: Duration) -> Duration {
+    let period_ns = period.as_nanos().max(1) as i128;
+    let since = if at >= vblank { at.duration_since(vblank).as_nanos() as i128 } else { -(vblank.duration_since(at).as_nanos() as i128) };
+    Duration::from_nanos(since.rem_euclid(period_ns) as u64)
+}
+
+/// The desktop compositor's refresh clock (the primary display's).
+#[cfg(windows)]
+fn system_display_clock() -> Option<(Instant, Duration)> {
+    // DWM_TIMING_INFO is declared under `#pragma pack(1)`; only the leading fields are read and
+    // the rest is sized to match (292 bytes, checked against dwmapi.h).
+    #[repr(C, packed)]
+    struct DwmTimingInfo {
+        size: u32,
+        refresh_rate: [u32; 2],
+        refresh_period_qpc: u64,
+        compose_rate: [u32; 2],
+        vblank_qpc: u64,
+        rest: [u8; 292 - 36],
+    }
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetCompositionTimingInfo(hwnd: *mut core::ffi::c_void, info: *mut DwmTimingInfo) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryPerformanceCounter(count: *mut i64) -> i32;
+        fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
+    }
+
+    let mut info = DwmTimingInfo { size: 292, refresh_rate: [0; 2], refresh_period_qpc: 0, compose_rate: [0; 2], vblank_qpc: 0, rest: [0; 292 - 36] };
+    let (mut now_qpc, mut frequency) = (0i64, 0i64);
+    // SAFETY: plain Win32 calls writing into locals of the documented sizes.
+    let ok = unsafe {
+        DwmGetCompositionTimingInfo(core::ptr::null_mut(), &mut info) >= 0
+            && QueryPerformanceCounter(&mut now_qpc) != 0
+            && QueryPerformanceFrequency(&mut frequency) != 0
+    };
+    let now = Instant::now();
+    let (period_qpc, vblank_qpc) = (info.refresh_period_qpc, info.vblank_qpc);
+    if !ok || frequency <= 0 || period_qpc == 0 {
+        return None
+    }
+    let to_duration = |qpc: u64| Duration::from_nanos((qpc as u128 * 1_000_000_000 / frequency as u128) as u64);
+    let period = to_duration(period_qpc);
+    // Refresh rates outside this are not a monitor's (or not one worth steering for).
+    if period < Duration::from_micros(2_000) || period > Duration::from_micros(50_000) {
+        return None
+    }
+    // The reported refresh may be in the past or (usually) the next one to come.
+    let vblank = if now_qpc as u64 >= vblank_qpc {
+        now.checked_sub(to_duration(now_qpc as u64 - vblank_qpc))?
+    }
+    else {
+        now + to_duration(vblank_qpc - now_qpc as u64)
+    };
+    Some((vblank, period))
+}
+
+#[cfg(not(windows))]
+fn system_display_clock() -> Option<(Instant, Duration)> {
+    None
+}
 
 /// The opposite of [`mark_thread_latency_sensitive`]: a follower of another player's game may
 /// run on an efficiency core and yields to the player's own game whenever both want the CPU.

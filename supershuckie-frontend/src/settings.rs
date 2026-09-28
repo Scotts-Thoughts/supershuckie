@@ -350,6 +350,9 @@ impl Settings {
         self.play_together.clamp();
         self.pokeabyte.clamp();
         self.game_boy_settings.custom_colors.clamp();
+        for preset in &mut self.game_boy_settings.color_presets {
+            *preset = GameBoyColorPreset::new(preset.name.clone(), &preset.colors());
+        }
     }
 }
 
@@ -796,7 +799,12 @@ pub struct GameBoySettings {
     pub controls: Controls,
 
     #[serde(default = "GameBoyCustomColors::default")]
-    pub custom_colors: GameBoyCustomColors
+    pub custom_colors: GameBoyCustomColors,
+
+    /// Named sets of custom colors the user can switch [`Self::custom_colors`] to in one step, in
+    /// menu order.
+    #[serde(default = "Vec::new")]
+    pub color_presets: Vec<GameBoyColorPreset>
 }
 
 impl GameBoySettings {
@@ -810,7 +818,8 @@ impl Default for GameBoySettings {
             sgb: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
             controls: Controls::default(),
-            custom_colors: GameBoyCustomColors::default()
+            custom_colors: GameBoyCustomColors::default(),
+            color_presets: Vec::new()
         }
     }
 }
@@ -873,6 +882,46 @@ impl Default for GameBoyCustomColors {
     }
 }
 
+/// A named set of custom Game Boy colors (Settings › Game Boy › Color presets); the colors are as
+/// in [`GameBoyCustomColors`], which one becomes when it is picked.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GameBoyColorPreset {
+    pub name: UTF8CString,
+
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub background: [u32; 4],
+
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub objects_0: [u32; 4],
+
+    #[serde(default = "GameBoyCustomColors::DEFAULT_SHADES", with = "hex_colors")]
+    pub objects_1: [u32; 4]
+}
+
+impl GameBoyColorPreset {
+    /// A preset named `name` holding `colors`' colors.
+    pub fn new(name: UTF8CString, colors: &GameBoyCustomColors) -> Self {
+        Self {
+            name,
+            background: colors.background,
+            objects_0: colors.objects_0,
+            objects_1: colors.objects_1
+        }
+    }
+
+    /// The preset's colors, switched on.
+    pub fn colors(&self) -> GameBoyCustomColors {
+        let mut colors = GameBoyCustomColors {
+            enabled: true,
+            background: self.background,
+            objects_0: self.objects_0,
+            objects_1: self.objects_1
+        };
+        colors.clamp();
+        colors
+    }
+}
+
 /// `[u32; 4]` colors as `"#RRGGBB"` strings in the settings file.
 mod hex_colors {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -927,6 +976,11 @@ pub struct NintendoDSSettings {
 
     #[serde(default = "bool::default")]
     pub jit: bool,
+
+    /// Draw only about 60 frames a second when sped up, instead of as many as the display can
+    /// show (see `SuperShuckieCore::set_draw_fewer_frames_when_sped_up`).
+    #[serde(default = "bool::default")]
+    pub draw_fewer_frames_when_sped_up: bool,
 
     /// Swap the on-screen positions of the top and bottom DS screens.
     #[serde(default = "bool::default")]
@@ -1019,6 +1073,7 @@ impl Default for NintendoDSSettings {
             date: NintendoDSDate::default(),
             date_presets: Vec::new(),
             jit: false,
+            draw_fewer_frames_when_sped_up: false,
             swap_screens: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
             controls: Controls::default()
@@ -1513,5 +1568,28 @@ mod tests {
         let lenient: GameBoyCustomColors = serde_json::from_str(r##"{"background": ["ff0000", "#00FF00", "blue", "#0000FF"]}"##).unwrap();
         assert_eq!(lenient.background, [0xFF0000, 0x00FF00, 0x555555, 0x0000FF], "a string that is not a color keeps that shade's gray");
         assert!(!lenient.enabled);
+    }
+
+    #[test]
+    fn game_boy_color_presets_round_trip_and_default_to_empty() {
+        let older: GameBoySettings = serde_json::from_str(r#"{"sgb": true}"#).unwrap();
+        assert!(older.color_presets.is_empty(), "settings saved before presets existed have none");
+
+        let mut colors = GameBoyCustomColors::default();
+        colors.background = [0xE0F8D0, 0x88C070, 0x346856, 0x081820];
+        colors.objects_0[1] = 0xFF8484;
+        let mut settings = GameBoySettings::default();
+        settings.color_presets = vec![
+            GameBoyColorPreset::new("DMG green".into(), &colors),
+            GameBoyColorPreset::new("Grays ☀".into(), &GameBoyCustomColors::default()),
+        ];
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r##""#88C070""##), "preset colors are written as #RRGGBB: {json}");
+        let reloaded: GameBoySettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(reloaded.color_presets, settings.color_presets, "presets keep their names, colors and order");
+
+        let picked = reloaded.color_presets[0].colors();
+        assert!(picked.enabled, "picking a preset switches custom colors on");
+        assert_eq!((picked.background, picked.objects_0, picked.objects_1), (colors.background, colors.objects_0, colors.objects_1));
     }
 }

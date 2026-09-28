@@ -173,6 +173,7 @@ private:
     QAction *horizontal_nds;
     QAction *swap_nds_screens;
     QAction *nds_jit;
+    QAction *nds_draw_fewer_frames;
     QAction *ignore_speed_changes_in_replay;
     QAction *auto_resync_keyframes_in_replay;
     QAction *continue_last_replay;
@@ -197,6 +198,13 @@ private:
     static const std::size_t N3DS_LANGUAGE_COUNT = 12;
     NumberedAction *n3ds_language[N3DS_LANGUAGE_COUNT];
     QAction *gb_custom_colors;
+    QMenu *gb_color_presets_menu;
+    QAction *gb_color_no_presets;
+    // As with the date presets, the first presets get fixed actions so shortcuts can be bound to
+    // them; any more are made (and remade) by rebuild_gb_color_presets_menu().
+    static const std::size_t GB_COLOR_PRESET_SLOTS = 9;
+    QAction *gb_color_preset_slots[GB_COLOR_PRESET_SLOTS];
+    std::vector<QAction *> gb_color_preset_extras;
     void set_game_boy_hardware_settings_enabled(bool enabled);
 
     std::unique_ptr<AudioOutput> audio;
@@ -317,6 +325,9 @@ private:
     // Re-keys a favorite's saved keyboard shortcut after its ROM was pointed at another file.
     void move_favorite_rom_shortcut(const QString &from, const QString &to);
     void open_shortcuts_dialog(const QString &focus_id = QString());
+    void rebuild_gb_color_presets_menu();
+    void refresh_gb_color_preset_checks();
+    void apply_gb_color_preset(std::size_t index);
     void rebuild_nds_date_menu();
     void refresh_nds_date_preset_states();
     void apply_nds_date_preset(std::size_t index);
@@ -415,6 +426,7 @@ private slots:
     void do_toggle_horizontal_nds();
     void do_toggle_swap_nds_screens();
     void do_toggle_nds_jit();
+    void do_toggle_nds_draw_fewer_frames();
     void do_clear_recent_roms();
     void do_reload_core();
     void do_toggle_external_commands();
