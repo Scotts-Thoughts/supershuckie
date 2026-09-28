@@ -1,0 +1,262 @@
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -5,7 +5,9 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
++#include <cstddef>
+ #include <functional>
+ #include <vector>
+ #include "common/common_types.h"
+@@ -109,6 +111,71 @@
+     }
+ }
+ 
++/// Super Shuckie: what touched each 4 KB page of VRAM first since the last take, while
++/// g_vram_access_tracking is set: 0 nothing, 1 a read, 2 a write. The replay recorder leaves a
++/// VRAM page out of a keyframe when the GPU rewrites it before anything reads it (render targets,
++/// display framebuffers), which is most of what changes in VRAM between two keyframes. Reads are
++/// texture sampling, transfer and copy sources, vertex and index data, command lists, and HLE
++/// block reads: what carries a page's content into something that outlives the frame. Blending,
++/// depth tests and the screen showing a framebuffer only affect that frame's picture, which a
++/// seek redraws several times before showing it, so they do not count. Writes are draw colour
++/// and depth targets, transfer, copy and fill destinations. A write that covers only part of a
++/// page counts as a read: the rest of the page would stay stale. CPU reads through the JIT's
++/// fast path are not seen (games do not read VRAM that way in practice). Emulation thread only.
++constexpr PAddr VRAM_TRACK_START = 0x18000000;
++constexpr u32 VRAM_TRACK_SIZE = 0x00600000;
++constexpr u32 VRAM_TRACK_PAGE = 4096;
++constexpr std::size_t VRAM_TRACK_PAGES = VRAM_TRACK_SIZE / VRAM_TRACK_PAGE;
++inline std::atomic<bool> g_vram_access_tracking{false};
++inline std::array<u8, VRAM_TRACK_PAGES> g_vram_first_access{};
++
++/// [start, start + size) clipped to VRAM as page-relative byte offsets, or nothing.
++inline bool ClipToVram(PAddr start, u64 size, u32& from, u32& to) {
++    if (size == 0) {
++        return false;
++    }
++    const u64 end = std::min<u64>(u64{start} + size, u64{VRAM_TRACK_START} + VRAM_TRACK_SIZE);
++    const u64 begin = std::max<u64>(start, VRAM_TRACK_START);
++    if (begin >= end) {
++        return false;
++    }
++    from = static_cast<u32>(begin - VRAM_TRACK_START);
++    to = static_cast<u32>(end - VRAM_TRACK_START);
++    return true;
++}
++
++inline void NoteVramRead(PAddr start, u64 size) {
++    if (!g_vram_access_tracking.load(std::memory_order_relaxed)) {
++        return;
++    }
++    u32 from, to;
++    if (!ClipToVram(start, size, from, to)) {
++        return;
++    }
++    for (u32 page = from / VRAM_TRACK_PAGE; page <= (to - 1) / VRAM_TRACK_PAGE; page++) {
++        if (g_vram_first_access[page] == 0) {
++            g_vram_first_access[page] = 1;
++        }
++    }
++}
++
++inline void NoteVramWrite(PAddr start, u64 size) {
++    if (!g_vram_access_tracking.load(std::memory_order_relaxed)) {
++        return;
++    }
++    u32 from, to;
++    if (!ClipToVram(start, size, from, to)) {
++        return;
++    }
++    const u32 first_full = (from + VRAM_TRACK_PAGE - 1) / VRAM_TRACK_PAGE;
++    const u32 end_full = to / VRAM_TRACK_PAGE; // exclusive
++    for (u32 page = from / VRAM_TRACK_PAGE; page <= (to - 1) / VRAM_TRACK_PAGE; page++) {
++        if (g_vram_first_access[page] == 0) {
++            g_vram_first_access[page] = (page >= first_full && page < end_full) ? 2 : 1;
++        }
++    }
++}
++
+ enum class LoadCallbackStage {
+     Prepare,
+     Preload,
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -413,6 +413,7 @@
+         const u32 vertex_num = vs_input_index_max - vs_input_index_min + 1;
+         const u32 data_size = loader.byte_count * vertex_num;
+ 
++        VideoCore::NoteVramRead(data_addr, data_size); // Super Shuckie
+         res_cache.FlushRegion(data_addr, data_size);
+         std::memcpy(array_ptr, memory.GetPhysicalPointer(data_addr), data_size);
+ 
+@@ -488,6 +489,24 @@
+     return {start, start + fb.GetWidth() * fb.GetHeight() * bytes_per_pixel};
+ }
+ 
++// Super Shuckie: the depth/stencil buffer of a draw, as [start, end) (see VideoCore::NoteVramWrite).
++std::pair<PAddr, PAddr> DepthBufferRange(const Pica::RegsInternal& regs) {
++    const auto& fb = regs.framebuffer.framebuffer;
++    const PAddr start = fb.GetDepthBufferPhysicalAddress();
++    u32 bytes_per_pixel = 4;
++    switch (fb.depth_format.Value()) {
++    case Pica::FramebufferRegs::DepthFormat::D16:
++        bytes_per_pixel = 2;
++        break;
++    case Pica::FramebufferRegs::DepthFormat::D24:
++        bytes_per_pixel = 3;
++        break;
++    default:
++        break;
++    }
++    return {start, start + fb.GetWidth() * fb.GetHeight() * bytes_per_pixel};
++}
++
+ } // namespace
+ 
+ bool RasterizerOpenGL::AccelerateDrawBatch(bool is_indexed) {
+@@ -558,6 +577,9 @@
+         const u8* index_data =
+             memory.GetPhysicalPointer(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
+                                       regs.pipeline.index_array.offset);
++        VideoCore::NoteVramRead(regs.pipeline.vertex_attributes.GetPhysicalBaseAddress() +
++                                    regs.pipeline.index_array.offset,
++                                index_buffer_size); // Super Shuckie
+         std::tie(buffer_ptr, buffer_offset, std::ignore) = index_buffer.Map(index_buffer_size, 4);
+         std::memcpy(buffer_ptr, index_data, index_buffer_size);
+         index_buffer.Unmap(index_buffer_size);
+@@ -614,6 +636,20 @@
+         (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
+          (has_stencil && state.stencil.test_enabled));
+ 
++    // Super Shuckie: what the draw writes, for VRAM access tracking (textures it samples are
++    // noted where the cache looks them up). Blending and depth tests read the targets too, but
++    // only into this frame's picture, which a seek redraws several times before showing it.
++    if (VideoCore::g_vram_access_tracking.load(std::memory_order_relaxed)) {
++        if (using_color_fb) {
++            const auto [start, end] = ColorBufferRange(regs);
++            VideoCore::NoteVramWrite(start, end - start);
++        }
++        if (using_depth_fb && write_depth_fb) {
++            const auto [start, end] = DepthBufferRange(regs);
++            VideoCore::NoteVramWrite(start, end - start);
++        }
++    }
++
+     // Super Shuckie: a draw sampling a texture that a skipped draw left stale is stale too.
+     if (using_color_fb && !VideoCore::g_stale_surfaces.empty()) {
+         std::array<PAddr, 3> sampled{};
+@@ -903,6 +939,10 @@
+     const u32 bytes = config.output_width.Value() * config.output_height.Value() *
+                       Pica::BytesPerPixel(config.output_format.Value());
+     VideoCore::NoteTransfer(config.GetPhysicalInputAddress(), dst, dst + bytes);
++    VideoCore::NoteVramRead(config.GetPhysicalInputAddress(),
++                            u64{config.input_width.Value()} * config.input_height.Value() *
++                                Pica::BytesPerPixel(config.input_format.Value()));
++    VideoCore::NoteVramWrite(dst, bytes);
+     return res_cache.AccelerateDisplayTransfer(config);
+ }
+ 
+@@ -910,11 +950,15 @@
+     // Super Shuckie: see VideoCore::g_stale_surfaces.
+     const PAddr dst = config.GetPhysicalOutputAddress();
+     VideoCore::NoteTransfer(config.GetPhysicalInputAddress(), dst, dst + config.texture_copy.size);
++    VideoCore::NoteVramRead(config.GetPhysicalInputAddress(), config.texture_copy.size);
++    VideoCore::NoteVramWrite(dst, config.texture_copy.size);
+     return res_cache.AccelerateTextureCopy(config);
+ }
+ 
+ bool RasterizerOpenGL::AccelerateFill(const Pica::MemoryFillConfig& config) {
+     VideoCore::NoteFill(config.GetStartAddress(), config.GetEndAddress()); // Super Shuckie
++    VideoCore::NoteVramWrite(config.GetStartAddress(),
++                             u64{config.GetEndAddress()} - config.GetStartAddress());
+     return res_cache.AccelerateFill(config);
+ }
+ 
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -16,6 +16,7 @@
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/memory.h"
++#include "video_core/rasterizer_interface.h"
+ #include "video_core/custom_textures/custom_tex_manager.h"
+ #include "video_core/pica/regs_external.h"
+ #include "video_core/pica/regs_internal.h"
+@@ -606,6 +607,7 @@
+         initial_flags |= SurfaceFlagBits::ShadowSource;
+     }
+     params.UpdateParams();
++    VideoCore::NoteVramRead(params.addr, params.size); // Super Shuckie: sampled
+ 
+     const u32 min_width = info.width >> max_level;
+     const u32 min_height = info.height >> max_level;
+diff --git a/src/video_core/pica/pica_core.cpp b/src/video_core/pica/pica_core.cpp
+--- a/src/video_core/pica/pica_core.cpp
++++ b/src/video_core/pica/pica_core.cpp
+@@ -261,6 +261,7 @@
+     }
+ 
+     const u8* head = memory.GetPhysicalPointer(list);
++    VideoCore::NoteVramRead(list, size); // Super Shuckie
+     cmd_list.Reset(list, head, size);
+ 
+     bool stop_requested = false;
+diff --git a/src/video_core/pica/vertex_loader.cpp b/src/video_core/pica/vertex_loader.cpp
+--- a/src/video_core/pica/vertex_loader.cpp
++++ b/src/video_core/pica/vertex_loader.cpp
+@@ -5,6 +5,7 @@
+ #include "common/alignment.h"
+ #include "common/logging/log.h"
+ #include "video_core/pica/vertex_loader.h"
++#include "video_core/rasterizer_interface.h"
+ 
+ namespace Pica {
+ 
+@@ -81,6 +82,7 @@
+         // Load per-vertex data from the loader arrays
+         const PAddr source_addr =
+             base_address + vertex_attribute_sources[i] + vertex_attribute_strides[i] * vertex;
++        VideoCore::NoteVramRead(source_addr, vertex_attribute_elements[i] * 4u); // Super Shuckie
+ 
+         switch (vertex_attribute_formats[i]) {
+         case PipelineRegs::VertexAttributeFormat::BYTE:
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -42,6 +42,7 @@
+ #include "core/hle/service/plgldr/plgldr.h"
+ #include "core/memory.h"
+ #include "video_core/gpu.h"
++#include "video_core/rasterizer_interface.h"
+ #include "video_core/renderer_base.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Memory::MemorySystem::BackingMemImpl<Memory::Region::FCRAM>)
+@@ -1391,12 +1392,22 @@
+     return Read<std::optional<u32_le>>(process.vm_manager.page_table, addr);
+ }
+ 
++// Super Shuckie: a block read of the VRAM mapping is a read for VideoCore's access tracking.
++static void NoteVramBlockRead(VAddr src_addr, std::size_t size) {
++    if (src_addr < VRAM_VADDR_END && u64{src_addr} + size > VRAM_VADDR) {
++        const VAddr start = std::max<VAddr>(src_addr, VRAM_VADDR);
++        VideoCore::NoteVramRead(start - VRAM_VADDR + VRAM_PADDR, u64{src_addr} + size - start);
++    }
++}
++
+ void MemorySystem::ReadBlock(const Kernel::Process& process, const VAddr src_addr,
+                              void* dest_buffer, const std::size_t size) {
++    NoteVramBlockRead(src_addr, size);
+     return impl->ReadBlockImpl<false>(process, src_addr, dest_buffer, size);
+ }
+ 
+ void MemorySystem::ReadBlock(VAddr src_addr, void* dest_buffer, std::size_t size) {
++    NoteVramBlockRead(src_addr, size);
+     const auto& process = *impl->system.Kernel().GetCurrentProcess();
+     return impl->ReadBlockImpl<false>(process, src_addr, dest_buffer, size);
+ }

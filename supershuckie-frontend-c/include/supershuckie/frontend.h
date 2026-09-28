@@ -53,7 +53,8 @@ enum SuperShuckieEmulatorType {
     SuperShuckieEmulatorType__GameBoySGB2,
     SuperShuckieEmulatorType__GameBoyColor,
     SuperShuckieEmulatorType__GameBoyAdvance,
-    SuperShuckieEmulatorType__NintendoDS
+    SuperShuckieEmulatorType__NintendoDS,
+    SuperShuckieEmulatorType__Nintendo3DS
 };
 
 typedef void (*SuperShuckieRefreshScreensCallback)(void *user_data, size_t screen_count, const uint32_t *const *pixels);
@@ -948,7 +949,31 @@ void supershuckie_frontend_get_nds_date(const struct SuperShuckieFrontendRaw *fr
 void supershuckie_frontend_set_nds_date(struct SuperShuckieFrontendRaw *frontend, const struct SuperShuckieNintendoDSDate *date);
 
 /**
- * Get the number of Nintendo DS date presets.
+ * Get the date the Nintendo 3DS clock starts at when a game is loaded
+ */
+void supershuckie_frontend_get_n3ds_date(const struct SuperShuckieFrontendRaw *frontend, struct SuperShuckieNintendoDSDate *date);
+
+/**
+ * Set the date the Nintendo 3DS clock starts at (takes effect the next time the core is loaded;
+ * save states and replays keep the clock they were made with)
+ */
+void supershuckie_frontend_set_n3ds_date(struct SuperShuckieFrontendRaw *frontend, const struct SuperShuckieNintendoDSDate *date);
+
+/**
+ * Get the Nintendo 3DS system language: 0 Japanese, 1 English, 2 French, 3 German, 4 Italian,
+ * 5 Spanish, 6 Simplified Chinese, 7 Korean, 8 Dutch, 9 Portuguese, 10 Russian,
+ * 11 Traditional Chinese
+ */
+uint8_t supershuckie_frontend_get_n3ds_language(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Set the Nintendo 3DS system language (takes effect the next time the core is loaded; save
+ * states and replays keep the language they were made with). Out-of-range values are ignored.
+ */
+void supershuckie_frontend_set_n3ds_language(struct SuperShuckieFrontendRaw *frontend, uint8_t language);
+
+/**
+ * Get the number of date presets (shared by the Nintendo DS and Nintendo 3DS).
  */
 size_t supershuckie_frontend_get_nds_date_preset_count(const struct SuperShuckieFrontendRaw *frontend);
 

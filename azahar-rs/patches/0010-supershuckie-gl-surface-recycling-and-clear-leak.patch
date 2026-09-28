@@ -1,0 +1,180 @@
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+index dd64a57..8592273 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -149,18 +149,26 @@ void RasterizerCache<T>::TickFrame() {
+ template <class T>
+ void RasterizerCache<T>::RunGarbageCollector() {
+     const u64 resource_free_tick = runtime.GetResourceFreeTick();
++    // Super Shuckie: discarded surfaces wait this long for a CreateSurface to recycle them, but
++    // no more than MAX_SENTENCED of them (the list is oldest first).
++    const u64 retention = runtime.GetResourceRetentionTicks();
++    constexpr std::size_t MAX_SENTENCED = 512;
++    std::size_t excess = sentenced.size() > MAX_SENTENCED ? sentenced.size() - MAX_SENTENCED : 0;
+     for (auto it = sentenced.begin(); it != sentenced.end();) {
+         const auto [surface_id, resource_last_used_tick] = *it;
+         // Tick-values less than or equal to the current resource-tick are possibly still in-use.
+         // Tick-values larger than the current resource-tick are not being utilized anymore and can
+         // be safely deleted.
+-        if (resource_free_tick <= resource_last_used_tick) {
++        if (resource_free_tick <= resource_last_used_tick ||
++            (excess == 0 && resource_free_tick <= resource_last_used_tick + retention)) {
+             // Resource is still in-use, skip deletion
+             it++;
+             continue;
+         }
++        excess -= excess > 0 ? 1 : 0;
+         RemoveFramebuffers(surface_id);
+         slot_surfaces.erase(surface_id);
++        g_cache_stats.surfaces_destroyed++;
+         it = sentenced.erase(it);
+     }
+ }
+@@ -816,6 +824,7 @@ FramebufferHelper<T> RasterizerCache<T>::GetFramebufferSurfaces(bool using_color
+ 
+     auto [it, new_framebuffer] = framebuffers.try_emplace(fb_params);
+     if (new_framebuffer) {
++        g_cache_stats.framebuffers_created++;
+         it->second = slot_framebuffers.insert(runtime, fb_params, color_surface, depth_surface);
+     }
+ 
+@@ -1060,6 +1069,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
+ template <class T>
+ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interval) {
+     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
++    g_cache_stats.uploads++;
+ 
+     const SurfaceParams load_info = surface.FromInterval(interval);
+     ASSERT(load_info.addr >= surface.addr && load_info.end <= surface.end);
+@@ -1159,6 +1169,7 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
+ template <class T>
+ void RasterizerCache<T>::DownloadSurface(Surface& surface, SurfaceInterval interval) {
+     MICROPROFILE_SCOPE(RasterizerCache_DownloadSurface);
++    g_cache_stats.downloads++;
+ 
+     const SurfaceParams flush_info = surface.FromInterval(interval);
+     const u32 flush_start = boost::icl::first(interval);
+@@ -1284,6 +1295,16 @@ void RasterizerCache<T>::ClearAll(bool flush) {
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flush_start).count());
+         }
+     }
++    // Super Shuckie: unregister every surface (which unmarks its pages) so that the collector
++    // frees it, or a later frame recycles it. Clearing the page table alone orphaned them: every
++    // save state and state load leaked all cached textures and framebuffers (~45 MB of video
++    // memory per replay keyframe on Pokemon Sun).
++    for (auto& [page, surfaces] : page_table) {
++        while (!surfaces.empty()) {
++            UnregisterSurface(surfaces.back());
++        }
++    }
++
+     // Unmark all of the marked pages
+     for (auto& pair : RangeFromInterval(cached_pages, flush_interval)) {
+         const auto interval = pair.first & flush_interval;
+@@ -1377,6 +1398,7 @@ void RasterizerCache<T>::InvalidateRegion(PAddr addr, u32 size, SurfaceId region
+         // If the CPU is invalidating this region we want to remove it
+         // to (likely) mark the memory pages as uncached
+         if (!region_owner_id && size <= 8) {
++            g_cache_stats.invalidations++;
+             FlushRegion(surface.addr, surface.size, surface_id);
+             remove_surfaces.push_back(surface_id);
+             return;
+@@ -1418,8 +1440,13 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
+         if (it != sentenced.end()) {
+             const SurfaceId surface_id = it->first;
+             sentenced.erase(it);
++            // Super Shuckie: start from the flags a new surface would get (a shadow source or a
++            // cube face before is not one now).
++            slot_surfaces[surface_id].flags = initial_flags;
++            g_cache_stats.surfaces_recycled++;
+             return surface_id;
+         }
++        g_cache_stats.surfaces_created++;
+         return slot_surfaces.insert(runtime, params, initial_flags);
+     }();
+     Surface& surface = slot_surfaces[surface_id];
+@@ -1451,6 +1478,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
+                "Trying to unregister an already unregistered surface");
+ 
+     surface.flags &= ~SurfaceFlagBits::Registered;
++    g_cache_stats.surfaces_unregistered++;
+     UpdatePagesCachedCount(surface.addr, surface.size, -1);
+     ForEachPage(surface.addr, surface.size, [this, surface_id](u64 page) {
+         const auto page_it = page_table.find(page);
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index ddd1f99..f6c9e44 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -23,6 +23,20 @@ struct MemoryFillConfig;
+ 
+ namespace VideoCore {
+ 
++/// Super Shuckie: counters of what the texture cache does, for profiling (never reset here).
++struct CacheStats {
++    u64 surfaces_created = 0;
++    u64 surfaces_recycled = 0;
++    u64 surfaces_unregistered = 0;
++    u64 framebuffers_created = 0;
++    u64 uploads = 0;
++    u64 downloads = 0;
++    u64 invalidations = 0;
++    u64 draws = 0;
++    u64 surfaces_destroyed = 0;
++};
++inline CacheStats g_cache_stats;
++
+ /// Super Shuckie: when set, the hardware rasterizer accepts every draw batch and draws nothing
+ /// (the frontend uses it while seeking through a replay, where only the CPU-side state
+ /// matters). Display transfers, fills and the texture cache keep working, so the emulated
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+index 2682097..8670541 100644
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -613,6 +613,7 @@ void RasterizerOpenGL::DrawTriangles() {
+ 
+ bool RasterizerOpenGL::Draw(bool accelerate, bool is_indexed) {
+     MICROPROFILE_SCOPE(OpenGL_Drawing);
++    VideoCore::g_cache_stats.draws++;
+     const DebugScope scope(runtime, Common::Vec4f{}, "RasterizerOpenGL::Draw");
+ 
+     SyncDrawState();
+diff --git a/src/video_core/renderer_opengl/gl_texture_runtime.h b/src/video_core/renderer_opengl/gl_texture_runtime.h
+index 2428c44..c93b8ed 100644
+--- a/src/video_core/renderer_opengl/gl_texture_runtime.h
++++ b/src/video_core/renderer_opengl/gl_texture_runtime.h
+@@ -48,7 +48,17 @@ public:
+     /// Gets an opaque tick-value used to indicate to the garbage collector what surfaces can be
+     /// safely deleted.
+     u64 GetResourceFreeTick() {
+-        return GetResourceTick();
++        // Super Shuckie: OpenGL orders a texture's reuse after the commands still using it, so a
++        // discarded surface can be recycled at once. With the current tick here nothing ever was:
++        // the collector destroyed every discarded surface at the next frame, before a later
++        // frame could ask for it again, so render-to-texture effects re-created their textures
++        // and framebuffers every frame (each a stall in threaded GL drivers).
++        return GetResourceTick() + 1;
++    }
++
++    /// Super Shuckie: frames a discarded surface is kept for recycling before it is destroyed.
++    u64 GetResourceRetentionTicks() const {
++        return 60;
+     }
+ 
+     /// Submits and waits for current GPU work.
+diff --git a/src/video_core/renderer_vulkan/vk_texture_runtime.h b/src/video_core/renderer_vulkan/vk_texture_runtime.h
+index 8ce827e..52f7c0f 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_runtime.h
++++ b/src/video_core/renderer_vulkan/vk_texture_runtime.h
+@@ -132,6 +132,12 @@ public:
+     /// safely deleted.
+     u64 GetResourceFreeTick();
+ 
++    /// Super Shuckie: ticks a discarded surface is kept for recycling after the GPU is done with
++    /// it (none: Vulkan's free tick already trails the GPU).
++    u64 GetResourceRetentionTicks() const {
++        return 0;
++    }
++
+     /// Submits and waits for current GPU work.
+     void Finish();
+ 

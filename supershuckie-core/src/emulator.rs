@@ -176,6 +176,13 @@ pub trait EmulatorCore: Send + 'static {
     /// `presented: false` in [`RunTime`]); emulation itself is unaffected. Default: ignored.
     fn set_skip_drawing(&mut self, _skip: bool) {}
 
+    /// Presentation hint for cores that draw every frame (see [`Self::draw_lead_frames`]): when
+    /// `false`, the frames run from now on must still be drawn, but nobody will look at their
+    /// pictures, so the core need not hand them out (the 3DS core then skips reading them back
+    /// from the GPU) and reports `presented: false`. Every [`Self::set_skip_drawing`] call sets
+    /// it back to `true`. Default: ignored.
+    fn set_picture_wanted(&mut self, _wanted: bool) {}
+
     /// How many frames before a frame that will be looked at must also be drawn for its picture
     /// to be complete; `u64::MAX` when every frame must be drawn for any picture to be right.
     /// The 3DS shows a frame one VBlank after the game renders it, and games redraw a screen
@@ -184,6 +191,46 @@ pub trait EmulatorCore: Send + 'static {
     /// the 3DS drawing is never skipped while anyone watches. Default: 0.
     fn draw_lead_frames(&self) -> u64 {
         0
+    }
+
+    /// How many frames before its target a replay seek draws: the others on the way are run with
+    /// drawing skipped, and [`Self::skipped_draws_left_stale`] says whether that left something
+    /// the target frame shows out of date. Default: [`Self::draw_lead_frames`] (a core without
+    /// that check must be exact from the lead alone).
+    fn seek_draw_tail_frames(&self) -> u64 {
+        self.draw_lead_frames()
+    }
+
+    /// After frames were run with drawing skipped: `Some(n)` when the oldest draw skipped `n`
+    /// frames ago (the last frame run being 1) left a buffer nothing has redrawn since, so the
+    /// picture is not what drawing every frame would have given until the frames from there on
+    /// are drawn; `None` when the picture is complete. Only draws skipped since the last state
+    /// load count. Default: always `None`.
+    fn skipped_draws_left_stale(&self) -> Option<u64> {
+        None
+    }
+
+    /// Start (or stop) noting which parts of the game file the game reads, for
+    /// [`Self::take_rom_reads`]. Default: the core cannot tell.
+    fn set_rom_read_log(&mut self, _enabled: bool) {}
+
+    /// Append the game-file ranges `(offset, length)` the game read since the last call (while
+    /// the log is on): the bytes a replay keyframe may find again in memory and store as a
+    /// reference to the game file (see `ReplayFileRecorder::rom_reads`).
+    fn take_rom_reads(&mut self, _into: &mut Vec<(u64, u64)>) {}
+
+    /// Start (or stop) noting what touches each page of the console's transient memory first
+    /// (Nintendo 3DS: VRAM), for [`Self::take_transient_page_access`]. Default: the core cannot
+    /// tell.
+    fn set_transient_page_tracking(&mut self, _enabled: bool) {}
+
+    /// The first access of each page of the console's transient memory since the last call, one
+    /// byte per page (0 nothing, 1 a read, 2 a write), with `Some((offset in a save state,
+    /// bytes per page))` of that memory; `None` when the core does not track it. A replay
+    /// keyframe leaves out the pages that are written before anything reads them (see
+    /// `ReplayFileRecorder::transient_page_access`).
+    fn take_transient_page_access(&mut self, _into: &mut Vec<u8>) -> Option<(usize, usize)> {
+        None
     }
 
     /// Turn audio generation on or off. Off by default.

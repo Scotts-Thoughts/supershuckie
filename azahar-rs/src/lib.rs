@@ -30,13 +30,36 @@ pub struct Settings {
     pub jit: bool,
     /// Console region, `-1` = pick from the game.
     pub region: i32,
-    /// The emulated clock at power-on, seconds since 2000-01-01 (fixed, never the host clock).
+    /// The console's clock at power-on: the date and time it shows, as seconds since
+    /// 1970-01-01 00:00:00 on the console's own clock (no time zone; patch 0008). Fixed, never
+    /// the host clock. A save state keeps the clock it was made with.
     pub init_time: u64,
+    /// The system language (Azahar's `SystemLanguage`: 0 Japanese, 1 English, 2 French, 3 German,
+    /// 4 Italian, 5 Spanish, 6 Simplified Chinese, 7 Korean, 8 Dutch, 9 Portuguese, 10 Russian,
+    /// 11 Traditional Chinese), or `-1` for the NAND config's own. Azahar moves it to one the
+    /// game's region has when it has not. A save state keeps the language it was made with.
+    pub language: i32,
+}
+
+impl Settings {
+    /// [`Self::init_time`] for a date and time on the console's clock (proleptic Gregorian).
+    pub fn init_time_for(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> u64 {
+        // Days from 1970-01-01 to the date (Howard Hinnant's days_from_civil).
+        let y = i64::from(year) - i64::from(month <= 2);
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let m = i64::from(month);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        (days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second)) as u64
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { new_3ds: false, jit: true, region: -1, init_time: 946_681_277 }
+        // 2000-01-01 00:00:00, English.
+        Self { new_3ds: false, jit: true, region: -1, init_time: 946_684_800, language: 1 }
     }
 }
 
@@ -92,7 +115,11 @@ unsafe extern "C" {
     fn azahar_rs_core_new(rom_path: *const c_char, user_dir: *const c_char, settings: *const Settings, error_out: *mut u32) -> *mut AzaharCoreRaw;
     fn azahar_rs_core_free(core: *mut AzaharCoreRaw);
     fn azahar_rs_core_last_error(core: *const AzaharCoreRaw) -> *const c_char;
-    fn azahar_rs_core_run_frame(core: *mut AzaharCoreRaw, skip_drawing: bool) -> bool;
+    fn azahar_rs_core_run_frame(core: *mut AzaharCoreRaw, skip_drawing: bool, capture: bool) -> bool;
+    fn azahar_rs_core_frame_timing(core: *const AzaharCoreRaw, out: *mut u64);
+    fn azahar_rs_cache_stats(out: *mut u64);
+    fn azahar_rs_core_gpu_memory_available_kb(core: *mut AzaharCoreRaw) -> i64;
+    fn azahar_rs_core_gl_renderer(core: *mut AzaharCoreRaw) -> *const c_char;
     fn azahar_rs_core_get_pixels(core: *const AzaharCoreRaw, screen: u32) -> *const u32;
     fn azahar_rs_core_set_input(core: *mut AzaharCoreRaw, input: *const InputState);
     fn azahar_rs_core_state_pending(core: *const AzaharCoreRaw) -> bool;
@@ -104,7 +131,19 @@ unsafe extern "C" {
     fn azahar_rs_core_write_memory(core: *mut AzaharCoreRaw, address: u32, data: *const u8, len: usize) -> bool;
     fn azahar_rs_core_region(core: *const AzaharCoreRaw, index: u32, out: *mut Region) -> bool;
     fn azahar_rs_core_reset(core: *mut AzaharCoreRaw) -> bool;
+    fn azahar_rs_core_stale_frames_ago(core: *const AzaharCoreRaw) -> i64;
+    fn azahar_rs_core_set_rom_read_log(core: *mut AzaharCoreRaw, enabled: bool);
+    fn azahar_rs_core_take_rom_reads(core: *mut AzaharCoreRaw) -> usize;
+    fn azahar_rs_core_rom_reads(core: *const AzaharCoreRaw) -> *const u64;
+    fn azahar_rs_core_set_vram_access_tracking(core: *mut AzaharCoreRaw, enabled: bool);
+    fn azahar_rs_core_take_vram_access(core: *mut AzaharCoreRaw, out: *mut u8, capacity: usize) -> usize;
+    fn azahar_rs_core_vram_raw_offset(core: *const AzaharCoreRaw) -> u64;
 }
+
+/// Bytes per page of [`Core::take_vram_access`].
+pub const VRAM_ACCESS_PAGE: usize = 4096;
+/// Pages of VRAM (6 MB) [`Core::take_vram_access`] reports.
+pub const VRAM_ACCESS_PAGES: usize = (6 << 20) / VRAM_ACCESS_PAGE;
 
 /// Why [`Core::new`] failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,7 +213,24 @@ impl Core {
     /// [`Self::last_error`].
     #[inline]
     pub fn run_frame(&mut self, skip_drawing: bool) -> bool {
-        unsafe { azahar_rs_core_run_frame(self.inner, skip_drawing) }
+        self.run_frame_capturing(skip_drawing, !skip_drawing)
+    }
+
+    /// [`Self::run_frame`], taking the picture into [`Self::pixels`] only if `capture` (and the
+    /// frame was drawn). Reading a picture back waits for the GPU to finish the frame, so a
+    /// frame nobody looks at is cheaper without.
+    #[inline]
+    pub fn run_frame_capturing(&mut self, skip_drawing: bool, capture: bool) -> bool {
+        unsafe { azahar_rs_core_run_frame(self.inner, skip_drawing, capture) }
+    }
+
+    /// Where the last [`Self::run_frame`] spent its time, in nanoseconds: emulating to the
+    /// VBlank, taking the picture out of the renderer (present + readback), converting it.
+    #[inline]
+    pub fn frame_timing(&self) -> [u64; 3] {
+        let mut out = [0u64; 3];
+        unsafe { azahar_rs_core_frame_timing(self.inner, out.as_mut_ptr()) };
+        out
     }
 
     /// `0xAARRGGBB` pixels of the top (0, 400x240) or bottom (1, 320x240) screen as of the last
@@ -276,6 +332,79 @@ impl Core {
     #[inline]
     pub fn reset(&mut self) -> bool {
         unsafe { azahar_rs_core_reset(self.inner) }
+    }
+
+    /// Whether frames run with `skip_drawing` left a hole in the picture: `Some(n)` when the
+    /// oldest draw that was skipped `n` frames ago (the last frame being 1) went to a colour
+    /// buffer nothing has cleared since (or into a draw that sampled one), so the screens and
+    /// whatever the game renders from those buffers are stale until it redraws them. `None`
+    /// when every skipped draw has been superseded, or nothing was skipped since the last state
+    /// load (patch 0007).
+    #[inline]
+    pub fn stale_frames_ago(&self) -> Option<u64> {
+        u64::try_from(unsafe { azahar_rs_core_stale_frames_ago(self.inner) }).ok()
+    }
+
+    /// Log which parts of the game file the game reads from now on (or stop). Either way the log
+    /// starts empty.
+    #[inline]
+    pub fn set_rom_read_log(&mut self, enabled: bool) {
+        unsafe { azahar_rs_core_set_rom_read_log(self.inner, enabled) }
+    }
+
+    /// Append the game-file reads `(offset, length)` logged since the last call to `into`.
+    pub fn take_rom_reads(&mut self, into: &mut Vec<(u64, u64)>) {
+        let count = unsafe { azahar_rs_core_take_rom_reads(self.inner) };
+        if count == 0 {
+            return;
+        }
+        // SAFETY: the binding holds `count` (offset, length) pairs until the next take.
+        let pairs = unsafe { core::slice::from_raw_parts(azahar_rs_core_rom_reads(self.inner), count * 2) };
+        into.extend(pairs.chunks_exact(2).map(|pair| (pair[0], pair[1])));
+    }
+
+    /// Note what touches each 4 KB page of VRAM first (or stop): texture sampling, transfer and
+    /// copy sources, the framebuffers shown, vertex and index data and command lists are reads;
+    /// draw targets and transfer, copy and fill destinations are writes (Azahar patch 0009).
+    /// Either way the record starts empty.
+    #[inline]
+    pub fn set_vram_access_tracking(&mut self, enabled: bool) {
+        unsafe { azahar_rs_core_set_vram_access_tracking(self.inner, enabled) }
+    }
+
+    /// Replace `into` with the first access of each VRAM page since the last call (0 nothing,
+    /// 1 read, 2 write; [`VRAM_ACCESS_PAGES`] bytes) and start a new record.
+    pub fn take_vram_access(&mut self, into: &mut Vec<u8>) {
+        into.clear();
+        into.resize(VRAM_ACCESS_PAGES, 0);
+        // SAFETY: `into` holds `VRAM_ACCESS_PAGES` writable bytes; the binding copies at most that many.
+        let pages = unsafe { azahar_rs_core_take_vram_access(self.inner, into.as_mut_ptr(), into.len()) };
+        into.truncate(pages);
+    }
+
+    /// Byte offset of VRAM in a raw save state of this core.
+    #[inline]
+    pub fn vram_raw_offset(&self) -> usize {
+        unsafe { azahar_rs_core_vram_raw_offset(self.inner) as usize }
+    }
+
+    /// Counters of Azahar's texture cache since the process started: surfaces created,
+    /// recycled, unregistered, framebuffers created, uploads, downloads, CPU-write
+    /// invalidations, draws, surfaces destroyed (for profiling).
+    pub fn cache_stats() -> [u64; 9] {
+        let mut out = [0u64; 9];
+        unsafe { azahar_rs_cache_stats(out.as_mut_ptr()) };
+        out
+    }
+
+    /// Video memory the driver reports available, in KB (NVIDIA only; 0 elsewhere).
+    pub fn gpu_memory_available_kb(&mut self) -> i64 {
+        unsafe { azahar_rs_core_gpu_memory_available_kb(self.inner) }
+    }
+
+    /// The OpenGL driver the core renders with, as "vendor / renderer / version".
+    pub fn gl_renderer(&mut self) -> String {
+        cstr_to_string(unsafe { azahar_rs_core_gl_renderer(self.inner) })
     }
 
     pub fn last_error(&self) -> String {

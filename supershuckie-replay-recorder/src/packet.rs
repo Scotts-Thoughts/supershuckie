@@ -180,6 +180,17 @@ pub enum Packet {
     /// A small picture of both screens at `elapsed_frames` (Nintendo 3DS files, once a second):
     /// what the timeline shows while it is dragged, so a drag never has to seek (a seek costs up
     /// to a second there). `top`/`bottom` are zstd frames of RGB565 pixels, row-major.
+    ///
+    /// With `against_previous` (format v9, discriminator 0xFD) each screen is stored against the
+    /// same screen of the `Thumbnail` before it in the stream, which has the same size: empty
+    /// when the picture is identical, else a zstd frame with the previous picture's pixels as
+    /// prefix. The recorder starts a new independent picture every
+    /// [`THUMBNAIL_GROUP`](crate::replay_file::record::THUMBNAIL_GROUP) pictures, so decoding
+    /// any one never walks back further than that.
+    ///
+    /// With `jpeg` (format v10, discriminator 0xEF) each screen is a JPEG of the picture (see
+    /// [`thumbnail_jpeg`](crate::thumbnail_jpeg)), decoded on its own; `against_previous` is
+    /// then false.
     #[allow(missing_docs)]
     Thumbnail {
         elapsed_frames: UnsignedInteger,
@@ -188,7 +199,9 @@ pub enum Packet {
         bottom_width: UnsignedInteger,
         bottom_height: UnsignedInteger,
         top: ByteVec,
-        bottom: ByteVec
+        bottom: ByteVec,
+        against_previous: bool,
+        jpeg: bool
     },
 
     /// Everything the console received over its link cable during the frame that the next

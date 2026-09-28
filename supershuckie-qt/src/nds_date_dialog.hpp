@@ -25,7 +25,8 @@ class NDSDateDialog: public QDialog {
     friend MainWindow;
 
 public:
-    NDSDateDialog(MainWindow *main_window);
+    /** The DS's date, or the 3DS's when for_3ds; the presets are shared by both. */
+    NDSDateDialog(MainWindow *main_window, bool for_3ds = false);
     int exec() override;
 
     /** e.g. "Mon 2026-09-21 22:00", with the seconds only when they are not zero */
@@ -36,6 +37,7 @@ public:
 
 private:
     MainWindow *main_window;
+    bool for_3ds;
 
     QListWidget *presets;
     QPushButton *add_preset;

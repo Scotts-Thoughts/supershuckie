@@ -1,0 +1,128 @@
+diff --git a/src/core/hle/kernel/shared_page.cpp b/src/core/hle/kernel/shared_page.cpp
+index ef7f169..21a128f 100644
+--- a/src/core/hle/kernel/shared_page.cpp
++++ b/src/core/hle/kernel/shared_page.cpp
+@@ -101,15 +101,23 @@ u64 Handler::GetSystemTimeSince2000() const {
+ 
+     // 3DS system does't allow user to set a time before Jan 1 2000,
+     // so we use it as an auxiliary epoch to calculate the console time.
+-    std::tm epoch_tm;
+-    epoch_tm.tm_sec = 0;
+-    epoch_tm.tm_min = 0;
+-    epoch_tm.tm_hour = 0;
+-    epoch_tm.tm_mday = 1;
+-    epoch_tm.tm_mon = 0;
+-    epoch_tm.tm_year = 100;
+-    epoch_tm.tm_isdst = 0;
+-    s64 epoch = std::mktime(&epoch_tm) * 1000;
++    s64 epoch;
++    if (console_local_epoch) {
++        // Super Shuckie: init_time is the console's clock reading, so its epoch is a constant
++        // (2000-01-01 00:00:00 on the same scale) and the host's time zone plays no part: the same
++        // settings give the same console time on every machine.
++        epoch = 946684800LL * 1000;
++    } else {
++        std::tm epoch_tm;
++        epoch_tm.tm_sec = 0;
++        epoch_tm.tm_min = 0;
++        epoch_tm.tm_hour = 0;
++        epoch_tm.tm_mday = 1;
++        epoch_tm.tm_mon = 0;
++        epoch_tm.tm_year = 100;
++        epoch_tm.tm_isdst = 0;
++        epoch = std::mktime(&epoch_tm) * 1000;
++    }
+ 
+     // Only when system time is after 2000, we set it as 3DS system time
+     if (now.count() > epoch) {
+@@ -175,9 +183,22 @@ SharedPageDef& Handler::GetSharedPage() {
+ }
+ 
+ template <class Archive>
+-void Handler::serialize(Archive& ar, const unsigned int) {
++void Handler::serialize(Archive& ar, const unsigned int file_version) {
+     ar& boost::serialization::base_object<BackingMem>(*this);
+     ar& boost::serialization::make_binary_object(&shared_page, sizeof(shared_page));
++    // Super Shuckie: the clock's start is part of the state, so a state (and every replay made
++    // of states) keeps the console time it was made with whatever the settings are now.
++    if (file_version >= 1) {
++        s64 seconds = init_time.count();
++        ar & seconds;
++        ar & console_local_epoch;
++        init_time = std::chrono::seconds(seconds);
++    } else if (Archive::is_loading::value) {
++        // Every Super Shuckie build before version 1 started the clock at this fixed time,
++        // counted from the host's local midnight.
++        init_time = std::chrono::seconds(946681277);
++        console_local_epoch = false;
++    }
+ }
+ SERIALIZE_IMPL(Handler)
+ 
+diff --git a/src/core/hle/kernel/shared_page.h b/src/core/hle/kernel/shared_page.h
+index 1329798..7f68c0d 100644
+--- a/src/core/hle/kernel/shared_page.h
++++ b/src/core/hle/kernel/shared_page.h
+@@ -14,6 +14,7 @@
+ #include <ctime>
+ #include <memory>
+ #include <boost/serialization/export.hpp>
++#include <boost/serialization/version.hpp>
+ #include "common/bit_field.h"
+ #include "common/common_funcs.h"
+ #include "common/common_types.h"
+@@ -132,6 +133,10 @@ private:
+     Core::Timing& timing;
+     Core::TimingEventType* update_time_event;
+     std::chrono::seconds init_time;
++    // Super Shuckie: whether init_time is the console's own clock reading (seconds since
++    // 1970-01-01 in the console's time, no host time zone involved). False only for states from
++    // before class version 1, whose clock counted from the host's local midnight of 2000-01-01.
++    bool console_local_epoch = true;
+ 
+     SharedPageDef shared_page;
+ 
+@@ -142,6 +147,8 @@ private:
+ 
+ } // namespace SharedPage
+ 
++BOOST_CLASS_VERSION(SharedPage::Handler, 1)
++
+ namespace boost::serialization {
+ 
+ template <class Archive>
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index 6eb7302..ae7a12a 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -1046,8 +1046,15 @@ void Module::SaveMCUConfig() {
+     }
+ }
+ 
++s32 g_system_language_override = -1;
++
+ Module::Module(Core::System& system_) : system(system_) {
+     load_savegame_res = LoadConfigNANDSaveFile();
++    // Super Shuckie: before anything reads it, so the region choice (UpdatePreferredRegionCode)
++    // adjusts this language rather than the savegame's.
++    if (g_system_language_override >= LANGUAGE_JP && g_system_language_override <= LANGUAGE_TW) {
++        SetSystemLanguage(static_cast<SystemLanguage>(g_system_language_override));
++    }
+     LoadMCUConfig();
+     (void)GetMacAddress();
+     // Check the config savegame EULA Version and update it to 0x7F7F if necessary
+diff --git a/src/core/hle/service/cfg/cfg.h b/src/core/hle/service/cfg/cfg.h
+index 4c5275a..a6fa7e7 100644
+--- a/src/core/hle/service/cfg/cfg.h
++++ b/src/core/hle/service/cfg/cfg.h
+@@ -670,6 +670,10 @@ private:
+ 
+ std::shared_ptr<Module> GetModule(Core::System& system);
+ 
++/// Super Shuckie: the system language a config savegame is given as it is loaded, in memory only
++/// (-1 = the savegame's own). Set before System::Load; a save state brings its own language.
++extern s32 g_system_language_override;
++
+ void InstallInterfaces(Core::System& system);
+ 
+ std::string GetUsername(Core::System& system);

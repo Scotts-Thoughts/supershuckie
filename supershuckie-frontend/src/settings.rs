@@ -316,6 +316,8 @@ impl Settings {
             let ds = &self.nintendo_ds_settings;
             self.nintendo_3ds_settings = Nintendo3DSSettings {
                 swap_screens: ds.swap_screens,
+                date: NintendoDSDate::default(),
+                language: Nintendo3DSSettings::DEFAULT_LANGUAGE(),
                 video_scale: ds.video_scale,
                 controls: ds.controls.clone(),
                 inherit_from_ds: false
@@ -945,6 +947,16 @@ impl NintendoDSSettings {
 /// 3DS game leaves the DS's alone.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Nintendo3DSSettings {
+    /// The date and time the console's clock starts at when a game is loaded. Save states (and
+    /// so replays) keep the clock they were made with.
+    #[serde(default = "NintendoDSDate::default")]
+    pub date: NintendoDSDate,
+
+    /// The system language (see [`Nintendo3DSLanguage`]); like the date, a save state keeps the
+    /// one it was made with.
+    #[serde(default = "Nintendo3DSSettings::DEFAULT_LANGUAGE")]
+    pub language: u8,
+
     /// Swap the on-screen positions of the top and bottom screens.
     #[serde(default = "bool::default")]
     pub swap_screens: bool,
@@ -963,6 +975,7 @@ pub struct Nintendo3DSSettings {
 
 impl Nintendo3DSSettings {
     const DEFAULT_VIDEO_SCALE: fn() -> NonZeroU8 = || unsafe { NonZeroU8::new_unchecked(2) };
+    const DEFAULT_LANGUAGE: fn() -> u8 = || Nintendo3DSLanguage::English as u8;
 
     fn missing() -> Self {
         Self { inherit_from_ds: true, ..Self::default() }
@@ -972,12 +985,32 @@ impl Nintendo3DSSettings {
 impl Default for Nintendo3DSSettings {
     fn default() -> Self {
         Self {
+            date: NintendoDSDate::default(),
+            language: Self::DEFAULT_LANGUAGE(),
             swap_screens: false,
             video_scale: Self::DEFAULT_VIDEO_SCALE(),
             controls: Controls::default(),
             inherit_from_ds: false
         }
     }
+}
+
+/// The 3DS system languages, numbered as the console (and Azahar) numbers them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u8)]
+pub enum Nintendo3DSLanguage {
+    Japanese = 0,
+    English = 1,
+    French = 2,
+    German = 3,
+    Italian = 4,
+    Spanish = 5,
+    SimplifiedChinese = 6,
+    Korean = 7,
+    Dutch = 8,
+    Portuguese = 9,
+    Russian = 10,
+    TraditionalChinese = 11
 }
 
 impl Default for NintendoDSSettings {
@@ -1434,6 +1467,31 @@ mod tests {
         ];
         let reloaded: NintendoDSSettings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(reloaded.date_presets, settings.date_presets, "presets keep their names, dates and order");
+    }
+
+    #[test]
+    fn nintendo_3ds_date_and_language_default_and_round_trip() {
+        let older: Nintendo3DSSettings = serde_json::from_str(r#"{"swap_screens": true}"#).unwrap();
+        assert_eq!(older.date, NintendoDSDate::default(), "settings saved before the 3DS date existed start at 2000-01-01");
+        assert_eq!(older.language, Nintendo3DSLanguage::English as u8, "and in English");
+
+        let mut settings = Nintendo3DSSettings::default();
+        settings.date = NintendoDSDate { year: 2026, month: 9, day: 26, hour: 14, minute: 30, second: 5 };
+        settings.language = Nintendo3DSLanguage::French as u8;
+        let reloaded: Nintendo3DSSettings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(reloaded.date, settings.date);
+        assert_eq!(reloaded.language, settings.language);
+    }
+
+    #[test]
+    fn nintendo_3ds_init_time_is_the_console_clock_reading() {
+        use supershuckie_core::emulator::Nintendo3DSSettings as CoreSettings;
+        // The same instants as calendar.timegm, i.e. the date read as UTC (patch 0008).
+        assert_eq!(CoreSettings::init_time_for(2000, 1, 1, 0, 0, 0), 946_684_800);
+        assert_eq!(CoreSettings::init_time_for(2024, 2, 29, 23, 59, 59), 1_709_251_199);
+        assert_eq!(CoreSettings::init_time_for(2026, 9, 26, 14, 30, 5), 1_790_433_005);
+        assert_eq!(CoreSettings::init_time_for(2099, 12, 31, 23, 59, 59), 4_102_444_799);
+        assert_eq!(CoreSettings::default().init_time, 946_684_800);
     }
 
     #[test]

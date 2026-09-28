@@ -16,6 +16,7 @@ use super::ReplayFileSink;
 use super::ReplayFileWriteError;
 use super::super::playback::ReplayFilePlayer;
 use super::super::playback::ReplaySeekError;
+use crate::replay_file::{ReplayConsoleType, REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES};
 use crate::{BookmarkTable, ByteVec, Counter, InputBuffer, Packet, Speed, TimestampMillis, UnsignedInteger};
 
 /// Counter snapshot + position + input/speed at the resume point.
@@ -123,11 +124,20 @@ pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
             .iter()
             .all(|p| matches!(p, Packet::CompressedBlob { .. }));
 
+    // A Nintendo 3DS file this build writes the same way (format v9) has no blobs, but its
+    // keyframes can be copied as they are: everything before the last keyframe at or before the
+    // boundary is, and the re-feed starts there.
+    let stored_copy = !all_blobs
+        && source.get_replay_metadata().console_type == ReplayConsoleType::Nintendo3DS
+        && source.get_replay_version() >= REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES;
+
     // Determine where the re-fed (decompressed) portion begins. On the fast path we first copy every
     // completed blob that ends before the boundary; the re-feed then starts at the first keyframe of
     // the straddling blob. On the fallback path we re-feed everything from frame 0.
     let start_frame = if all_blobs {
         copy_completed_blobs_before_boundary(&mut recorder, source, target)?
+    } else if stored_copy {
+        copy_stored_packets_before_boundary(&mut recorder, source, target)?
     } else {
         0
     };
@@ -159,10 +169,15 @@ const VERBATIM_COPY_MINIMUM_VERSION: u32 = 3;
 /// the source claimed).
 ///
 /// The returned recorder is OPEN and positioned at the end of the source; the caller closes it.
+///
+/// `rom` (Nintendo 3DS replays): the game's ROM, which the output's keyframes then copy from
+/// wherever they can (the source does not record what the game read, so the whole ROM is
+/// searched; see [`ReplayFileRecorder::set_rom_reads_unknown`]).
 pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
     source: &mut ReplayFilePlayer,
     settings: ReplayFileRecorderSettings,
     tolerate_read_errors: bool,
+    rom: Option<crate::replay_file::RomBytes>,
     final_sink: FS,
     temp_sink: TS,
     progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
@@ -172,6 +187,10 @@ pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
 
     let seed = source.bookmark_table().clone();
     let mut recorder = blank_recorder_from_source(source, metadata, settings, final_sink, temp_sink)?;
+    if let Some(rom) = rom {
+        recorder.set_rom(rom);
+        recorder.set_rom_reads_unknown(true);
+    }
     let info = prime_and_refeed(&mut recorder, source, 0, total, tolerate_read_errors, seed, progress)?;
 
     Ok((recorder, info))
@@ -254,6 +273,28 @@ fn copy_completed_blobs_before_boundary<FS: ReplayFileSink, TS: ReplayFileSink>(
     }
 
     Ok(start_frame)
+}
+
+/// The 3DS counterpart of [`copy_completed_blobs_before_boundary`]: copy every top-level packet
+/// before the last keyframe at or before `target` into `recorder` verbatim (keyframe frames
+/// included, not decoded), and return that keyframe's frame, where the re-feed begins. Resuming
+/// a two-hour 3DS file then re-encodes one keyframe interval, not 900 keyframes.
+fn copy_stored_packets_before_boundary<FS: ReplayFileSink, TS: ReplayFileSink>(
+    recorder: &mut ReplayFileRecorder<FS, TS>,
+    source: &mut ReplayFilePlayer,
+    target: UnsignedInteger,
+) -> Result<UnsignedInteger, ReplayResumeError> {
+    let Some(frame) = source.all_keyframes().range(..=target).next_back().map(|(&frame, _)| frame) else {
+        return Ok(0);
+    };
+    let boundary = source.stored_keyframe_packet_index(frame).map_err(ReplayResumeError::Read)?;
+    for index in 0..boundary {
+        let extra = source.stored_frame_bytes(index).map_err(|error| ReplayResumeError::Read(ReplaySeekError::ReadError { error }))?;
+        recorder
+            .append_stored_packet_verbatim(&source.all_uncompressed_packets()[index], extra)
+            .map_err(ReplayResumeError::Write)?;
+    }
+    Ok(frame)
 }
 
 /// Position `source` at the keyframe `start_frame`, prime `recorder` to continue from it, and re-feed
@@ -356,6 +397,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             Keyframe(ByteVec, TimestampMillis, UnsignedInteger),
             IncrementCounter(String, i64),
             SerialIn(ByteVec),
+            Thumbnail(UnsignedInteger),
             Skip,
         }
 
@@ -376,9 +418,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 }
                 Packet::ResetConsole => Action::ResetConsole,
                 Packet::LoadSaveState { state } => Action::LoadSaveState(state.clone()),
-                // Thumbnails before the resume point are not carried over (the timeline falls
-                // back to keyframe snapping there).
-                Packet::Bookmark { .. } | Packet::BookmarkTable { .. } | Packet::Thumbnail { .. } => Action::Skip,
+                // Timeline pictures are decoded and stored again (the recorder regroups them).
+                Packet::Thumbnail { elapsed_frames, .. } => Action::Thumbnail(*elapsed_frames),
+                Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => Action::Skip,
                 Packet::Keyframe { metadata, state } => {
                     Action::Keyframe(state.clone(), metadata.elapsed_millis, metadata.elapsed_frames)
                 }
@@ -459,6 +501,14 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             Action::SerialIn(data) => {
                 recorder.serial_in(data).map_err(ReplayResumeError::Write)?;
             }
+            Action::Thumbnail(frame) => {
+                // An undecodable picture is left out; the timeline shows the one before it.
+                if let Some(picture) = source.thumbnail_at_or_before(frame).filter(|p| p.frame == frame) {
+                    recorder
+                        .thumbnail((picture.top.0, picture.top.1, &picture.top.2), (picture.bottom.0, picture.bottom.1, &picture.bottom.2))
+                        .map_err(ReplayResumeError::Write)?;
+                }
+            }
             Action::Skip => {}
         }
     }
@@ -497,6 +547,8 @@ mod tests {
             mask_transient_buffers: true,
             stored_keyframe_levels: (15, 15),
             stored_keyframe_compression_level: 3,
+            stored_keyframe_mask_transients: true,
+            stored_thumbnail_jpeg_quality: 75,
         }
     }
 
@@ -757,7 +809,7 @@ mod tests {
     fn build_source_with_bookmarks(max_frames_per_blob: u64, table: &BookmarkTable) -> Vec<u8> {
         use crate::test_support::{bv, state_for as script_state};
 
-        let settings = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob, compression_level: 1, mask_transient_buffers: true, stored_keyframe_levels: (15, 15), stored_keyframe_compression_level: 3 };
+        let settings = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob, compression_level: 1, mask_transient_buffers: true, stored_keyframe_levels: (15, 15), stored_keyframe_compression_level: 3, stored_keyframe_mask_transients: true, stored_thumbnail_jpeg_quality: 75 };
         let mut recorder = ReplayFileRecorder::new_with_metadata(
             make_metadata(), ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&script_state(0)), Vec::<u8>::new(), Vec::<u8>::new()
         ).unwrap();
@@ -836,7 +888,7 @@ mod tests {
         let single_blob = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob: 0, ..small_settings() };
 
         let mut player = ReplayFilePlayer::new(&source, false).unwrap();
-        let (mut recorder, _) = build_reencoded_recorder(&mut player, single_blob.clone(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, single_blob.clone(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (reencoded, _) = recorder.close().unwrap();
 
         let mut feed = ReplayFilePlayer::new(&source, false).unwrap();
@@ -963,6 +1015,7 @@ mod tests {
                 &mut player,
                 ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() },
                 false,
+                None,
                 Vec::<u8>::new(),
                 NullReplayFileSink,
                 &mut |done, total| {
@@ -1013,7 +1066,7 @@ mod tests {
         let (source, _) = recorder.close().unwrap();
 
         let mut player = ReplayFilePlayer::new(&source, false).unwrap();
-        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
 
         let out = ReplayFilePlayer::new(&bytes, false).unwrap();
@@ -1037,7 +1090,7 @@ mod tests {
         let intact_total = player.get_total_frames();
         assert!(intact_total < TOTAL_FRAMES);
 
-        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
         assert_eq!(info.elapsed_frames, intact_total);
         assert_eq!(ReplayFilePlayer::new(&bytes, false).unwrap().get_total_frames(), intact_total);
@@ -1053,6 +1106,7 @@ mod tests {
             &mut player,
             small_settings(),
             false,
+            None,
             Vec::<u8>::new(),
             NullReplayFileSink,
             &mut |_, _| {

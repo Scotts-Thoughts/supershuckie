@@ -17,8 +17,8 @@ use core::num::NonZeroU64;
 use alloc::collections::BTreeMap;
 use supershuckie_replay_recorder::keyframe_masks::transient_ranges;
 use supershuckie_replay_recorder::replay_file::playback::{ReplayFilePlayer, ReplaySeekError, ReplayThumbnail};
-use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy};
-use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat};
+use supershuckie_replay_recorder::replay_file::record::{build_resumed_recorder, NonBlockingReplayFileRecorder, ReplayFileRecorder, ReplayFileRecorderFns, ReplayFileSink, ReplayFileWriteError, ReplayResumeError, ResumeCropPolicy, TransientPageAccess};
+use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBlake3Hash, ReplayPatchFormat, RomBytes};
 use supershuckie_replay_recorder::{blake3_hash_slices, BookmarkTable, ByteVec, Counter, InputBuffer, KeyframeMetadata, Packet, SignedInteger, TimestampMillis, UnsignedInteger, KEYFRAME_BOOKMARK_LEAD_FRAMES};
 use crate::stream::{StreamPublisherFns, SYNC_HASH_INTERVAL_FRAMES};
 
@@ -197,6 +197,19 @@ pub struct SuperShuckieCore {
     /// `WriteMemory` packets in played-back replays that could not be applied.
     replay_write_failures: u64,
 
+    /// Seeks whose walk had to be redone drawn because skipping drawing left the picture
+    /// incomplete (see [`Self::replay_seek_redraws`]).
+    replay_seek_redraws: u64,
+
+    /// The game's ROM file, given to every recorder made from now on (see
+    /// [`Self::set_game_rom`]).
+    game_rom: Option<RomBytes>,
+
+    /// ROM reads taken from the core at a keyframe (kept to reuse the allocation).
+    rom_reads_scratch: Vec<(u64, u64)>,
+    /// Buffer for `EmulatorCore::take_transient_page_access`, kept between keyframes.
+    transient_access_scratch: Vec<u8>,
+
     /// Present (draw) one frame in this many while running paced; see [`Self::present_every`].
     present_every: u64,
 
@@ -364,6 +377,10 @@ impl SuperShuckieCore {
             run_serial: 0,
             state_epoch: 0,
             replay_write_failures: 0,
+            replay_seek_redraws: 0,
+            game_rom: None,
+            rom_reads_scratch: Vec::new(),
+            transient_access_scratch: Vec::new(),
             present_every: 1,
             state_buffers: Vec::new(),
             #[cfg(feature = "std")]
@@ -602,6 +619,16 @@ impl SuperShuckieCore {
         let skip = self.present_every > 1 && !self.core.is_mid_frame()
             && !(0..=lead).any(|k| (self.total_frames + k) % self.present_every == 0);
         self.core.set_skip_drawing(skip);
+        // A core that draws every frame (the 3DS) still only has to hand out the pictures of the
+        // frames other cores draw (one in `present_every`) and of the ones a recording keeps as
+        // timeline pictures (see `push_thumbnail_if_needed`, which looks at the frame count
+        // after the run).
+        let shown = self.present_every <= 1 || self.total_frames % self.present_every == 0;
+        let thumbnail = self.replay_file_recorder.is_some()
+            && (self.total_frames + 1) % Self::THUMBNAIL_INTERVAL_FRAMES == 0;
+        if !skip && !shown && !thumbnail {
+            self.core.set_picture_wanted(false);
+        }
         self.do_run_fn(EmulatorCore::run, true);
     }
 
@@ -839,6 +866,12 @@ impl SuperShuckieCore {
     /// Get an immutable reference to the underlying core.
     pub fn get_core(&self) -> &dyn EmulatorCore {
         self.core.as_ref()
+    }
+
+    /// The underlying core, for tools that drive it directly (measurements); changing its state
+    /// behind this wrapper's back is theirs to answer for.
+    pub fn get_core_mut(&mut self) -> &mut dyn EmulatorCore {
+        self.core.as_mut()
     }
 
     /// Set the speed multiplier of the game. While the console is linked this paces the pair
@@ -1407,6 +1440,7 @@ impl SuperShuckieCore {
         self.frames_per_keyframe = partial_replay_record_metadata.frames_per_keyframe.get();
         self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(recorder));
+        self.attach_rom_to_recorder();
         #[cfg(feature = "std")]
         self.prime_state_buffers();
         self.replay_counters = Some(BTreeMap::new());
@@ -1512,6 +1546,7 @@ impl SuperShuckieCore {
         // Install the resumed recorder.
         self.full_keyframe_pending = false;
         self.replay_file_recorder = Some(Box::new(NonBlockingReplayFileRecorder::new(recorder)));
+        self.attach_rom_to_recorder();
         #[cfg(feature = "std")]
         self.prime_state_buffers();
         self.frames_per_keyframe = partial.frames_per_keyframe.get();
@@ -1544,6 +1579,8 @@ impl SuperShuckieCore {
     /// Returns None if no replay was being recorded. Otherwise, returns Some(true) if successfully closed, or Some(false) if not.
     pub fn stop_recording_replay(&mut self) -> Option<bool> {
         if let Some(mut old_recorder) = self.replay_file_recorder.take() {
+            self.core.set_rom_read_log(false);
+            self.core.set_transient_page_tracking(false);
             if self.stream_publisher.is_none() && !self.is_following() {
                 self.replay_counters = None;
             }
@@ -1846,7 +1883,7 @@ impl SuperShuckieCore {
         }
 
         if (self.full_keyframe_pending || self.frames_since_last_keyframe >= self.frames_per_keyframe)
-            && !self.core.save_state_possible()
+            && (!self.core.save_state_possible() || self.recorder_backlogged())
         {
             // Not this frame (see `EmulatorCore::save_state_possible`); a requested full keyframe
             // stays requested and the interval keeps counting.
@@ -1857,6 +1894,18 @@ impl SuperShuckieCore {
         if full || self.frames_since_last_keyframe >= self.frames_per_keyframe {
             self.write_keyframe(full);
         }
+    }
+
+    /// Keyframes a 3DS recording lets its recorder thread fall behind by before the next one
+    /// waits: each is a 150 MB state, and at high speed a busy stretch (a keyframe that takes
+    /// half a second to compress) must stretch the interval rather than fill the memory.
+    const MAX_3DS_KEYFRAMES_IN_FLIGHT: usize = 2;
+
+    /// Whether the recorder is too far behind for another keyframe now (3DS recordings only;
+    /// see [`Self::MAX_3DS_KEYFRAMES_IN_FLIGHT`]).
+    fn recorder_backlogged(&self) -> bool {
+        self.core.replay_console_type() == Some(ReplayConsoleType::Nintendo3DS)
+            && self.replay_file_recorder.as_ref().is_some_and(|r| r.keyframes_in_flight() >= Self::MAX_3DS_KEYFRAMES_IN_FLIGHT)
     }
 
     /// Frames between the timeline pictures a 3DS recording stores (one a second).
@@ -1894,6 +1943,29 @@ impl SuperShuckieCore {
 
         let mut buffer = self.take_state_buffer();
         self.core.create_save_state_into(&mut buffer);
+        // What the game read from its ROM since the last keyframe: where this keyframe's new
+        // bytes may be copies of the game file (3DS only; nothing elsewhere).
+        let mut reads = core::mem::take(&mut self.rom_reads_scratch);
+        self.core.take_rom_reads(&mut reads);
+        if !reads.is_empty() {
+            self.with_recorder(|r| {
+                r.rom_reads(reads.clone());
+                Ok(())
+            });
+            reads.clear();
+        }
+        self.rom_reads_scratch = reads;
+        // What touched each page of the transient memory first since the last keyframe (3DS:
+        // VRAM), which lets the recorder leave out what the game rewrites before reading it.
+        let mut access = core::mem::take(&mut self.transient_access_scratch);
+        if let Some((state_offset, page_size)) = self.core.take_transient_page_access(&mut access) {
+            self.with_recorder(|r| {
+                r.transient_page_access(TransientPageAccess { state_offset: state_offset as u64, page_size: page_size as u32, first_access: access.clone() });
+                Ok(())
+            });
+        }
+        access.clear();
+        self.transient_access_scratch = access;
         let result = self.replay_file_recorder.as_mut().map(|f| if full {
             f.insert_keyframe_full(ByteVec::Heap(buffer), ms)
         }
@@ -2250,7 +2322,7 @@ impl SuperShuckieCore {
         }
 
         self.load_replay_keyframe_at_or_before(frame)?;
-        self.run_replay_to(desired);
+        self.run_replay_to_complete_picture(desired)?;
 
         if !self.core.shows_stale_output() {
             return Ok(())
@@ -2298,14 +2370,65 @@ impl SuperShuckieCore {
     /// only that last frame (nobody looks at the ones on the way) and the few before it the core
     /// needs drawn for it (see [`Self::draw_lead_frames`]).
     fn run_replay_to(&mut self, desired: UnsignedInteger) {
-        let lead = self.core.draw_lead_frames();
+        self.run_replay_to_drawing_from(desired, UnsignedInteger::MAX);
+    }
+
+    /// [`Self::run_replay_to`], drawing every frame from `draw_from` on as well.
+    fn run_replay_to_drawing_from(&mut self, desired: UnsignedInteger, draw_from: UnsignedInteger) {
+        let lead = self.core.seek_draw_tail_frames();
         while self.total_frames <= desired && !self.replay_stalled {
-            if self.total_frames.saturating_add(lead) < desired {
+            if self.total_frames.saturating_add(lead) < desired && self.total_frames < draw_from {
                 self.run_unlocked_hidden();
             }
             else {
                 self.run_unlocked();
             }
+        }
+    }
+
+    /// [`Self::run_replay_to`] from the keyframe just loaded, then, when drawing skipped on the
+    /// way left something in the picture out of date (a buffer the game drew into during a
+    /// skipped frame and has not redrawn since; see `EmulatorCore::skipped_draws_left_stale`),
+    /// the same walk again from the same keyframe with every frame drawn from the first such
+    /// draw on. Rare (a scene that renders into a buffer once and keeps it), and never worse
+    /// than drawing the whole walk.
+    fn run_replay_to_complete_picture(&mut self, desired: UnsignedInteger) -> Result<(), String> {
+        self.run_replay_to(desired);
+        let Some(frames_ago) = self.core.skipped_draws_left_stale() else {
+            return Ok(())
+        };
+        if self.replay_stalled {
+            return Ok(())
+        }
+        let draw_from = self.total_frames.saturating_sub(frames_ago);
+        self.replay_seek_redraws += 1;
+        let keyframe = self.replay_keyframe_loaded;
+        self.load_replay_keyframe_at_or_before(keyframe)?;
+        self.run_replay_to_drawing_from(desired, draw_from);
+        Ok(())
+    }
+
+    /// How many seeks so far had to redo their walk drawn (see
+    /// [`Self::run_replay_to_complete_picture`]); for measurements.
+    pub fn replay_seek_redraws(&self) -> u64 {
+        self.replay_seek_redraws
+    }
+
+    /// Give the core the game's ROM file: every replay recorded from now on (a Nintendo 3DS one)
+    /// stores what its keyframes copy from it as references (see `ReplayFileRecorder::set_rom`).
+    pub fn set_game_rom(&mut self, rom: Option<RomBytes>) {
+        self.game_rom = rom;
+    }
+
+    /// Give a recorder just installed the ROM and start noting what the game reads from it.
+    fn attach_rom_to_recorder(&mut self) {
+        self.core.set_rom_read_log(true);
+        self.core.set_transient_page_tracking(true);
+        if let Some(rom) = self.game_rom.clone() {
+            self.with_recorder(|r| {
+                r.set_rom(rom);
+                Ok(())
+            });
         }
     }
 
@@ -2655,7 +2778,17 @@ mod tests {
         /// `EmulatorCore::shows_stale_output`), like a Nintendo DS masked keyframe; 0 = none.
         stale_frames_after_load: u32,
         stale_frames_left: u32,
-        stale_shown: bool
+        stale_shown: bool,
+        /// A 3DS-like skipped draw (see `EmulatorCore::skipped_draws_left_stale`): a frame run
+        /// with drawing skipped that makes `counter` this value leaves the picture stale until the
+        /// next state load; `seek_tail` is then the core's seek tail.
+        stale_draw_at: Option<u32>,
+        seek_tail: u64,
+        skip_drawing: bool,
+        frames_run: u64,
+        stale_since: Option<u64>,
+        /// `counter` after every frame run drawn, oldest first.
+        drawn: Arc<Mutex<Vec<u32>>>
     }
 
     impl FakePacedCore {
@@ -2664,6 +2797,12 @@ mod tests {
                 stale_frames_after_load: 0,
                 stale_frames_left: 0,
                 stale_shown: false,
+                stale_draw_at: None,
+                seek_tail: 0,
+                skip_drawing: false,
+                frames_run: 0,
+                stale_since: None,
+                drawn: Arc::new(Mutex::new(Vec::new())),
                 clock,
                 period_micros,
                 last_frame_micros: 0,
@@ -2712,7 +2851,27 @@ mod tests {
             self.frame_inputs.lock().unwrap().push(self.input_byte);
             self.stale_shown = self.stale_frames_left > 0;
             self.stale_frames_left = self.stale_frames_left.saturating_sub(1);
+            let this_frame = self.frames_run;
+            self.frames_run += 1;
+            if !self.skip_drawing {
+                self.drawn.lock().unwrap().push(self.counter);
+            }
+            else if self.stale_draw_at == Some(self.counter) {
+                self.stale_since.get_or_insert(this_frame);
+            }
             RunTime::ONE_FRAME
+        }
+
+        fn set_skip_drawing(&mut self, skip: bool) {
+            self.skip_drawing = skip;
+        }
+
+        fn seek_draw_tail_frames(&self) -> u64 {
+            self.seek_tail
+        }
+
+        fn skipped_draws_left_stale(&self) -> Option<u64> {
+            self.stale_since.map(|since| self.frames_run - since)
         }
 
         fn read_ram(&self, _address: u32, _into: &mut [u8]) -> Result<(), &'static str> {
@@ -2747,6 +2906,7 @@ mod tests {
             self.counter_bytes = bytes;
             self.stale_frames_left = self.stale_frames_after_load;
             self.stale_shown = false;
+            self.stale_since = None;
             Ok(())
         }
 
@@ -3423,6 +3583,48 @@ mod tests {
         let player = ReplayFilePlayer::new(bytes, false).expect("parse the recorded replay");
         core.attach_replay_player(player, true).expect("attach");
         (core, clock, played_log)
+    }
+
+    /// A seek that skipped drawing and left the picture incomplete (a 3DS game rendering into a
+    /// buffer during a skipped frame and never redrawing it) redoes its walk from the same
+    /// keyframe, drawing from that frame on; one that did not is done in a single pass.
+    #[test]
+    fn seeks_redo_the_walk_drawn_when_skipping_left_the_picture_stale() {
+        // Keyframes at 0, 10, ..., 50.
+        let clock = FakeClock::new();
+        let mut recorder = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        recorder.start_recording_replay(PartialReplayRecordMetadata {
+            frames_per_keyframe: NonZeroU64::new(10).unwrap(),
+            ..metadata(final_buf.clone(), SharedSink::default())
+        }).expect("start recording");
+        for _ in 0..60 {
+            run_one_frame(&mut recorder, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(recorder.stop_recording_replay(), Some(true));
+        let bytes = final_buf.0.lock().unwrap().clone();
+
+        let clock = FakeClock::new();
+        let mut fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        fake.stale_draw_at = Some(23);
+        fake.seek_tail = 2;
+        let drawn = fake.drawn.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock));
+        core.attach_replay_player(ReplayFilePlayer::new(&bytes, false).expect("parse"), true).expect("attach");
+
+        // Keyframe 30 to frame 38: nothing stale on the way, one pass, the last frames drawn.
+        drawn.lock().unwrap().clear();
+        core.go_to_replay_frame(38).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.replay_seek_redraws()), (38, 30, 0));
+        assert_eq!(*drawn.lock().unwrap(), [36, 37, 38]);
+
+        // Keyframe 20 to frame 28: the frame that made the counter 23 ran hidden and left the
+        // picture stale, so the walk is done again from 20, drawn from that frame on.
+        drawn.lock().unwrap().clear();
+        core.go_to_replay_frame(28).expect("seek");
+        assert_eq!((core.total_frames(), core.replay_keyframe_loaded(), core.replay_seek_redraws()), (28, 20, 1));
+        assert_eq!(*drawn.lock().unwrap(), [26, 27, 28, 23, 24, 25, 26, 27, 28]);
+        assert_eq!(core.get_core().skipped_draws_left_stale(), None);
     }
 
     /// A seek never ends on a frame that still shows output a stale keyframe left out (a masked

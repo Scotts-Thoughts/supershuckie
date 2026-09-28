@@ -11,6 +11,7 @@
 #include <QToolButton>
 #include <QLabel>
 #include <QMenu>
+#include <QMessageBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QDir>
@@ -43,6 +44,17 @@ static const char *LANDING_HINT_DISMISSED = "qt__landing_hint_dismissed";
 // Mime type of an in-progress tile reorder; the data is the source tile's index as decimal text.
 static const char *TILE_MIME = "application/x-supershuckie-favorite-tile";
 
+static QStringList rom_name_filters() {
+    return QStringList({
+        "All compatible ROM files (*.gb *.gbc *.gba *.nds *.3ds *.cci *.cxi *.3dsx)",
+        "GB/GBC ROM dumps (*.gb *.gbc)",
+        "GBA ROM dumps (*.gba)",
+        "NDS ROM files (*.nds)",
+        "3DS ROM files (*.3ds *.cci *.cxi *.3dsx)",
+        "Any files (*)"
+    });
+}
+
 LandingWidget::LandingWidget(MainWindow *window, QWidget *parent): QWidget(parent), main_window(window) {
     this->setAcceptDrops(true);
 
@@ -74,7 +86,7 @@ LandingWidget::LandingWidget(MainWindow *window, QWidget *parent): QWidget(paren
     hint_layout->setSpacing(8);
     this->hint = new QLabel(
         "Click a game to play it. Drag games to reorder them. Right-click a game to give it a picture, "
-        "rename it, give it a keyboard shortcut, or remove it. Drop a ROM anywhere here to open it, or "
+        "rename it, give it a keyboard shortcut, point it at a different ROM file, or remove it. Drop a ROM anywhere here to open it, or "
         "drop a picture on a game to use it as that game's icon.",
         this->hint_row
     );
@@ -416,14 +428,7 @@ void LandingWidget::add_rom(const QString &path) {
 void LandingWidget::do_add_rom() {
     QFileDialog rom_opener(this->main_window);
     rom_opener.setFileMode(QFileDialog::FileMode::ExistingFiles);
-    rom_opener.setNameFilters(QStringList({
-        "All compatible ROM files (*.gb *.gbc *.gba *.nds *.3ds *.cci *.cxi *.3dsx)",
-        "GB/GBC ROM dumps (*.gb *.gbc)",
-        "GBA ROM dumps (*.gba)",
-        "NDS ROM files (*.nds)",
-        "3DS ROM files (*.3ds *.cci *.cxi *.3dsx)",
-        "Any files (*)"
-    }));
+    rom_opener.setNameFilters(rom_name_filters());
     rom_opener.setWindowTitle("Select ROMs to add to the start screen");
 
     // exec() runs a nested event loop; keep the 1 ms ticker from re-entering tick() underneath it.
@@ -442,7 +447,125 @@ void LandingWidget::open_favorite(std::size_t index) {
     }
     // Copy the path first: loading a ROM swaps this widget out and may rebuild the tiles.
     QString path = this->favorites[index].path;
-    this->main_window->load_rom(std::filesystem::path(path.toStdU16String()));
+    QString native = QDir::toNativeSeparators(path);
+
+    if(!QFileInfo(path).isFile()) {
+        this->resolve_broken_favorite(index, QString("\"%1\" can't be found. It may have been renamed, moved, or deleted.").arg(native));
+        return;
+    }
+
+    QString failure;
+    if(!this->main_window->load_rom(std::filesystem::path(path.toStdU16String()), &failure)) {
+        this->resolve_broken_favorite(index, QString("\"%1\" failed to load:\n\n%2").arg(native, failure));
+    }
+}
+
+void LandingWidget::resolve_broken_favorite(std::size_t index, const QString &problem) {
+    if(index >= this->favorites.size()) {
+        return;
+    }
+    QString path = this->favorites[index].path;
+
+    QMessageBox box(this->main_window);
+    box.setWindowTitle(QString("Can't open %1").arg(this->favorites[index].name));
+    box.setIcon(QMessageBox::Icon::Warning);
+    box.setText(problem);
+    box.setInformativeText("Choose the ROM file this game should open, or remove it from the start screen.");
+    QPushButton *locate = box.addButton("Locate ROM…", QMessageBox::AcceptRole);
+    QPushButton *remove = box.addButton("Remove from start screen", QMessageBox::DestructiveRole);
+    box.addButton(QMessageBox::Cancel);
+    box.setDefaultButton(locate);
+
+    // exec() runs a nested event loop; keep the 1 ms ticker from re-entering tick() underneath it.
+    this->main_window->stop_timer();
+    box.exec();
+    this->main_window->start_timer();
+
+    // Find the game again by path in case the list changed while the box was up.
+    index = static_cast<std::size_t>(this->favorite_paths().indexOf(path));
+    if(index >= this->favorites.size()) {
+        return;
+    }
+
+    if(box.clickedButton() == static_cast<QAbstractButton *>(locate)) {
+        auto file = this->choose_rom_file(index);
+        if(file.has_value() && this->change_rom(index, *file)) {
+            // Asks again if the new file fails too.
+            this->open_favorite(index);
+        }
+    }
+    else if(box.clickedButton() == static_cast<QAbstractButton *>(remove)) {
+        this->remove_favorite(index);
+    }
+}
+
+std::optional<QString> LandingWidget::choose_rom_file(std::size_t index) {
+    if(index >= this->favorites.size()) {
+        return std::nullopt;
+    }
+    const auto &favorite = this->favorites[index];
+
+    QFileDialog picker(this->main_window);
+    picker.setFileMode(QFileDialog::FileMode::ExistingFile);
+    picker.setNameFilters(rom_name_filters());
+    picker.setWindowTitle(QString("Select the ROM for \"%1\"").arg(favorite.name));
+    // Start where the old file was, which is usually where the renamed one is.
+    QDir folder = QFileInfo(favorite.path).absoluteDir();
+    if(folder.exists()) {
+        picker.setDirectory(folder);
+    }
+
+    this->main_window->stop_timer();
+    picker.exec();
+    this->main_window->start_timer();
+
+    auto files = picker.selectedFiles();
+    if(files.size() != 1) {
+        return std::nullopt;
+    }
+    return files[0];
+}
+
+bool LandingWidget::change_rom(std::size_t index, const QString &path) {
+    if(index >= this->favorites.size()) {
+        return false;
+    }
+
+    QFileInfo info(path);
+    if(!info.isFile()) {
+        this->main_window->show_error("Can't change ROM", "\"%s\" is not a file.", QDir::toNativeSeparators(path).toUtf8().constData());
+        return false;
+    }
+
+    QString absolute = info.absoluteFilePath();
+    for(std::size_t i = 0; i < this->favorites.size(); i++) {
+        if(i != index && QFileInfo(this->favorites[i].path).absoluteFilePath() == absolute) {
+            this->main_window->show_error(
+                "Can't change ROM",
+                "\"%s\" is already on the start screen as \"%s\".",
+                QDir::toNativeSeparators(absolute).toUtf8().constData(),
+                this->favorites[i].name.toUtf8().constData()
+            );
+            return false;
+        }
+    }
+
+    auto &favorite = this->favorites[index];
+    QString old_path = favorite.path;
+    if(old_path == absolute) {
+        return true;
+    }
+
+    // A name that was just the old file's name follows the file; one the user chose stays.
+    if(favorite.name == QFileInfo(old_path).completeBaseName()) {
+        favorite.name = info.completeBaseName();
+    }
+    favorite.path = absolute;
+
+    this->save_favorites();
+    this->main_window->move_favorite_rom_shortcut(old_path, absolute);
+    this->rebuild_tiles();
+    return true;
 }
 
 void LandingWidget::set_image(std::size_t index, const QString &source) {
@@ -557,6 +680,7 @@ void LandingWidget::show_tile_menu(std::size_t index, const QPoint &global_pos) 
     auto *clear_picture = menu.addAction("Use default picture");
     clear_picture->setEnabled(!this->favorites[index].image.isEmpty());
     auto *rename = menu.addAction("Rename…");
+    auto *change_rom = menu.addAction("Choose different ROM file…");
     auto shortcuts = this->main_window->favorite_rom_shortcuts(this->favorites[index].path);
     auto *set_shortcut = menu.addAction(shortcuts.isEmpty()
         ? QString("Set shortcut…")
@@ -606,6 +730,12 @@ void LandingWidget::show_tile_menu(std::size_t index, const QPoint &global_pos) 
     }
     else if(chosen == rename) {
         this->rename_favorite(index);
+    }
+    else if(chosen == change_rom) {
+        auto file = this->choose_rom_file(index);
+        if(file.has_value()) {
+            this->change_rom(index, *file);
+        }
     }
     else if(chosen == set_shortcut) {
         this->main_window->edit_favorite_rom_shortcut(this->favorites[index].path);

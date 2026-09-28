@@ -1,10 +1,11 @@
-use super::{KeyframeEncoding, ReplayFileWriteError, ReplayFileRecorder, ReplayFileSink, ReplayFileRecorderFns};
+use super::{TransientPageAccess, KeyframeEncoding, ReplayFileWriteError, ReplayFileRecorder, ReplayFileSink, ReplayFileRecorderFns};
 use crate::{BookmarkTable, ByteVec, InputBuffer, SignedInteger, Speed, TimestampMillis, UnsignedInteger};
 use alloc::borrow::Cow;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use std::time::Duration;
@@ -26,7 +27,10 @@ pub struct NonBlockingReplayFileRecorder<Final: ReplayFileSink + Send + 'static,
     sender: Sender<ThreadedReplayFileRecorderCommand>,
     errors: Receiver<ReplayFileWriteError>,
     free_buffers: Receiver<Vec<u8>>,
-    closed: Receiver<()>
+    closed: Receiver<()>,
+    /// Keyframes sent to the recorder thread and not yet written (see
+    /// [`Self::keyframes_in_flight`]).
+    keyframes_in_flight: Arc<AtomicUsize>
 }
 
 impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'static> NonBlockingReplayFileRecorder<Final, Temp> {
@@ -51,12 +55,14 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
         let (closed_helper, closed_main) = channel();
         let (free_sender, free_receiver) = sync_channel(FREE_BUFFER_CHANNEL_CAPACITY);
 
+        let keyframes_in_flight = Arc::new(AtomicUsize::new(0));
         let helper = ThreadedReplayFileRecorderThread {
             recorder: Arc::downgrade(&recorder),
             error_sender: sender_helper,
             receiver: receiver_helper,
             free_buffers: free_sender,
-            closed: closed_helper
+            closed: closed_helper,
+            keyframes_in_flight: keyframes_in_flight.clone()
         };
 
         std::thread::Builder::new()
@@ -74,8 +80,16 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
             errors: receiver_main,
             free_buffers: free_receiver,
             recorder: Some(recorder),
-            closed: closed_main
+            closed: closed_main,
+            keyframes_in_flight
         }
+    }
+
+    /// Keyframes handed over with [`Self::insert_keyframe`] (or `_full`) that the recorder thread
+    /// has not written yet. A producer whose keyframes are large (a 3DS state is 150 MB) can hold
+    /// off while this is high rather than queue them without bound.
+    pub fn keyframes_in_flight(&self) -> usize {
+        self.keyframes_in_flight.load(Ordering::Acquire)
     }
 
     /// A keyframe state buffer the recorder thread has finished with, if one is waiting.
@@ -140,12 +154,19 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
 
     /// Add a new keyframe.
     pub fn insert_keyframe(&mut self, state: ByteVec, timestamp: TimestampMillis) {
-        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp, encoding: KeyframeEncoding::Auto });
+        self.send_keyframe(state, timestamp, KeyframeEncoding::Auto);
     }
 
     /// Add a new keyframe that is always stored in full (see [`KeyframeEncoding::Full`]).
     pub fn insert_keyframe_full(&mut self, state: ByteVec, timestamp: TimestampMillis) {
-        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp, encoding: KeyframeEncoding::Full });
+        self.send_keyframe(state, timestamp, KeyframeEncoding::Full);
+    }
+
+    fn send_keyframe(&mut self, state: ByteVec, timestamp: TimestampMillis, encoding: KeyframeEncoding) {
+        self.keyframes_in_flight.fetch_add(1, Ordering::AcqRel);
+        if self.sender.send(ThreadedReplayFileRecorderCommand::NewKeyframe { state, timestamp, encoding }).is_err() {
+            self.keyframes_in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Set the current input.
@@ -185,6 +206,28 @@ impl<Final: ReplayFileSink + Send + 'static, Temp: ReplayFileSink + Send + 'stat
     /// Store a timeline picture (see [`ReplayFileRecorder::thumbnail`]).
     pub fn thumbnail(&mut self, top: (u32, u32, Vec<u8>), bottom: (u32, u32, Vec<u8>)) {
         let _ = self.sender.send(ThreadedReplayFileRecorderCommand::Thumbnail { top, bottom });
+    }
+
+    /// Give the recorder the game's ROM (see [`ReplayFileRecorder::set_rom`]).
+    pub fn set_rom(&mut self, rom: crate::replay_file::RomBytes) {
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::SetRom { rom });
+    }
+
+    /// ROM ranges the emulator read (see [`ReplayFileRecorder::rom_reads`]).
+    /// See [`ReplayFileRecorder::transient_page_access`].
+    pub fn transient_page_access(&mut self, access: TransientPageAccess) {
+        if self.is_closed() {
+            return;
+        }
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::TransientPageAccess { access });
+    }
+
+    /// ROM ranges the emulator read (see [`ReplayFileRecorder::rom_reads`]).
+    pub fn rom_reads(&mut self, reads: Vec<(u64, u64)>) {
+        if reads.is_empty() {
+            return
+        }
+        let _ = self.sender.send(ThreadedReplayFileRecorderCommand::RomReads { reads });
     }
 
     /// Check for errors, if any.
@@ -246,7 +289,8 @@ struct ThreadedReplayFileRecorderThread<Final: ReplayFileSink, Temp: ReplayFileS
     /// [`FREE_BUFFER_CHANNEL_CAPACITY`]): if the producer stops draining it, buffers are dropped
     /// instead of piling up unboundedly.
     free_buffers: SyncSender<Vec<u8>>,
-    closed: Sender<()>
+    closed: Sender<()>,
+    keyframes_in_flight: Arc<AtomicUsize>
 }
 
 /// Reports, via `errors`, that the recorder thread stopped without a clean `Close` command -- a
@@ -307,6 +351,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             },
             ThreadedReplayFileRecorderCommand::NewKeyframe { timestamp, state, encoding } => {
                 let result = recorder.insert_keyframe_with(state, timestamp, encoding);
+                self.keyframes_in_flight.fetch_sub(1, Ordering::AcqRel);
                 if let Some(buffer) = recorder.take_recycled_state() {
                     // If the producer isn't draining these (channel full), drop the buffer rather
                     // than growing the channel without bound.
@@ -338,6 +383,18 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ThreadedReplayFileRecorderThre
             ThreadedReplayFileRecorderCommand::Thumbnail { top, bottom } => {
                 recorder.thumbnail((top.0, top.1, top.2.as_slice()), (bottom.0, bottom.1, bottom.2.as_slice()))
             }
+            ThreadedReplayFileRecorderCommand::SetRom { rom } => {
+                recorder.set_rom(rom);
+                Ok(())
+            }
+            ThreadedReplayFileRecorderCommand::RomReads { reads } => {
+                recorder.rom_reads(&reads);
+                Ok(())
+            }
+            ThreadedReplayFileRecorderCommand::TransientPageAccess { access } => {
+                recorder.transient_page_access(&access);
+                Ok(())
+            }
             ThreadedReplayFileRecorderCommand::MarkStart { timer_offset } => {
                 recorder.mark_start(timer_offset)
             }
@@ -361,6 +418,9 @@ enum ThreadedReplayFileRecorderCommand {
     LoadSaveState { state: ByteVec },
     SerialIn { data: ByteVec },
     Thumbnail { top: (u32, u32, Vec<u8>), bottom: (u32, u32, Vec<u8>) },
+    SetRom { rom: crate::replay_file::RomBytes },
+    RomReads { reads: Vec<(u64, u64)> },
+    TransientPageAccess { access: TransientPageAccess },
     IncrementCounter { name: String, delta: SignedInteger },
     MarkStart { timer_offset: TimestampMillis },
     MarkEnd,
@@ -445,6 +505,18 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
         Ok(())
     }
 
+    fn set_rom(&mut self, rom: crate::replay_file::RomBytes) {
+        self.set_rom(rom);
+    }
+
+    fn rom_reads(&mut self, reads: Vec<(u64, u64)>) {
+        self.rom_reads(reads);
+    }
+
+    fn transient_page_access(&mut self, access: TransientPageAccess) {
+        self.transient_page_access(access);
+    }
+
     #[inline]
     fn get_errors(&mut self) -> Vec<ReplayFileWriteError> {
         self.poll_errors()
@@ -472,6 +544,11 @@ impl<Final: ReplayFileSink + Sync + Send + 'static, Temp: ReplayFileSink + Sync 
     fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
         self.take_free_state_buffer()
     }
+
+    #[inline]
+    fn keyframes_in_flight(&self) -> usize {
+        self.keyframes_in_flight()
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +567,8 @@ mod tests {
             mask_transient_buffers: true,
             stored_keyframe_levels: (15, 15),
             stored_keyframe_compression_level: 3,
+            stored_keyframe_mask_transients: true,
+            stored_thumbnail_jpeg_quality: 75,
         }
     }
 

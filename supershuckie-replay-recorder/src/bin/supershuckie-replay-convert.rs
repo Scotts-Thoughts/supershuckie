@@ -47,6 +47,12 @@ options:
                        keyframes, i.e. every keyframe reconstructs bit-exactly
   --verify             re-open both files afterwards and compare them packet by packet
   --allow-corruption   read as much of a damaged source as possible instead of failing
+  --rom <file>         Nintendo 3DS replays: the game's ROM file. Needed to read a v9 source;
+                       with it the output's keyframes copy what they can from the ROM (and
+                       playing the output needs the ROM, which the app always has)
+  --keyframe-levels <a,b>  Nintendo 3DS replays: a level-1 keyframe every <b> keyframes, a full
+                       one every <a> level-1 keyframes (default 30,15: with a recording's 8-s
+                       keyframes, every 2 minutes and every 60)
   --force              overwrite <out.replay> if it exists
   -h, --help           show this help
 ";
@@ -68,6 +74,8 @@ fn parse_args() -> Result<Args, String> {
     let mut verify = false;
     let mut allow_corruption = false;
     let mut force = false;
+    let mut rom_path = None;
+    let mut levels = (30u32, 15u32);
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -86,6 +94,12 @@ fn parse_args() -> Result<Args, String> {
             "--verify" => verify = true,
             "--allow-corruption" => allow_corruption = true,
             "--force" => force = true,
+            "--rom" => rom_path = Some(PathBuf::from(value("--rom")?)),
+            "--keyframe-levels" => {
+                let text = value("--keyframe-levels")?;
+                let (a, b) = text.split_once(',').ok_or("--keyframe-levels: expected <a>,<b>")?;
+                levels = (a.trim().parse().map_err(|e| format!("--keyframe-levels: {e}"))?, b.trim().parse().map_err(|e| format!("--keyframe-levels: {e}"))?);
+            }
             other if other.starts_with('-') => return Err(format!("unknown option {other}\n\n{USAGE}")),
             _ => positional.push(PathBuf::from(arg)),
         }
@@ -99,10 +113,13 @@ fn parse_args() -> Result<Args, String> {
             max_frames_per_blob: chain_frames,
             compression_level: level,
             mask_transient_buffers: masks,
-            stored_keyframe_levels: (15, 15),
+            stored_keyframe_levels: levels,
             stored_keyframe_compression_level: 3,
+            stored_keyframe_mask_transients: true,
+            stored_thumbnail_jpeg_quality: 75,
         },
         allow_corruption,
+        rom_path,
     };
 
     Ok(Args { input, output, options, verify, force })
@@ -170,7 +187,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     if args.verify {
         let mut reporter = ProgressReporter::new();
-        let verified = verify_replay_files(&args.input, &args.output, args.options.settings.mask_transient_buffers, args.options.allow_corruption, &mut |phase, done, total| reporter.report(phase, done, total))
+        let verified = verify_replay_files(&args.input, &args.output, args.options.settings.mask_transient_buffers, args.options.allow_corruption, args.options.rom_path.as_deref(), &mut |phase, done, total| reporter.report(phase, done, total))
             .map_err(|e| format!("VERIFY FAILED: {e}"))?;
         eprintln!();
         eprintln!(

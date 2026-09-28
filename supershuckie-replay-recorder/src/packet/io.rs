@@ -326,6 +326,12 @@ pub enum PacketDiscriminator {
     /// A picture of both screens for the timeline (format v8).
     Thumbnail = 0xFC,
 
+    /// A picture of both screens stored against the previous one (format v9).
+    ThumbnailAgainstPrevious = 0xFD,
+
+    /// A picture of both screens as two JPEGs (format v10).
+    ThumbnailJpeg = 0xEF,
+
     /// Compressed blob
     CompressedBlob = 0xFE,
     
@@ -412,7 +418,9 @@ impl Packet {
             Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8,
             Packet::SerialIn { .. } => PacketDiscriminator::SerialIn as u8,
             Packet::StoredKeyframe { .. } => PacketDiscriminator::StoredKeyframe as u8,
-            Packet::Thumbnail { .. } => PacketDiscriminator::Thumbnail as u8
+            Packet::Thumbnail { jpeg: true, .. } => PacketDiscriminator::ThumbnailJpeg as u8,
+            Packet::Thumbnail { against_previous: false, .. } => PacketDiscriminator::Thumbnail as u8,
+            Packet::Thumbnail { against_previous: true, .. } => PacketDiscriminator::ThumbnailAgainstPrevious as u8
         }
     }
 }
@@ -529,7 +537,8 @@ impl PacketIO<'_> for Packet {
                 commands.extend(uncompressed_len.write_packet_instructions());
                 commands.extend(frame_len.write_packet_instructions());
             },
-            Packet::Thumbnail { elapsed_frames, top_width, top_height, bottom_width, bottom_height, top, bottom } => {
+            // `against_previous` and `jpeg` are carried by the discriminator.
+            Packet::Thumbnail { elapsed_frames, top_width, top_height, bottom_width, bottom_height, top, bottom, .. } => {
                 commands.extend(elapsed_frames.write_packet_instructions());
                 commands.extend(top_width.write_packet_instructions());
                 commands.extend(top_height.write_packet_instructions());
@@ -613,14 +622,16 @@ impl PacketIO<'_> for Packet {
                 *from = rest;
                 Ok(Packet::StoredKeyframe { metadata, level, state_len, uncompressed_len, frame_len, frame_offset: 0 })
             },
-            PacketDiscriminator::Thumbnail => Ok(Packet::Thumbnail {
+            PacketDiscriminator::Thumbnail | PacketDiscriminator::ThumbnailAgainstPrevious | PacketDiscriminator::ThumbnailJpeg => Ok(Packet::Thumbnail {
                 elapsed_frames: UnsignedInteger::read_all(from, version)?,
                 top_width: UnsignedInteger::read_all(from, version)?,
                 top_height: UnsignedInteger::read_all(from, version)?,
                 bottom_width: UnsignedInteger::read_all(from, version)?,
                 bottom_height: UnsignedInteger::read_all(from, version)?,
                 top: ByteVec::read_all(from, version)?,
-                bottom: ByteVec::read_all(from, version)?
+                bottom: ByteVec::read_all(from, version)?,
+                against_previous: t == PacketDiscriminator::ThumbnailAgainstPrevious,
+                jpeg: t == PacketDiscriminator::ThumbnailJpeg
             }),
             PacketDiscriminator::Bookmark => Ok(Packet::Bookmark { metadata: BookmarkMetadata::read_all(from, version)? }),
             PacketDiscriminator::BookmarkTable => Ok(Packet::BookmarkTable { table: crate::BookmarkTable::read_all(from, version)? }),
@@ -809,8 +820,19 @@ mod tests {
 
     #[test]
     fn thumbnail_round_trips() {
-        let packet = Packet::Thumbnail { elapsed_frames: 600, top_width: 200, top_height: 120, bottom_width: 160, bottom_height: 120, top: bv(&[1, 2, 3]), bottom: bv(&[4, 5]) };
+        let packet = Packet::Thumbnail { elapsed_frames: 600, top_width: 200, top_height: 120, bottom_width: 160, bottom_height: 120, top: bv(&[1, 2, 3]), bottom: bv(&[4, 5]), against_previous: false, jpeg: false };
         assert_eq!(serialize(&packet)[0], PacketDiscriminator::Thumbnail as u8);
+        assert_eq!(round_trip(&packet, REPLAY_VERSION), packet);
+
+        // Against the previous picture; an unchanged screen is empty.
+        let packet = Packet::Thumbnail { elapsed_frames: 660, top_width: 200, top_height: 120, bottom_width: 160, bottom_height: 120, top: bv(&[7]), bottom: bv(&[]), against_previous: true, jpeg: false };
+        assert_eq!(serialize(&packet)[0], PacketDiscriminator::ThumbnailAgainstPrevious as u8);
+        let round = Packet::read_all(&mut serialize(&packet).as_slice(), crate::replay_file::REPLAY_VERSION_NINTENDO_3DS).unwrap();
+        assert_eq!(round, packet);
+        let packet = Packet::Thumbnail { elapsed_frames: 720, top_width: 200, top_height: 120, bottom_width: 160, bottom_height: 120, top: bv(&[0xFF, 0xD8]), bottom: bv(&[0xFF, 0xD8, 1]), against_previous: false, jpeg: true };
+        assert_eq!(serialize(&packet)[0], PacketDiscriminator::ThumbnailJpeg as u8);
+        let round = Packet::read_all(&mut serialize(&packet).as_slice(), crate::replay_file::REPLAY_VERSION_NINTENDO_3DS).unwrap();
+        assert_eq!(round, packet);
         assert_eq!(round_trip(&packet, REPLAY_VERSION), packet);
     }
 
@@ -876,7 +898,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xFD, 0, 0];
+        let mut slice: &[u8] = &[0xEE, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 

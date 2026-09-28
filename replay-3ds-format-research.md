@@ -1,5 +1,15 @@
 # 3DS replay format: what else can be squeezed out (research, 2026-09-26)
 
+> **Status (2026-09-26, later): all six items of §8 are implemented** as format v9 plus player
+> and seek changes; `replay-3ds-spec.md` §8 has what was built and the numbers measured on the
+> same 2-hour file (684 MB as v8 → 241 MB converted to v9; random seeks rebuild their keyframe
+> ~10x faster). History (§2.2, §7) was not implemented: ROM references came first as planned, and
+> the live recorder's ROM copies come from Azahar's own read log rather than a scan.
+>
+> **Later the same day: format v10** leaves out the VRAM pages the GPU rewrites (41% of every
+> keyframe) and stores timeline pictures as JPEG; `replay-3ds-spec.md` §9 has the measurements on
+> the user's Omega Ruby recording (487 MB as recorded).
+
 Question: how far can the Nintendo 3DS replay format (v8, `replay-3ds-spec.md` §7) go on file
 size, timeline (seek) speed and keyframe generation cost?
 

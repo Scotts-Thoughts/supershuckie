@@ -24,3 +24,4 @@ melonds-rs = { workspace = true, features = ["link-cores"] }
 mgba-rs = { workspace = true, features = ["link-cores"] }
 azahar-rs = { workspace = true, features = ["link-cores"] }
 zstd-sys = { workspace = true }
+memmap2 = "0.9"

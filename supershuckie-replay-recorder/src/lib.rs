@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod replay_file;
 pub mod keyframe_masks;
 pub mod bookmarks;
+pub mod thumbnail_jpeg;
 
 mod packet;
 mod util;

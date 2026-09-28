@@ -12,8 +12,9 @@ use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use crate::replay_file::bookmark_section::{decode_bookmark_section, BookmarkSectionError};
-use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION};
-use crate::util::decompress_data_with_prefix;
+use crate::replay_file::stored_keyframe::{split_payload_v8, split_payload_v9, RomBytes};
+use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION, REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES, REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM};
+use crate::util::decompress_into_with_prefix;
 use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, BookmarkTable, ByteVec, KeyframeMetadata, Packet, PacketDiscriminator, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
 use crate::util::{decompress_data, launder_reference, region_diff_touches, BlobDecoder};
 use crate::keyframe_masks::transient_ranges;
@@ -55,6 +56,10 @@ pub struct ReplayFilePlayer {
     chain: ChainState,
     /// The file's bytes, kept for 3DS files whose keyframe frames are read on demand.
     source: Option<Arc<dyn AsRef<[u8]> + Send + Sync>>,
+    /// 3DS files: every `StoredKeyframe` of the top-level list, in stream order.
+    stored_keyframes: Vec<StoredKeyframeInfo>,
+    /// The game's ROM, which format-v9 3DS keyframes copy bytes from (see [`Self::set_rom`]).
+    rom: Option<RomBytes>,
     /// Set by a seek: the next stored keyframe handed out must be materialised even when
     /// keyframe states are not wanted (the seek's caller reads `current_keyframe_state`). A
     /// stored keyframe met in a plain sequential read is otherwise left alone: materialising a
@@ -63,11 +68,16 @@ pub struct ReplayFilePlayer {
     materialise_next: bool,
     /// `(frame, top-level packet index)` of every [`Packet::Thumbnail`], in frame order.
     thumbnails: Vec<(UnsignedInteger, usize)>,
+    /// The last picture [`Self::thumbnail_at_or_before`] decoded (index into `thumbnails`), the
+    /// starting point of the next one in its group.
+    thumbnail_cache: spin::Mutex<Option<(usize, [(u32, u32, Vec<u8>); 2])>>,
     /// The packet most recently handed out by [`Self::next_packet`] when it was not a reference
     /// into the top-level list: a packet parsed out of a blob, or a materialised keyframe.
     scratch: Option<Packet>,
     /// See [`Self::set_keyframe_states_wanted`].
     keyframe_states_wanted: bool,
+    /// See [`Self::set_materialise_every_keyframe`].
+    materialise_every_keyframe: bool,
     /// See [`Self::current_keyframe_has_stale_transients`].
     keyframe_transients_stale: bool,
 
@@ -121,13 +131,73 @@ struct ChainState {
     /// Whether a region delta may change the state's length (3DS files only; see
     /// `region_diff_resizing`).
     resizing: bool,
-    /// 3DS files (`StoredKeyframe`): the state after the most recent keyframe of level `<= i`,
-    /// with its list position and decoded delta payload (the zstd prefix of the next level-`i`
-    /// delta). Shared between levels when one keyframe set several of them.
-    levels: [Option<LevelState>; 3],
-    /// 3DS files: the materialised state of the last folded keyframe (`levels[2]`'s), which
-    /// stands in for `state`.
-    stored_state: Option<Arc<Vec<u8>>>,
+    /// 3DS files (`StoredKeyframe`): see [`StoredBuffers`].
+    stored: StoredBuffers,
+}
+
+/// A `StoredKeyframe` of a 3DS file (see `ReplayFilePlayer::stored_keyframes`).
+#[derive(Copy, Clone, Debug)]
+struct StoredKeyframeInfo {
+    /// Index in the top-level packet list.
+    packet: usize,
+    level: u8,
+    /// The keyframe (index into the stored-keyframe list) a delta is against: the most recent
+    /// keyframe of a level at most its own. `None` for a full keyframe, or a delta without one.
+    reference: Option<usize>,
+}
+
+/// The working states of a 3DS file's keyframe chain: one buffer per level, each holding the
+/// materialised state of one keyframe (or nothing), reused from seek to seek.
+///
+/// A level-`l` keyframe is always materialised into buffer `l`: a full keyframe is decoded into
+/// buffer 0; a delta is applied in place when its reference keyframe is the one buffer `l` holds
+/// (walking forward along a level), and otherwise its reference's buffer is copied into buffer
+/// `l` first (a walk branching off the level below). A 150 MB state is then copied once per level
+/// per walk rather than once per step: a step is its decode plus the in-place apply, 1–5 ms
+/// instead of ~75 ms (`replay-3ds-format-research.md` §4). Any buffer's keyframe can be reused by
+/// a later seek, so seeking back and forth near one spot re-walks only a few steps.
+#[derive(Default)]
+struct StoredBuffers {
+    states: [Vec<u8>; 3],
+    /// Which stored keyframe (index into `ReplayFilePlayer::stored_keyframes`) each buffer holds.
+    holds: [Option<usize>; 3],
+    /// Format v8: the decoded payload of the keyframe each buffer holds (the zstd prefix of a
+    /// delta against it; empty for a full keyframe). Format v9 deltas use the state instead.
+    payloads: [Vec<u8>; 3],
+    /// The buffer holding the keyframe folded last.
+    current: Option<usize>,
+    /// A delta's decoded payload, and (v9) its data stream with the ROM copies spliced in.
+    payload: Vec<u8>,
+    data: Vec<u8>,
+}
+
+/// Room a 3DS state buffer is given past the state's length: Azahar's raw states drift by a few
+/// bytes from keyframe to keyframe, and growing a 150 MB `Vec` by a byte must not reallocate it.
+const STORED_STATE_SLACK: usize = 1 << 20;
+
+/// Make `buffer` able to hold `len` bytes without growing again for a while.
+fn reserve_state(buffer: &mut Vec<u8>, len: usize) -> Result<(), ReplayFileReadError> {
+    if buffer.capacity() < len {
+        buffer.try_reserve_exact(len + STORED_STATE_SLACK - buffer.len())
+            .map_err(|_| ReplayFileReadError::Other { explanation: Cow::Borrowed("failed to allocate RAM for a 3DS keyframe state") })?;
+    }
+    Ok(())
+}
+
+impl StoredBuffers {
+    /// The buffer holding stored keyframe `k`, if any.
+    fn holding(&self, k: usize) -> Option<usize> {
+        (0..3).find(|&b| self.holds[b] == Some(k))
+    }
+
+    /// Forget whatever buffer `b` held (its bytes are about to change or failed to).
+    fn drop_buffer(&mut self, b: usize) {
+        self.holds[b] = None;
+        self.payloads[b].clear();
+        if self.current == Some(b) {
+            self.current = None;
+        }
+    }
 }
 
 /// A decoded [`Packet::Thumbnail`]: `(width, height, RGB565 pixels)` for each screen.
@@ -139,14 +209,6 @@ pub struct ReplayThumbnail {
     pub top: (u32, u32, Vec<u8>),
     #[allow(missing_docs)]
     pub bottom: (u32, u32, Vec<u8>),
-}
-
-/// See `ChainState::levels`.
-#[derive(Clone)]
-struct LevelState {
-    position: usize,
-    state: Arc<Vec<u8>>,
-    payload: Arc<Vec<u8>>,
 }
 
 fn is_keyframe_class(packet: &Packet) -> bool {
@@ -165,14 +227,14 @@ fn keyframe_metadata(packet: &Packet) -> Option<&KeyframeMetadata> {
 }
 
 impl ChainState {
-    const fn new(resizing: bool) -> Self {
-        Self { list: None, last_applied: None, state: Vec::new(), folds: 0, resizing, levels: [None, None, None], stored_state: None }
+    fn new(resizing: bool) -> Self {
+        Self { list: None, last_applied: None, state: Vec::new(), folds: 0, resizing, stored: StoredBuffers::default() }
     }
 
     /// The materialised state of the last folded keyframe.
     fn current(&self) -> &[u8] {
-        match &self.stored_state {
-            Some(state) => state.as_slice(),
+        match self.stored.current {
+            Some(b) => self.stored.states[b].as_slice(),
             None => self.state.as_slice()
         }
     }
@@ -182,7 +244,7 @@ impl ChainState {
     }
 
     fn set_full(&mut self, list: ListId, position: usize, state: &[u8]) {
-        self.stored_state = None;
+        self.stored.current = None;
         self.state.clear();
         self.state.extend_from_slice(state);
         self.list = Some(list);
@@ -199,67 +261,12 @@ impl ChainState {
 
     /// Fold `packet`, which sits at `position` of `list`, into the chain (a no-op for
     /// non-keyframe packets). `predecessor_held` is [`Self::holds_predecessor_of`] for that
-    /// position; a delta whose predecessor is not held cannot be applied.
-    fn fold(&mut self, list: ListId, position: usize, packet: &Packet, predecessor_held: bool, source: Option<&[u8]>) -> Result<(), ReplayFileReadError> {
+    /// position; a delta whose predecessor is not held cannot be applied. 3DS keyframes are folded
+    /// by `ReplayFilePlayer::fold_stored` instead.
+    fn fold(&mut self, list: ListId, position: usize, packet: &Packet, predecessor_held: bool) -> Result<(), ReplayFileReadError> {
         match packet {
             Packet::Keyframe { state, .. } => {
                 self.set_full(list, position, state.as_slice());
-            },
-
-            Packet::StoredKeyframe { level, state_len, uncompressed_len, frame_len, frame_offset, .. } => {
-                let level = usize::from(*level);
-                if level > 2 {
-                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("3DS keyframe has an unknown level") });
-                }
-                let Some(source) = source else {
-                    return Err(ReplayFileReadError::Other { explanation: Cow::Borrowed("3DS keyframe data is not available: the replay file is not kept open") });
-                };
-                let broken = |what: &'static str| ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed(what) };
-                let start = usize::try_from(*frame_offset).map_err(|_| broken("3DS keyframe offset does not fit"))?;
-                let len = usize::try_from(*frame_len).map_err(|_| broken("3DS keyframe length does not fit"))?;
-                let frame = start.checked_add(len).and_then(|end| source.get(start..end)).ok_or_else(|| broken("3DS keyframe frame is outside the file"))?;
-                let uncompressed = usize::try_from(*uncompressed_len).map_err(|_| broken("3DS keyframe uncompressed length does not fit"))?;
-                let wanted = usize::try_from(*state_len).map_err(|_| broken("3DS keyframe state length does not fit"))?;
-                let decode_error = |e: Cow<'static, str>| ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("3DS keyframe failed to decode: {e}")) };
-
-                if level == 0 {
-                    let state = decompress_data_with_prefix(frame, uncompressed, &[]).map_err(decode_error)?;
-                    if state.len() != wanted {
-                        return Err(broken("3DS full keyframe length disagrees with its state length"));
-                    }
-                    let state = Arc::new(state);
-                    let payload = Arc::new(Vec::new());
-                    for m in 0..3 {
-                        self.levels[m] = Some(LevelState { position, state: state.clone(), payload: payload.clone() });
-                    }
-                }
-                else {
-                    if !predecessor_held {
-                        return Err(broken("3DS delta keyframe's reference keyframe is not in its chain"));
-                    }
-                    let reference = self.levels[level].clone().ok_or_else(|| broken("3DS delta keyframe has no reference keyframe"))?;
-                    let payload = decompress_data_with_prefix(frame, uncompressed, &reference.payload).map_err(decode_error)?;
-                    let (control_len, rest) = payload.split_at_checked(8).ok_or_else(|| broken("3DS delta payload is too short"))?;
-                    let control_len = usize::try_from(u64::from_le_bytes(control_len.try_into().expect("8 bytes"))).map_err(|_| broken("3DS delta control length does not fit"))?;
-                    let (control, data) = rest.split_at_checked(control_len).ok_or_else(|| broken("3DS delta control stream is truncated"))?;
-                    let mut state: Vec<u8> = (*reference.state).clone();
-                    if wanted > state.len().saturating_mul(2).max(1 << 20) {
-                        return Err(broken("3DS delta keyframe state length is implausible"));
-                    }
-                    state.resize(wanted, 0);
-                    if !apply_region_diff_in_place(state.as_mut_slice(), control, data) {
-                        return Err(broken("3DS delta keyframe failed to apply"));
-                    }
-                    let state = Arc::new(state);
-                    let payload = Arc::new(payload);
-                    for m in level..3 {
-                        self.levels[m] = Some(LevelState { position, state: state.clone(), payload: payload.clone() });
-                    }
-                }
-                self.stored_state = self.levels[2].as_ref().map(|l| l.state.clone());
-                self.list = Some(list);
-                self.last_applied = Some(position);
-                self.folds += 1;
             },
 
             Packet::DeltaKeyframe { diff, .. } => {
@@ -622,6 +629,10 @@ impl ReplayFilePlayer {
         }
 
         let mut thumbnails = Vec::new();
+        let mut stored_keyframes: Vec<StoredKeyframeInfo> = Vec::new();
+        // The most recent stored keyframe of a level at most `m`: what a level-`m` delta is
+        // against.
+        let mut latest_at_most: [Option<usize>; 3] = [None; 3];
         #[cfg(feature = "std")]
         let mut compressed_blobs_decompressing = BTreeMap::new();
         let mut decoded_blobs = BTreeMap::new();
@@ -662,10 +673,19 @@ impl ReplayFilePlayer {
                     total_frame_count = *elapsed_frames_end;
                     total_millis = timestamp_end.0;
                 },
+                Packet::StoredKeyframe { metadata, level, .. } => {
+                    add_keyframe!(metadata);
+                    let k = stored_keyframes.len();
+                    let level_index = usize::from(*level).min(2);
+                    let reference = if *level == 0 { None } else { latest_at_most[level_index] };
+                    stored_keyframes.push(StoredKeyframeInfo { packet: packet_index, level: *level, reference });
+                    for latest in &mut latest_at_most[level_index..] {
+                        *latest = Some(k);
+                    }
+                },
                 Packet::Keyframe { metadata, .. }
                 | Packet::DeltaKeyframe { metadata, .. }
-                | Packet::RegionDeltaKeyframe { metadata, .. }
-                | Packet::StoredKeyframe { metadata, .. } => {
+                | Packet::RegionDeltaKeyframe { metadata, .. } => {
                     add_keyframe!(metadata);
                 },
                 Packet::NextFrame { timestamp_delta } => {
@@ -716,8 +736,11 @@ impl ReplayFilePlayer {
             patch_data,
             chain: ChainState::new(replay_file_metadata.console_type == ReplayConsoleType::Nintendo3DS),
             source,
+            stored_keyframes,
+            rom: None,
             materialise_next: false,
             thumbnails,
+            thumbnail_cache: spin::Mutex::new(None),
             replay_file_metadata,
             keyframes: unsafe { transmute::<KeyframeMap, KeyframeMap<'static>>(all_keyframes) },
             legacy_bookmarks: unsafe { transmute::<BookmarkMap, BookmarkMap<'static>>(all_bookmarks) },
@@ -738,6 +761,7 @@ impl ReplayFilePlayer {
             header_raw: *header_raw,
             scratch: None,
             keyframe_states_wanted: true,
+            materialise_every_keyframe: false,
             keyframe_transients_stale: false,
 
             #[cfg(feature = "std")]
@@ -774,6 +798,20 @@ impl ReplayFilePlayer {
         self.threading = true;
     }
 
+    /// Give the player the game's ROM file. Format-v9 Nintendo 3DS replays copy bytes from it
+    /// into their keyframes (see `stored_keyframe`); without it, seeking to such a keyframe
+    /// fails. The ROM must be the one the header's checksum names.
+    pub fn set_rom(&mut self, rom: RomBytes) {
+        self.rom = Some(rom);
+    }
+
+    /// Whether this file needs [`Self::set_rom`] to materialise its keyframes (a format-v9
+    /// Nintendo 3DS file; whether a given keyframe actually copies from the ROM is only known
+    /// once it is decoded).
+    pub fn wants_rom(&self) -> bool {
+        !self.stored_keyframes.is_empty() && self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES
+    }
+
     /// Choose whether the [`Packet::Keyframe`] returned for a delta keyframe carries a copy of
     /// the reconstructed state (`true`, the default) or an empty `state` (`false`).
     ///
@@ -785,9 +823,18 @@ impl ReplayFilePlayer {
         self.keyframe_states_wanted = wanted;
     }
 
+    /// Make a straight read materialise every Nintendo 3DS keyframe it passes even when keyframe
+    /// states are not wanted (see [`Self::set_keyframe_states_wanted`]), so that
+    /// [`Self::current_keyframe_state`] is always the keyframe just handed out. Off by default:
+    /// playback materialises a 3DS keyframe only when it seeks to it.
+    pub fn set_materialise_every_keyframe(&mut self, materialise: bool) {
+        self.materialise_every_keyframe = materialise;
+    }
+
     /// The full state of the keyframe-class packet most recently returned by
     /// [`Self::next_packet`], regardless of [`Self::set_keyframe_states_wanted`]. Empty before
-    /// the first keyframe.
+    /// the first keyframe. After a Nintendo 3DS keyframe that a straight read did not materialise
+    /// (see [`Self::set_materialise_every_keyframe`]), it is an earlier keyframe's state.
     pub fn current_keyframe_state(&self) -> &[u8] {
         self.chain.current()
     }
@@ -915,6 +962,28 @@ impl ReplayFilePlayer {
         }
     }
 
+    /// Nintendo 3DS files: the top-level index of the keyframe [`Self::go_to_keyframe`] uses for
+    /// `keyframe_frames_index` (resume copies everything before it verbatim).
+    pub(crate) fn stored_keyframe_packet_index(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<usize, ReplaySeekError> {
+        match self.locate_keyframe(keyframe_frames_index)? {
+            (ListId::TopLevel, index) => Ok(index),
+            _ => Err(ReplaySeekError::ReadError { error: ReplayFileReadError::Other { explanation: Cow::Borrowed("keyframe is in a blob") } })
+        }
+    }
+
+    /// The bytes that follow the top-level packet at `index` in the file: a `StoredKeyframe`'s
+    /// zstd frame, empty for any other packet.
+    pub(crate) fn stored_frame_bytes(&self, index: usize) -> Result<&[u8], ReplayFileReadError> {
+        let Packet::StoredKeyframe { frame_len, frame_offset, .. } = &self.all_uncompressed_packets[index] else {
+            return Ok(&[]);
+        };
+        let source: &[u8] = self.source.as_ref().map(|s| (**s).as_ref()).unwrap_or(&[]);
+        usize::try_from(*frame_offset).ok()
+            .zip(usize::try_from(*frame_len).ok())
+            .and_then(|(start, len)| source.get(start..start.checked_add(len)?))
+            .ok_or(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("3DS keyframe frame is outside the file") })
+    }
+
     /// Find the list and position of the last keyframe-class packet on the given frame.
     fn locate_keyframe(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<(ListId, usize), ReplaySeekError> {
         if self.keyframes.get(&keyframe_frames_index).is_none() {
@@ -984,7 +1053,7 @@ impl ReplayFilePlayer {
             ListId::TopLevel => {
                 let packets = self.all_uncompressed_packets.clone();
                 if matches!(packets[target], Packet::StoredKeyframe { .. }) {
-                    return self.fast_forward_stored_chain(&packets, target);
+                    return self.fast_forward_stored_chain(target);
                 }
                 let Some(restart) = packets[..=target].iter().rposition(|p| matches!(p, Packet::Keyframe { .. })) else {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe with no full keyframe before it") })
@@ -1044,45 +1113,145 @@ impl ReplayFilePlayer {
         Ok(())
     }
 
-    /// The 3DS chain to the keyframe just before `target`: the last level-0 keyframe at or
-    /// before it, the level-1 keyframes after that, then the level-2 keyframes after the last of
-    /// those. Whatever the chain already holds of that walk is kept (a level's state is
-    /// current for the walk when the level below it is at the walk's own start).
-    fn fast_forward_stored_chain(&mut self, packets: &[Packet], target: usize) -> Result<(), ReplayFileReadError> {
-        let list = ListId::TopLevel;
-        let level_of = |i: usize| match &packets[i] { Packet::StoredKeyframe { level, .. } => Some(*level), _ => None };
-        let Some(restart) = (0..=target).rev().find(|&i| level_of(i) == Some(0)) else {
-            return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("3DS delta keyframe with no full keyframe before it") })
-        };
-        let level1: Vec<usize> = (restart + 1..target).filter(|&i| level_of(i) == Some(1)).collect();
-        let last_level1 = level1.last().copied().unwrap_or(restart);
-        let level2: Vec<usize> = (last_level1 + 1..target).filter(|&i| level_of(i) == Some(2)).collect();
+    /// Materialise the keyframe the 3DS keyframe at top-level index `target` is a delta against
+    /// (nothing for a full keyframe), so that folding `target` itself is one more step.
+    fn fast_forward_stored_chain(&mut self, target: usize) -> Result<(), ReplayFileReadError> {
+        let k = self.stored_index_of(target)?;
+        if self.chain.stored.holding(k).is_some() {
+            return Ok(()); // folding it just selects its buffer
+        }
+        match self.stored_keyframes[k].reference {
+            Some(reference) if self.stored_keyframes[k].level > 0 => self.fold_stored(reference),
+            _ => Ok(())
+        }
+    }
 
-        let held_at = |chain: &ChainState, level: usize, position: usize| chain.list == Some(list) && chain.levels[level].as_ref().is_some_and(|l| l.position == position);
-        if !held_at(&self.chain, 0, restart) {
-            self.fold_top_level(packets, restart)?;
+    /// The index in `stored_keyframes` of the `StoredKeyframe` at top-level index `packet`.
+    fn stored_index_of(&self, packet: usize) -> Result<usize, ReplayFileReadError> {
+        self.stored_keyframes.binary_search_by_key(&packet, |info| info.packet)
+            .map_err(|_| ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("3DS keyframe is not in the keyframe list") })
+    }
+
+    /// Make stored keyframe `k` the chain's current keyframe: a buffer that already holds it is
+    /// simply selected; otherwise its references are followed back to the nearest keyframe some
+    /// buffer holds (or to the full keyframe that starts its chain), and the keyframes from there
+    /// on are materialised in order.
+    fn fold_stored(&mut self, k: usize) -> Result<(), ReplayFileReadError> {
+        let broken = |what: &'static str| ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed(what) };
+        let mut walk = Vec::new();
+        let mut next = Some(k);
+        while let Some(at) = next {
+            if self.chain.stored.holding(at).is_some() {
+                break;
+            }
+            walk.push(at);
+            let info = self.stored_keyframes[at];
+            if info.level == 0 {
+                break;
+            }
+            next = Some(info.reference.ok_or_else(|| broken("3DS delta keyframe with no keyframe before it to apply to"))?);
         }
-        // Walking a level's chain from its start (a backward seek, or a segment the chain never
-        // walked) begins from the state of the level below: that is what its first delta
-        // references.
-        let start1 = level1.iter().rposition(|&p| held_at(&self.chain, 1, p)).map_or(0, |i| i + 1);
-        if start1 == 0 {
-            self.chain.levels[1] = self.chain.levels[0].clone();
+        for &at in walk.iter().rev() {
+            self.materialise_stored(at)?;
         }
-        for &p in &level1[start1..] {
-            self.fold_top_level(packets, p)?;
-        }
-        let start2 = if held_at(&self.chain, 1, last_level1) {
-            level2.iter().rposition(|&p| held_at(&self.chain, 2, p)).map_or(0, |i| i + 1)
-        } else {
-            0
+        let b = self.chain.stored.holding(k).expect("just materialised");
+        self.chain.stored.current = Some(b);
+        self.chain.list = Some(ListId::TopLevel);
+        self.chain.last_applied = Some(self.stored_keyframes[k].packet);
+        Ok(())
+    }
+
+    /// Decode stored keyframe `k` into buffer `level`: a full keyframe on its own, a delta on top
+    /// of its reference keyframe, which a buffer must hold.
+    fn materialise_stored(&mut self, k: usize) -> Result<(), ReplayFileReadError> {
+        let broken = |what: &'static str| ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed(what) };
+        let decode_error = |e: Cow<'static, str>| ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("3DS keyframe failed to decode: {e}")) };
+        let info = self.stored_keyframes[k];
+        let Packet::StoredKeyframe { level, state_len, uncompressed_len, frame_len, frame_offset, .. } = &self.all_uncompressed_packets[info.packet] else {
+            return Err(broken("3DS keyframe list is out of step with the packets"));
         };
-        if start2 == 0 {
-            self.chain.levels[2] = self.chain.levels[1].clone();
+        let level = usize::from(*level);
+        if level > 2 {
+            return Err(broken("3DS keyframe has an unknown level"));
         }
-        for &p in &level2[start2..] {
-            self.fold_top_level(packets, p)?;
+        let Some(source) = self.source.as_ref() else {
+            return Err(ReplayFileReadError::Other { explanation: Cow::Borrowed("3DS keyframe data is not available: the replay file is not kept open") });
+        };
+        let source: &[u8] = (**source).as_ref();
+        let start = usize::try_from(*frame_offset).map_err(|_| broken("3DS keyframe offset does not fit"))?;
+        let len = usize::try_from(*frame_len).map_err(|_| broken("3DS keyframe length does not fit"))?;
+        let frame = start.checked_add(len).and_then(|end| source.get(start..end)).ok_or_else(|| broken("3DS keyframe frame is outside the file"))?;
+        let uncompressed = usize::try_from(*uncompressed_len).map_err(|_| broken("3DS keyframe uncompressed length does not fit"))?;
+        let wanted = usize::try_from(*state_len).map_err(|_| broken("3DS keyframe state length does not fit"))?;
+        let v9 = self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES;
+        let rom = self.rom.as_ref().map(|rom| (**rom).as_ref());
+        let chain = &mut self.chain;
+        let stored = &mut chain.stored;
+
+        if level == 0 {
+            stored.drop_buffer(0);
+            reserve_state(&mut stored.states[0], uncompressed)?;
+            decompress_into_with_prefix(frame, uncompressed, &[], &mut stored.states[0]).map_err(decode_error)?;
+            if stored.states[0].len() != wanted {
+                return Err(broken("3DS full keyframe length disagrees with its state length"));
+            }
+            stored.holds[0] = Some(k);
+            stored.current = Some(0);
+            chain.folds += 1;
+            return Ok(());
         }
+
+        let reference = info.reference.ok_or_else(|| broken("3DS delta keyframe with no keyframe before it to apply to"))?;
+        let from = stored.holding(reference).ok_or_else(|| broken("3DS delta keyframe's reference keyframe is not in its chain"))?;
+        if wanted > stored.states[from].len().saturating_mul(2).max(1 << 20) {
+            return Err(broken("3DS delta keyframe state length is implausible"));
+        }
+
+        // Decode the payload against the reference (its state in v9, its payload in v8). The
+        // target buffer is untouched until the payload decoded.
+        let StoredBuffers { states, payloads, payload, data, .. } = &mut *stored;
+        let prefix: &[u8] = if v9 { &states[from] } else { &payloads[from] };
+        decompress_into_with_prefix(frame, uncompressed, prefix, payload).map_err(decode_error)?;
+        let control_len = if v9 {
+            let parts = split_payload_v9(payload).map_err(broken)?;
+            parts.data_into(rom, data).map_err(decode_error)?;
+            parts.control.len()
+        } else {
+            let (control, delta_data) = split_payload_v8(payload).map_err(broken)?;
+            data.clear();
+            data.extend_from_slice(delta_data);
+            control.len()
+        };
+        // Both payload layouts put the control stream at a fixed offset.
+        let control_start = if v9 { 16 } else { 8 };
+
+        stored.drop_buffer(level);
+        let StoredBuffers { states, payloads, payload, data, .. } = &mut *stored;
+        // Branching off another buffer: start from a copy of the reference.
+        if from != level {
+            let (source_state, target_state) = if from < level {
+                let (low, high) = states.split_at_mut(level);
+                (&low[from], &mut high[0])
+            } else {
+                let (low, high) = states.split_at_mut(from);
+                (&high[0], &mut low[level])
+            };
+            reserve_state(target_state, source_state.len().max(wanted))?;
+            target_state.clear();
+            target_state.extend_from_slice(source_state);
+        }
+        reserve_state(&mut states[level], wanted)?;
+        states[level].resize(wanted, 0);
+        let control = &payload[control_start..control_start + control_len];
+        if !apply_region_diff_in_place(states[level].as_mut_slice(), control, data) {
+            return Err(broken("3DS delta keyframe failed to apply"));
+        }
+        if !v9 {
+            core::mem::swap(&mut payloads[level], payload);
+        }
+        stored.holds[level] = Some(k);
+        stored.current = Some(level);
+        chain.folds += 1;
         Ok(())
     }
 
@@ -1090,20 +1259,16 @@ impl ReplayFilePlayer {
     fn fold_top_level(&mut self, packets: &[Packet], index: usize) -> Result<(), ReplayFileReadError> {
         let list = ListId::TopLevel;
         let packet = &packets[index];
+        if matches!(packet, Packet::StoredKeyframe { .. }) {
+            let k = self.stored_index_of(index)?;
+            return self.fold_stored(k);
+        }
         if !is_keyframe_class(packet) || self.chain.is_at(list, index) {
             // Nothing to fold, or a repeated seek to the same delta finds it already folded.
             return Ok(());
         }
-        let held = match packet {
-            // A 3DS delta's reference is the most recent keyframe of a level at most its own.
-            Packet::StoredKeyframe { level, .. } if *level > 0 => {
-                let reference = (0..index).rev().find(|&i| matches!(&packets[i], Packet::StoredKeyframe { level: l, .. } if l <= level));
-                self.chain.list == Some(list) && self.chain.levels[usize::from(*level)].as_ref().is_some_and(|l| Some(l.position) == reference)
-            },
-            _ => self.chain.holds_predecessor_of(list, index, |a, b| packets[a + 1..b].iter().any(is_keyframe_class))
-        };
-        let source = self.source.clone();
-        self.chain.fold(list, index, packet, held, source.as_deref().map(|s| s.as_ref()))
+        let held = self.chain.holds_predecessor_of(list, index, |a, b| packets[a + 1..b].iter().any(is_keyframe_class));
+        self.chain.fold(list, index, packet, held)
     }
 
     /// Parse the packet at byte `offset` of the blob at `top_index`, fold it into the chain if it
@@ -1121,7 +1286,7 @@ impl ReplayFilePlayer {
             // A repeated seek to the same delta finds it already folded.
             if !self.chain.is_at(list, offset) {
                 let held = self.chain.holds_predecessor_of(list, offset, |a, b| blob.keyframe_between(a, b));
-                self.chain.fold(list, offset, &packet, held, None)?;
+                self.chain.fold(list, offset, &packet, held)?;
             }
         }
 
@@ -1209,25 +1374,78 @@ impl ReplayFilePlayer {
     }
 
     /// The timeline picture nearest at or before `frame`, decoded.
+    ///
+    /// A picture stored against the one before it (format v9) is decoded from the start of its
+    /// group, or from the last picture this returned when that is on the way (a drag moving
+    /// forward decodes one picture per step).
     pub fn thumbnail_at_or_before(&self, frame: UnsignedInteger) -> Option<ReplayThumbnail> {
         let at = self.thumbnails.partition_point(|&(f, _)| f <= frame).checked_sub(1)?;
-        let (thumb_frame, index) = self.thumbnails[at];
-        let Packet::Thumbnail { top_width, top_height, bottom_width, bottom_height, top, bottom, .. } = &self.all_uncompressed_packets[index] else {
+        let mut cache = self.thumbnail_cache.lock();
+
+        // Walk back to a picture that decodes on its own, or to the one the cache holds.
+        let mut first = at;
+        let mut pictures: Option<[(u32, u32, Vec<u8>); 2]> = None;
+        loop {
+            if let Some((cached, cached_pictures)) = cache.as_ref() && *cached == first {
+                if first == at {
+                    return Some(ReplayThumbnail { frame: self.thumbnails[at].0, top: cached_pictures[0].clone(), bottom: cached_pictures[1].clone() });
+                }
+                pictures = Some(cached_pictures.clone());
+                first += 1;
+                break;
+            }
+            let Packet::Thumbnail { against_previous, .. } = &self.all_uncompressed_packets[self.thumbnails[first].1] else {
+                return None;
+            };
+            if !against_previous {
+                break;
+            }
+            // A picture against a previous one needs one, and groups are bounded.
+            if first == 0 || at - first > 4 * crate::replay_file::record::THUMBNAIL_GROUP as usize {
+                return None;
+            }
+            first -= 1;
+        }
+
+        for i in first..=at {
+            pictures = Some(self.decode_thumbnail(self.thumbnails[i].1, pictures.as_ref())?);
+        }
+        let pictures = pictures?;
+        let thumbnail = ReplayThumbnail { frame: self.thumbnails[at].0, top: pictures[0].clone(), bottom: pictures[1].clone() };
+        *cache = Some((at, pictures));
+        Some(thumbnail)
+    }
+
+    /// Decode the `Thumbnail` at top-level index `index`, given the pictures of the one before it
+    /// when it is stored against them.
+    fn decode_thumbnail(&self, index: usize, previous: Option<&[(u32, u32, Vec<u8>); 2]>) -> Option<[(u32, u32, Vec<u8>); 2]> {
+        let Packet::Thumbnail { top_width, top_height, bottom_width, bottom_height, top, bottom, against_previous, jpeg, .. } = &self.all_uncompressed_packets[index] else {
             return None;
         };
-        let decode = |w: UnsignedInteger, h: UnsignedInteger, data: &ByteVec| -> Option<(u32, u32, Vec<u8>)> {
+        let decode = |screen: usize, w: UnsignedInteger, h: UnsignedInteger, data: &ByteVec| -> Option<(u32, u32, Vec<u8>)> {
             let (w, h) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
             let len = usize::try_from(u64::from(w).checked_mul(u64::from(h))?.checked_mul(2)?).ok()?;
             if len == 0 || len > 16 << 20 {
                 return None;
             }
-            Some((w, h, crate::util::decompress_data(data.as_slice(), len).ok()?))
+            if *jpeg {
+                return Some((w, h, crate::thumbnail_jpeg::decode_to_rgb565(data.as_slice(), w, h)?));
+            }
+            if !against_previous {
+                return Some((w, h, crate::util::decompress_data(data.as_slice(), len).ok()?));
+            }
+            let previous = &previous?[screen];
+            if (previous.0, previous.1) != (w, h) {
+                return None;
+            }
+            if data.is_empty() {
+                return Some((w, h, previous.2.clone()));
+            }
+            let mut pixels = Vec::new();
+            decompress_into_with_prefix(data.as_slice(), len, &previous.2, &mut pixels).ok()?;
+            Some((w, h, pixels))
         };
-        Some(ReplayThumbnail {
-            frame: thumb_frame,
-            top: decode(*top_width, *top_height, top)?,
-            bottom: decode(*bottom_width, *bottom_height, bottom)?
-        })
+        Some([decode(0, *top_width, *top_height, top)?, decode(1, *bottom_width, *bottom_height, bottom)?])
     }
 
     /// Get the next packet in the stream.
@@ -1248,7 +1466,7 @@ impl ReplayFilePlayer {
             if !matches!(self.all_uncompressed_packets[packet_index], Packet::CompressedBlob { .. }) {
                 self.next_uncompressed_packet_index += 1;
                 let packets = self.all_uncompressed_packets.clone();
-                if matches!(packets[packet_index], Packet::StoredKeyframe { .. }) && !self.keyframe_states_wanted && !self.materialise_next {
+                if matches!(packets[packet_index], Packet::StoredKeyframe { .. }) && !self.keyframe_states_wanted && !self.materialise_next && !self.materialise_every_keyframe {
                     // Sequential playback past a 3DS keyframe: not materialised (see
                     // `materialise_next`); handed out with an empty state.
                     let metadata = keyframe_metadata(&packets[packet_index]).expect("stored keyframe").clone();
@@ -1299,6 +1517,9 @@ impl ReplayFilePlayer {
                     let ranges = transient_ranges(self.replay_file_metadata.console_type, self.chain.current());
                     !ranges.is_empty() && ranges.iter().all(|r| !region_diff_touches(control.as_slice(), r.start, r.end))
                 },
+                // A format-v10 Nintendo 3DS delta keyframe may leave the VRAM pages the GPU
+                // rewrites as its reference had them (see `stored_keyframe_mask_transients`).
+                Packet::StoredKeyframe { level, .. } => *level > 0 && self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM,
                 _ => false
             };
         }

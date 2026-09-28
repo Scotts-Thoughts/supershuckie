@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [features]
 default = ["std"]
-std = ["dep:memmap2"]
+std = ["dep:memmap2", "dep:jpeg-encoder", "dep:zune-jpeg"]
 # The offline `supershuckie-replay-convert` binary (kept as an alias of `std`).
 convert = ["std"]
 
@@ -18,6 +18,9 @@ spin = { workspace = true }
 zstd-sys = { workspace = true }
 blake3 = { workspace = true }
 memmap2 = { version = "0.9", optional = true }
+# Timeline pictures of Nintendo 3DS files (see `thumbnail_jpeg`).
+jpeg-encoder = { version = "0.6", optional = true }
+zune-jpeg = { version = "0.5", optional = true }
 
 [[bin]]
 name = "supershuckie-replay-convert"

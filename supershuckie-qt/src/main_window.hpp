@@ -79,7 +79,11 @@ public:
     MainWindow();
     ~MainWindow();
 
-    void load_rom(const std::filesystem::path &path);
+    /**
+     * Returns false only if the ROM failed to load (not if the user backed out first). The error is
+     * shown in a dialog unless `failure` is given, in which case it's stored there instead.
+     */
+    bool load_rom(const std::filesystem::path &path, QString *failure = nullptr);
     void load_rom(const char *path);
 
     /**
@@ -190,6 +194,8 @@ private:
     QMenu *game_boy_settings;
     QMenu *gbc_mode_items;
     NumberedAction *gbc_mode[3];
+    static const std::size_t N3DS_LANGUAGE_COUNT = 12;
+    NumberedAction *n3ds_language[N3DS_LANGUAGE_COUNT];
     QAction *gb_custom_colors;
     void set_game_boy_hardware_settings_enabled(bool enabled);
 
@@ -308,11 +314,17 @@ private:
     QList<QKeySequence> favorite_rom_shortcuts(const QString &path) const;
     void edit_favorite_rom_shortcut(const QString &path);
     void clear_favorite_rom_shortcut(const QString &path);
+    // Re-keys a favorite's saved keyboard shortcut after its ROM was pointed at another file.
+    void move_favorite_rom_shortcut(const QString &from, const QString &to);
     void open_shortcuts_dialog(const QString &focus_id = QString());
     void rebuild_nds_date_menu();
     void refresh_nds_date_preset_states();
     void apply_nds_date_preset(std::size_t index);
     bool is_nds_game_running();
+    bool is_n3ds_game_running();
+    // The date of the console whose game is running: the 3DS's in a 3DS game, else the DS's.
+    void get_running_console_date(SuperShuckieNintendoDSDate *date);
+    void open_date_dialog(bool for_3ds);
 
     void refresh_action_states();
     void set_quick_load_shortcuts();
@@ -320,6 +332,7 @@ private:
     void quick_save(std::uint8_t index);
     void quick_load(std::uint8_t index);
     void set_gbc_mode(std::uint8_t mode);
+    void set_n3ds_language(std::uint8_t language);
     void set_replay_compression_level(std::uint8_t level);
 
     void make_save_state(const char *state);
@@ -397,6 +410,8 @@ private slots:
     void do_toggle_gb_custom_colors();
     void do_open_gb_palette_dialog();
     void do_open_nds_date_dialog() noexcept;
+    void do_open_n3ds_date_dialog() noexcept;
+    void do_open_running_console_date_dialog() noexcept;
     void do_toggle_horizontal_nds();
     void do_toggle_swap_nds_screens();
     void do_toggle_nds_jit();

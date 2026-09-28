@@ -50,11 +50,12 @@ std::vector<NDSDatePreset> NDSDateDialog::load_presets(const SuperShuckieFronten
     return presets;
 }
 
-NDSDateDialog::NDSDateDialog(MainWindow *main_window): QDialog(main_window), main_window(main_window) {
-    this->setWindowTitle("Set Nintendo DS date");
+NDSDateDialog::NDSDateDialog(MainWindow *main_window, bool for_3ds): QDialog(main_window), main_window(main_window), for_3ds(for_3ds) {
+    this->setWindowTitle(for_3ds ? "Set Nintendo 3DS date" : "Set Nintendo DS date");
     auto *layout = new QGridLayout(this);
 
     auto *presets_box = new QGroupBox("Presets", this);
+    presets_box->setToolTip("The Nintendo DS and Nintendo 3DS share these presets");
     auto *presets_layout = new QHBoxLayout(presets_box);
     this->presets = new QListWidget(presets_box);
     // The order here is the order of Gameplay > Reload core with date.
@@ -114,13 +115,18 @@ NDSDateDialog::NDSDateDialog(MainWindow *main_window): QDialog(main_window), mai
     layout->setColumnStretch(2, 1);
 
     QLabel *note;
-    bool is_nds = supershuckie_frontend_get_emulator_type(this->main_window->frontend) == SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
+    auto this_console = for_3ds ? SuperShuckieEmulatorType::SuperShuckieEmulatorType__Nintendo3DS : SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
+    bool is_this_console = supershuckie_frontend_get_emulator_type(this->main_window->frontend) == this_console;
 
-    if(is_nds) {
+    if(is_this_console && for_3ds) {
+        // The 3DS clock starts with the console; loading a save file doesn't restart it.
+        note = new QLabel("Notes:\n• Changes will apply upon reloading the core.\n• Replays and save states will ignore this setting.\n• Gameplay › Reload core with date switches to a preset in one step.", this);
+    }
+    else if(is_this_console) {
         note = new QLabel("Notes:\n• Changes will apply upon reloading the core or loading a save.\n• Replays and save states will ignore this setting.\n• Gameplay › Reload core with date switches to a preset in one step.", this);
     }
     else {
-        note = new QLabel("Notes:\n• Replays and save states will ignore this setting.\n• In a DS game, Gameplay › Reload core with date switches to a preset in one step.", this);
+        note = new QLabel(QString("Notes:\n• Replays and save states will ignore this setting.\n• In a %1 game, Gameplay › Reload core with date switches to a preset in one step.").arg(for_3ds ? "3DS" : "DS"), this);
     }
 
     note->setAttribute(Qt::WA_MacSmallSize);
@@ -133,7 +139,7 @@ NDSDateDialog::NDSDateDialog(MainWindow *main_window): QDialog(main_window), mai
     this->default_button = save;
 
     if(
-        supershuckie_frontend_get_replay_state(this->main_window->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__NoReplay && is_nds
+        supershuckie_frontend_get_replay_state(this->main_window->frontend) == SuperShuckieReplayState::SuperShuckieReplayState__NoReplay && is_this_console
     ) {
         auto *save_reload = new QPushButton("Save and reload core", this);
         connect(save_reload, SIGNAL(clicked()), this, SLOT(save_and_reload()));
@@ -145,7 +151,12 @@ NDSDateDialog::NDSDateDialog(MainWindow *main_window): QDialog(main_window), mai
     layout->addLayout(buttons, 201, 0, 1, 3);
 
     SuperShuckieNintendoDSDate date = {};
-    supershuckie_frontend_get_nds_date(this->main_window->frontend, &date);
+    if(for_3ds) {
+        supershuckie_frontend_get_n3ds_date(this->main_window->frontend, &date);
+    }
+    else {
+        supershuckie_frontend_get_nds_date(this->main_window->frontend, &date);
+    }
 
     this->year->setMinimum(2000);
     this->year->setMaximum(2099);
@@ -374,7 +385,12 @@ void NDSDateDialog::on_remove_preset() {
 
 void NDSDateDialog::accept() {
     auto date = this->entered_date();
-    supershuckie_frontend_set_nds_date(this->main_window->frontend, &date);
+    if(this->for_3ds) {
+        supershuckie_frontend_set_n3ds_date(this->main_window->frontend, &date);
+    }
+    else {
+        supershuckie_frontend_set_nds_date(this->main_window->frontend, &date);
+    }
 
     if(this->presets_changed()) {
         auto presets = this->current_presets();
@@ -406,7 +422,7 @@ void NDSDateDialog::reject() {
     if(this->presets_changed()) {
         QMessageBox box(this);
         box.setIcon(QMessageBox::Question);
-        box.setWindowTitle("Set Nintendo DS date");
+        box.setWindowTitle(this->windowTitle());
         box.setText("Discard your changes to the date presets?");
         auto *discard = box.addButton("Discard changes", QMessageBox::DestructiveRole);
         auto *keep = box.addButton("Keep editing", QMessageBox::RejectRole);

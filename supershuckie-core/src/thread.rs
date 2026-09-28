@@ -894,6 +894,13 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
+    /// Give the core the game's ROM file for the replays it records from now on (see
+    /// [`SuperShuckieCore::set_game_rom`]).
+    #[inline]
+    pub fn set_game_rom(&self, rom: Option<supershuckie_replay_recorder::replay_file::RomBytes>) {
+        let _ = self.send(ThreadCommand::SetGameRom(rom));
+    }
+
     /// Start mirroring the session into `publisher` (see [`SuperShuckieCore::start_stream_publishing`]).
     ///
     /// NOTE: This is blocking.
@@ -1233,6 +1240,7 @@ enum ThreadCommand {
     ChangeReplayCounter { name: String, delta: SignedInteger },
     IgnoreSpeedChangesInReplay(bool),
     AutoResyncKeyframesInReplay(bool),
+    SetGameRom(Option<supershuckie_replay_recorder::replay_file::RomBytes>),
     SetAudioOutput(Option<Arc<AudioOutput>>),
     SetAudioEnabled(bool),
     SetAudioMuteWhenSpedUp(bool),
@@ -2426,6 +2434,9 @@ impl CoreLoop {
             }
             ThreadCommand::AutoResyncKeyframesInReplay(resync) => {
                 self.core.set_auto_resync_keyframes_in_replays(resync)
+            },
+            ThreadCommand::SetGameRom(rom) => {
+                self.core.set_game_rom(rom)
             },
             ThreadCommand::SetAudioOutput(output) => {
                 self.core.set_audio_output(output)

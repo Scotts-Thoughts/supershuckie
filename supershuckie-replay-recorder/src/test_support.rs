@@ -405,6 +405,8 @@ pub fn settings(max_frames_per_blob: u64, minimum_uncompressed_bytes_per_blob: u
         mask_transient_buffers: true,
         stored_keyframe_levels: (15, 15),
         stored_keyframe_compression_level: 3,
+        stored_keyframe_mask_transients: true,
+        stored_thumbnail_jpeg_quality: 75,
     }
 }
 

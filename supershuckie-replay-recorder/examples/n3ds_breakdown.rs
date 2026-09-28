@@ -1,4 +1,4 @@
-//! Where the bytes of a Nintendo 3DS replay (format v8) go: serialised size of every top-level
+//! Where the bytes of a Nintendo 3DS replay (format v8 or v9) go: serialised size of every top-level
 //! packet kind, keyframe frames by level, and what the thumbnails and inputs would cost under
 //! other encodings. Research tool for `replay-3ds-format-research.md`.
 //!
@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use supershuckie_replay_recorder::append_packet;
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
-use supershuckie_replay_recorder::{compress_data, compress_data_with_prefix, decompress_data};
+use supershuckie_replay_recorder::{compress_data, compress_data_with_prefix};
 use supershuckie_replay_recorder::Packet;
 
 fn main() {
@@ -44,13 +44,15 @@ fn main() {
                 add(&format!("StoredKeyframe L{level} header"), n);
                 add(&format!("StoredKeyframe L{level} frame"), *frame_len);
             }
-            Packet::Thumbnail { top, bottom, top_width, top_height, bottom_width, bottom_height, .. } => {
-                add("Thumbnail", n);
+            Packet::Thumbnail { top, bottom, top_width, top_height, bottom_width, bottom_height, elapsed_frames, against_previous, jpeg } => {
+                add(if *jpeg { "Thumbnail (jpeg)" } else if *against_previous { "Thumbnail (against previous)" } else { "Thumbnail" }, n);
                 add("Thumbnail top zstd", top.len() as u64);
                 add("Thumbnail bottom zstd", bottom.len() as u64);
                 thumb_dims = (*top_width, *top_height, *bottom_width, *bottom_height);
-                thumbs_raw_top.push(decompress_data(top, (*top_width * *top_height * 2) as usize).expect("top"));
-                thumbs_raw_bottom.push(decompress_data(bottom, (*bottom_width * *bottom_height * 2) as usize).expect("bottom"));
+                // Decoded through the player, which reads both encodings (v8 alone, v9 grouped).
+                let picture = player.thumbnail_at_or_before(*elapsed_frames).expect("thumbnail decodes");
+                thumbs_raw_top.push(picture.top.2);
+                thumbs_raw_bottom.push(picture.bottom.2);
             }
             Packet::ChangeInput { data } => {
                 add("ChangeInput", n);

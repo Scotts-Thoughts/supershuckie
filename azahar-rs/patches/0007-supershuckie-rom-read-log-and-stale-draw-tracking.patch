@@ -1,0 +1,357 @@
+diff --git a/src/common/file_derived.h b/src/common/file_derived.h
+--- a/src/common/file_derived.h
++++ b/src/common/file_derived.h
+@@ -115,6 +115,14 @@
+ 
+     std::unique_ptr<IOFileBase> OpenCopy() const override;
+ 
++    /// Super Shuckie: where this window starts in the file below it, and that file.
++    std::size_t SubFileOffset() const {
++        return m_sub_file_offset;
++    }
++    const IOFileBase* ChildFile() const {
++        return Child().get();
++    }
++
+ protected:
+     bool Open() override;
+     std::size_t ReadImpl(void* data, std::size_t length, std::size_t elem_size) override;
+diff --git a/src/core/file_sys/romfs_reader.h b/src/core/file_sys/romfs_reader.h
+--- a/src/core/file_sys/romfs_reader.h
++++ b/src/core/file_sys/romfs_reader.h
+@@ -6,6 +6,9 @@
+ 
+ #include <array>
+ #include <shared_mutex>
++#include <string>
++#include <utility>
++#include <vector>
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/base_object.hpp>
+ #include <boost/serialization/export.hpp>
+@@ -23,6 +26,16 @@
+ namespace FileSys {
+ 
+ /**
++ * Super Shuckie: a log of the game's RomFS reads, as (offset in the game file, length), for the
++ * replay recorder, which finds the bytes again in the emulated memory and stores a reference
++ * instead of them. Only reads of the file at the path given to SetRomReadLog are logged, and
++ * only while it is enabled; consecutive reads are merged. Thread-safe.
++ */
++void SetRomReadLog(const std::string& game_path, bool enabled);
++/// The reads logged since the last call (the log is emptied).
++std::vector<std::pair<u64, u64>> TakeRomReads();
++
++/**
+  * Interface for reading RomFS data.
+  */
+ class RomFSReader {
+diff --git a/src/core/file_sys/romfs_reader.cpp b/src/core/file_sys/romfs_reader.cpp
+--- a/src/core/file_sys/romfs_reader.cpp
++++ b/src/core/file_sys/romfs_reader.cpp
+@@ -3,10 +3,16 @@
+ // Refer to the license.txt file included.
+ 
+ #include <algorithm>
++#include <atomic>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <utility>
+ #include <vector>
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
+ #include "common/archives.h"
++#include "common/file_derived.h"
+ #include "common/logging/log.h"
+ #include "core/file_sys/archive_artic.h"
+ #include "core/file_sys/archive_backend.h"
+@@ -18,10 +24,86 @@
+ 
+ namespace FileSys {
+ 
++namespace {
++
++// Super Shuckie: see SetRomReadLog.
++struct RomReadLog {
++    std::mutex mutex;
++    std::atomic<bool> enabled{false};
++    std::string path;
++    std::vector<std::pair<u64, u64>> reads;
++};
++
++RomReadLog& GetRomReadLog() {
++    static RomReadLog log;
++    return log;
++}
++
++// More than a keyframe interval of reads is never needed; past this the oldest half goes.
++constexpr std::size_t MAX_LOGGED_ROM_READS = 1 << 16;
++
++// Where byte `offset` of `file` is in the file on disk underneath it, when it is reached through
++// plain sub-file windows only (no decryption or decompression on the way).
++std::optional<u64> OffsetInBaseFile(const FileUtil::IOFileBase* file, u64 offset) {
++    while (file) {
++        if (const auto* window = dynamic_cast<const FileUtil::SubIOFile*>(file)) {
++            offset += window->SubFileOffset();
++            file = window->ChildFile();
++            continue;
++        }
++        if (dynamic_cast<const FileUtil::IOFile*>(file)) {
++            return offset;
++        }
++        return std::nullopt;
++    }
++    return std::nullopt;
++}
++
++void NoteRomRead(const FileUtil::IOFileBase& file, std::size_t offset, std::size_t length) {
++    auto& log = GetRomReadLog();
++    if (!log.enabled.load(std::memory_order_relaxed)) {
++        return;
++    }
++    const auto at = OffsetInBaseFile(&file, offset);
++    if (!at) {
++        return;
++    }
++    std::lock_guard lock{log.mutex};
++    if (!log.enabled.load(std::memory_order_relaxed) || file.Filename() != log.path) {
++        return;
++    }
++    auto& reads = log.reads;
++    if (!reads.empty() && reads.back().first + reads.back().second == *at) {
++        reads.back().second += length;
++        return;
++    }
++    if (reads.size() >= MAX_LOGGED_ROM_READS) {
++        reads.erase(reads.begin(), reads.begin() + reads.size() / 2);
++    }
++    reads.emplace_back(*at, length);
++}
++
++} // namespace
++
++void SetRomReadLog(const std::string& game_path, bool enabled) {
++    auto& log = GetRomReadLog();
++    std::lock_guard lock{log.mutex};
++    log.path = game_path;
++    log.reads.clear();
++    log.enabled.store(enabled, std::memory_order_relaxed);
++}
++
++std::vector<std::pair<u64, u64>> TakeRomReads() {
++    auto& log = GetRomReadLog();
++    std::lock_guard lock{log.mutex};
++    return std::exchange(log.reads, {});
++}
++
+ std::size_t DirectRomFSReader::ReadFile(std::size_t offset, std::size_t length, u8* buffer) {
+     length = std::min(length, GetSize() - offset);
+     if (length == 0)
+         return 0; // Crypto++ does not like zero size buffer
++    NoteRomRead(*file, offset, length);
+ 
+     const auto segments = BreakupRead(offset, length);
+     std::size_t read_progress = 0;
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -4,8 +4,10 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <functional>
++#include <vector>
+ #include "common/common_types.h"
+ 
+ namespace Pica {
+@@ -25,6 +27,88 @@
+ /// program's memory is unaffected; only the picture is stale until it is cleared.
+ inline std::atomic<bool> g_skip_drawing{false};
+ 
++/// Super Shuckie: colour buffers whose picture is stale because draws into them were skipped
++/// (see g_skip_drawing), with the frame (g_draw_frame) the first of those was skipped in. A
++/// seek that skipped drawing and still has one at its end redoes that stretch drawn. Touched on
++/// the emulation thread only.
++struct StaleSurface {
++    PAddr start;
++    PAddr end;
++    u64 since;
++};
++inline std::vector<StaleSurface> g_stale_surfaces;
++/// The frontend's frame counter, set before each frame it runs.
++inline std::atomic<u64> g_draw_frame{0};
++
++inline StaleSurface* FindStaleSurface(PAddr addr) {
++    for (auto& surface : g_stale_surfaces) {
++        if (addr >= surface.start && addr < surface.end) {
++            return &surface;
++        }
++    }
++    return nullptr;
++}
++
++inline void MarkStale(PAddr start, PAddr end, u64 since) {
++    for (auto& surface : g_stale_surfaces) {
++        if (surface.start == start) {
++            surface.end = std::max(surface.end, end);
++            surface.since = std::min(surface.since, since);
++            return;
++        }
++    }
++    g_stale_surfaces.push_back({start, end, since});
++}
++
++/// A draw into the colour buffer [start, end) was skipped.
++inline void NoteSkippedDraw(PAddr start, PAddr end) {
++    if (start != 0 && end > start) {
++        MarkStale(start, end, g_draw_frame.load(std::memory_order_relaxed));
++    }
++}
++
++/// A draw into the colour buffer [start, end) was made, sampling textures at `textures`: when
++/// one of them is stale, the draw's output is too. A drawn draw does not make its target fresh
++/// (it may redraw only part of it); only a fill does. Taking a buffer drawn again as whole was
++/// tried and saved few redos (13 of 60 seeks still redone on Pokémon Alpha Sapphire).
++inline void NoteDrawnDraw(PAddr start, PAddr end, const PAddr* textures, std::size_t count) {
++    if (g_stale_surfaces.empty() || start == 0 || end <= start) {
++        return;
++    }
++    u64 since = ~u64{0};
++    for (std::size_t i = 0; i < count; i++) {
++        if (const auto* surface = FindStaleSurface(textures[i])) {
++            since = std::min(since, surface->since);
++        }
++    }
++    if (since != ~u64{0}) {
++        MarkStale(start, end, since);
++    }
++}
++
++/// [start, end) was filled: a buffer it clears is fresh again. A clear starts at the buffer and
++/// covers it; the buffer's own extent is only an estimate (width x height x bytes per pixel of
++/// the draw that marked it), so most of it is enough.
++inline void NoteFill(PAddr start, PAddr end) {
++    std::erase_if(g_stale_surfaces, [&](const StaleSurface& s) {
++        const PAddr covered_end = std::min(end, s.end);
++        return s.start >= start && s.start < end && (covered_end - s.start) * 4 >= (s.end - s.start) * 3;
++    });
++}
++
++/// A display transfer or texture copy from `src` into [dst, dst_end): the destination is as
++/// stale as its source.
++inline void NoteTransfer(PAddr src, PAddr dst, PAddr dst_end) {
++    if (g_stale_surfaces.empty()) {
++        return;
++    }
++    if (const auto* source = FindStaleSurface(src)) {
++        MarkStale(dst, std::max(dst_end, dst + 1), source->since);
++    } else {
++        std::erase_if(g_stale_surfaces, [&](const StaleSurface& s) { return s.start == dst && s.end <= dst_end; });
++    }
++}
++
+ enum class LoadCallbackStage {
+     Prepare,
+     Preload,
+diff --git a/src/video_core/renderer_opengl/gl_rasterizer.cpp b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+--- a/src/video_core/renderer_opengl/gl_rasterizer.cpp
++++ b/src/video_core/renderer_opengl/gl_rasterizer.cpp
+@@ -466,9 +466,36 @@
+     return true;
+ }
+ 
++namespace {
++
++// Super Shuckie: the colour buffer a draw goes to, as [start, end) (see VideoCore::g_stale_surfaces).
++std::pair<PAddr, PAddr> ColorBufferRange(const Pica::RegsInternal& regs) {
++    const auto& fb = regs.framebuffer.framebuffer;
++    const PAddr start = fb.GetColorBufferPhysicalAddress();
++    u32 bytes_per_pixel = 4;
++    switch (fb.color_format.Value()) {
++    case Pica::FramebufferRegs::ColorFormat::RGB8:
++        bytes_per_pixel = 3;
++        break;
++    case Pica::FramebufferRegs::ColorFormat::RGB5A1:
++    case Pica::FramebufferRegs::ColorFormat::RGB565:
++    case Pica::FramebufferRegs::ColorFormat::RGBA4:
++        bytes_per_pixel = 2;
++        break;
++    default:
++        break;
++    }
++    return {start, start + fb.GetWidth() * fb.GetHeight() * bytes_per_pixel};
++}
++
++} // namespace
++
+ bool RasterizerOpenGL::AccelerateDrawBatch(bool is_indexed) {
+     if (VideoCore::g_skip_drawing.load(std::memory_order_relaxed)) {
+-        return true; // Super Shuckie: consumed, nothing drawn, no CPU vertex processing either
++        // Super Shuckie: consumed, nothing drawn, no CPU vertex processing either.
++        const auto [start, end] = ColorBufferRange(regs);
++        VideoCore::NoteSkippedDraw(start, end);
++        return true;
+     }
+     if (regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No) {
+         if (regs.pipeline.gs_config.mode != Pica::PipelineRegs::GSMode::Point) {
+@@ -549,7 +576,12 @@
+ 
+ void RasterizerOpenGL::DrawTriangles() {
+     if (VideoCore::g_skip_drawing.load(std::memory_order_relaxed)) {
+-        vertex_batch.clear(); // Super Shuckie
++        // Super Shuckie
++        if (!vertex_batch.empty()) {
++            const auto [start, end] = ColorBufferRange(regs);
++            VideoCore::NoteSkippedDraw(start, end);
++        }
++        vertex_batch.clear();
+         return;
+     }
+     if (vertex_batch.empty())
+@@ -582,6 +614,19 @@
+         (write_depth_fb || regs.framebuffer.output_merger.depth_test_enable != 0 ||
+          (has_stencil && state.stencil.test_enabled));
+ 
++    // Super Shuckie: a draw sampling a texture that a skipped draw left stale is stale too.
++    if (using_color_fb && !VideoCore::g_stale_surfaces.empty()) {
++        std::array<PAddr, 3> sampled{};
++        std::size_t count = 0;
++        for (const auto& texture : regs.texturing.GetTextures()) {
++            if (texture.enabled) {
++                sampled[count++] = texture.config.GetPhysicalAddress();
++            }
++        }
++        const auto [start, end] = ColorBufferRange(regs);
++        VideoCore::NoteDrawnDraw(start, end, sampled.data(), count);
++    }
++
+     const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
+     const Framebuffer* framebuffer = fb_helper.Framebuffer();
+     if (!framebuffer->color_id && framebuffer->shadow_rendering) {
+@@ -853,14 +898,23 @@
+ }
+ 
+ bool RasterizerOpenGL::AccelerateDisplayTransfer(const Pica::DisplayTransferConfig& config) {
++    // Super Shuckie: see VideoCore::g_stale_surfaces.
++    const PAddr dst = config.GetPhysicalOutputAddress();
++    const u32 bytes = config.output_width.Value() * config.output_height.Value() *
++                      Pica::BytesPerPixel(config.output_format.Value());
++    VideoCore::NoteTransfer(config.GetPhysicalInputAddress(), dst, dst + bytes);
+     return res_cache.AccelerateDisplayTransfer(config);
+ }
+ 
+ bool RasterizerOpenGL::AccelerateTextureCopy(const Pica::DisplayTransferConfig& config) {
++    // Super Shuckie: see VideoCore::g_stale_surfaces.
++    const PAddr dst = config.GetPhysicalOutputAddress();
++    VideoCore::NoteTransfer(config.GetPhysicalInputAddress(), dst, dst + config.texture_copy.size);
+     return res_cache.AccelerateTextureCopy(config);
+ }
+ 
+ bool RasterizerOpenGL::AccelerateFill(const Pica::MemoryFillConfig& config) {
++    VideoCore::NoteFill(config.GetStartAddress(), config.GetEndAddress()); // Super Shuckie
+     return res_cache.AccelerateFill(config);
+ }
+ 

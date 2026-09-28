@@ -39,10 +39,28 @@ pub const REPLAY_VERSION_MINIMUM_SUPPORTED: u32 = 2;
 ///   for byte a v6 file apart from the version, and reading v6 files is untouched.
 pub const REPLAY_VERSION: u32 = 7;
 
-/// Format version of Nintendo 3DS files: `StoredKeyframe` packets (0xFB) whose zstd frames
-/// follow them in the stream and are read on demand, no blobs, two delta levels. Files of every
-/// other console keep writing [`REPLAY_VERSION`] and are byte for byte unchanged.
-pub const REPLAY_VERSION_NINTENDO_3DS: u32 = 8;
+/// Format version of Nintendo 3DS files. Files of every other console keep writing
+/// [`REPLAY_VERSION`] and are byte for byte unchanged.
+///
+/// * v8: `StoredKeyframe` packets (0xFB) whose zstd frames follow them in the stream and are read
+///   on demand, no blobs, two delta levels, `Thumbnail` packets (0xFC).
+/// * v9 (see [`REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES`]): a delta keyframe is compressed with
+///   its reference keyframe's whole state as zstd prefix (v8: that keyframe's payload) and may
+///   copy bytes from the game's ROM; timeline pictures may be stored against the previous one
+///   (`Thumbnail` with 0xFD); an input is written only when it changes.
+/// * v10 (see [`REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM`]): same encodings; a delta keyframe may
+///   leave the VRAM pages the GPU rewrites before reading them as the previous keyframe had
+///   them, so a seek draws several frames from a keyframe before trusting the picture; timeline
+///   pictures may be JPEGs (`Thumbnail` with 0xEF).
+pub const REPLAY_VERSION_NINTENDO_3DS: u32 = 10;
+
+/// First Nintendo 3DS format version whose delta keyframes may leave VRAM partly stale (see
+/// `ReplayFileRecorderSettings::stored_keyframe_mask_transients`).
+pub const REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM: u32 = 10;
+
+/// First Nintendo 3DS format version whose delta keyframes use the v9 payload (see
+/// `stored_keyframe`): the reference state as prefix, and ROM references.
+pub const REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES: u32 = 9;
 
 /// Newest format version this build reads.
 pub const REPLAY_VERSION_MAX_SUPPORTED: u32 = REPLAY_VERSION_NINTENDO_3DS;

@@ -1,0 +1,28 @@
+﻿cargo :    Compiling supershuckie-core v0.4.15 (A:\Programs\supershuckie\supershuckie-core)
+At line:1 char:439
++ ... pershuckie; cargo run --release -p supershuckie-core --example n3ds_v ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling su...ershuckie-core):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `release` profile [optimized] target(s) in 8.82s
+     Running `target\release\examples\n3ds_v9_lab.exe "A:\Dropbox\stp-projects\programs\roms\6\Pokemon Alpha 
+Sapphire.3ds" "A:\Programs\supershuckie\UserData\Pokemon Alpha Sapphire (USA) (En,Ja,Fr,De,Es,It,Ko) (Rev 
+2).3ds-data\replays\default-0.replay" --frames 20000 --cadences none --seeks 12`
+core made in 244 ms
+replay: version 8, 429666 frames, 897 keyframes
+played 19999 frames in 77.2 s (259 fps with captures); the game read 0 ROM ranges, 0 bytes
+seek 11280 (keyframe 11041): 2343 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 12840 (keyframe 12481): 3081 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 8760 (keyframe 8641): 497 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 19320 (keyframe 19201): 1206 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 120 (keyframe 1): 420 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 12720 (keyframe 12481): 2612 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 11520 (keyframe 11041): 3421 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 4920 (keyframe 4801): 699 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 14160 (keyframe 13921): 2381 ms (redrawn), heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 7800 (keyframe 7681): 521 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 12480 (keyframe 12001): 1025 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seek 11760 (keyframe 11521): 710 ms, heap ok, top ok, bottom ok; same picture as drawing every frame: yes
+seeks: 12, 1576 ms average, 3421 ms worst; heap 12/12, top 12/12, bottom 12/12 (against straight playback); same picture as drawing the walk 12/12; 6 redone drawn
+done

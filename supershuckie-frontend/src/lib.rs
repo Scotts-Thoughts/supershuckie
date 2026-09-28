@@ -28,7 +28,7 @@ use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, Part
 use supershuckie_core::{std_timestamp_provider, AudioOutput, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
 use supershuckie_core::{ExportRange, ScreenLayout, VideoExportError, VideoExportHandle, VideoFrameSink};
 use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShuckieWebserver};
-use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat};
+use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat, RomBytes};
 use supershuckie_replay_recorder::{blake3_hash, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettings, ReplayFileWriteError, ResumeCropPolicy};
@@ -164,7 +164,9 @@ pub struct SuperShuckieFrontend {
     /// The speed the core was last set to (base speed, turbo, or the link cable's).
     current_speed: Speed,
 
-    loaded_rom_data: Option<Vec<u8>>,
+    /// The loaded ROM file's bytes; shared with the 3DS core's recorder and replay players,
+    /// whose keyframes refer to it.
+    loaded_rom_data: Option<Arc<Vec<u8>>>,
     /// The loaded ROM's file path and the Azahar user directory for it; the 3DS core loads the
     /// game from the file itself (its saves live on Azahar's virtual SD card in that directory).
     loaded_rom_path: Option<(String, PathBuf)>,
@@ -526,6 +528,10 @@ impl SuperShuckieFrontend {
                 return Err(format!("{e} ({name})").into())
             }
         };
+        // A 3DS replay's keyframes copy bytes from the game file.
+        if player.wants_rom() && let Some(rom) = self.loaded_rom_data.clone() {
+            player.set_rom(rom);
+        }
 
         if self.settings.replay.auto_decompress_replays_upfront {
             player.decompress_all_blobs();
@@ -1004,7 +1010,7 @@ impl SuperShuckieFrontend {
 
         self.create_userdata_for_rom(filename)?;
         self.close_rom();
-        self.loaded_rom_data = Some(data);
+        self.loaded_rom_data = Some(Arc::new(data));
         // One Azahar directory for every 3DS game, like one SD card: saves live under their title
         // id inside it, so games share it naturally, and the path stays short. Windows refuses
         // paths past 260 characters, the SD layout alone is 110 deep, and with a per-ROM
@@ -1150,6 +1156,11 @@ impl SuperShuckieFrontend {
         let rom_data = self.loaded_rom_data.as_ref().expect("reload_rom_in_place with no loaded rom");
         let core = self.make_new_core(rom_data, save_file_data, emulator_type)?;
         self.switch_core(ThreadedSuperShuckieCore::new(core));
+        // 3DS replays store what the game read from its ROM as references to the file.
+        if emulator_type == SuperShuckieEmulatorType::Nintendo3DS {
+            let rom: Option<RomBytes> = self.loaded_rom_data.clone().map(|rom| rom as RomBytes);
+            self.core.set_game_rom(rom);
+        }
         Ok(())
     }
 
@@ -1190,11 +1201,10 @@ impl SuperShuckieFrontend {
     }
 
     /// The keyframe interval a recording gets: the user's setting, except on the 3DS, whose
-    /// keyframes are 170 MB states and cost 2–3 MB each even as deltas (replay-3ds-spec.md:
-    /// 480 frames = 8 s keeps three hours under 5 GB).
+    /// keyframes are 150 MB states (see [`NINTENDO_3DS_FRAMES_PER_KEYFRAME`]).
     fn frames_per_keyframe_for_recording(&self) -> NonZeroU64 {
         if self.emulator_type == Some(SuperShuckieEmulatorType::Nintendo3DS) {
-            NonZeroU64::new(480).unwrap()
+            NonZeroU64::new(NINTENDO_3DS_FRAMES_PER_KEYFRAME).unwrap()
         } else {
             self.settings.replay.frames_per_keyframe
         }
@@ -1240,8 +1250,15 @@ impl SuperShuckieFrontend {
                     return Err("the 3DS core needs the game's file path".into())
                 };
                 let user_dir = user_dir.to_str().ok_or("user directory is not UTF-8")?;
+                let date = self.get_n3ds_date().get_cleaned();
+                let language = Nintendo3DSLanguage::try_from(self.get_n3ds_language()).unwrap_or(Nintendo3DSLanguage::English);
+                let settings = Nintendo3DSSettings {
+                    init_time: Nintendo3DSSettings::init_time_for(date.year, date.month, date.day, date.hour, date.minute, date.second),
+                    language: language as i32,
+                    ..Nintendo3DSSettings::default()
+                };
                 Box::new(
-                    Nintendo3DS::new_from_path(rom_path, rom_data, user_dir, std_timestamp_provider(), &Nintendo3DSSettings::default())
+                    Nintendo3DS::new_from_path(rom_path, rom_data, user_dir, std_timestamp_provider(), &settings)
                         .map_err(|e| format!("Azahar rejected the game: {e}"))?
                 )
             }
@@ -1425,6 +1442,33 @@ impl SuperShuckieFrontend {
     #[inline]
     pub fn set_nds_date(&mut self, date: NintendoDSDate) {
         self.settings.nintendo_ds_settings.date = date;
+    }
+
+    /// Get the date the Nintendo 3DS clock starts at.
+    #[inline]
+    pub fn get_n3ds_date(&self) -> &NintendoDSDate {
+        &self.settings.nintendo_3ds_settings.date
+    }
+
+    /// Set the date the Nintendo 3DS clock starts at (from the next core load).
+    #[inline]
+    pub fn set_n3ds_date(&mut self, date: NintendoDSDate) {
+        self.settings.nintendo_3ds_settings.date = date;
+    }
+
+    /// Get the Nintendo 3DS system language (a [`Nintendo3DSLanguage`]).
+    #[inline]
+    pub fn get_n3ds_language(&self) -> u8 {
+        self.settings.nintendo_3ds_settings.language
+    }
+
+    /// Set the Nintendo 3DS system language (from the next core load); out-of-range values are
+    /// ignored.
+    #[inline]
+    pub fn set_n3ds_language(&mut self, language: u8) {
+        if Nintendo3DSLanguage::try_from(language).is_ok() {
+            self.settings.nintendo_3ds_settings.language = language;
+        }
     }
 
     /// Get the Nintendo DS date presets, in menu order.
@@ -1971,8 +2015,11 @@ impl SuperShuckieFrontend {
             compression_level: self.settings.replay.zstd_compression_level,
             max_frames_per_blob: self.settings.replay.max_frames_per_blob(),
             mask_transient_buffers: self.settings.replay.mask_transient_buffers,
-            stored_keyframe_levels: (15, 15),
+            stored_keyframe_levels: NINTENDO_3DS_KEYFRAME_LEVELS,
             stored_keyframe_compression_level: 3,
+            // The same choice as for the DS: keyframes leave out what the game regenerates.
+            stored_keyframe_mask_transients: self.settings.replay.mask_transient_buffers,
+            stored_thumbnail_jpeg_quality: 75,
         }
     }
 
@@ -3646,6 +3693,19 @@ impl VideoFrameSink for FfmpegVideoSink {
         let _ = std::fs::remove_file(&self.output_path);
     }
 }
+
+/// Frames between the keyframes of a Nintendo 3DS recording: 4 seconds. Measured on the busiest
+/// 20 minutes of a real Alpha Sapphire session with format-v9 keyframes (reference-state prefix,
+/// ROM copies): 2 s = 0.96 GB/h, 4 s = 0.54 GB/h, 8 s = 0.30 GB/h, so 4 s keeps even a session
+/// that busy throughout at 1.6 GB per 3 hours (the ceiling is 5 GB), and halves the re-emulation
+/// of a seek against 8 s (`replay-3ds-spec.md` §8).
+const NINTENDO_3DS_FRAMES_PER_KEYFRAME: u64 = 240;
+
+/// How a Nintendo 3DS recording's keyframes are levelled (see
+/// `ReplayFileRecorderSettings::stored_keyframe_levels`): at 4 s per keyframe, a level-1 keyframe
+/// every 2 minutes and a full one every 60. A seek applies at most 60 deltas, a few milliseconds
+/// each since the player applies them in place.
+const NINTENDO_3DS_KEYFRAME_LEVELS: (u32, u32) = (30, 30);
 
 /// Open a replay file for the player. A Nintendo 3DS file is memory-mapped: its keyframes (most
 /// of a multi-gigabyte file) stay on disk and are read as they are seeked to. Every other

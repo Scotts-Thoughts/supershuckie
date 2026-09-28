@@ -698,8 +698,8 @@ void MainWindow::set_up_gameplay_menu() {
     this->reload_core->setObjectName("reload-core");
     connect(this->reload_core, SIGNAL(triggered()), this, SLOT(do_reload_core()));
 
-    // DS only: each preset sets the date and reloads the core so the game sees it at once
-    // (see rebuild_nds_date_menu()).
+    // DS and 3DS only: each preset sets the running console's date and reloads the core so the
+    // game sees it at once (see rebuild_nds_date_menu()).
     this->nds_date_menu = this->gameplay_menu->addMenu("Reload core with date");
     for(std::size_t i = 0; i < MainWindow::NDS_DATE_PRESET_SLOTS; i++) {
         auto *slot = this->nds_date_menu->addAction(QString("Date preset %1").arg(i + 1));
@@ -715,7 +715,7 @@ void MainWindow::set_up_gameplay_menu() {
     this->nds_date_no_presets->setEnabled(false);
     this->nds_date_menu->addSeparator();
     auto *edit_nds_date_presets = this->nds_date_menu->addAction("Edit presets…");
-    connect(edit_nds_date_presets, SIGNAL(triggered()), this, SLOT(do_open_nds_date_dialog()));
+    connect(edit_nds_date_presets, SIGNAL(triggered()), this, SLOT(do_open_running_console_date_dialog()));
 
     this->pause = this->gameplay_menu->addAction("Pause");
     this->pause->setObjectName("pause");
@@ -1318,6 +1318,29 @@ void MainWindow::set_up_settings_menu() {
     this->nds_jit->setCheckable(true);
     connect(this->nds_jit, SIGNAL(triggered()), this, SLOT(do_toggle_nds_jit()));
 
+    auto *n3ds_settings = this->settings_menu->addMenu("Nintendo 3DS");
+
+    auto *set_n3ds_date = n3ds_settings->addAction("Set date…");
+    set_n3ds_date->setObjectName("n3ds-set-date");
+    set_n3ds_date->setToolTip("The date and time the 3DS clock starts at when a game is loaded");
+    connect(set_n3ds_date, SIGNAL(triggered()), this, SLOT(do_open_n3ds_date_dialog()));
+
+    // Numbered as the console numbers them (supershuckie_frontend_set_n3ds_language()).
+    static const char *const N3DS_LANGUAGES[MainWindow::N3DS_LANGUAGE_COUNT] = {
+        "Japanese", "English", "French", "German", "Italian", "Spanish", "Chinese (Simplified)",
+        "Korean", "Dutch", "Portuguese", "Russian", "Chinese (Traditional)"
+    };
+    auto *n3ds_language_menu = n3ds_settings->addMenu("Language");
+    n3ds_language_menu->setToolTipsVisible(true);
+    for(std::size_t i = 0; i < MainWindow::N3DS_LANGUAGE_COUNT; i++) {
+        auto *action = new NumberedAction(this, N3DS_LANGUAGES[i], static_cast<std::uint8_t>(i), &MainWindow::set_n3ds_language);
+        action->setObjectName(QString("n3ds-language-%1").arg(i));
+        action->setCheckable(true);
+        action->setToolTip("The 3DS system language, which games like Pokémon X and Y play in. Applies upon reloading the core; a language the game's region lacks is swapped for one it has.");
+        n3ds_language_menu->addAction(action);
+        this->n3ds_language[i] = action;
+    }
+
     this->settings_menu->addSeparator();
 
     auto *pokeabyte_menu = this->settings_menu->addMenu("Poke-A-Byte");
@@ -1394,7 +1417,7 @@ void MainWindow::refresh_action_states() {
 
     this->reload_core->setEnabled(game_loaded);
     this->reset_console->setEnabled(game_loaded);
-    this->nds_date_menu->menuAction()->setVisible(this->is_nds_game_running());
+    this->nds_date_menu->menuAction()->setVisible(this->is_nds_game_running() || this->is_n3ds_game_running());
 
     for(auto &scale : this->change_video_scale) {
         scale->setEnabled(game_loaded);
@@ -1403,6 +1426,11 @@ void MainWindow::refresh_action_states() {
     auto gbc_mode = this->frontend != nullptr ? supershuckie_frontend_get_gbc_mode(this->frontend) : 0;
     for(auto &i : this->gbc_mode) {
         i->setChecked(i->number == gbc_mode);
+    }
+
+    auto n3ds_language = this->frontend != nullptr ? supershuckie_frontend_get_n3ds_language(this->frontend) : 1;
+    for(auto &i : this->n3ds_language) {
+        i->setChecked(i->number == n3ds_language);
     }
 
     this->continue_last_replay->setEnabled(this->frontend != nullptr && supershuckie_frontend_can_continue_last_replay(this->frontend));
@@ -1509,24 +1537,31 @@ void MainWindow::do_open_rom() {
     this->load_rom(std::filesystem::path(files[0].toStdU16String()));
 }
 
-void MainWindow::load_rom(const std::filesystem::path &path) {
+bool MainWindow::load_rom(const std::filesystem::path &path, QString *failure) {
     char error[256] = "";
 
     if(this->play_together != nullptr && !this->play_together->confirm_leave("Opening another ROM")) {
-        return;
+        return true;
     }
 
     // path.string() converts to the narrow "native" encoding and throws for characters that
     // encoding can't represent; u8string() always succeeds and is what the Rust side expects.
     auto path_utf8 = path.u8string();
     const char *path_utf8_str = reinterpret_cast<const char *>(path_utf8.c_str());
-    if(!supershuckie_frontend_load_rom(this->frontend, path_utf8_str, error, sizeof(error))) {
-        this->stop_timer();
-        DISPLAY_ERROR_DIALOG_P(this, "Can't load ROM", "\"%s\" failed to load:\n\n%s", path_utf8_str, error);
-        this->start_timer();
+    bool loaded = supershuckie_frontend_load_rom(this->frontend, path_utf8_str, error, sizeof(error));
+    if(!loaded) {
+        if(failure != nullptr) {
+            *failure = QString::fromUtf8(error);
+        }
+        else {
+            this->stop_timer();
+            DISPLAY_ERROR_DIALOG_P(this, "Can't load ROM", "\"%s\" failed to load:\n\n%s", path_utf8_str, error);
+            this->start_timer();
+        }
     }
 
     this->rebuild_recent_roms_menu();
+    return loaded;
 }
 
 void MainWindow::load_rom(const char *path) {
@@ -2531,6 +2566,16 @@ void MainWindow::set_gbc_mode(std::uint8_t mode) {
     this->refresh_action_states();
 }
 
+void MainWindow::set_n3ds_language(std::uint8_t language) {
+    bool changed = supershuckie_frontend_get_n3ds_language(this->frontend) != language;
+    supershuckie_frontend_set_n3ds_language(this->frontend, language);
+    supershuckie_frontend_write_settings(this->frontend);
+    this->refresh_action_states();
+    if(changed && this->is_n3ds_game_running()) {
+        this->set_title("3DS language changed; reload the core to apply it");
+    }
+}
+
 void MainWindow::set_replay_compression_level(std::uint8_t level) {
     supershuckie_frontend_set_replay_compression_level(this->frontend, level);
     this->refresh_action_states();
@@ -2583,11 +2628,32 @@ void MainWindow::set_audio_buffer(std::uint8_t preset) {
     this->refresh_action_states();
 }
 
-void MainWindow::do_open_nds_date_dialog() noexcept {
-    auto *dialog = new NDSDateDialog(this);
+void MainWindow::open_date_dialog(bool for_3ds) {
+    auto *dialog = new NDSDateDialog(this, for_3ds);
     dialog->exec();
     delete dialog;
     this->rebuild_nds_date_menu();
+}
+
+void MainWindow::do_open_nds_date_dialog() noexcept {
+    this->open_date_dialog(false);
+}
+
+void MainWindow::do_open_n3ds_date_dialog() noexcept {
+    this->open_date_dialog(true);
+}
+
+void MainWindow::do_open_running_console_date_dialog() noexcept {
+    this->open_date_dialog(this->is_n3ds_game_running());
+}
+
+void MainWindow::get_running_console_date(SuperShuckieNintendoDSDate *date) {
+    if(this->is_n3ds_game_running()) {
+        supershuckie_frontend_get_n3ds_date(this->frontend, date);
+    }
+    else {
+        supershuckie_frontend_get_nds_date(this->frontend, date);
+    }
 }
 
 void MainWindow::rebuild_nds_date_menu() {
@@ -2599,7 +2665,7 @@ void MainWindow::rebuild_nds_date_menu() {
     this->nds_date_preset_extras.clear();
 
     SuperShuckieNintendoDSDate current = {};
-    supershuckie_frontend_get_nds_date(this->frontend, &current);
+    this->get_running_console_date(&current);
 
     auto presets = NDSDateDialog::load_presets(this->frontend);
     for(std::size_t i = 0; i < presets.size() || i < MainWindow::NDS_DATE_PRESET_SLOTS; i++) {
@@ -2629,13 +2695,34 @@ void MainWindow::rebuild_nds_date_menu() {
 
 void MainWindow::refresh_nds_date_preset_states() {
     // A preset reloads the core, so it is available exactly when Reload core is. Checking for a DS
-    // game matters for the slots' shortcuts, which a hidden submenu doesn't turn off.
-    bool enabled = this->reload_core->isEnabled() && this->is_nds_game_running();
+    // or 3DS game matters for the slots' shortcuts, which a hidden submenu doesn't turn off.
+    bool enabled = this->reload_core->isEnabled() && (this->is_nds_game_running() || this->is_n3ds_game_running());
     for(auto *action : this->nds_date_preset_slots) {
         action->setEnabled(enabled);
     }
     for(auto *action : this->nds_date_preset_extras) {
         action->setEnabled(enabled);
+    }
+
+    if(this->frontend == nullptr) {
+        return;
+    }
+
+    // The DS and 3DS have a date each, so the preset that is checked follows the running game.
+    SuperShuckieNintendoDSDate current = {};
+    this->get_running_console_date(&current);
+    auto presets = NDSDateDialog::load_presets(this->frontend);
+    for(std::size_t i = 0; i < presets.size(); i++) {
+        QAction *action = nullptr;
+        if(i < MainWindow::NDS_DATE_PRESET_SLOTS) {
+            action = this->nds_date_preset_slots[i];
+        }
+        else if(i - MainWindow::NDS_DATE_PRESET_SLOTS < this->nds_date_preset_extras.size()) {
+            action = this->nds_date_preset_extras[i - MainWindow::NDS_DATE_PRESET_SLOTS];
+        }
+        if(action != nullptr) {
+            action->setChecked(NDSDateDialog::same_date(presets[i].date, current));
+        }
     }
 }
 
@@ -2643,8 +2730,13 @@ bool MainWindow::is_nds_game_running() {
     return this->is_game_running() && supershuckie_frontend_get_emulator_type(this->frontend) == SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
 }
 
+bool MainWindow::is_n3ds_game_running() {
+    return this->is_game_running() && supershuckie_frontend_get_emulator_type(this->frontend) == SuperShuckieEmulatorType::SuperShuckieEmulatorType__Nintendo3DS;
+}
+
 void MainWindow::apply_nds_date_preset(std::size_t index) {
-    if(!this->reload_core->isEnabled() || !this->is_nds_game_running()) {
+    bool is_3ds = this->is_n3ds_game_running();
+    if(!this->reload_core->isEnabled() || !(is_3ds || this->is_nds_game_running())) {
         return;
     }
 
@@ -2655,7 +2747,12 @@ void MainWindow::apply_nds_date_preset(std::size_t index) {
     }
 
     auto message = QString("Reloaded core with date preset %1 (%2)").arg(QString::fromUtf8(name), NDSDateDialog::describe_date(date));
-    supershuckie_frontend_set_nds_date(this->frontend, &date);
+    if(is_3ds) {
+        supershuckie_frontend_set_n3ds_date(this->frontend, &date);
+    }
+    else {
+        supershuckie_frontend_set_nds_date(this->frontend, &date);
+    }
     supershuckie_frontend_reload_core(this->frontend);
     this->set_title(message.toUtf8().constData());
     this->rebuild_nds_date_menu();
@@ -2740,7 +2837,15 @@ void MainWindow::open_favorite_rom(const QString &path, const QString &name) {
             return;
         }
     }
-    this->load_rom(std::filesystem::path(path.toStdU16String()));
+    // Through the start screen, so a favorite whose file has moved offers to locate it.
+    auto paths = this->landing_widget->favorite_paths();
+    auto index = paths.indexOf(path);
+    if(index >= 0) {
+        this->landing_widget->open_favorite(static_cast<std::size_t>(index));
+    }
+    else {
+        this->load_rom(std::filesystem::path(path.toStdU16String()));
+    }
 }
 
 QList<QKeySequence> MainWindow::favorite_rom_shortcuts(const QString &path) const {
@@ -2766,6 +2871,26 @@ void MainWindow::clear_favorite_rom_shortcut(const QString &path) {
             return;
         }
     }
+}
+
+void MainWindow::move_favorite_rom_shortcut(const QString &from, const QString &to) {
+    // Works on the saved entries: by now the bindings have been rebuilt under the new path, and
+    // the old entry would otherwise linger in the settings file.
+    const char *setting = supershuckie_frontend_get_custom_setting(this->frontend, SHORTCUTS);
+    if(setting == nullptr) {
+        return;
+    }
+    auto saved = QJsonDocument::fromJson(QByteArray(setting)).object();
+    auto value = saved.take(FAVORITE_ROM_SHORTCUT_PREFIX + from);
+    if(value.isUndefined()) {
+        return;
+    }
+    saved.insert(FAVORITE_ROM_SHORTCUT_PREFIX + to, value);
+    supershuckie_frontend_set_custom_setting(this->frontend, SHORTCUTS, QJsonDocument(saved).toJson(QJsonDocument::Compact).constData());
+    supershuckie_frontend_write_settings(this->frontend);
+
+    this->load_shortcuts();
+    this->apply_shortcuts();
 }
 
 void MainWindow::do_clear_recent_roms() {
@@ -2912,8 +3037,12 @@ void MainWindow::refresh_play_together_actions() {
     bool active = this->play_together->is_active();
     bool host = this->play_together->is_host();
     auto emulator_type = supershuckie_frontend_get_emulator_type(this->frontend);
-    bool supported = game_loaded && emulator_type != SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS;
+    bool unsupported_game = game_loaded && (emulator_type == SuperShuckieEmulatorType::SuperShuckieEmulatorType__NintendoDS || emulator_type == SuperShuckieEmulatorType::SuperShuckieEmulatorType__Nintendo3DS);
+    bool supported = game_loaded && !unsupported_game;
 
+    // Play Together only runs Game Boy, Game Boy Color and Game Boy Advance games, so the whole
+    // menu is greyed out while a DS or 3DS game is loaded.
+    this->play_together_menu->menuAction()->setEnabled(active || !unsupported_game);
     this->pt_open->setEnabled(active || supported);
     this->pt_leave->setEnabled(active);
     this->pt_leave->setText(host ? "Stop hosting" : "Leave session");

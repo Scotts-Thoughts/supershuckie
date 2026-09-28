@@ -34,7 +34,8 @@ use std::{
 };
 use alloc::collections::BTreeMap;
 use crate::keyframe_masks::apply_masks;
-use crate::util::{compress_data_with_prefix, region_diff_resizing};
+use crate::replay_file::stored_keyframe::{encode_payload_v9, merge_ranges, RomBytes, RomIndex};
+use crate::util::{compress_data_with_prefix, compress_data_with_state_prefix, compress_small_data_with_prefix, region_diff_resizing};
 use alloc::sync::Arc;
 
 /// Records a replay file
@@ -68,6 +69,11 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
     /// Nintendo 3DS files: the reference states of the stored-keyframe levels; `None` for every
     /// other console.
     stored: Option<StoredKeyframes>,
+    /// The game's ROM, which 3DS keyframes may copy bytes from (see [`Self::set_rom`]).
+    rom: Option<RomBytes>,
+    /// Look for ROM copies in the whole ROM rather than in what was read (see
+    /// [`Self::set_rom_reads_unknown`]).
+    rom_reads_unknown: bool,
     header: ReplayHeaderRaw,
 
     counters: BTreeMap<String, SignedInteger>,
@@ -151,20 +157,119 @@ pub struct ReplayFileRecorderSettings {
     pub stored_keyframe_levels: (u32, u32),
     /// Nintendo 3DS files only: zstd level of each keyframe's frame (they are compressed one at a
     /// time, on the fly; 3 keeps a 44 MB delta payload under 150 ms). Default `3`.
-    pub stored_keyframe_compression_level: i32
+    pub stored_keyframe_compression_level: i32,
+    /// Nintendo 3DS files: leave out of each delta keyframe the pages of transient memory (VRAM)
+    /// that the GPU writes before anything reads them in the interval after the keyframe
+    /// (render targets, display framebuffers), as [`ReplayFileRecorder::transient_page_access`]
+    /// reports; the state a player rebuilds has them as the previous keyframe had. A keyframe is
+    /// then written only when the next one arrives (its interval's report comes with it), and
+    /// the packets in between wait behind it. About 40% of a keyframe on Pokemon Omega Ruby.
+    /// Default `true`.
+    pub stored_keyframe_mask_transients: bool,
+    /// Nintendo 3DS files: store the timeline pictures as JPEG at this quality (1-100) instead of
+    /// lossless RGB565 against the previous picture (`0`). They are only shown while the timeline
+    /// is dragged; at 75 a pair of screens is about 8 KB instead of 16 (`thumb_codec_lab`), and
+    /// every picture decodes on its own. Default `75`.
+    pub stored_thumbnail_jpeg_quality: u8
 }
 
-/// Nintendo 3DS files: what the next `StoredKeyframe` diffs against.
+/// What touched each page of a console's transient memory (Nintendo 3DS: VRAM) first during a
+/// keyframe interval; see [`ReplayFileRecorder::transient_page_access`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TransientPageAccess {
+    /// Byte offset of the tracked memory in a save state.
+    pub state_offset: u64,
+    /// Bytes per page.
+    pub page_size: u32,
+    /// One byte per page: 0 nothing, 1 a read, 2 a write.
+    pub first_access: Vec<u8>
+}
+
+/// Nintendo 3DS files: what the next `StoredKeyframe` diffs against, and the state of the
+/// timeline pictures.
 #[derive(Default)]
 struct StoredKeyframes {
-    /// The state after the most recent keyframe of level `<= i`, and that keyframe's decoded
-    /// delta payload (empty for a level-0 keyframe), the zstd prefix of the next level-`i` delta.
+    /// The state after the most recent keyframe of level `<= i`: the reference (and zstd
+    /// prefix) of the next level-`i` delta.
     states: [Option<Arc<Vec<u8>>>; 3],
-    payloads: [Option<Arc<Vec<u8>>>; 3],
     /// Keyframes since the last level-0 / level-1 keyframe.
     since_level0: u32,
-    since_level1: u32
+    since_level1: u32,
+    /// ROM ranges `(offset, length)` the emulator read since the most recent keyframe of level
+    /// `<= i` (see [`ReplayFileRecorder::rom_reads`]): where a level-`i` delta's ROM copies can
+    /// come from. Index 0 is unused (full keyframes copy nothing).
+    reads_since: [Vec<(u64, u64)>; 3],
+    /// The index of the ROM ranges the last delta was looked up in, kept while they stay the same.
+    rom_index: Option<(Vec<(u64, u64)>, RomIndex)>,
+    /// The last timeline picture's `(width, height, pixels)` per screen, and how many pictures
+    /// its group holds so far.
+    thumbnail: Option<[(u32, u32, Vec<u8>); 2]>,
+    thumbnails_in_group: u32,
+    /// Whether a level-0 keyframe has been decided on (it may still be waiting to be written).
+    has_level0: bool,
+    /// What touched each transient page first since the most recent keyframe (the merged
+    /// [`ReplayFileRecorder::transient_page_access`] reports), and the tracked memory's
+    /// `(offset in a state, bytes per page)`.
+    access_since: Vec<u8>,
+    access_range: Option<(usize, usize)>,
+    /// The keyframe waiting for the report of the interval after it (see
+    /// `ReplayFileRecorderSettings::stored_keyframe_mask_transients`), and every packet written
+    /// since, which follows it in the file.
+    pending: Option<PendingKeyframe>,
+    pending_packets: Vec<u8>
 }
+
+/// A Nintendo 3DS keyframe decided on but not yet written (see `StoredKeyframes::pending`).
+struct PendingKeyframe {
+    state: Vec<u8>,
+    metadata: KeyframeMetadata,
+    level: u8,
+    /// ROM ranges `(offset, length)` read since its reference: where its ROM copies may come from.
+    reads: Vec<(u64, u64)>
+}
+
+/// Make the transient pages of `state` that nothing read in the interval after it (`access`: 0
+/// nothing, 1 a read, 2 a write per page of `page` bytes from `offset`) equal to `reference`, so
+/// the delta leaves them out. Returns how many pages it changed.
+fn mask_unread_pages(state: &mut [u8], reference: &[u8], offset: usize, page: usize, access: &[u8]) -> MaskedPages {
+    let mut counts = MaskedPages::default();
+    for (i, &first) in access.iter().enumerate() {
+        let start = offset + i * page;
+        let end = start + page;
+        if end > state.len() || end > reference.len() {
+            break;
+        }
+        if state[start..end] == reference[start..end] {
+            continue;
+        }
+        match first {
+            1 => counts.kept_read += 1,
+            _ => {
+                state[start..end].copy_from_slice(&reference[start..end]);
+                if first == 0 { counts.masked_untouched += 1 } else { counts.masked_written += 1 }
+            }
+        }
+    }
+    counts
+}
+
+/// What [`mask_unread_pages`] did with the changed pages: left out because written first or
+/// untouched in the interval after the keyframe, or kept because something read them first.
+#[derive(Default, Clone, Copy, Debug)]
+struct MaskedPages {
+    masked_written: usize,
+    masked_untouched: usize,
+    kept_read: usize
+}
+
+/// A Nintendo 3DS file's timeline pictures come in groups of this many: the first stored on its
+/// own, the others against the picture before them (`Packet::Thumbnail::against_previous`). At one
+/// picture a second a group is a minute, 1/9 of the bytes of independent pictures, and decoding
+/// the last one of a group takes a few milliseconds (`replay-3ds-format-research.md` §5).
+pub const THUMBNAIL_GROUP: u32 = 60;
+
+/// Longest list of ROM reads a recorder keeps per level before merging it.
+const ROM_READS_BEFORE_MERGE: usize = 4096;
 
 /// Default minimum uncompressed bytes per blob
 pub const DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB: usize = 1024 * 1024 * 1024;
@@ -287,6 +392,8 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             current_blob_keyframe_offsets: Vec::new(),
             current_blob_offset: u64::try_from(current_blob_offset).expect("failed to read"),
             stored: (metadata.console_type.get_or_default() == ReplayConsoleType::Nintendo3DS).then(StoredKeyframes::default),
+            rom: None,
+            rom_reads_unknown: false,
             header: metadata,
             last_state_to_diff: None,
             recycled_state: None,
@@ -400,8 +507,10 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         // A temp-sink-only failure (`TempSink`) must not stop the bookmark section from being
         // written -- the final file is unaffected by it, and the temp file is disposable scratch.
         // Only a genuine final-sink failure skips straight to returning the sinks.
+        let pending_result = self.finish_pending_stored_keyframe();
         let blob_result = self.next_blob();
-        let section_result = if matches!(blob_result, Err(ref e) if !is_temp_sink_error(e)) {
+        let genuine = |r: &Result<(), ReplayFileWriteError>| matches!(r, Err(e) if !is_temp_sink_error(e));
+        let section_result = if genuine(&pending_result) || genuine(&blob_result) {
             Ok(())
         }
         else {
@@ -415,7 +524,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         // The first genuine (non-`TempSink`) error from either step is what makes close() fail; a
         // `TempSink` notice (already delivered to the caller once, from whichever call produced it)
         // does not.
-        let final_error = [blob_result, section_result].into_iter().find_map(|r| match r {
+        let final_error = [pending_result, blob_result, section_result].into_iter().find_map(|r| match r {
             Err(e) if !is_temp_sink_error(&e) => Some(e),
             _ => None,
         });
@@ -684,9 +793,9 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             ByteVec::Inline(a) => a.to_vec()
         };
         let (level0_every_level1s, level1_every) = self.settings.stored_keyframe_levels;
-        let zstd_level = self.settings.stored_keyframe_compression_level;
+        let mask = self.settings.stored_keyframe_mask_transients;
         let stored = self.stored.as_mut().expect("stored keyframes");
-        let level: u8 = if stored.states[0].is_none() || encoding == KeyframeEncoding::Full
+        let level: u8 = if !stored.has_level0 || encoding == KeyframeEncoding::Full
             || stored.since_level0 >= level0_every_level1s.saturating_mul(level1_every) {
             0
         }
@@ -696,21 +805,95 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         else {
             2
         };
+        match level {
+            0 => { stored.has_level0 = true; stored.since_level0 = 0; stored.since_level1 = 0; },
+            1 => { stored.since_level1 = 0; stored.since_level0 += 1; },
+            _ => { stored.since_level1 += 1; stored.since_level0 += 1; }
+        }
+        // The ROM ranges its copies may come from: what was read since its reference keyframe.
+        let reads = if level == 0 { Vec::new() } else { core::mem::take(&mut stored.reads_since[usize::from(level)]) };
+        for m in usize::from(level)..3 {
+            stored.reads_since[m].clear();
+        }
+        let keyframe = PendingKeyframe { state, metadata, level, reads };
 
-        let compress_error = |e: Cow<'static, str>| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("keyframe compression failed: {e}")) };
-        let (frame, uncompressed_len, payload) = if level == 0 {
-            (compress_data_with_prefix(&state, zstd_level, &[]).map_err(compress_error)?, state.len(), None)
+        if mask {
+            // Written once the report of the interval after it is in, which the next keyframe
+            // brings: the pages nothing read in that interval are left out. The one waiting is
+            // written now, with the report gathered since it.
+            if let Some(previous) = stored.pending.take() {
+                let access = core::mem::take(&mut stored.access_since);
+                self.encode_stored_keyframe(previous, Some(&access))?;
+                self.flush_pending_packets()?;
+                let stored = self.stored.as_mut().expect("stored keyframes");
+                stored.access_since = access;
+            }
+            let stored = self.stored.as_mut().expect("stored keyframes");
+            stored.access_since.fill(0);
+            stored.pending = Some(keyframe);
         }
         else {
+            self.encode_stored_keyframe(keyframe, None)?;
+        }
+        Ok(self.elapsed_frames)
+    }
+
+    /// Write a Nintendo 3DS keyframe: the whole state (level 0) or the format-v9 delta against
+    /// its level's reference. With `access` (what touched each transient page first in the
+    /// interval after it), the changed pages nothing read are left out, and the state kept as
+    /// the next deltas' reference has them as the reference had, which is what a player
+    /// rebuilds.
+    fn encode_stored_keyframe(&mut self, keyframe: PendingKeyframe, access: Option<&[u8]>) -> Result<(), ReplayFileWriteError> {
+        let PendingKeyframe { mut state, metadata, level, reads } = keyframe;
+        let zstd_level = self.settings.stored_keyframe_compression_level;
+        let stored = self.stored.as_mut().expect("stored keyframes");
+        let compress_error = |e: Cow<'static, str>| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("keyframe compression failed: {e}")) };
+        let (frame, uncompressed_len) = if level == 0 {
+            (compress_data_with_prefix(&state, zstd_level, &[]).map_err(compress_error)?, state.len())
+        }
+        else {
+            // The format-v9 payload (see `stored_keyframe`): the region diff against the
+            // reference state, with whatever the game read from its ROM since the reference
+            // stored as ROM copies, compressed with the whole reference state as prefix.
             let reference = stored.states[usize::from(level)].clone().expect("a level-0 keyframe exists");
+            let masked = match (access, stored.access_range) {
+                (Some(access), Some((offset, page))) => mask_unread_pages(&mut state, &reference, offset, page, access),
+                _ => MaskedPages::default()
+            };
             let diff = region_diff_resizing(&reference, &state);
-            let mut payload = Vec::with_capacity(8 + diff.control.len() + diff.data.len());
-            payload.extend_from_slice(&(diff.control.len() as u64).to_le_bytes());
-            payload.extend_from_slice(&diff.control);
-            payload.extend_from_slice(&diff.data);
-            let prefix: &[u8] = stored.payloads[usize::from(level)].as_deref().map_or(&[], |p| p.as_slice());
-            let frame = compress_data_with_prefix(&payload, zstd_level, prefix).map_err(compress_error)?;
-            (frame, payload.len(), Some(Arc::new(payload)))
+            let mut ranges = reads;
+            let copies = match self.rom.as_ref() {
+                Some(rom) if self.rom_reads_unknown || !ranges.is_empty() => {
+                    let rom: &[u8] = (**rom).as_ref();
+                    if self.rom_reads_unknown {
+                        ranges.clear();
+                        ranges.push((0, rom.len() as u64));
+                    }
+                    merge_ranges(&mut ranges);
+                    // The same ranges as last time (a whole ROM): the same index.
+                    if stored.rom_index.as_ref().is_none_or(|(indexed, _)| *indexed != ranges) {
+                        stored.rom_index = RomIndex::build(rom, &ranges).map(|index| (ranges.clone(), index));
+                    }
+                    stored.rom_index.as_ref().map(|(_, index)| index.find_copies(rom, &diff.data)).unwrap_or_default()
+                },
+                _ => Vec::new()
+            };
+            #[cfg(feature = "std")]
+            {
+                static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DEBUG.get_or_init(|| std::env::var_os("SUPERSHUCKIE_ROM_COPY_DEBUG").is_some()) {
+                    std::eprintln!("keyframe {} level {level}: rom {}, {} read ranges ({} bytes), {} changed bytes, {} copies ({} bytes), transient pages: {} left out (written first), {} left out (untouched), {} kept (read first)",
+                                   metadata.elapsed_frames, self.rom.is_some(), ranges.len(), ranges.iter().map(|r| r.1).sum::<u64>(),
+                                   diff.data.len(), copies.len(), copies.iter().map(|c| c.len).sum::<usize>(),
+                                   masked.masked_written, masked.masked_untouched, masked.kept_read);
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            let _ = masked;
+            let payload = encode_payload_v9(&diff.control, &diff.data, &copies);
+            drop(diff);
+            let frame = compress_data_with_state_prefix(&payload, zstd_level, &reference).map_err(compress_error)?;
+            (frame, payload.len())
         };
 
         let packet = Packet::StoredKeyframe {
@@ -721,7 +904,7 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             frame_len: frame.len() as UnsignedInteger,
             frame_offset: 0
         };
-        self.write_direct(&packet, &frame)?;
+        self.write_direct_now(&packet, &frame)?;
 
         let state = Arc::new(state);
         let displaced = {
@@ -731,12 +914,6 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
                 if let Some(old) = stored.states[m].replace(state.clone()) {
                     displaced = Some(old);
                 }
-                stored.payloads[m] = payload.clone();
-            }
-            match level {
-                0 => { stored.since_level0 = 0; stored.since_level1 = 0; },
-                1 => { stored.since_level1 = 0; stored.since_level0 += 1; },
-                _ => { stored.since_level1 += 1; stored.since_level0 += 1; }
             }
             displaced
         };
@@ -752,31 +929,198 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         if level == 0 && (self.bookmark_snapshot_pending || self.bookmarks_written) {
             self.write_bookmark_snapshot()?;
         }
-        Ok(self.elapsed_frames)
+        Ok(())
+    }
+
+    /// Write the keyframe still waiting for its interval's report (the recording is ending, or
+    /// something must go out in order): nothing is left out of it.
+    fn finish_pending_stored_keyframe(&mut self) -> Result<(), ReplayFileWriteError> {
+        let Some(pending) = self.stored.as_mut().and_then(|stored| stored.pending.take()) else {
+            return Ok(())
+        };
+        self.encode_stored_keyframe(pending, None)?;
+        self.flush_pending_packets()
+    }
+
+    /// Write out the packets held back behind a pending keyframe (now written).
+    fn flush_pending_packets(&mut self) -> Result<(), ReplayFileWriteError> {
+        let Some(stored) = self.stored.as_mut() else {
+            return Ok(())
+        };
+        let mut bytes = core::mem::take(&mut stored.pending_packets);
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let result = (|| {
+            self.assert_not_closed()?;
+            self.refuse_if_final_failed()?;
+            let written = self.final_write(|final_sink| {
+                final_sink.write_bytes(&bytes)?;
+                Ok(bytes.len())
+            })?;
+            self.current_blob_offset = self.current_blob_offset.checked_add(written as u64).expect("stream position overflowed");
+            self.temp_write(|temp_sink| temp_sink.write_bytes(&bytes))
+        })();
+        bytes.clear();
+        if let Some(stored) = self.stored.as_mut() {
+            stored.pending_packets = bytes;
+        }
+        result
+    }
+
+    /// What touched each page of the console's transient memory first since the last report
+    /// (Nintendo 3DS: VRAM, from the emulator), merged until the next keyframe consumes it; see
+    /// [`ReplayFileRecorderSettings::stored_keyframe_mask_transients`]. Report it before the
+    /// keyframe that ends the interval, like [`Self::rom_reads`].
+    pub fn transient_page_access(&mut self, access: &TransientPageAccess) {
+        let Some(stored) = self.stored.as_mut() else {
+            return
+        };
+        let range = (access.state_offset as usize, access.page_size as usize);
+        if stored.access_range != Some(range) || stored.access_since.len() != access.first_access.len() {
+            stored.access_range = Some(range);
+            stored.access_since.clear();
+            stored.access_since.resize(access.first_access.len(), 0);
+        }
+        for (kept, &first) in stored.access_since.iter_mut().zip(&access.first_access) {
+            if *kept == 0 {
+                *kept = first;
+            }
+        }
     }
 
     /// A picture of both screens for the timeline to show while it is dragged (Nintendo 3DS
     /// files; see [`Packet::Thumbnail`]). `top` and `bottom` are `(width, height, RGB565 pixels)`.
+    ///
+    /// In groups of [`THUMBNAIL_GROUP`]: the first picture of a group is stored on its own, the
+    /// others against the one before (an unchanged screen costs nothing).
     pub fn thumbnail(&mut self, top: (u32, u32, &[u8]), bottom: (u32, u32, &[u8])) -> Result<(), ReplayFileWriteError> {
         self.assert_not_closed()?;
-        let compress = |bytes: &[u8]| crate::util::compress_data(bytes, 3)
-            .map(ByteVec::Heap)
-            .map_err(|e| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("thumbnail compression failed: {e}")) });
+        let compress_error = |e: Cow<'static, str>| ReplayFileWriteError::Other { explanation: Cow::Owned(format!("thumbnail compression failed: {e}")) };
+        let screens = [top, bottom];
+        let quality = self.settings.stored_thumbnail_jpeg_quality;
+        if self.stored.is_some() && quality > 0 {
+            // Format v10: each screen a JPEG on its own (see `thumbnail_jpeg`).
+            let mut encoded = [ByteVec::new(), ByteVec::new()];
+            for (i, screen) in screens.iter().enumerate() {
+                encoded[i] = ByteVec::Heap(crate::thumbnail_jpeg::encode_rgb565(screen.0, screen.1, screen.2, quality).map_err(compress_error)?);
+            }
+            let [top_data, bottom_data] = encoded;
+            let packet = Packet::Thumbnail {
+                elapsed_frames: self.elapsed_frames,
+                top_width: top.0.into(),
+                top_height: top.1.into(),
+                bottom_width: bottom.0.into(),
+                bottom_height: bottom.1.into(),
+                top: top_data,
+                bottom: bottom_data,
+                against_previous: false,
+                jpeg: true
+            };
+            self.write_packet_data(&packet)?;
+            if let Some(stored) = self.stored.as_mut() {
+                // A lossless picture after this one starts its own group.
+                stored.thumbnails_in_group = 0;
+                stored.thumbnail = None;
+            }
+            return Ok(());
+        }
+        let previous = self.stored.as_ref().and_then(|stored| {
+            let previous = stored.thumbnail.as_ref()?;
+            let same_sizes = previous.iter().zip(&screens).all(|(p, s)| p.0 == s.0 && p.1 == s.1 && p.2.len() == s.2.len());
+            (same_sizes && stored.thumbnails_in_group < THUMBNAIL_GROUP).then_some(previous)
+        });
+        let mut encoded = [ByteVec::new(), ByteVec::new()];
+        for (i, screen) in screens.iter().enumerate() {
+            encoded[i] = match previous {
+                Some(previous) if previous[i].2.as_slice() == screen.2 => ByteVec::new(),
+                Some(previous) => ByteVec::Heap(compress_small_data_with_prefix(screen.2, 3, &previous[i].2).map_err(compress_error)?),
+                None => ByteVec::Heap(crate::util::compress_data(screen.2, 3).map_err(compress_error)?)
+            };
+        }
+        let against_previous = previous.is_some();
+        let [top_data, bottom_data] = encoded;
         let packet = Packet::Thumbnail {
             elapsed_frames: self.elapsed_frames,
             top_width: top.0.into(),
             top_height: top.1.into(),
             bottom_width: bottom.0.into(),
             bottom_height: bottom.1.into(),
-            top: compress(top.2)?,
-            bottom: compress(bottom.2)?
+            top: top_data,
+            bottom: bottom_data,
+            against_previous,
+            jpeg: false
         };
-        self.write_packet_data(&packet)
+        self.write_packet_data(&packet)?;
+
+        if let Some(stored) = self.stored.as_mut() {
+            stored.thumbnails_in_group = if against_previous { stored.thumbnails_in_group + 1 } else { 1 };
+            let pictures = stored.thumbnail.get_or_insert_with(Default::default);
+            for (kept, screen) in pictures.iter_mut().zip(&screens) {
+                kept.0 = screen.0;
+                kept.1 = screen.1;
+                kept.2.clear();
+                kept.2.extend_from_slice(screen.2);
+            }
+        }
+        Ok(())
+    }
+
+    /// Give the recorder the game's ROM file, so that 3DS keyframes can copy what the game read
+    /// from it (see [`Self::rom_reads`]) instead of storing those bytes. A player of the file
+    /// then needs the same ROM (`ReplayFilePlayer::set_rom`).
+    pub fn set_rom(&mut self, rom: RomBytes) {
+        self.rom = Some(rom);
+    }
+
+    /// Look for ROM copies anywhere in the ROM given to [`Self::set_rom`], not only in the ranges
+    /// [`Self::rom_reads`] reports: for re-encoding states nobody recorded the reads of (the
+    /// converter). The whole ROM is indexed once, at a coarser stride than a read set, so only
+    /// copies of about half a kilobyte and more are found in a 2 GB ROM.
+    pub fn set_rom_reads_unknown(&mut self, unknown: bool) {
+        self.rom_reads_unknown = unknown;
+    }
+
+    /// ROM ranges `(offset in the ROM file, length)` the emulator read since the last call: the
+    /// candidates for the next keyframes' ROM copies. Only kept for Nintendo 3DS files; call it
+    /// before the keyframe whose interval they belong to.
+    pub fn rom_reads(&mut self, reads: &[(u64, u64)]) {
+        let Some(stored) = self.stored.as_mut() else {
+            return
+        };
+        for ranges in &mut stored.reads_since[1..] {
+            ranges.extend_from_slice(reads);
+            if ranges.len() > ROM_READS_BEFORE_MERGE {
+                merge_ranges(ranges);
+            }
+        }
+    }
+
+    /// Append a packet of a Nintendo 3DS source file as it is, with the bytes that follow it
+    /// there (a `StoredKeyframe`'s frame): the resume fast path for 3DS files, whose keyframes
+    /// this recorder writes the same way.
+    pub(crate) fn append_stored_packet_verbatim(&mut self, packet: &Packet, extra: &[u8]) -> Result<(), ReplayFileWriteError> {
+        debug_assert!(self.stored.is_some(), "a 3DS recorder");
+        self.write_direct(packet, extra)
     }
 
     /// Write a packet (and `extra` bytes right after it) to the final sink, then the temp sink,
     /// advancing the stream position: the 3DS path, which has no in-progress blob.
     fn write_direct<'a, P: PacketIO<'a>>(&mut self, what: &'a P, extra: &[u8]) -> Result<(), ReplayFileWriteError> {
+        if self.stored.as_ref().is_some_and(|stored| stored.pending.is_some()) {
+            // Behind the keyframe waiting to be written (see `StoredKeyframes::pending`).
+            self.assert_not_closed()?;
+            let instructions = what.write_packet_instructions();
+            let stored = self.stored.as_mut().expect("checked above");
+            stored.pending_packets.write_packet_data(&instructions)?;
+            stored.pending_packets.write_bytes(extra)?;
+            return Ok(());
+        }
+        self.write_direct_now(what, extra)
+    }
+
+    /// [`Self::write_direct`] to the sinks themselves, whatever is pending.
+    fn write_direct_now<'a, P: PacketIO<'a>>(&mut self, what: &'a P, extra: &[u8]) -> Result<(), ReplayFileWriteError> {
         self.assert_not_closed()?;
         self.refuse_if_final_failed()?;
         let instructions = what.write_packet_instructions();
@@ -896,7 +1240,14 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     }
 
     /// Set the current input.
+    ///
+    /// Nintendo 3DS files (format v9) write it only when it differs from the current one: the
+    /// core sets it every frame and 97% of those repeat, which with no blobs to compress them
+    /// was 1% of a file. Other consoles' files are unchanged.
     pub fn set_input(&mut self, input_buffer: InputBuffer) -> Result<(), ReplayFileWriteError> {
+        if self.stored.is_some() && input_buffer == self.current_input {
+            return Ok(())
+        }
         self.current_input = input_buffer.clone();
         self.write_packet_data(&Packet::ChangeInput { data: input_buffer })
     }
@@ -1024,6 +1375,8 @@ impl Default for ReplayFileRecorderSettings {
             mask_transient_buffers: true,
             stored_keyframe_levels: (15, 15),
             stored_keyframe_compression_level: 3,
+            stored_keyframe_mask_transients: true,
+            stored_thumbnail_jpeg_quality: 75,
         }
     }
 }
@@ -1241,6 +1594,18 @@ pub trait ReplayFileRecorderFns: core::any::Any + 'static + Send {
         let _ = (top, bottom);
         Ok(())
     }
+    /// See [`ReplayFileRecorder::set_rom`]; ignored by recorders that do not use it.
+    fn set_rom(&mut self, rom: RomBytes) {
+        let _ = rom;
+    }
+    /// See [`ReplayFileRecorder::rom_reads`]; ignored by recorders that do not use it.
+    fn rom_reads(&mut self, reads: Vec<(u64, u64)>) {
+        let _ = reads;
+    }
+    /// See [`ReplayFileRecorder::transient_page_access`]; ignored by recorders that do not use it.
+    fn transient_page_access(&mut self, access: TransientPageAccess) {
+        let _ = access;
+    }
     fn get_errors(&mut self) -> Vec<ReplayFileWriteError>;
     fn mark_start(&mut self, timer_offset: TimestampMillis) -> Result<(), ReplayFileWriteError>;
     fn mark_end(&mut self) -> Result<(), ReplayFileWriteError>;
@@ -1250,6 +1615,12 @@ pub trait ReplayFileRecorderFns: core::any::Any + 'static + Send {
     /// `insert_keyframe` (see `ReplayFileRecorder::take_recycled_state`).
     fn take_free_state_buffer(&mut self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Keyframes handed over but not written yet (a recorder that writes them as they come:
+    /// always 0).
+    fn keyframes_in_flight(&self) -> usize {
+        0
     }
 }
 
@@ -1268,6 +1639,18 @@ impl<Final: ReplayFileSink + 'static + Send, Temp: ReplayFileSink + 'static + Se
     fn close(&mut self) -> Result<(), ReplayFileWriteError> {
         self.close().map_err(|e| e.2)?;
         Ok(())
+    }
+
+    fn set_rom(&mut self, rom: RomBytes) {
+        self.set_rom(rom);
+    }
+
+    fn rom_reads(&mut self, reads: Vec<(u64, u64)>) {
+        self.rom_reads(&reads);
+    }
+
+    fn transient_page_access(&mut self, access: TransientPageAccess) {
+        self.transient_page_access(&access);
     }
 
     #[inline]
@@ -1364,6 +1747,8 @@ mod tests {
             mask_transient_buffers: true,
             stored_keyframe_levels: (15, 15),
             stored_keyframe_compression_level: 3,
+            stored_keyframe_mask_transients: true,
+            stored_thumbnail_jpeg_quality: 75,
         }
     }
 
@@ -2128,44 +2513,90 @@ mod tests {
         let (_final_sink, _temp, error) = recorder.close().unwrap_err();
         assert!(matches!(error, ReplayFileWriteError::Other { .. }), "{error:?}");
     }
-    /// Nintendo 3DS files: keyframes are `StoredKeyframe` frames in the stream (no blobs), in two
-    /// delta levels over a full one, with states whose length drifts; every seek and a straight
-    /// read materialise the exact states.
-    #[test]
-    fn nintendo_3ds_stored_keyframes_record_and_seek() {
-        use crate::replay_file::playback::ReplayFilePlayer;
-        use crate::replay_file::REPLAY_VERSION_NINTENDO_3DS;
+    /// A game ROM for the Nintendo 3DS tests, and where keyframe `frame`'s state copied a block
+    /// of it from (word-aligned, like a sector read into a buffer).
+    fn rom_3ds() -> Vec<u8> {
+        pseudo_random_bytes(99, 400_000)
+    }
 
-        fn state_3ds(frame: u64) -> Vec<u8> {
-            let mut s = pseudo_random_bytes(7, 60_000);
-            // A few scattered changes per keyframe, a moving buffer, and a drifting length.
-            for i in 0..40u64 {
-                let at = ((i * 1543 + frame * 97) % 59_000) as usize;
-                s[at] ^= (frame as u8).wrapping_add(i as u8);
-            }
-            let moving = pseudo_random_bytes(frame, 2_000);
-            let at = 20_000 + ((frame % 7) * 1_000) as usize;
-            s[at..at + 2_000].copy_from_slice(&moving);
-            s.truncate(60_000 - ((frame % 5) * 7) as usize);
-            s
+    fn rom_block_at(frame: u64) -> usize {
+        ((frame * 37_000) % 390_000) as usize & !3
+    }
+
+    const ROM_BLOCK: usize = 6_000;
+
+    /// A Nintendo 3DS state: a few scattered changes per keyframe, a moving buffer, a drifting
+    /// length, and a block the game "read" from its ROM since the last keyframe.
+    fn state_3ds(frame: u64, rom: &[u8]) -> Vec<u8> {
+        let mut s = pseudo_random_bytes(7, 60_000);
+        for i in 0..40u64 {
+            let at = ((i * 1543 + frame * 97) % 59_000) as usize;
+            s[at] ^= (frame as u8).wrapping_add(i as u8);
         }
+        let moving = pseudo_random_bytes(frame, 2_000);
+        let at = 20_000 + ((frame % 7) * 1_000) as usize;
+        s[at..at + 2_000].copy_from_slice(&moving);
+        let from = rom_block_at(frame);
+        s[40_000..40_000 + ROM_BLOCK].copy_from_slice(&rom[from..from + ROM_BLOCK]);
+        s.truncate(60_000 - ((frame % 5) * 7) as usize);
+        s
+    }
 
+    fn metadata_3ds() -> ReplayFileMetadata {
         let mut metadata = make_metadata();
         metadata.console_type = ReplayConsoleType::Nintendo3DS;
+        metadata
+    }
+
+    /// Record `state_3ds` keyframes every other frame through frame 20 (levels (2, 3)), with the
+    /// ROM (and its reads reported) or without.
+    fn record_3ds(rom: Option<&Vec<u8>>) -> Vec<u8> {
+        let rom_bytes = rom_3ds();
         let settings = ReplayFileRecorderSettings { stored_keyframe_levels: (2, 3), ..Default::default() };
         let mut recorder = ReplayFileRecorder::new_with_metadata(
-            metadata, ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_3ds(0)), Vec::<u8>::new(), Vec::<u8>::new()
+            metadata_3ds(), ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_3ds(0, &rom_bytes)), Vec::<u8>::new(), Vec::<u8>::new()
         ).unwrap();
+        if let Some(rom) = rom {
+            recorder.set_rom(Arc::new(rom.clone()));
+        }
         for frame in 1..=20u64 {
             recorder.next_frame((frame * 16).into()).unwrap();
             if frame % 2 == 0 {
-                recorder.insert_keyframe(bv(&state_3ds(frame)), (frame * 16).into()).unwrap();
+                recorder.rom_reads(&[(rom_block_at(frame) as u64, ROM_BLOCK as u64)]);
+                recorder.insert_keyframe(bv(&state_3ds(frame, &rom_bytes)), (frame * 16).into()).unwrap();
             }
         }
-        let (closed, _) = recorder.close().unwrap();
+        recorder.close().unwrap().0
+    }
+
+    fn check_3ds_keyframe(player: &mut crate::replay_file::playback::ReplayFilePlayer, frame: u64, rom: &[u8]) {
+        player.go_to_keyframe(frame).unwrap();
+        match player.next_packet().unwrap() {
+            Some(Packet::Keyframe { metadata, state }) => {
+                assert_eq!(metadata.elapsed_frames, frame);
+                assert!(state.as_slice() == state_3ds(frame, rom).as_slice(), "state at keyframe {frame}");
+            },
+            other => panic!("seek to {frame} handed out {other:?}")
+        }
+    }
+
+    /// Nintendo 3DS files: keyframes are `StoredKeyframe` frames in the stream (no blobs), in two
+    /// delta levels over a full one, with states whose length drifts and ROM bytes copied in;
+    /// every seek and a straight read materialise the exact states.
+    #[test]
+    fn nintendo_3ds_stored_keyframes_record_and_seek() {
+        use crate::replay_file::playback::{ReplayFilePlayer, ReplayFileReadError, ReplaySeekError};
+        use crate::replay_file::REPLAY_VERSION_NINTENDO_3DS;
+
+        let rom = rom_3ds();
+        let closed = record_3ds(Some(&rom));
         assert_eq!(u32::from_le_bytes(closed[4..8].try_into().unwrap()), REPLAY_VERSION_NINTENDO_3DS);
+        let without_rom = record_3ds(None);
+        assert!(closed.len() + 10 * ROM_BLOCK / 2 < without_rom.len(), "ROM copies: {} bytes, none: {} bytes", closed.len(), without_rom.len());
 
         let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+        assert!(player.wants_rom());
+        player.set_rom(Arc::new(rom.clone()));
         player.set_keyframe_states_wanted(true);
         assert_eq!(player.all_keyframes().len(), 11);
         let levels: Vec<u8> = player.all_uncompressed_packets().iter().filter_map(|p| match p {
@@ -2177,14 +2608,7 @@ mod tests {
 
         // Forward and backward, within one full keyframe's segment and across them.
         for &frame in &[20u64, 4, 10, 18, 12, 4, 10, 6, 0, 20, 12, 14, 2, 16, 12, 14] {
-            player.go_to_keyframe(frame).unwrap();
-            match player.next_packet().unwrap() {
-                Some(Packet::Keyframe { metadata, state }) => {
-                    assert_eq!(metadata.elapsed_frames, frame);
-                    assert!(state.as_slice() == state_3ds(frame).as_slice(), "state at keyframe {frame}");
-                },
-                other => panic!("seek to {frame} handed out {other:?}")
-            }
+            check_3ds_keyframe(&mut player, frame, &rom);
         }
 
         // A straight read materialises every keyframe in order.
@@ -2192,10 +2616,288 @@ mod tests {
         let mut seen = 0;
         while let Some(packet) = player.next_packet().unwrap() {
             if let Packet::Keyframe { metadata, state } = packet {
-                assert!(state.as_slice() == state_3ds(metadata.elapsed_frames).as_slice(), "state at keyframe {}", metadata.elapsed_frames);
+                assert!(state.as_slice() == state_3ds(metadata.elapsed_frames, &rom).as_slice(), "state at keyframe {}", metadata.elapsed_frames);
                 seen += 1;
             }
         }
         assert_eq!(seen, 11);
+
+        // Without the ROM, a keyframe that copies from it cannot be materialised (and says why).
+        let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+        match player.go_to_keyframe(2).and_then(|()| player.next_packet().map(|_| ()).map_err(|error| ReplaySeekError::ReadError { error })) {
+            Err(ReplaySeekError::ReadError { error: ReplayFileReadError::BrokenPacket { explanation } }) => assert!(explanation.contains("ROM"), "{explanation}"),
+            other => panic!("materialising a ROM-copying keyframe without the ROM gave {other:?}")
+        }
+        // A file recorded without a ROM needs none.
+        let mut player = ReplayFilePlayer::new(&without_rom, false).unwrap();
+        check_3ds_keyframe(&mut player, 14, &rom);
+    }
+
+    /// Re-encoding states nobody logged the reads of (the converter): with the reads unknown the
+    /// whole ROM is searched, and the copies are found all the same.
+    #[test]
+    fn nintendo_3ds_whole_rom_search_finds_copies_without_reads() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        let record = |whole_rom: bool| {
+            let settings = ReplayFileRecorderSettings { stored_keyframe_levels: (2, 3), ..Default::default() };
+            let mut recorder = ReplayFileRecorder::new_blank(metadata_3ds(), ByteVec::new(), settings, ib(&[0]), Speed::default(), Vec::<u8>::new(), Vec::<u8>::new()).unwrap();
+            recorder.set_rom(Arc::new(rom.clone()));
+            recorder.set_rom_reads_unknown(whole_rom);
+            // As the re-feed does: prime from the first keyframe, then insert it and the rest.
+            recorder.prime_for_resume(&metadata_at(0));
+            recorder.insert_keyframe(bv(&state_3ds(0, &rom)), 0u64.into()).unwrap();
+            for frame in 1..=20u64 {
+                recorder.next_frame((frame * 16).into()).unwrap();
+                if frame % 2 == 0 {
+                    recorder.insert_keyframe(bv(&state_3ds(frame, &rom)), (frame * 16).into()).unwrap();
+                }
+            }
+            recorder.close().unwrap().0
+        };
+        let searched = record(true);
+        let not_searched = record(false);
+        assert!(searched.len() + 10 * ROM_BLOCK / 2 < not_searched.len(), "whole ROM: {} bytes, no reads: {} bytes", searched.len(), not_searched.len());
+        let mut player = ReplayFilePlayer::new(&searched, false).unwrap();
+        player.set_rom(Arc::new(rom.clone()));
+        for frame in [20u64, 6, 12, 0, 18] {
+            check_3ds_keyframe(&mut player, frame, &rom);
+        }
+    }
+
+    /// Resuming a 3DS (v9) file copies every packet before the last keyframe at or before the
+    /// resume point as it is, keyframe frames included, re-encodes only from that keyframe on,
+    /// and the result plays exactly.
+    #[test]
+    fn nintendo_3ds_resume_copies_the_prefix_verbatim() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        let source = record_3ds(Some(&rom));
+        let mut player = ReplayFilePlayer::new(&source, false).unwrap();
+        player.set_rom(Arc::new(rom.clone()));
+        player.set_keyframe_states_wanted(true);
+        let settings = ReplayFileRecorderSettings { stored_keyframe_levels: (2, 3), ..Default::default() };
+        let (mut recorder, info) = build_resumed_recorder(&mut player, Some(15), settings, ResumeCropPolicy::PreserveStartDropEnd, None, Vec::<u8>::new(), Vec::<u8>::new()).unwrap();
+        assert_eq!(info.elapsed_frames, 15);
+        recorder.set_rom(Arc::new(rom.clone()));
+        for frame in 16..=20u64 {
+            recorder.next_frame((frame * 16).into()).unwrap();
+            if frame % 2 == 0 {
+                recorder.rom_reads(&[(rom_block_at(frame) as u64, ROM_BLOCK as u64)]);
+                recorder.insert_keyframe(bv(&state_3ds(frame, &rom)), (frame * 16).into()).unwrap();
+            }
+        }
+        let (resumed, _) = recorder.close().unwrap();
+
+        let source_player = ReplayFilePlayer::new(&source, false).unwrap();
+        let mut out = ReplayFilePlayer::new(&resumed, false).unwrap();
+        // Everything before keyframe 14 is the source's own, byte for byte.
+        let boundary = source_player.all_uncompressed_packets().iter().position(|p| matches!(p, Packet::StoredKeyframe { metadata, .. } if metadata.elapsed_frames == 14)).unwrap();
+        assert!(boundary > 10);
+        for index in 0..boundary {
+            assert_eq!(out.all_uncompressed_packets()[index], source_player.all_uncompressed_packets()[index], "packet {index}");
+            assert_eq!(out.stored_frame_bytes(index).unwrap(), source_player.stored_frame_bytes(index).unwrap(), "frame of packet {index}");
+        }
+        // Keyframe 14 starts a new chain in the resumed file.
+        assert!(matches!(out.all_uncompressed_packets()[boundary], Packet::StoredKeyframe { level: 0, ref metadata, .. } if metadata.elapsed_frames == 14));
+        out.set_rom(Arc::new(rom.clone()));
+        assert_eq!(out.get_total_frames(), 20);
+        for frame in [20u64, 14, 12, 0, 16, 6, 18, 2] {
+            check_3ds_keyframe(&mut out, frame, &rom);
+        }
+    }
+
+    /// The player works on one buffer per level: walking forward along a level applies one delta
+    /// per keyframe, seeking back to a keyframe a buffer still holds applies none, and a
+    /// backward seek inside a segment re-walks only that segment's level-2 deltas.
+    #[test]
+    fn nintendo_3ds_seeks_reuse_what_the_chain_holds() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        let closed = record_3ds(Some(&rom));
+        let mut player = ReplayFilePlayer::new(&closed, false).unwrap();
+        player.set_rom(Arc::new(rom.clone()));
+
+        // Levels: 0@0 2@2 2@4 2@6 1@8 2@10 2@12 0@14 2@16 2@18 2@20.
+        let folds_for = |player: &mut ReplayFilePlayer, frame: u64| {
+            let before = player.chain_folds();
+            check_3ds_keyframe(player, frame, &rom);
+            player.chain_folds() - before
+        };
+        assert_eq!(folds_for(&mut player, 12), 4, "0, 1@8, 2@10, 2@12");
+        assert_eq!(folds_for(&mut player, 12), 0, "already current");
+        assert_eq!(folds_for(&mut player, 8), 0, "the level-1 buffer still holds 8");
+        assert_eq!(folds_for(&mut player, 0), 0, "the level-0 buffer still holds 0");
+        assert_eq!(folds_for(&mut player, 10), 1, "one delta on top of 8");
+        assert_eq!(folds_for(&mut player, 6), 3, "2@2, 2@4, 2@6 on top of 0");
+        assert_eq!(folds_for(&mut player, 20), 4, "0@14, 2@16, 2@18, 2@20");
+        assert_eq!(folds_for(&mut player, 18), 2, "the level-2 walk restarts from 14");
+    }
+
+    /// Format-v8 3DS files (each delta compressed with its reference keyframe's payload as prefix,
+    /// no ROM copies) still play.
+    #[test]
+    fn nintendo_3ds_v8_files_still_play() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::stored_keyframe::encode_payload_v8;
+
+        let rom = rom_3ds();
+        let mut header = metadata_3ds().as_raw_header().unwrap();
+        header.replay_version = 8;
+        let mut bytes = header.as_bytes().to_vec();
+        let levels = [0u8, 2, 2, 1, 2, 1, 2, 2, 0, 2];
+        let mut states: [Vec<u8>; 3] = Default::default();
+        let mut payloads: [Vec<u8>; 3] = Default::default();
+        for (frame, &level) in levels.iter().enumerate() {
+            let frame = frame as u64;
+            let state = state_3ds(frame, &rom);
+            let (compressed, uncompressed_len) = if level == 0 {
+                payloads = Default::default();
+                (compress_data_with_prefix(&state, 3, &[]).unwrap(), state.len())
+            } else {
+                let diff = region_diff_resizing(&states[usize::from(level)], &state);
+                let payload = encode_payload_v8(&diff.control, &diff.data);
+                let compressed = compress_data_with_prefix(&payload, 3, &payloads[usize::from(level)]).unwrap();
+                let len = payload.len();
+                for m in usize::from(level)..3 {
+                    payloads[m] = payload.clone();
+                }
+                (compressed, len)
+            };
+            for m in usize::from(level)..3 {
+                states[m] = state.clone();
+            }
+            if frame > 0 {
+                bytes.extend_from_slice(&Packet::NextFrame { timestamp_delta: 16.into() }.write_packet_instructions().iter().flat_map(|c| c.bytes().to_vec()).collect::<Vec<u8>>());
+            }
+            let packet = Packet::StoredKeyframe { metadata: metadata_at(frame), level, state_len: state.len() as u64, uncompressed_len: uncompressed_len as u64, frame_len: compressed.len() as u64, frame_offset: 0 };
+            for command in packet.write_packet_instructions() {
+                bytes.extend_from_slice(command.bytes());
+            }
+            bytes.extend_from_slice(&compressed);
+        }
+
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        assert!(!player.wants_rom());
+        for frame in [9u64, 4, 7, 2, 0, 6, 5, 3, 9, 8, 1] {
+            check_3ds_keyframe(&mut player, frame, &rom);
+        }
+    }
+
+    /// Timeline pictures come in groups: the first of each on its own, the rest against the one
+    /// before (an unchanged screen stored as nothing); every picture decodes exactly, in any order.
+    #[test]
+    fn nintendo_3ds_thumbnails_are_grouped() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        // Lossless pictures (the default is JPEG; see `nintendo_3ds_thumbnails_as_jpeg`).
+        let settings = ReplayFileRecorderSettings { stored_thumbnail_jpeg_quality: 0, ..Default::default() };
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            metadata_3ds(), ByteVec::new(), settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_3ds(0, &rom)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        let pictures = |i: u64| {
+            // The top screen changes a little every picture; the bottom one every tenth.
+            let mut top = pseudo_random_bytes(1, 64 * 32 * 2);
+            top[(i as usize * 50) % 4000..][..40].fill(i as u8);
+            let bottom = pseudo_random_bytes(2 + i / 10, 48 * 32 * 2);
+            (top, bottom)
+        };
+        const PICTURES: u64 = 150;
+        for i in 0..PICTURES {
+            for _ in 0..60 {
+                recorder.next_frame(((i * 60 + 1) * 16).into()).unwrap();
+            }
+            let (top, bottom) = pictures(i);
+            recorder.thumbnail((64, 32, &top), (48, 32, &bottom)).unwrap();
+        }
+        let (closed, _) = recorder.close().unwrap();
+
+        let player = ReplayFilePlayer::new(&closed, false).unwrap();
+        let thumbnails: Vec<&Packet> = player.all_uncompressed_packets().iter().filter(|p| matches!(p, Packet::Thumbnail { .. })).collect();
+        assert_eq!(thumbnails.len(), PICTURES as usize);
+        for (i, packet) in thumbnails.iter().enumerate() {
+            let Packet::Thumbnail { against_previous, bottom, .. } = packet else { unreachable!() };
+            assert_eq!(*against_previous, i % THUMBNAIL_GROUP as usize != 0, "picture {i}");
+            assert_eq!(bottom.is_empty(), *against_previous && i % 10 != 0, "picture {i}: an unchanged bottom screen is empty");
+        }
+
+        let mut order: Vec<u64> = (0..PICTURES).collect();
+        order.extend([149, 0, 61, 60, 59, 120, 119, 5, 90, 91, 92, 10]);
+        for i in order {
+            let frame = (i + 1) * 60;
+            let got = player.thumbnail_at_or_before(frame + 3).unwrap();
+            let (top, bottom) = pictures(i);
+            assert_eq!(got.frame, frame);
+            assert_eq!((got.top.0, got.top.1), (64, 32));
+            assert!(got.top.2 == top && got.bottom.2 == bottom, "picture {i}");
+        }
+        assert!(player.thumbnail_at_or_before(10).is_none(), "nothing before the first picture");
+    }
+
+    /// By default a 3DS file's timeline pictures are JPEGs (format v10): each decodes on its own, in
+    /// any order, to a picture close to the one recorded.
+    #[test]
+    fn nintendo_3ds_thumbnails_as_jpeg() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            metadata_3ds(), ByteVec::new(), ReplayFileRecorderSettings::default(), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_3ds(0, &rom)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        // Smooth gradients (JPEG keeps them well), shifted per picture.
+        let picture = |i: u64, w: u32, h: u32| -> Vec<u8> {
+            let mut out = Vec::with_capacity((w * h * 2) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let p = ((((x + i as u32) * 31 / w) as u16) << 11) | (((y * 63 / h) as u16) << 5) | (((x + y) * 31 / (w + h)) as u16);
+                    out.extend_from_slice(&p.to_le_bytes());
+                }
+            }
+            out
+        };
+        for i in 0..5u64 {
+            for _ in 0..60 {
+                recorder.next_frame(((i * 60 + 1) * 16).into()).unwrap();
+            }
+            recorder.thumbnail((64, 32, &picture(i, 64, 32)), (48, 32, &picture(i + 7, 48, 32))).unwrap();
+        }
+        let (closed, _) = recorder.close().unwrap();
+        let player = ReplayFilePlayer::new(&closed, false).unwrap();
+        let thumbnails: Vec<&Packet> = player.all_uncompressed_packets().iter().filter(|p| matches!(p, Packet::Thumbnail { .. })).collect();
+        assert_eq!(thumbnails.len(), 5);
+        assert!(thumbnails.iter().all(|p| matches!(p, Packet::Thumbnail { jpeg: true, against_previous: false, .. })));
+        for i in [3u64, 0, 4, 1, 2] {
+            let got = player.thumbnail_at_or_before((i + 1) * 60 + 3).unwrap();
+            assert_eq!(got.frame, (i + 1) * 60);
+            assert_eq!((got.top.0, got.top.1, got.top.2.len()), (64, 32, 64 * 32 * 2));
+            assert_eq!((got.bottom.0, got.bottom.1, got.bottom.2.len()), (48, 32, 48 * 32 * 2));
+            let want = picture(i, 64, 32);
+            let error: u64 = want.chunks_exact(2).zip(got.top.2.chunks_exact(2)).map(|(a, b)| {
+                let (a, b) = (u16::from_le_bytes([a[0], a[1]]), u16::from_le_bytes([b[0], b[1]]));
+                (a >> 11).abs_diff(b >> 11) as u64 + ((a >> 5) & 63).abs_diff((b >> 5) & 63) as u64 + (a & 31).abs_diff(b & 31) as u64
+            }).sum();
+            assert!(error / (64 * 32) <= 6, "picture {i}: average error {} per pixel", error / (64 * 32));
+        }
+    }
+
+    /// A 3DS file stores an input only when it changes; other consoles' files are unchanged.
+    #[test]
+    fn nintendo_3ds_inputs_are_written_when_they_change() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        let rom = rom_3ds();
+        let inputs = [0u8, 0, 0, 1, 1, 0, 2, 2, 2, 2];
+        let mut recorder = ReplayFileRecorder::new_with_metadata(
+            metadata_3ds(), ByteVec::new(), ReplayFileRecorderSettings::default(), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_3ds(0, &rom)), Vec::<u8>::new(), Vec::<u8>::new()
+        ).unwrap();
+        for (frame, &input) in inputs.iter().enumerate() {
+            recorder.set_input(ib(&[input])).unwrap();
+            recorder.next_frame(((frame as u64 + 1) * 16).into()).unwrap();
+        }
+        let (closed, _) = recorder.close().unwrap();
+        let player = ReplayFilePlayer::new(&closed, false).unwrap();
+        let written: Vec<u8> = player.all_uncompressed_packets().iter().filter_map(|p| match p {
+            Packet::ChangeInput { data } => Some(data[0]),
+            _ => None
+        }).collect();
+        assert_eq!(written, [1, 0, 2], "the starting input is 0");
     }
 }

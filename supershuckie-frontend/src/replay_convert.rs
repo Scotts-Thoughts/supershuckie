@@ -316,7 +316,7 @@ impl Drop for ConversionJob {
 
 fn run_job(shared: Arc<Shared>, plan: ConversionPlan, settings: ReplayFileRecorderSettings, keep_backups: bool) -> ConversionSummary {
     let started = Instant::now();
-    let options = ConvertOptions { settings, allow_corruption: false };
+    let options = ConvertOptions { settings, allow_corruption: false, rom_path: None };
     let mut summary = ConversionSummary { planned: plan.files.len(), kept_backups: keep_backups, ..Default::default() };
 
     for (index, path) in plan.files.iter().enumerate() {
@@ -362,7 +362,7 @@ fn convert_one(shared: &Shared, path: &Path, options: &ConvertOptions, keep_back
 
     let report = convert_replay_file(path, &temp, options, true, &mut progress)?;
 
-    if let Err(error) = verify_replay_files(path, &temp, options.settings.mask_transient_buffers, false, &mut progress) {
+    if let Err(error) = verify_replay_files(path, &temp, options.settings.mask_transient_buffers, false, None, &mut progress) {
         let _ = std::fs::remove_file(&temp);
         return Err(match error {
             ConvertError::Cancelled => ConvertError::Cancelled,

@@ -8,7 +8,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -28,9 +31,11 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/image_interface.h"
 #include "core/frontend/input.h"
+#include "core/file_sys/romfs_reader.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
 #include "core/hle/kernel/vm_manager.h"
+#include "core/hle/service/cfg/cfg.h"
 #include "core/hle/service/service.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
@@ -60,6 +65,7 @@ struct AzaharRsSettings {
     bool jit;
     int32_t region;
     uint64_t init_time;
+    int32_t language;
 };
 
 struct AzaharRsInput {
@@ -82,6 +88,12 @@ struct AzaharRsRegion {
 
 constexpr unsigned TOP_W = 400, TOP_H = 240, BOTTOM_W = 320, BOTTOM_H = 240;
 constexpr unsigned LAYOUT_W = 400, LAYOUT_H = 480;
+
+inline uint64_t NowNs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
 
 // ------------------------------------------------------------------ input devices
 
@@ -229,7 +241,9 @@ public:
 
     // Take the newest rendered frame out of the renderer's mailbox into our framebuffer and read
     // it back as 0xAARRGGBB, split into the two screens.
-    void Capture(std::vector<uint32_t>& top, std::vector<uint32_t>& bottom) {
+    // `readback_ns` gets the time until the pixels were back in memory.
+    void Capture(std::vector<uint32_t>& top, std::vector<uint32_t>& bottom, uint64_t& readback_ns) {
+        const uint64_t start = NowNs();
 #ifdef AZAHAR_RS_HAVE_GL
         auto& renderer = Core::System::GetInstance().GPU().Renderer();
         const auto prev_state = OpenGL::OpenGLState::GetCurState();
@@ -250,6 +264,7 @@ public:
         glReadPixels(0, 0, LAYOUT_W, LAYOUT_H, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
         OpenGL::OpenGLState{}.Apply();
         prev_state.Apply();
+        readback_ns = NowNs() - start;
 
         const auto& layout = GetFramebufferLayout();
         auto crop = [&](std::vector<uint32_t>& out, const Common::Rectangle<u32>& rect, unsigned w, unsigned h) {
@@ -306,7 +321,15 @@ struct AzaharCore {
     std::string rom_path;
     std::string error;
     bool loaded = false;
+    // Frames run so far: the clock of VideoCore::g_stale_surfaces (patch 0007).
+    uint64_t frames_run = 0;
+    // The ROM reads taken by the last azahar_rs_core_take_rom_reads, as (offset, length) pairs.
+    std::vector<uint64_t> rom_reads;
+    // Where the last azahar_rs_core_run_frame spent its time, in nanoseconds: emulating to the
+    // VBlank, taking the picture out of the renderer (TryPresent + readback), converting it.
+    uint64_t timing_ns[3] = {};
 };
+
 
 std::atomic<bool> g_instance{false};
 std::string g_static_error;
@@ -358,6 +381,8 @@ void ApplySettings(const AzaharRsSettings& s) {
     v.region_value.SetValue(s.region);
     v.init_clock.SetValue(Settings::InitClock::FixedTime);
     v.init_time.SetValue(s.init_time);
+    // Read as the config savegame loads (patch 0008), so a reset gets it too.
+    Service::CFG::g_system_language_override = s.language;
     v.init_ticks_type.SetValue(Settings::InitTicks::Fixed);
     v.init_ticks_override.SetValue(0);
     v.deterministic_async_operations.SetValue(true);
@@ -418,6 +443,7 @@ bool Load(AzaharCore& c) {
     system.RegisterCoreLoopThreadId();
     c.window->TakeSubmitted();
     c.loaded = true;
+    VideoCore::g_stale_surfaces.clear();
     return true;
 }
 
@@ -490,16 +516,35 @@ extern "C" void azahar_rs_core_free(AzaharCore* core) {
     g_instance = false;
 }
 
+// The OpenGL driver the core renders with ("vendor / renderer / version"), for diagnostics:
+// on a machine with two GPUs the hidden window's context can land on the slower one.
+extern "C" const char* azahar_rs_core_gl_renderer(AzaharCore* core) {
+    static std::string text;
+#ifdef AZAHAR_RS_HAVE_GL
+    if (ContextReady(core)) {
+        auto str = [](GLenum name) {
+            const auto* s = reinterpret_cast<const char*>(glGetString(name));
+            return std::string(s ? s : "?");
+        };
+        text = str(GL_VENDOR) + " / " + str(GL_RENDERER) + " / " + str(GL_VERSION);
+    }
+#endif
+    return text.c_str();
+}
+
 extern "C" const char* azahar_rs_core_last_error(const AzaharCore* core) {
     return core ? core->error.c_str() : g_static_error.c_str();
 }
 
-extern "C" bool azahar_rs_core_run_frame(AzaharCore* core, bool skip_drawing) {
+// Run to the next VBlank; with `capture` (and drawing), take the picture into top/bottom.
+extern "C" bool azahar_rs_core_run_frame(AzaharCore* core, bool skip_drawing, bool capture) {
     if (!core->loaded) return false;
     if (!ContextReady(core)) return false;
     VideoCore::g_skip_drawing.store(skip_drawing, std::memory_order_relaxed);
+    VideoCore::g_draw_frame.store(core->frames_run, std::memory_order_relaxed);
     auto& system = Core::System::GetInstance();
     core->window->Touch(g_input);
+    const uint64_t start = NowNs();
     while (!core->window->TakeSubmitted()) {
         const auto status = system.RunLoop();
         if (status != Core::System::ResultStatus::Success) {
@@ -508,10 +553,108 @@ extern "C" bool azahar_rs_core_run_frame(AzaharCore* core, bool skip_drawing) {
             return false;
         }
     }
-    if (!skip_drawing) {
-        core->window->Capture(core->top, core->bottom);
+    core->frames_run++;
+    const uint64_t ran = NowNs();
+    core->timing_ns[0] = ran - start;
+    core->timing_ns[1] = core->timing_ns[2] = 0;
+    if (!skip_drawing && capture) {
+        core->window->Capture(core->top, core->bottom, core->timing_ns[1]);
+        core->timing_ns[2] = NowNs() - ran - core->timing_ns[1];
     }
     return true;
+}
+
+// The texture cache's counters since the process started (VideoCore::g_cache_stats): surfaces
+// created, recycled, unregistered, framebuffers created, uploads, downloads, CPU-write
+// invalidations, draws, surfaces destroyed.
+extern "C" void azahar_rs_cache_stats(uint64_t* out) {
+    const auto& c = VideoCore::g_cache_stats;
+    const uint64_t v[9] = {c.surfaces_created, c.surfaces_recycled, c.surfaces_unregistered, c.framebuffers_created,
+                           c.uploads, c.downloads, c.invalidations, c.draws, c.surfaces_destroyed};
+    std::memcpy(out, v, sizeof(v));
+}
+
+// Video memory the driver reports available, in KB (NVX_gpu_memory_info; 0 where unsupported).
+extern "C" int64_t azahar_rs_core_gpu_memory_available_kb(AzaharCore* core) {
+#ifdef AZAHAR_RS_HAVE_GL
+    if (!ContextReady(core)) return 0;
+    GLint kb = 0;
+    glGetIntegerv(0x9049 /* GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX */, &kb);
+    if (glGetError() != GL_NO_ERROR) return 0;
+    return kb;
+#else
+    return 0;
+#endif
+}
+
+// Where the last azahar_rs_core_run_frame spent its time (see AzaharCore::timing_ns).
+extern "C" void azahar_rs_core_frame_timing(const AzaharCore* core, uint64_t* out) {
+    std::memcpy(out, core->timing_ns, sizeof(core->timing_ns));
+}
+
+// How many frames ago (counting the last one as 1) the oldest draw was skipped whose target
+// nothing has made fresh since (see VideoCore::g_stale_surfaces, patch 0007), or -1 when the
+// picture has no such hole. Only draws skipped since the last state load count.
+extern "C" int64_t azahar_rs_core_stale_frames_ago(const AzaharCore* core) {
+    if (VideoCore::g_stale_surfaces.empty()) return -1;
+    static const bool debug = std::getenv("SUPERSHUCKIE_STALE_DEBUG") != nullptr;
+    uint64_t since = ~uint64_t{0};
+    for (const auto& surface : VideoCore::g_stale_surfaces) {
+        since = std::min(since, surface.since);
+        if (debug) {
+            std::fprintf(stderr, "stale surface %08x-%08x (%u bytes) since frame %llu, now %llu\n", surface.start, surface.end,
+                         surface.end - surface.start, static_cast<unsigned long long>(surface.since),
+                         static_cast<unsigned long long>(core->frames_run));
+        }
+    }
+    return static_cast<int64_t>(core->frames_run - std::min(since, core->frames_run));
+}
+
+// Track what touches each 4 KB page of VRAM first (see VideoCore::g_vram_first_access), or stop;
+// either clears the record.
+extern "C" void azahar_rs_core_set_vram_access_tracking(AzaharCore* core, bool enabled) {
+    (void)core;
+    VideoCore::g_vram_first_access.fill(0);
+    VideoCore::g_vram_access_tracking.store(enabled, std::memory_order_relaxed);
+}
+
+// Copy the first-access record (one byte per VRAM page: 0 nothing, 1 read, 2 write) into `out`
+// (up to `capacity` bytes) and start a new one. Returns how many pages there are.
+extern "C" size_t azahar_rs_core_take_vram_access(AzaharCore* core, uint8_t* out, size_t capacity) {
+    (void)core;
+    const size_t n = std::min(capacity, VideoCore::g_vram_first_access.size());
+    std::memcpy(out, VideoCore::g_vram_first_access.data(), n);
+    VideoCore::g_vram_first_access.fill(0);
+    return VideoCore::g_vram_first_access.size();
+}
+
+// Where VRAM starts in a raw save state: the 32-byte raw header, then FCRAM (patch 0004's
+// RawRegionLayout puts VRAM right after it).
+extern "C" uint64_t azahar_rs_core_vram_raw_offset(const AzaharCore* core) {
+    (void)core;
+    return 32 + (Settings::values.is_new_3ds.GetValue() ? Memory::FCRAM_N3DS_SIZE : Memory::FCRAM_SIZE);
+}
+
+// Log the game's RomFS reads of its own file from now on (or stop; either empties the log).
+extern "C" void azahar_rs_core_set_rom_read_log(AzaharCore* core, bool enabled) {
+    FileSys::SetRomReadLog(core->rom_path, enabled);
+}
+
+// Take the ROM reads logged since the last call: returns how many (offset, length) pairs
+// azahar_rs_core_rom_reads now points to.
+extern "C" size_t azahar_rs_core_take_rom_reads(AzaharCore* core) {
+    const auto reads = FileSys::TakeRomReads();
+    core->rom_reads.clear();
+    core->rom_reads.reserve(reads.size() * 2);
+    for (const auto& [offset, length] : reads) {
+        core->rom_reads.push_back(offset);
+        core->rom_reads.push_back(length);
+    }
+    return reads.size();
+}
+
+extern "C" const uint64_t* azahar_rs_core_rom_reads(const AzaharCore* core) {
+    return core->rom_reads.data();
 }
 
 extern "C" const uint32_t* azahar_rs_core_get_pixels(const AzaharCore* core, uint32_t screen) {
@@ -569,6 +712,8 @@ extern "C" bool azahar_rs_core_load_state_raw(AzaharCore* core, const uint8_t* d
         return false;
     }
     core->window->TakeSubmitted();
+    // Every surface is reloaded from the state's memory: nothing is stale any more.
+    VideoCore::g_stale_surfaces.clear();
     return true;
 }
 

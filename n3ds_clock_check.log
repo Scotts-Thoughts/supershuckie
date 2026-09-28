@@ -1,0 +1,16 @@
+﻿cargo :    Compiling supershuckie-core v0.4.15 (A:\Programs\supershuckie\supershuckie-core)
+At line:1 char:439
++ ... pershuckie; cargo run --release -p supershuckie-core --example n3ds_c ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling su...ershuckie-core):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Finished `release` profile [optimized] target(s) in 4.32s
+     Running `target\release\examples\n3ds_clock_check.exe "A:\Dropbox\stp-projects\programs\roms\6\Pokemon X.3ds" 
+--frames 600 --hour`
+booted at 2026-09-26 14:30:00: counter 1, clock 2026-09-26 14:30:00 (3999421800000 ms since 1900)
+booted at 2001-02-03 04:05:06: counter 1, clock 2001-02-03 04:05:06
+state loaded: counter 1, clock 2026-09-26 14:30:00
+after 600 frames: counter 1, clock 2026-09-26 14:30:00
+after 214193 more frames: counter 2, clock 2026-09-26 15:30:00
+OK

@@ -1292,6 +1292,26 @@ pub extern "C" fn supershuckie_frontend_set_nds_date(frontend: &mut SuperShuckie
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_n3ds_date(frontend: &SuperShuckieFrontend, date: &mut NintendoDSDate) {
+    *date = frontend.get_n3ds_date().get_cleaned();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_n3ds_date(frontend: &mut SuperShuckieFrontend, date: &NintendoDSDate) {
+    frontend.set_n3ds_date(*date);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_n3ds_language(frontend: &SuperShuckieFrontend) -> u8 {
+    frontend.get_n3ds_language()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_n3ds_language(frontend: &mut SuperShuckieFrontend, language: u8) {
+    frontend.set_n3ds_language(language);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_get_nds_date_preset_count(frontend: &SuperShuckieFrontend) -> usize {
     frontend.get_nds_date_presets().len()
 }

@@ -25,11 +25,17 @@ pub struct Nintendo3DS {
     microseconds_per_frames: TimestampMicros,
     clock: Box<dyn MonotonicTimestampProvider>,
     skip_drawing: bool,
+    /// Whether the picture of the frames run is wanted (see [`EmulatorCore::set_picture_wanted`]):
+    /// when not, they are drawn but not read back from the GPU.
+    picture_wanted: bool,
     /// How many frames in a row have been drawn before this one. The 3DS shows a frame one VBlank
     /// or more after the game renders it, so the picture on the screens after a drawn frame was
     /// rendered by earlier frames: only when those were drawn too is there anything worth
     /// showing (see [`EmulatorCore::draw_lead_frames`]).
     drawn_in_a_row: u64,
+    /// Drawn frames still needed before the picture is trusted after a keyframe whose VRAM the
+    /// replay left partly stale (see `load_save_state_with_stale_output`).
+    masked_settle_left: u64,
     /// Whether the picture in `screens` is older than the emulation (frames were skipped), so the
     /// next drawn frame must be copied even if nothing else changed.
     stale: bool,
@@ -54,7 +60,9 @@ impl Nintendo3DS {
             microseconds_per_frames: DEFAULT_MICROSECONDS_PER_FRAME,
             clock,
             skip_drawing: false,
+            picture_wanted: true,
             drawn_in_a_row: u64::MAX,
+            masked_settle_left: 0,
             stale: false,
             stopped: false
         })
@@ -64,6 +72,21 @@ impl Nintendo3DS {
     /// advance. [`EmulatorCore::hard_reset`] recovers.
     pub fn stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// Where the last frame spent its time, in nanoseconds (see [`Core::frame_timing`]).
+    pub fn frame_timing(&self) -> [u64; 3] {
+        self.core.frame_timing()
+    }
+
+    /// Video memory the driver reports available, in KB (NVIDIA only; 0 elsewhere).
+    pub fn gpu_memory_available_kb(&mut self) -> i64 {
+        self.core.gpu_memory_available_kb()
+    }
+
+    /// The OpenGL driver the core renders with, as "vendor / renderer / version".
+    pub fn gl_renderer(&mut self) -> String {
+        self.core.gl_renderer()
     }
 
     /// What stopped it, or the last error.
@@ -85,6 +108,18 @@ impl Nintendo3DS {
 
 // 268111856 Hz / 4481136 cycles per frame = 59.8261 Hz
 const DEFAULT_MICROSECONDS_PER_FRAME: u64 = 16_715;
+
+/// Frames a replay seek draws before its target (see `seek_draw_tail_frames`): the frame the
+/// game renders the target's picture in, the VBlank that shows it, and one to spare.
+const SEEK_DRAW_TAIL_FRAMES: u64 = 3;
+
+/// Drawn frames after loading a keyframe whose VRAM is partly stale (format v10 replays leave
+/// out the VRAM pages the GPU rewrites before reading them: render targets, display
+/// framebuffers) before the picture is trusted. Measured on Pokemon Omega Ruby: with every
+/// changed VRAM page 4 s stale, both screens were the recording's again after 1 frame in most
+/// cases and after 2 in the rest (`n3ds_mask_lab`); a game that clears nothing and draws a
+/// buffer over several frames needs more.
+const MASKED_VRAM_SETTLE_FRAMES: u64 = 6;
 
 const N3DS_REGION_HEAP: usize = 0;
 const N3DS_REGION_LINEAR: usize = 1;
@@ -183,15 +218,23 @@ impl EmulatorCore for Nintendo3DS {
         }
         let render = !self.skip_drawing;
         // What the screens show after this frame was rendered a frame or more earlier.
-        let present = render && self.drawn_in_a_row >= self.draw_lead_frames();
-        if !self.core.run_frame(!render) {
+        let presentable = render && self.drawn_in_a_row >= self.draw_lead_frames();
+        // Reading the picture back waits for the GPU to finish the frame (about a third of a
+        // frame's time at 4x), so only the pictures someone looks at are taken.
+        let present = presentable && self.picture_wanted;
+        if !self.core.run_frame_capturing(!render, present) {
             self.stopped = true;
             return RunTime::NONE
         }
         self.drawn_in_a_row = if render { self.drawn_in_a_row.saturating_add(1) } else { 0 };
+        if render {
+            self.masked_settle_left = self.masked_settle_left.saturating_sub(1);
+        }
         if !present {
             self.stale = true;
-            self.drawn_in_a_row = u64::MAX;
+            if !presentable {
+                self.drawn_in_a_row = u64::MAX;
+            }
             return RunTime { frames: 1, presented: false }
         }
         self.screens[0].pixels.copy_from_slice(self.core.pixels(0));
@@ -202,6 +245,11 @@ impl EmulatorCore for Nintendo3DS {
 
     fn set_skip_drawing(&mut self, skip: bool) {
         self.skip_drawing = skip;
+        self.picture_wanted = true;
+    }
+
+    fn set_picture_wanted(&mut self, wanted: bool) {
+        self.picture_wanted = wanted;
     }
 
     fn draw_lead_frames(&self) -> u64 {
@@ -216,6 +264,52 @@ impl EmulatorCore for Nintendo3DS {
         }
         #[allow(unreachable_code)]
         u64::MAX
+    }
+
+    fn seek_draw_tail_frames(&self) -> u64 {
+        // A seek skips drawing except for these last frames (738 fps instead of ~400); what
+        // skipping left out of date is caught by `skipped_draws_left_stale` and redrawn. After a
+        // keyframe with stale VRAM, enough drawn frames for the game to have redrawn it.
+        // SUPERSHUCKIE_3DS_SEEK_TAIL overrides it (u64::MAX draws every frame, as before).
+        #[cfg(feature = "std")]
+        let tail = {
+            static TAIL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            *TAIL.get_or_init(|| std::env::var("SUPERSHUCKIE_3DS_SEEK_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(SEEK_DRAW_TAIL_FRAMES))
+        };
+        #[cfg(not(feature = "std"))]
+        let tail = SEEK_DRAW_TAIL_FRAMES;
+        tail.max(self.masked_settle_left)
+    }
+
+    fn load_save_state_with_stale_output(&mut self, state: &[u8]) -> Result<(), String> {
+        self.load_save_state(state)?;
+        self.masked_settle_left = MASKED_VRAM_SETTLE_FRAMES;
+        Ok(())
+    }
+
+    fn shows_stale_output(&self) -> bool {
+        self.masked_settle_left > 0
+    }
+
+    fn set_transient_page_tracking(&mut self, enabled: bool) {
+        self.core.set_vram_access_tracking(enabled);
+    }
+
+    fn take_transient_page_access(&mut self, into: &mut Vec<u8>) -> Option<(usize, usize)> {
+        self.core.take_vram_access(into);
+        Some((self.core.vram_raw_offset(), azahar_rs::VRAM_ACCESS_PAGE))
+    }
+
+    fn skipped_draws_left_stale(&self) -> Option<u64> {
+        self.core.stale_frames_ago()
+    }
+
+    fn set_rom_read_log(&mut self, enabled: bool) {
+        self.core.set_rom_read_log(enabled);
+    }
+
+    fn take_rom_reads(&mut self, into: &mut Vec<(u64, u64)>) {
+        self.core.take_rom_reads(into);
     }
 
     fn microseconds_until_next_frame(&mut self) -> Option<u64> {
@@ -277,6 +371,7 @@ impl EmulatorCore for Nintendo3DS {
             self.stopped = false;
             self.stale = true;
             self.drawn_in_a_row = u64::MAX;
+            self.masked_settle_left = 0;
             Ok(())
         } else {
             Err(alloc::format!("failed to load 3DS save state: {}", self.core.last_error()))

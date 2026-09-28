@@ -5,6 +5,7 @@
 #include <QString>
 #include <QPixmap>
 #include <vector>
+#include <optional>
 
 class QGridLayout;
 class QScrollArea;
@@ -21,7 +22,8 @@ class MainWindow;
  * Holds a user-curated grid of "favorite" ROMs. Clicking a tile loads that ROM immediately; a
  * tile can be given a custom picture (copied, scaled, into `<app dir>/favorite-icons/`), renamed,
  * given a keyboard shortcut (kept with the other shortcuts; see MainWindow::rebuild_favorite_roms_menu()),
- * reordered, or removed from its context menu. Dropping a ROM anywhere on the widget loads it,
+ * reordered, pointed at a different ROM file, or removed from its context menu. A tile whose ROM
+ * is missing or fails to load offers to locate the file or remove the tile. Dropping a ROM anywhere on the widget loads it,
  * just as dropping one on the game view does; dropping an image on a tile sets that tile's icon.
  * Tiles can also be dragged onto one another (or past the last one) to reorder them.
  *
@@ -81,7 +83,10 @@ private:
     void remove_favorite(std::size_t index);
     void rename_favorite(std::size_t index);
     void move_favorite(std::size_t index, int delta);
+    bool change_rom(std::size_t index, const QString &path);
+    std::optional<QString> choose_rom_file(std::size_t index);
     void open_favorite(std::size_t index);
+    void resolve_broken_favorite(std::size_t index, const QString &problem);
     void show_tile_menu(std::size_t index, const QPoint &global_pos);
 
     int tile_index_at(const QPoint &pos) const;

@@ -21,7 +21,7 @@ use crate::replay_file::record::{
     build_reencoded_recorder, NullReplayFileSink, ReplayFileRecorderSettings, ReplayResumeError,
 };
 use crate::replay_file::playback::ReplayFileReadError;
-use crate::replay_file::{ReplayConsoleType, ReplayHeaderBytes, ReplayHeaderRaw};
+use crate::replay_file::{ReplayConsoleType, ReplayHeaderBytes, ReplayHeaderRaw, RomBytes};
 use crate::util::launder_reference;
 use crate::{Packet, UnsignedInteger};
 
@@ -33,11 +33,16 @@ pub struct ConvertOptions {
 
     /// Read as much of a damaged source as possible instead of failing.
     pub allow_corruption: bool,
+
+    /// Nintendo 3DS replays: the game's ROM file. A format-v9 source needs it to be read, and
+    /// with it the output's keyframes copy what they can from it (see
+    /// `ReplayFileRecorder::set_rom_reads_unknown`); a player of the output then needs it too.
+    pub rom_path: Option<PathBuf>,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
-        Self { settings: ReplayFileRecorderSettings::default(), allow_corruption: false }
+        Self { settings: ReplayFileRecorderSettings::default(), allow_corruption: false, rom_path: None }
     }
 }
 
@@ -151,8 +156,29 @@ fn map_file(path: &Path) -> Result<memmap2::Mmap, String> {
     unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", path.display()))
 }
 
-fn open_player(path: &Path, bytes: &[u8], allow_corruption: bool) -> Result<ReplayFilePlayer, String> {
-    ReplayFilePlayer::new(bytes, allow_corruption).map_err(|e| format!("cannot parse {}: {e:?}", path.display()))
+/// Open `path` (mapped as `map`) for reading. A Nintendo 3DS replay keeps the mapping (its
+/// keyframes are read from it on demand) and is given the ROM, when there is one.
+fn open_player(path: &Path, map: &alloc::sync::Arc<memmap2::Mmap>, allow_corruption: bool, rom: Option<&RomBytes>) -> Result<ReplayFilePlayer, String> {
+    let is_3ds = map.get(8..12).is_some_and(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) == ReplayConsoleType::Nintendo3DS as u32);
+    let player = if is_3ds {
+        let source: alloc::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = map.clone();
+        ReplayFilePlayer::new_shared(source, allow_corruption)
+    } else {
+        ReplayFilePlayer::new(&map[..], allow_corruption)
+    };
+    let mut player = player.map_err(|e| format!("cannot parse {}: {e:?}", path.display()))?;
+    if let Some(rom) = rom {
+        player.set_rom(rom.clone());
+    }
+    Ok(player)
+}
+
+/// Map a game's ROM file for a Nintendo 3DS conversion.
+fn map_rom(path: Option<&Path>) -> Result<Option<RomBytes>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    Ok(Some(alloc::sync::Arc::new(map_file(path)?)))
 }
 
 fn source_info(player: &ReplayFilePlayer, size: u64) -> ReplaySourceInfo {
@@ -222,17 +248,24 @@ pub fn convert_replay_file(
 
     // Open and parse the source before touching anything else, so a bad source never costs an
     // existing output file.
-    let input_map = map_file(input)?;
+    let input_map = alloc::sync::Arc::new(map_file(input)?);
     let input_size = input_map.len() as u64;
-    let mut player = open_player(input, &input_map[..], options.allow_corruption)?;
+    let rom = map_rom(options.rom_path.as_deref())?;
+    let mut player = open_player(input, &input_map, options.allow_corruption, rom.as_ref())?;
     let source = source_info(&player, input_size);
+    if let Some(rom) = rom.as_ref() {
+        // The output's keyframes will point into this file: it must be the game the replay is of.
+        if crate::blake3_hash((**rom).as_ref()) != player.get_replay_metadata().rom_checksum {
+            return Err(ConvertError::Failed(format!("{} is not the game this replay was recorded with (its checksum differs)", options.rom_path.as_deref().unwrap_or(Path::new("")).display())));
+        }
+    }
 
     // Written to a temp file in the output directory, never to `output` itself, until it is known
     // to be complete: `output` is only ever replaced by the rename below, and is never truncated
     // or deleted by a failure in between.
     let tmp_path = output.with_extension("replay.tmp");
     let tmp_file = File::create(&tmp_path).map_err(|e| format!("cannot create {}: {e}", tmp_path.display()))?;
-    let result = write_reencoded(&mut player, tmp_file, options, progress);
+    let result = write_reencoded(&mut player, tmp_file, options, rom, progress);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -251,6 +284,7 @@ fn write_reencoded(
     player: &mut ReplayFilePlayer,
     output_file: File,
     options: &ConvertOptions,
+    rom: Option<RomBytes>,
     progress: ProgressFn<'_>,
 ) -> Result<(u64, UnsignedInteger), ConvertError> {
     let sink = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
@@ -259,6 +293,7 @@ fn write_reencoded(
         player,
         options.settings.clone(),
         options.allow_corruption,
+        rom,
         sink,
         NullReplayFileSink,
         &mut |frames, total| progress(ConvertPhase::Converting, frames, total),
@@ -317,14 +352,20 @@ fn check_states(console: ReplayConsoleType, masked: bool, frame: UnsignedInteger
     Ok(())
 }
 
-/// The next packet that is not a bookmark packet. Bookmark packets are compared as whole tables
-/// instead: the output carries the source's table as snapshots of its own, not the source's
-/// `Bookmark`/`BookmarkTable` packets.
-fn next_non_bookmark_packet(player: &mut ReplayFilePlayer) -> Result<Option<&Packet>, ReplayFileReadError> {
+/// The next packet that means something: not a bookmark packet, and not a `ChangeInput` to the
+/// input already in effect (`input`, which this keeps up to date). Bookmark packets are compared
+/// as whole tables instead: the output carries the source's table as snapshots of its own, not
+/// the source's `Bookmark`/`BookmarkTable` packets. A Nintendo 3DS output writes an input only
+/// when it changes, where its source may have repeated it every frame.
+fn next_non_bookmark_packet<'a>(player: &'a mut ReplayFilePlayer, input: &mut crate::InputBuffer) -> Result<Option<&'a Packet>, ReplayFileReadError> {
     loop {
         let packet = player.next_packet()?;
-        if matches!(packet, Some(Packet::Bookmark { .. } | Packet::BookmarkTable { .. })) {
-            continue;
+        match packet {
+            Some(Packet::Bookmark { .. } | Packet::BookmarkTable { .. }) => continue,
+            Some(Packet::ChangeInput { data }) if data == input => continue,
+            Some(Packet::ChangeInput { data }) => *input = data.clone(),
+            Some(Packet::Keyframe { metadata, .. }) => *input = metadata.input.clone(),
+            _ => {}
         }
         // SAFETY: the packet is owned by `player` and stays valid until its next `next_packet`
         // call, which the caller's borrow of `player` rules out; laundering only works around the
@@ -338,18 +379,22 @@ fn next_non_bookmark_packet(player: &mut ReplayFilePlayer) -> Result<Option<&Pac
 /// keyframe state reconstructing bit-exactly — outside the transient ranges if `masked` (the
 /// output was written with `mask_transient_buffers`). Keyframes that the output's keyframe
 /// bookmarks rely on must be stored full.
+///
+/// `rom_path` is the game's ROM for Nintendo 3DS replays whose keyframes copy from it.
 pub fn verify_replay_files(
     input: &Path,
     output: &Path,
     masked: bool,
     allow_corruption: bool,
+    rom_path: Option<&Path>,
     progress: ProgressFn<'_>,
 ) -> Result<VerifyReport, ConvertError> {
     let started = Instant::now();
-    let input_map = map_file(input)?;
-    let output_map = map_file(output)?;
-    let mut source = open_player(input, &input_map[..], allow_corruption)?;
-    let mut result = open_player(output, &output_map[..], false)?;
+    let input_map = alloc::sync::Arc::new(map_file(input)?);
+    let output_map = alloc::sync::Arc::new(map_file(output)?);
+    let rom = map_rom(rom_path)?;
+    let mut source = open_player(input, &input_map, allow_corruption, rom.as_ref())?;
+    let mut result = open_player(output, &output_map, false, rom.as_ref())?;
 
     check_eq("total frames", source.get_total_frames(), result.get_total_frames())?;
     check_eq("total milliseconds", source.get_total_milliseconds(), result.get_total_milliseconds())?;
@@ -368,6 +413,13 @@ pub fn verify_replay_files(
     }
     let console = source.get_replay_metadata().console_type;
 
+    // Compare keyframe states where the players keep them rather than copying each one out (a
+    // 3DS state is 150 MB), but materialise every one.
+    for player in [&mut source, &mut result] {
+        player.set_keyframe_states_wanted(false);
+        player.set_materialise_every_keyframe(true);
+    }
+
     source.go_to_keyframe(0).map_err(|e| format!("source: cannot seek to frame 0: {e:?}"))?;
     result.go_to_keyframe(0).map_err(|e| format!("output: cannot seek to frame 0: {e:?}"))?;
 
@@ -375,10 +427,13 @@ pub fn verify_replay_files(
     let mut packets = 0u64;
     let mut keyframes = 0u64;
     let mut frames = 0u64;
+    let (mut source_input, mut result_input) = (crate::InputBuffer::new(), crate::InputBuffer::new());
 
     loop {
-        let a = next_non_bookmark_packet(&mut source).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?;
-        let b = next_non_bookmark_packet(&mut result).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?;
+        // SAFETY (both): see `next_non_bookmark_packet`; each packet is only used until the next
+        // `next_packet` call on its player, which is the next iteration.
+        let a = next_non_bookmark_packet(&mut source, &mut source_input).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        let b = next_non_bookmark_packet(&mut result, &mut result_input).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
 
         let (a, b) = match (a, b) {
             (None, None) => break,
@@ -390,11 +445,20 @@ pub fn verify_replay_files(
         match (a, b) {
             (Packet::Keyframe { metadata: ma, state: sa }, Packet::Keyframe { metadata: mb, state: sb }) => {
                 check_eq(&format!("keyframe metadata at frame {}", ma.elapsed_frames), ma, mb)?;
-                check_states(console, masked, ma.elapsed_frames, sa.as_slice(), sb.as_slice())?;
+                // Both players hand out empty states (see below); the chain holds them.
+                debug_assert!(sa.is_empty() || sa.as_slice() == source.current_keyframe_state());
+                debug_assert!(sb.is_empty() || sb.as_slice() == result.current_keyframe_state());
+                check_states(console, masked, ma.elapsed_frames, source.current_keyframe_state(), result.current_keyframe_state())?;
                 keyframes += 1;
                 if !progress(ConvertPhase::Verifying, frames, total) {
                     return Err(ConvertError::Cancelled);
                 }
+            }
+            // Timeline pictures are re-encoded (grouped); they must show the same pixels.
+            (Packet::Thumbnail { elapsed_frames: fa, .. }, Packet::Thumbnail { elapsed_frames: fb, .. }) => {
+                check_eq("timeline picture frame", fa, fb)?;
+                let pictures = |player: &ReplayFilePlayer| player.thumbnail_at_or_before(*fa).map(|p| (p.frame, p.top, p.bottom));
+                check_eq(&format!("timeline picture at frame {fa}"), pictures(&source), pictures(&result))?;
             }
             _ => {
                 if a != b {
@@ -451,7 +515,7 @@ mod tests {
 
         assert_eq!(replay_file_version(&input).unwrap(), 3);
 
-        let options = ConvertOptions { settings: ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() }, allow_corruption: false };
+        let options = ConvertOptions { settings: ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() }, allow_corruption: false, rom_path: None };
         let mut phases = Vec::new();
         let report = convert_replay_file(&input, &output, &options, false, &mut |phase, done, total| {
             phases.push((phase, done, total));
@@ -472,7 +536,7 @@ mod tests {
         assert!(matches!(convert_replay_file(&input, &output, &options, false, &mut |_, _, _| true), Err(ConvertError::Failed(_))));
         assert!(output.exists());
 
-        let verify = verify_replay_files(&input, &output, true, false, &mut |phase, _, _| phase == ConvertPhase::Verifying).unwrap();
+        let verify = verify_replay_files(&input, &output, true, false, None, &mut |phase, _, _| phase == ConvertPhase::Verifying).unwrap();
         assert_eq!(verify.frames, TOTAL_FRAMES);
         assert_eq!(verify.keyframes as usize, keyframe_frames().len());
         assert!(verify.packets > 200);
@@ -486,7 +550,7 @@ mod tests {
             tampered_bytes[at] ^= 0xFF;
             let tampered = dir.join("tampered.replay");
             std::fs::write(&tampered, &tampered_bytes).unwrap();
-            assert!(matches!(verify_replay_files(&input, &tampered, true, false, &mut |_, _, _| true), Err(ConvertError::Failed(_))), "damage at byte {at}");
+            assert!(matches!(verify_replay_files(&input, &tampered, true, false, None, &mut |_, _, _| true), Err(ConvertError::Failed(_))), "damage at byte {at}");
         }
 
         // Cancelling removes the partial output.

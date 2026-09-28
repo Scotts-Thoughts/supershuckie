@@ -206,6 +206,35 @@ pub fn decompress_data(data: &[u8], uncompressed_size: usize) -> Result<Vec<u8>,
 /// previous keyframe's delta (double-buffered GPU data moving around), which is what makes a
 /// 44 MB payload a 2–3 MB frame.
 pub fn compress_data_with_prefix(data: &[u8], compression_level: i32, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    compress_with_prefix_window(data, compression_level, prefix, Some(MAX_WINDOW_LOG))
+}
+
+/// [`compress_data_with_prefix`] for small inputs (timeline pictures against the previous one):
+/// zstd's own parameters for the sizes involved, no long-distance matching.
+/// [`decompress_into_with_prefix`] reads it.
+pub fn compress_small_data_with_prefix(data: &[u8], compression_level: i32, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    compress_with_prefix_window(data, compression_level, prefix, None)
+}
+
+/// Largest window [`compress_data_with_state_prefix`] asks for (1 GiB).
+const MAX_STATE_PREFIX_WINDOW_LOG: u32 = 30;
+
+/// Largest window a decoder here accepts (`ZSTD_WINDOWLOG_MAX_64`): frames read with a prefix are
+/// decoded into a flat buffer in one call, so the window costs no memory of its own.
+const MAX_DECODE_WINDOW_LOG: i32 = 31;
+
+/// [`compress_data_with_prefix`] with a window that reaches back over the whole of `prefix`
+/// (format-v9 3DS keyframes, whose prefix is the 150–300 MB reference state itself: a delta's
+/// new bytes are mostly data that already sat somewhere else in memory, which a 128 MiB window
+/// would not reach). [`decompress_into_with_prefix`] reads it.
+pub fn compress_data_with_state_prefix(data: &[u8], compression_level: i32, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    let span = prefix.len().saturating_add(data.len()).max(1);
+    let window_log = (usize::BITS - (span - 1).leading_zeros()).clamp(MAX_WINDOW_LOG, MAX_STATE_PREFIX_WINDOW_LOG);
+    compress_with_prefix_window(data, compression_level, prefix, Some(window_log))
+}
+
+/// `window_log`: that window with long-distance matching, or `None` for zstd's defaults.
+fn compress_with_prefix_window(data: &[u8], compression_level: i32, prefix: &[u8], window_log: Option<u32>) -> Result<Vec<u8>, Cow<'static, str>> {
     use core::ffi::c_void;
     // SAFETY: pure function of its argument.
     let bound = unsafe { zstd_sys::ZSTD_compressBound(data.len()) };
@@ -227,8 +256,10 @@ pub fn compress_data_with_prefix(data: &[u8], compression_level: i32, prefix: &[
         // SAFETY: pure functions.
         let level = unsafe { compression_level.clamp(ZSTD_minCLevel() as i32, ZSTD_maxCLevel() as i32) };
         set(ZSTD_cParameter::ZSTD_c_compressionLevel, level)?;
-        set(ZSTD_cParameter::ZSTD_c_windowLog, MAX_WINDOW_LOG as i32)?;
-        set(ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, 1)?;
+        if let Some(window_log) = window_log {
+            set(ZSTD_cParameter::ZSTD_c_windowLog, window_log as i32)?;
+            set(ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching, 1)?;
+        }
         if !prefix.is_empty() {
             // SAFETY: the prefix outlives the compression (it is borrowed for this whole function).
             let r = unsafe { zstd_sys::ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr() as *const c_void, prefix.len()) };
@@ -251,7 +282,17 @@ pub fn compress_data_with_prefix(data: &[u8], compression_level: i32, prefix: &[
 /// Decompress a frame made by [`compress_data_with_prefix`] with the same `prefix` (empty when
 /// it was compressed without one) into exactly `uncompressed_size` bytes.
 pub fn decompress_data_with_prefix(data: &[u8], uncompressed_size: usize, prefix: &[u8]) -> Result<Vec<u8>, Cow<'static, str>> {
+    let mut out = Vec::new();
+    decompress_into_with_prefix(data, uncompressed_size, prefix, &mut out)?;
+    Ok(out)
+}
+
+/// [`decompress_data_with_prefix`] into `out`, whose allocation is reused (its contents are
+/// replaced; it only grows when it is too small). Reads frames of [`compress_data_with_prefix`]
+/// and [`compress_data_with_state_prefix`]. On error `out` is left empty.
+pub fn decompress_into_with_prefix(data: &[u8], uncompressed_size: usize, prefix: &[u8], out: &mut Vec<u8>) -> Result<(), Cow<'static, str>> {
     use core::ffi::c_void;
+    out.clear();
     // SAFETY: `data` is a valid slice; only the frame header is inspected.
     let claimed_size = unsafe { ZSTD_getFrameContentSize(data.as_ptr() as *const c_void, data.len()) };
     if claimed_size == ZSTD_CONTENTSIZE_UNKNOWN {
@@ -263,7 +304,6 @@ pub fn decompress_data_with_prefix(data: &[u8], uncompressed_size: usize, prefix
     if claimed_size != uncompressed_size as u64 {
         return Err(Cow::Owned(format!("zstd frame claims {claimed_size} bytes but {uncompressed_size} were expected")));
     }
-    let mut out: Vec<u8> = Vec::new();
     if out.try_reserve_exact(uncompressed_size).is_err() {
         return Err(Cow::Borrowed("failed to allocate RAM to decompress"));
     }
@@ -274,7 +314,7 @@ pub fn decompress_data_with_prefix(data: &[u8], uncompressed_size: usize, prefix
     }
     let result = (|| -> Result<(), Cow<'static, str>> {
         // SAFETY: dctx is a live context.
-        let r = unsafe { ZSTD_DCtx_setParameter(dctx, ZSTD_dParameter::ZSTD_d_windowLogMax, MAX_WINDOW_LOG as i32) };
+        let r = unsafe { ZSTD_DCtx_setParameter(dctx, ZSTD_dParameter::ZSTD_d_windowLogMax, MAX_DECODE_WINDOW_LOG) };
         if unsafe { ZSTD_isError(r) } != 0 { return Err(zstd_error(r)); }
         if !prefix.is_empty() {
             // SAFETY: the prefix outlives the decompression.
@@ -294,7 +334,7 @@ pub fn decompress_data_with_prefix(data: &[u8], uncompressed_size: usize, prefix
     result?;
     // SAFETY: zstd wrote exactly `uncompressed_size` bytes.
     unsafe { out.set_len(uncompressed_size) };
-    Ok(out)
+    Ok(())
 }
 
 /// Incremental decompression of one zstd frame (a compressed blob) straight into a caller-owned
