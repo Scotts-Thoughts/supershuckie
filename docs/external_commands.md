@@ -12,6 +12,7 @@ The server is `127.0.0.1:30158`
     - [JavaScript](#javascript)
     - [TypeScript](#typescript)
   - [Example code](#example-code)
+- [Writing a bot](#writing-a-bot)
 - [Rest command reference](#rest-command-reference)
   - [add-bookmark](#add-bookmark)
   - [bookmarks](#bookmarks)
@@ -20,13 +21,18 @@ The server is `127.0.0.1:30158`
   - [go-to-bookmark](#go-to-bookmark)
   - [go-to-frame](#go-to-frame)
   - [increment-counter](#increment-counter)
+  - [input](#input)
   - [load-replay](#load-replay)
   - [mark-start](#mark-start)
   - [mark-end](#mark-end)
   - [play-together](#play-together)
+  - [press](#press)
+  - [read-memory](#read-memory)
+  - [screenshot](#screenshot)
   - [set-paused](#set-paused)
   - [set-playback-speed](#set-playback-speed)
   - [stats](#stats)
+  - [step](#step)
   - [toggle-range-bookmark](#toggle-range-bookmark)
   - [update-bookmark](#update-bookmark)
 
@@ -108,6 +114,58 @@ import { SuperShuckieClient } from "./somepath/client"
 Refer to [`client.d.ts`] for documentation on this API.
 
 [`client.d.ts`]: ../supershuckie-frontend-webserver/js/client.d.ts
+
+## Writing a bot
+
+A program can play the game through the bot routes: [input](#input),
+[press](#press), [step](#step), [read-memory](#read-memory) and
+[screenshot](#screenshot). They are off by default. Turn on both
+**Settings › Enable external commands** and **Settings › Allow bot control**;
+until then every bot route answers `403`.
+
+There are two ways to play, and a bot can switch between them at any time:
+
+- **Real time.** The game runs at its normal speed. The bot changes what it
+  holds with [input](#input), or presses something for a set number of frames
+  with [press](#press). A change takes effect on the next frame after the
+  request arrives, so timing is about as exact as a person's.
+- **Lockstep.** The game is paused and only moves when the bot asks:
+  [step](#step) holds the given buttons and runs exactly N frames, then answers.
+  Every frame is exact and the run is reproducible, and the bot can think as
+  long as it likes between steps.
+
+There is no mode switch. A step pauses the game if it is running, and
+[set-paused](#set-paused)`?paused=false` goes back to real time.
+
+What the bot holds is separate from the keyboard and controllers. Neither one
+replaces the other: the game sees both at once. Bot input is recorded into
+replays and sent to Play Together like any other input. A replay recorded in
+lockstep plays back at normal speed, because every stepped frame is timestamped
+one frame after the one before it, however long the bot waited.
+
+The bot routes do not unpause the game or stop a replay. They are refused with
+`409` when there is nothing to play: no game loaded, a replay playing back, a
+video export running, or (for [step](#step)) following another player or
+linked by cable. Whatever the bot holds is released when a game is loaded or
+closed, a replay stops, external commands or bot control are turned off.
+
+A minimal lockstep loop in JavaScript:
+
+```javascript
+const shuckie = new SuperShuckieClient()
+let held = []
+for (;;) {
+    // Hold `held` for 4 frames, then read 2 bytes at 0xD158.
+    const step = await shuckie.step(4, { buttons: held }, [[0xD158, 2]])
+    if (step.was_running) {
+        console.log("someone unpaused the game since the last step")
+    }
+    held = decide(step.reads[0].data)
+}
+```
+
+Each request costs a few milliseconds of round trip. To go faster, run more
+frames per step.
 
 ## REST command reference
 
@@ -263,6 +321,28 @@ Arguments:
 | `name`   | (required) | The name of the counter.                                     |
 | `by`     | 1          | Amount to increment (or decrement, if negative) the counter. |
 
+### input
+
+Bot control (see [Writing a bot](#writing-a-bot)): replace what the bot holds.
+It stays held until the next `input`. With no arguments, everything is released.
+Returns `{"frame": FRAME}`, the frame count when the input was queued. The input
+applies from the next frame.
+
+Usage:
+
+- `http://127.0.0.1:30158/input?buttons=a,up`
+- `http://127.0.0.1:30158/input?touch=128,96`
+- `http://127.0.0.1:30158/input`
+
+Arguments:
+
+| Argument  | Default  | Description                                                                                                       |
+|-----------|----------|-------------------------------------------------------------------------------------------------------------------|
+| `buttons` | (none)   | A comma-separated list of `a` `b` `x` `y` `l` `r` `zl` `zr` `start` `select` `up` `down` `left` `right`. An unknown name is a `400`. |
+| `touch`   | (none)   | `x,y`: a touch on the bottom screen, in its pixels (Nintendo DS and 3DS).                                          |
+| `circle`  | `0,0`    | `x,y`: the circle pad, `-127` to `127` each, positive = right / up (Nintendo 3DS).                                  |
+| `cstick`  | `0,0`    | `x,y`: the C-stick, like `circle` (Nintendo 3DS).                                                                  |
+
 ### load-replay
 
 Load a replay.
@@ -344,6 +424,51 @@ Usage:
  "errors": []}
 ```
 
+### press
+
+Bot control: hold buttons or a touch for exactly `frames` frames, on top of
+whatever else is held, then release them. Presses can overlap. Returns
+`{"frame": FRAME}` like [input](#input).
+
+Usage:
+
+- `http://127.0.0.1:30158/press?buttons=a`
+- `http://127.0.0.1:30158/press?buttons=start&frames=10`
+
+Arguments: `buttons`, `touch`, `circle` and `cstick` as for [input](#input)
+(at least one button or a touch is required), and:
+
+| Argument | Default | Description                            |
+|----------|---------|----------------------------------------|
+| `frames` | 4       | How many frames to hold, 1 to 3600.    |
+
+### read-memory
+
+Bot control: read console memory. Returns
+`{"address": ADDRESS, "data": "HEX"}`, with the bytes as lowercase hex.
+Returns `404` if the address is not mapped.
+
+Usage:
+
+- `http://127.0.0.1:30158/read-memory?address=0xD158&length=11`
+
+Arguments:
+
+| Argument  | Default    | Description                                  |
+|-----------|------------|----------------------------------------------|
+| `address` | (required) | The address, as `0x` hex or decimal.         |
+| `length`  | (required) | How many bytes to read, 1 to 65536.          |
+
+### screenshot
+
+Bot control: the current picture as a PNG. Consoles with two screens are
+stacked top screen first, in the console's own order (the "swap screens"
+setting is ignored).
+
+Usage:
+
+- `http://127.0.0.1:30158/screenshot`
+
 ### set-paused
 
 Set whether or not playback is paused.
@@ -404,6 +529,43 @@ Usage:
 | `frames_over_budget`   | `number`                 | Frames that took longer than the budget since the last speed change or ROM load.                                    |
 | `bookmark_generation`  | `number`                 | Changes whenever the bookmarks (or bookmark types) change; fetch [bookmarks](#bookmarks) when it does.              |
 
+### step
+
+Bot control (lockstep; see [Writing a bot](#writing-a-bot)): pause the game if
+it is running, then run exactly `frames` frames as fast as possible, without
+sound. Only the last frame is drawn. The reply comes once the frames have run.
+
+If input arguments are given, they replace what the bot holds before the first
+frame, as [input](#input) would, and stay held afterwards. Without them, what
+the bot holds stays as it is.
+
+Usage:
+
+- `http://127.0.0.1:30158/step`
+- `http://127.0.0.1:30158/step?frames=30&buttons=right`
+- `http://127.0.0.1:30158/step?frames=1&buttons=&read=0xD158:11,0xD16B:2`
+
+Arguments: `buttons`, `touch`, `circle` and `cstick` as for [input](#input)
+(`buttons=` with nothing after it releases everything), and:
+
+| Argument | Default | Description                                                                                   |
+|----------|---------|-----------------------------------------------------------------------------------------------|
+| `frames` | 1       | How many frames to run, 0 to 3600. 0 only pauses, sets the input and reads.                   |
+| `read`   | (none)  | `address:length` pairs, comma-separated, read after the last frame (up to 32, 65536 bytes in all). |
+
+Returns:
+
+| Field           | Type             | Description                                                                                                  |
+|-----------------|------------------|--------------------------------------------------------------------------------------------------------------|
+| `frame`         | `number`         | The frame count once the step ended (as `total_elapsed_frames` in [stats](#stats)).                           |
+| `frames_run`    | `number`         | Frames the step ran. A Game Boy paused partway through a frame first finishes that frame, which is not counted. |
+| `was_running`   | `boolean`        | `true` if the game was running when the step arrived. Something resumed it since the last step (for example a key press with "auto-unpause on input" on), so lockstep was broken in between. |
+| `cancelled`     | `boolean`        | `true` if the step ended before all its frames ran.                                                          |
+| `cancel_reason` | `string \| null` | Why: the game was unpaused, reset, loaded from a state or closed, a replay was loaded, a link cable was connected, bot control was turned off, or the step took longer than 50 seconds. |
+| `reads`         | `Read[]`         | `{"address": number, "data": "HEX" \| null}` for each `read` range, in order; `null` where unmapped.          |
+
+A second step sent while one is still running is refused with `409`.
+
 ### toggle-range-bookmark
 
 Start a range bookmark at the current frame, or end the range started last at
@@ -446,6 +608,10 @@ Arguments:
 | `out`     | (unchanged)| The frame the bookmark ends on: a frame number, `now` for the current frame, or `none` to remove it.|
 
 ### Errors
+
+Bot routes that fail return `{"error": "..."}` with status `400` (a bad
+argument), `403` (bot control is off), `404` (memory not mapped) or `409`
+(nothing can be played right now; the message says why).
 
 Bookmark requests that fail return `{"error": "..."}` with status `400` (a bad
 argument), `404` (no replay is recording or playing back, or there is no such

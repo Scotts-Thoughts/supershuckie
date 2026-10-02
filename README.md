@@ -147,6 +147,15 @@ deletes and seeks to bookmarks as well (see [docs/external_commands.md](docs/ext
 Bookmarks are saved inside the replay file (format v5). Adding one to a replay made by an older
 version upgrades that file in place, after asking; older versions cannot open it afterwards.
 
+## Bot control
+
+A program on the same computer can play the game through the REST API: hold buttons in real time,
+or pause the game and step it a set number of frames at a time with frame-exact input, reading
+memory and taking screenshots between steps. It is off by default; turn on **Settings › Allow bot
+control** (it needs **Enable external commands**, which is on by default). The bot's input is
+separate from the keyboard's, so neither cancels the other, and it is recorded into replays like
+any other input. See "Writing a bot" in [docs/external_commands.md](docs/external_commands.md).
+
 ## Play Together
 
 Play alongside friends (or race them) with every player's game on your screen. One player hosts

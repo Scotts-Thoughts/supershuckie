@@ -4,6 +4,7 @@ pub mod replay_convert;
 pub mod memory_tools;
 pub mod bookmarks;
 pub mod play_together;
+pub mod bot;
 
 use std::cell::OnceCell;
 use std::cmp::Ordering;
@@ -1797,6 +1798,10 @@ impl SuperShuckieFrontend {
                         reset_stats(&mut stats);
                         let _ = t.send(self.handle_bookmark_request(request));
                     }
+                    SuperShuckieServerCommand::Bot(t, request) => {
+                        reset_stats(&mut stats);
+                        self.handle_bot_request(request, t);
+                    }
                     SuperShuckieServerCommand::MarkStart(t, timer_offset) => {
                         reset_stats(&mut stats);
                         let _ = t.send(self.mark_replay_start(TimestampMillis(timer_offset as UnsignedInteger)).is_ok());
@@ -3170,6 +3175,8 @@ impl SuperShuckieFrontend {
         self.external_commands_error = None;
         if !enabled {
             self.web_server = None;
+            // A bot that can no longer reach the game must not leave a button held.
+            self.release_bot("external commands were turned off");
             return Ok(())
         }
         if self.web_server.is_some() {

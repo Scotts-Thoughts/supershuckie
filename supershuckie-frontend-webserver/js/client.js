@@ -152,6 +152,80 @@ export class SuperShuckieClient {
         await this._handle_error(result)
     }
 
+    async input(input = {}) {
+        const result = await fetch(this._construct_url(`input${this._bot_query(input)}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async press(input, frames = 4) {
+        this._check_frames("press", frames, 1)
+
+        const result = await fetch(this._construct_url(`press${this._bot_query(input, { frames })}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async step(frames = 1, input = undefined, reads = []) {
+        this._check_frames("step", frames, 0)
+        const extra = { frames }
+        if(reads.length > 0) {
+            extra.read = reads.map(([address, length]) => `${address}:${length}`).join(",")
+        }
+
+        const result = await fetch(this._construct_url(`step${input === undefined ? this._bot_query({}, extra, false) : this._bot_query(input, extra)}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async read_memory(address, length) {
+        if(typeof address !== "number" || !Number.isInteger(address) || address < 0) {
+            throw new TypeError("read_memory address must be an unsigned integer")
+        }
+        if(typeof length !== "number" || !Number.isInteger(length) || length < 1) {
+            throw new TypeError("read_memory length must be a positive integer")
+        }
+
+        const result = await fetch(this._construct_url(`read-memory?address=${address}&length=${length}`))
+        await this._handle_error(result)
+
+        return result.json()
+    }
+
+    async screenshot() {
+        const result = await fetch(this._construct_url(`screenshot`))
+        await this._handle_error(result)
+
+        return result.blob()
+    }
+
+    _check_frames(method, frames, min) {
+        if(typeof frames !== "number" || !Number.isInteger(frames) || frames < min || frames > 3600) {
+            throw new TypeError(`${method} frames must be an integer from ${min} to 3600`)
+        }
+    }
+
+    _bot_query(input, extra = {}, with_buttons = true) {
+        const params = new URLSearchParams()
+        for(const [key, value] of Object.entries(extra)) {
+            params.set(key, String(value))
+        }
+        if(with_buttons) {
+            // Always given, so that an empty input releases everything rather than keeping it.
+            params.set("buttons", (input.buttons ?? []).join(","))
+            for(const key of ["touch", "circle", "cstick"]) {
+                if(input[key] !== undefined && input[key] !== null) {
+                    params.set(key, input[key].join(","))
+                }
+            }
+        }
+        const query = params.toString()
+        return query === "" ? "" : `?${query}`
+    }
+
     _check_bookmark_id(method, id) {
         if(typeof id !== "number" || !Number.isInteger(id) || id < 0) {
             throw new TypeError(`${method} id must be an unsigned integer`)

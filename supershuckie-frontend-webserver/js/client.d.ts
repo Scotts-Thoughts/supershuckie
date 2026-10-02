@@ -115,6 +115,67 @@ export class SuperShuckieClient {
      * @param point "in" (default) or "out"
      */
     go_to_bookmark(id: number, point?: "in" | "out"): Promise<void>
+
+    /**
+     * Bot control (real time): replace what the bot holds; nothing given releases everything.
+     * Needs Settings > Allow bot control.
+     * @param input buttons, touch point and sticks to hold
+     */
+    input(input?: SuperShuckieBotInput): Promise<{ frame: number }>
+
+    /**
+     * Bot control (real time): hold for exactly `frames` frames, then release
+     * @param input buttons or touch point to press
+     * @param frames how long (1 to 3600, default 4)
+     */
+    press(input: SuperShuckieBotInput, frames?: number): Promise<{ frame: number }>
+
+    /**
+     * Bot control (lockstep): pause the game if it is running, then run exactly `frames` frames
+     * @param frames how many (0 to 3600, default 1)
+     * @param input replaces what the bot holds first (it stays held); omit to keep it
+     * @param reads [address, length] ranges to read after the last frame
+     */
+    step(frames?: number, input?: SuperShuckieBotInput, reads?: [number, number][]): Promise<SuperShuckieStepResult>
+
+    /**
+     * Read console memory
+     * @param address address
+     * @param length bytes (1 to 65536)
+     */
+    read_memory(address: number, length: number): Promise<{ address: number, data: string }>
+
+    /**
+     * The screens as a PNG (stacked top to bottom)
+     */
+    screenshot(): Promise<Blob>
+}
+
+/**
+ * What a bot holds (see external_commands.md)
+ */
+export interface SuperShuckieBotInput {
+    buttons?: ("a" | "b" | "x" | "y" | "l" | "r" | "zl" | "zr" | "start" | "select" | "up" | "down" | "left" | "right")[],
+    /** Bottom-screen pixels */
+    touch?: [number, number],
+    /** -127 to 127 each, positive = right / up */
+    circle?: [number, number],
+    cstick?: [number, number]
+}
+
+/**
+ * The outcome of a step (see external_commands.md)
+ */
+export interface SuperShuckieStepResult {
+    /** Frame count once the step ended */
+    frame: number,
+    frames_run: number,
+    /** The game was running when the step arrived: lockstep was broken since the last step */
+    was_running: boolean,
+    cancelled: boolean,
+    cancel_reason: string | null,
+    /** Hex, or null where unmapped */
+    reads: { address: number, data: string | null }[]
 }
 
 /**

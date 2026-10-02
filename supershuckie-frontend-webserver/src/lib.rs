@@ -68,6 +68,25 @@ impl SuperShuckieWebserver {
                 })
             }
 
+            if let Some(route) = BotRoute::from_path(url.as_str()) {
+                let bot_request = match route.parse(request) {
+                    Ok(n) => n,
+                    Err(error) => return fixup_response(Response::json(&Error { error }).with_status_code(400))
+                };
+
+                let (sender, response) = channel();
+                if backlog_sender.try_send((Instant::now(), SuperShuckieServerCommand::Bot(sender, bot_request))).is_err() {
+                    return emulator_not_available_error();
+                }
+
+                return fixup_response(match response.recv_timeout(REPLY_TIMEOUT) {
+                    Ok(Ok(BotBody::Json(json))) => Response::from_data("application/json", json),
+                    Ok(Ok(BotBody::Png(png))) => Response::from_data("image/png", png),
+                    Ok(Err((status, error))) => Response::json(&Error { error }).with_status_code(status),
+                    Err(_) => return emulator_not_available_error()
+                })
+            }
+
             fixup_response(match url.as_str() {
                 "/stats" => {
                     let (responder, response) = channel();
@@ -502,8 +521,233 @@ fn string_or_number<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option
     }))
 }
 
+/// The bot routes (see `docs/external_commands.md`, "Writing a bot").
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum BotRoute {
+    Input,
+    Press,
+    Step,
+    ReadMemory,
+    Screenshot
+}
+
+impl BotRoute {
+    fn from_path(path: &str) -> Option<Self> {
+        Some(match path {
+            "/input" => Self::Input,
+            "/press" => Self::Press,
+            "/step" => Self::Step,
+            "/read-memory" => Self::ReadMemory,
+            "/screenshot" => Self::Screenshot,
+            _ => return None
+        })
+    }
+
+    fn parse(self, request: &rouille::Request) -> Result<BotRequest, String> {
+        parse_bot_request(self, &|name| request.get_param(name))
+    }
+}
+
+/// Most frames `/press` holds for and `/step` runs in one request.
+pub const MAX_BOT_FRAMES: u64 = 3600;
+
+/// How many frames `/press` holds for when `frames` is not given.
+pub const DEFAULT_PRESS_FRAMES: u64 = 4;
+
+/// Most bytes `/read-memory` reads, and `/step`'s `read` reads in all.
+pub const MAX_BOT_READ_BYTES: usize = 65536;
+
+/// Most ranges `/step`'s `read` may list.
+pub const MAX_BOT_READ_RANGES: usize = 32;
+
+fn parse_bot_request(route: BotRoute, param: &dyn Fn(&str) -> Option<String>) -> Result<BotRequest, String> {
+    let frames = |default: u64, min: u64| -> Result<u64, String> {
+        match param("frames") {
+            None => Ok(default),
+            Some(n) => match n.trim().parse::<u64>() {
+                Ok(f) if (min..=MAX_BOT_FRAMES).contains(&f) => Ok(f),
+                _ => Err(format!("failed (frames must be a whole number from {min} to {MAX_BOT_FRAMES}, not {n})"))
+            }
+        }
+    };
+
+    Ok(match route {
+        BotRoute::Input => BotRequest::Input(parse_bot_input(param)?.unwrap_or_default()),
+        BotRoute::Press => {
+            let input = parse_bot_input(param)?.filter(|i| !i.is_empty())
+                .ok_or_else(|| "failed (nothing to press: give buttons or touch)".to_owned())?;
+            BotRequest::Press(input, frames(DEFAULT_PRESS_FRAMES, 1)?)
+        }
+        BotRoute::Step => BotRequest::Step {
+            input: parse_bot_input(param)?,
+            frames: frames(1, 0)?,
+            reads: match param("read") {
+                None => Vec::new(),
+                Some(list) => parse_read_list(&list)?
+            }
+        },
+        BotRoute::ReadMemory => {
+            let address = parse_address(&param("address").ok_or_else(|| "failed (missing the address parameter)".to_owned())?)?;
+            let length = parse_length(&param("length").ok_or_else(|| "failed (missing the length parameter)".to_owned())?)?;
+            BotRequest::ReadMemory { address, length }
+        }
+        BotRoute::Screenshot => BotRequest::Screenshot
+    })
+}
+
+/// The input parameters shared by `/input`, `/press` and `/step`; `None` when none is given.
+fn parse_bot_input(param: &dyn Fn(&str) -> Option<String>) -> Result<Option<BotInputParams>, String> {
+    let buttons = param("buttons");
+    let touch = param("touch");
+    let circle = param("circle");
+    let cstick = param("cstick");
+    if buttons.is_none() && touch.is_none() && circle.is_none() && cstick.is_none() {
+        return Ok(None)
+    }
+
+    let mut input = BotInputParams::default();
+    for name in buttons.as_deref().unwrap_or("").split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        let button = match name.to_ascii_lowercase().as_str() {
+            "a" => &mut input.a,
+            "b" => &mut input.b,
+            "x" => &mut input.x,
+            "y" => &mut input.y,
+            "l" => &mut input.l,
+            "r" => &mut input.r,
+            "zl" => &mut input.zl,
+            "zr" => &mut input.zr,
+            "start" => &mut input.start,
+            "select" => &mut input.select,
+            "up" => &mut input.up,
+            "down" => &mut input.down,
+            "left" => &mut input.left,
+            "right" => &mut input.right,
+            _ => return Err(format!("failed (unknown button {name}; buttons are a b x y l r zl zr start select up down left right)"))
+        };
+        *button = true;
+    }
+
+    let pair = |name: &str, value: &str| -> Result<(i64, i64), String> {
+        let bad = || format!("failed (can't parse {value} as x,y for {name})");
+        let (x, y) = value.split_once(',').ok_or_else(bad)?;
+        Ok((x.trim().parse().map_err(|_| bad())?, y.trim().parse().map_err(|_| bad())?))
+    };
+    if let Some(t) = touch.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        let (x, y) = pair("touch", t)?;
+        if !(0..=u16::MAX as i64).contains(&x) || !(0..=u16::MAX as i64).contains(&y) {
+            return Err(format!("failed (touch must be a point in the bottom screen's pixels, not {t})"))
+        }
+        input.touch = Some((x as u16, y as u16));
+    }
+    let stick = |name: &str, value: Option<String>| -> Result<(i8, i8), String> {
+        let Some(v) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned) else {
+            return Ok((0, 0))
+        };
+        let (x, y) = pair(name, &v)?;
+        if !(-127..=127).contains(&x) || !(-127..=127).contains(&y) {
+            return Err(format!("failed ({name} must be x,y from -127 to 127, not {v})"))
+        }
+        Ok((x as i8, y as i8))
+    };
+    input.circle = stick("circle", circle)?;
+    input.cstick = stick("cstick", cstick)?;
+    Ok(Some(input))
+}
+
+/// An address: hex with a `0x` prefix, or decimal.
+fn parse_address(text: &str) -> Result<u32, String> {
+    let t = text.trim();
+    let parsed = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16),
+        None => t.parse()
+    };
+    parsed.map_err(|_| format!("failed (can't parse {text} as an address; use 0x-prefixed hex or decimal)"))
+}
+
+fn parse_length(text: &str) -> Result<usize, String> {
+    match text.trim().parse::<usize>() {
+        Ok(n) if (1..=MAX_BOT_READ_BYTES).contains(&n) => Ok(n),
+        _ => Err(format!("failed (length must be from 1 to {MAX_BOT_READ_BYTES}, not {text})"))
+    }
+}
+
+/// `/step`'s `read`: `address:length` pairs separated by commas.
+fn parse_read_list(list: &str) -> Result<Vec<(u32, usize)>, String> {
+    let mut reads = Vec::new();
+    let mut total = 0usize;
+    for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+        let (address, length) = item.split_once(':').ok_or_else(|| format!("failed (read takes address:length pairs, not {item})"))?;
+        let address = parse_address(address)?;
+        let length = parse_length(length)?;
+        total += length;
+        reads.push((address, length));
+    }
+    if reads.len() > MAX_BOT_READ_RANGES || total > MAX_BOT_READ_BYTES {
+        return Err(format!("failed (read may list up to {MAX_BOT_READ_RANGES} ranges of {MAX_BOT_READ_BYTES} bytes in all)"))
+    }
+    Ok(reads)
+}
+
+/// What a bot route asks for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BotRequest {
+    /// `/input`: replace what the bot holds (all released when nothing is given).
+    Input(BotInputParams),
+    /// `/press`: hold for exactly this many frames, then release.
+    Press(BotInputParams, u64),
+    /// `/step`: pause, set what the bot holds (if given), run `frames` frames, read `reads`.
+    Step { input: Option<BotInputParams>, frames: u64, reads: Vec<(u32, usize)> },
+    /// `/read-memory`
+    ReadMemory { address: u32, length: usize },
+    /// `/screenshot`
+    Screenshot
+}
+
+/// Buttons, touch point and sticks, as given to a bot route (plain data: this crate does not
+/// depend on the core's `Input`).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct BotInputParams {
+    pub a: bool,
+    pub b: bool,
+    pub x: bool,
+    pub y: bool,
+    pub l: bool,
+    pub r: bool,
+    pub zl: bool,
+    pub zr: bool,
+    pub start: bool,
+    pub select: bool,
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    /// In the bottom screen's pixels.
+    pub touch: Option<(u16, u16)>,
+    /// `-127..=127` each, positive = right / up.
+    pub circle: (i8, i8),
+    pub cstick: (i8, i8)
+}
+
+impl BotInputParams {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A bot route's reply body.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BotBody {
+    Json(String),
+    Png(Vec<u8>)
+}
+
+/// A bot route's outcome: a body (200), or an HTTP status and message.
+pub type BotReply = Result<BotBody, (u16, String)>;
+
 pub enum SuperShuckieServerCommand {
     Stats(Sender<Arc<Stats>>),
+    /// The bot routes (`/input`, `/press`, `/step`, `/read-memory`, `/screenshot`).
+    Bot(Sender<BotReply>, BotRequest),
     /// `/play-together`: the Play Together state as JSON (the same document the C API's
     /// `supershuckie_frontend_play_together_state_json` gives).
     PlayTogetherState(Sender<String>),
@@ -592,6 +836,51 @@ mod tests {
         assert!(parse("/add-bookmark", &[("frame", "soon")]).unwrap_err().contains("frame"));
         assert!(parse("/add-bookmark", &[("keyframe", "yes")]).unwrap_err().contains("keyframe"));
         assert!(parse("/go-to-bookmark", &[("id", "1"), ("point", "middle")]).unwrap_err().contains("in or out"));
+    }
+
+    fn parse_bot(route: &str, query: &[(&str, &str)]) -> Result<BotRequest, String> {
+        let lookup = |name: &str| query.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string());
+        parse_bot_request(BotRoute::from_path(route).expect("route"), &lookup)
+    }
+
+    #[test]
+    fn bot_routes_parse_their_parameters() {
+        assert_eq!(parse_bot("/input", &[]), Ok(BotRequest::Input(BotInputParams::default())), "nothing given releases everything");
+        assert_eq!(
+            parse_bot("/input", &[("buttons", "A, up,ZR"), ("touch", "10,191"), ("circle", "-127,127"), ("cstick", "5, -5")]),
+            Ok(BotRequest::Input(BotInputParams { a: true, up: true, zr: true, touch: Some((10, 191)), circle: (-127, 127), cstick: (5, -5), ..Default::default() }))
+        );
+        assert_eq!(parse_bot("/input", &[("buttons", "")]), Ok(BotRequest::Input(BotInputParams::default())));
+        assert_eq!(parse_bot("/press", &[("buttons", "start")]), Ok(BotRequest::Press(BotInputParams { start: true, ..Default::default() }, DEFAULT_PRESS_FRAMES)));
+        assert_eq!(parse_bot("/press", &[("touch", "1,2"), ("frames", "1")]), Ok(BotRequest::Press(BotInputParams { touch: Some((1, 2)), ..Default::default() }, 1)));
+        assert_eq!(parse_bot("/step", &[]), Ok(BotRequest::Step { input: None, frames: 1, reads: Vec::new() }), "no input given keeps what is held");
+        assert_eq!(
+            parse_bot("/step", &[("frames", "3600"), ("buttons", ""), ("read", "0xD158:11, 49152:2")]),
+            Ok(BotRequest::Step { input: Some(BotInputParams::default()), frames: 3600, reads: vec![(0xD158, 11), (49152, 2)] })
+        );
+        assert_eq!(parse_bot("/step", &[("frames", "0")]), Ok(BotRequest::Step { input: None, frames: 0, reads: Vec::new() }));
+        assert_eq!(parse_bot("/read-memory", &[("address", "0x02000000"), ("length", "4")]), Ok(BotRequest::ReadMemory { address: 0x0200_0000, length: 4 }));
+        assert_eq!(parse_bot("/screenshot", &[]), Ok(BotRequest::Screenshot));
+        assert!(BotRoute::from_path("/inputs").is_none());
+    }
+
+    #[test]
+    fn bad_bot_parameters_are_rejected() {
+        assert!(parse_bot("/input", &[("buttons", "a,jump")]).unwrap_err().contains("unknown button jump"));
+        assert!(parse_bot("/input", &[("touch", "10")]).unwrap_err().contains("touch"));
+        assert!(parse_bot("/input", &[("touch", "-1,4")]).unwrap_err().contains("touch"));
+        assert!(parse_bot("/input", &[("circle", "128,0")]).unwrap_err().contains("-127 to 127"));
+        assert!(parse_bot("/press", &[]).unwrap_err().contains("nothing to press"));
+        assert!(parse_bot("/press", &[("buttons", "")]).unwrap_err().contains("nothing to press"));
+        assert!(parse_bot("/press", &[("buttons", "a"), ("frames", "0")]).unwrap_err().contains("frames"));
+        assert!(parse_bot("/step", &[("frames", "3601")]).unwrap_err().contains("frames"));
+        assert!(parse_bot("/step", &[("frames", "-1")]).unwrap_err().contains("frames"));
+        assert!(parse_bot("/step", &[("read", "0xD158")]).unwrap_err().contains("address:length"));
+        assert!(parse_bot("/step", &[("read", "0xD158:0")]).unwrap_err().contains("length"));
+        assert!(parse_bot("/step", &[("read", "0:40000,1:40000")]).unwrap_err().contains("in all"));
+        assert!(parse_bot("/read-memory", &[("length", "4")]).unwrap_err().contains("address"));
+        assert!(parse_bot("/read-memory", &[("address", "0xZZ"), ("length", "4")]).unwrap_err().contains("address"));
+        assert!(parse_bot("/read-memory", &[("address", "1"), ("length", "65537")]).unwrap_err().contains("length"));
     }
 
     /// Builds a `SuperShuckieWebserver` directly on top of a fresh backlog channel, bypassing

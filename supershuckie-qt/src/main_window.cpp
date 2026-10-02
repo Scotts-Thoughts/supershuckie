@@ -255,6 +255,8 @@ MainWindow::MainWindow(): QMainWindow() {
     else if(buf[0] != 0) {
         this->show_error("Failed to automatically start external commands", "An error occurred on startup when trying to enable external commands:\n\n%s", buf);
     }
+    this->allow_bot_control->setChecked(supershuckie_frontend_get_bot_control_enabled(this->frontend));
+    this->allow_bot_control->setEnabled(this->enable_external_commands->isChecked());
 
     const char *quick_slots = supershuckie_frontend_get_custom_setting(this->frontend, USE_NUMBER_KEYS_FOR_QUICK_SLOTS);
     if(quick_slots != nullptr && quick_slots[0] == '1') {
@@ -1394,6 +1396,12 @@ void MainWindow::set_up_settings_menu() {
     this->enable_external_commands->setObjectName("enable-external-commands");
     this->enable_external_commands->setCheckable(true);
     connect(this->enable_external_commands, SIGNAL(triggered()), this, SLOT(do_toggle_external_commands()));
+
+    this->allow_bot_control = this->settings_menu->addAction("Allow bot control");
+    this->allow_bot_control->setObjectName("allow-bot-control");
+    this->allow_bot_control->setCheckable(true);
+    this->allow_bot_control->setToolTip("Let a program on this computer press buttons, step frames, read memory and take screenshots through external commands");
+    connect(this->allow_bot_control, SIGNAL(triggered()), this, SLOT(do_toggle_bot_control()));
 }
 
 void MainWindow::refresh_action_states() {
@@ -3010,6 +3018,12 @@ void MainWindow::do_toggle_external_commands() {
     if(!supershuckie_frontend_set_external_commands_enabled(this->frontend, this->enable_external_commands->isChecked(), buf, sizeof(buf))) {
         this->show_error("Failed to start remote commands", "%s", buf);
     }
+    // Bot control goes through external commands, so it is only offered while they are on.
+    this->allow_bot_control->setEnabled(this->enable_external_commands->isChecked());
+}
+
+void MainWindow::do_toggle_bot_control() {
+    supershuckie_frontend_set_bot_control_enabled(this->frontend, this->allow_bot_control->isChecked());
 }
 
 void MainWindow::do_toggle_ignore_speed_changes_in_replay() {

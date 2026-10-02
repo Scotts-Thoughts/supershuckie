@@ -244,6 +244,7 @@ private:
     QAction *pokeabyte_port;
     QAction *pokeabyte_serve_friends;
     QAction *enable_external_commands;
+    QAction *allow_bot_control;
 
     SuperShuckieReplayState last_known_replay_state = SuperShuckieReplayState::SuperShuckieReplayState__NoReplay;
     // Playback has a sub-state (the replay stopped, the game live under the user) that changes what the menus allow.
@@ -430,6 +431,7 @@ private slots:
     void do_clear_recent_roms();
     void do_reload_core();
     void do_toggle_external_commands();
+    void do_toggle_bot_control();
     void do_toggle_ignore_speed_changes_in_replay();
     void do_toggle_auto_resync_keyframes_in_replay();
     void do_continue_last_replay();

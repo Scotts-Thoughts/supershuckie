@@ -819,6 +819,16 @@ pub unsafe extern "C" fn supershuckie_frontend_set_external_commands_enabled(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_get_bot_control_enabled(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_bot_control_enabled()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_set_bot_control_enabled(frontend: &mut SuperShuckieFrontend, enabled: bool) {
+    frontend.set_bot_control_enabled(enabled)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_set_auto_stop_playback_on_input_setting(
     frontend: &mut SuperShuckieFrontend,
     new_setting: bool

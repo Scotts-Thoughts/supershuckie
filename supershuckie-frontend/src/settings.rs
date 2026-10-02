@@ -106,6 +106,9 @@ pub struct Settings {
     #[serde(default = "SimpleEnabledByDefaultSettings::default")]
     pub external_commands: SimpleEnabledByDefaultSettings,
 
+    #[serde(default = "BotControlSettings::default")]
+    pub bot_control: BotControlSettings,
+
     #[serde(default = "ExportSettings::default")]
     pub export: ExportSettings,
 
@@ -702,6 +705,15 @@ impl Default for ROMConfig {
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimpleEnabledByDefaultSettings {
+    pub enabled: bool
+}
+
+/// Letting an external program play the game over the external-commands server: the bot routes
+/// (`/input`, `/press`, `/step`, `/read-memory`, `/screenshot`) answer only while this is on.
+/// Off unless the user turns it on.
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct BotControlSettings {
+    #[serde(default)]
     pub enabled: bool
 }
 

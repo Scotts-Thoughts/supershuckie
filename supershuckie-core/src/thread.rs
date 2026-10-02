@@ -231,6 +231,46 @@ impl FrameTimeStats {
     }
 }
 
+/// Most frames one step ([`ThreadedSuperShuckieCore::step_frames`]) may ask for.
+pub const MAX_STEP_FRAMES: u64 = 3600;
+
+/// How long a step may run before it answers with the frames run so far (and
+/// [`StepOutcome::cancelled`] saying why): the external-commands server gives up on a reply
+/// after 60 s, and a long step of a slow console (the 3DS) can take longer than that.
+pub const STEP_TIME_LIMIT: Duration = Duration::from_secs(50);
+
+/// How a step ([`ThreadedSuperShuckieCore::step_frames`]) ended.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepOutcome {
+    /// `SuperShuckieCore::total_frames` once the step ended.
+    pub frame: u64,
+    /// Frames the step ran. Fewer than asked for only when it was cancelled. A Game Boy paused
+    /// in the middle of a frame first finishes that frame, which is not counted here.
+    pub frames_run: u64,
+    /// Whether the game was running when the step arrived (and was paused by it): something
+    /// resumed the game since the last step, so lockstep was broken in between.
+    pub was_running: bool,
+    /// Why the step ended early, if it did.
+    pub cancelled: Option<String>,
+    /// The memory asked for with the step, read after its last frame, in the order asked;
+    /// `None` where unmapped.
+    pub reads: Vec<Option<Vec<u8>>>
+}
+
+/// Answers a step: the outcome once it has ended, or `Err` with the reason it was refused
+/// outright. Called on the core thread.
+pub type StepReply = Box<dyn FnOnce(Result<StepOutcome, String>) + Send>;
+
+/// A step being run by the core thread between commands (see `CoreLoop::run_one_step`).
+struct PendingStep {
+    frames_left: u64,
+    frames_run: u64,
+    was_running: bool,
+    reads: Vec<(u32, usize)>,
+    started: Instant,
+    reply: StepReply
+}
+
 impl ThreadedSuperShuckieCore {
     /// Wrap the given `core` as the player's own game (see [`CoreThreadRole::Primary`]).
     pub fn new(emulator_core: Box<dyn EmulatorCore>) -> Self {
@@ -317,6 +357,7 @@ impl ThreadedSuperShuckieCore {
                     freezes: BTreeMap::new(),
                     last_pokeabyte_freeze: None,
                     last_pokeabyte_read: None,
+                    pending_step: None,
                     memory_monitor: None,
                     follower: None,
                     follower_stats: follower_stats_thread,
@@ -654,6 +695,40 @@ impl ThreadedSuperShuckieCore {
     /// [`SuperShuckieCore::press_for_frames`]).
     pub fn press_for_frames(&self, input: Input, frames: NonZeroU64) {
         let _ = self.send(ThreadCommand::PressForFrames(input, frames));
+        self.wake();
+    }
+
+    /// Set what an external program holds, or release it with `None` (see
+    /// [`SuperShuckieCore::set_bot_input`]).
+    pub fn set_bot_input(&self, input: Option<Input>) {
+        let _ = self.send(ThreadCommand::SetBotInput(input));
+        self.wake();
+    }
+
+    /// Step the game `frames` frames (at most [`MAX_STEP_FRAMES`]) while paused, frame-exact:
+    /// pause it if it is running, set what the bot holds to `input` first if given (it stays
+    /// held afterwards), run the frames unpaced and silent, drawing only the last, then read
+    /// `reads` (`(address, length)`) and answer `reply` on the core thread.
+    ///
+    /// The thread keeps handling commands between the frames. The step is refused outright
+    /// (see [`SuperShuckieCore::can_step`]) when nothing can run, or another step is running;
+    /// it ends early, answering with the frames run so far, when the game is started, reset,
+    /// loaded from a state or closed, a replay is attached, a link begins, it is cancelled
+    /// ([`Self::cancel_step`]), or it runs past [`STEP_TIME_LIMIT`].
+    pub fn step_frames(&self, input: Option<Option<Input>>, frames: u64, reads: Vec<(u32, usize)>, reply: StepReply) {
+        let frames = frames.min(MAX_STEP_FRAMES);
+        if let Err(SendError(ThreadCommand::StepFrames { reply, .. })) = self.sender.send(ThreadCommand::StepFrames { input, frames, reads, reply }) {
+            self.alive.store(false, Ordering::Relaxed);
+            reply(Err(CoreThreadDead.to_string()));
+            return
+        }
+        self.wake();
+    }
+
+    /// End a step being run early, answering it with the frames run so far and `reason`.
+    pub fn cancel_step(&self, reason: &str) {
+        let _ = self.send(ThreadCommand::CancelStep(reason.to_owned()));
+        self.wake();
     }
 
     /// Create a save state.
@@ -1053,7 +1128,11 @@ impl ThreadedSuperShuckieCore {
     ///
     /// NOTE: This is blocking.
     pub fn read_ram(&self, address: u32, len: usize) -> Option<Vec<u8>> {
-        self.call(|reply| ThreadCommand::ReadRam { address, len, reply }).ok().flatten()
+        let (reply, receiver) = channel();
+        self.send(ThreadCommand::ReadRam { address, len, reply }).ok()?;
+        // A paused thread parks for up to 100 ms between command checks.
+        self.wake();
+        receiver.recv().ok().flatten()
     }
 
     /// Write `data` at `address` between frames, recorded and published like any external write
@@ -1244,6 +1323,9 @@ enum ThreadCommand {
     SetRapidFireInput(Option<SuperShuckieRapidFire>),
     SetToggledInput(Option<Input>),
     PressForFrames(Input, NonZeroU64),
+    SetBotInput(Option<Input>),
+    StepFrames { input: Option<Option<Input>>, frames: u64, reads: Vec<(u32, usize)>, reply: StepReply },
+    CancelStep(String),
     SetSpeed(Speed),
     HardReset,
     CreateSaveState(Sender<Vec<u8>>),
@@ -1407,6 +1489,9 @@ struct CoreLoop {
     last_pokeabyte_read: Option<(u64, u64)>,
     replay_stalled: Arc<AtomicBool>,
 
+    /// A step being run between commands (see [`Self::run_one_step`]).
+    pending_step: Option<PendingStep>,
+
     memory_monitor: Option<MemoryMonitorLocal>,
 
     /// Set while the core follows another player's game; `run_one_follower` runs instead of
@@ -1459,6 +1544,7 @@ impl CoreThread {
                 match cmd {
                     ThreadCommand::Close => break,
                     ThreadCommand::Lend(reply) => {
+                        loop_.finish_step(Some("the console was lent to another"));
                         // The loop goes to whoever asked; this thread forwards commands to it
                         // and waits for it to come back.
                         let (forward, commands) = channel();
@@ -1479,6 +1565,7 @@ impl CoreThread {
                         continue
                     }
                     ThreadCommand::Link { lent, settings, inbox, publisher } => {
+                        loop_.finish_step(Some("a link cable is being connected"));
                         self.begin_linking(lent, settings, inbox, publisher);
                         continue
                     }
@@ -1491,6 +1578,7 @@ impl CoreThread {
                     ThreadCommand::LinkHold(reply) => {
                         let r = if self.linked.is_some() { Err(String::from("already linked")) } else { loop_.core.link_hold() };
                         if r.is_ok() {
+                            loop_.finish_step(Some("a link cable is being connected"));
                             self.set_link_status(LinkStatus::Holding);
                         }
                         let _ = reply.send(r);
@@ -1555,6 +1643,10 @@ impl CoreThread {
                     }
                 }
             }
+            else if loop_.pending_step.is_some() {
+                // Lockstep: one stepped frame per pass, so commands are still handled between.
+                loop_.run_one_step();
+            }
             else if loop_.core.stream_snapshot_pending() {
                 // Paused, so no frame will complete to carry the snapshot somebody asked for.
                 loop_.core.publish_pending_stream_snapshot();
@@ -1575,6 +1667,7 @@ impl CoreThread {
         self.set_link_status(LinkStatus::Idle);
 
         if let Some(mut loop_) = self.loop_.take() {
+            loop_.finish_step(Some("the game was closed"));
             loop_.core.stop_stream_publishing();
             loop_.core.detach_live_source();
             loop_.core.stop_recording_replay();
@@ -2308,7 +2401,8 @@ impl CoreLoop {
         }
 
         // don't update reads or apply freezes mid-frame; it's too slow
-        let is_running = self.is_running();
+        // (a step runs frames while paused: freezes and reads keep up with every one of them)
+        let is_running = self.is_running() || self.pending_step.is_some();
         if self.core.is_mid_frame() && is_running {
             return;
         }
@@ -2352,7 +2446,7 @@ impl CoreLoop {
 
     /// Service the RAM tools' memory monitor, if attached.
     fn handle_memory_monitor(&mut self) {
-        let running = self.is_running();
+        let running = self.is_running() || self.pending_step.is_some();
         let Some(monitor) = self.memory_monitor.as_mut() else {
             return
         };
@@ -2362,9 +2456,95 @@ impl CoreLoop {
         }
     }
 
+    /// Take a step on (see [`ThreadedSuperShuckieCore::step_frames`]): refuse it, or pause the
+    /// game, set the bot's input and leave the frames to [`Self::run_one_step`].
+    fn begin_step(&mut self, input: Option<Option<Input>>, frames: u64, reads: Vec<(u32, usize)>, reply: StepReply) {
+        if self.pending_step.is_some() {
+            reply(Err(String::from("another step is still running")));
+            return
+        }
+        if let Err(e) = self.core.can_step() {
+            reply(Err(String::from(e)));
+            return
+        }
+        let was_running = self.is_running();
+        if !self.playback_paused.swap(true, Ordering::Relaxed) {
+            self.core.pause_timer();
+        }
+        if let Some(input) = input {
+            self.core.set_bot_input(input);
+        }
+        self.pending_step = Some(PendingStep {
+            frames_left: frames.min(MAX_STEP_FRAMES),
+            frames_run: 0,
+            was_running,
+            reads,
+            started: Instant::now(),
+            reply
+        });
+        if frames == 0 {
+            self.finish_step(None);
+        }
+    }
+
+    /// Run one frame of the pending step (the thread calls this once per pass while paused),
+    /// drawing it only if it is the last or one the last needs drawn first. After the last,
+    /// the screens are published and Poke-A-Byte and the RAM tools serviced before the step is
+    /// answered, so a client reading right after the reply sees that frame.
+    fn run_one_step(&mut self) {
+        let Some(step) = self.pending_step.as_ref() else {
+            return
+        };
+        if step.started.elapsed() > STEP_TIME_LIMIT {
+            self.finish_step(Some("the step took too long; ask for fewer frames at a time"));
+            return
+        }
+        let draw = step.frames_left <= self.core.draw_lead_frames().saturating_add(1);
+
+        let started = Instant::now();
+        let frames_before = self.core.total_frames();
+        let result = self.core.run_stepped_frame(draw);
+        let ran = self.core.total_frames().wrapping_sub(frames_before);
+        if ran > 0 {
+            self.emulated_frames.fetch_add(ran, Ordering::Relaxed);
+            self.frame_times.write().record(started.elapsed(), None);
+            self.update_counters();
+        }
+
+        if let Err(e) = result {
+            self.finish_step(Some(e));
+            return
+        }
+        let Some(step) = self.pending_step.as_mut() else {
+            return
+        };
+        step.frames_left -= 1;
+        step.frames_run += 1;
+        if step.frames_left == 0 {
+            self.housekeeping();
+            self.finish_step(None);
+        }
+    }
+
+    /// Answer the pending step, if any: done (`cancelled` is `None`) or ended early.
+    fn finish_step(&mut self, cancelled: Option<&str>) {
+        let Some(step) = self.pending_step.take() else {
+            return
+        };
+        let reads = step.reads.iter().map(|&(address, len)| self.core.read_memory(address, len)).collect();
+        (step.reply)(Ok(StepOutcome {
+            frame: self.core.total_frames(),
+            frames_run: step.frames_run,
+            was_running: step.was_running,
+            cancelled: cancelled.map(String::from),
+            reads
+        }));
+    }
+
     fn handle_command(&mut self, command: ThreadCommand) {
         match command {
             ThreadCommand::Start(sender) => {
+                self.finish_step(Some("the game was unpaused"));
                 if self.playback_paused.swap(false, Ordering::Relaxed) {
                     if self.core.replay_stalled {
                         if let Err(e) = self.core.go_to_replay_frame(0) {
@@ -2448,7 +2628,17 @@ impl CoreLoop {
             ThreadCommand::PressForFrames(input, frames) => {
                 self.core.press_for_frames(input, frames);
             }
+            ThreadCommand::SetBotInput(input) => {
+                self.core.set_bot_input(input);
+            }
+            ThreadCommand::StepFrames { input, frames, reads, reply } => {
+                self.begin_step(input, frames, reads, reply);
+            }
+            ThreadCommand::CancelStep(reason) => {
+                self.finish_step(Some(&reason));
+            }
             ThreadCommand::HardReset => {
+                self.finish_step(Some("the console was reset"));
                 self.core.hard_reset();
             }
             ThreadCommand::CreateSaveState(sender) => {
@@ -2456,6 +2646,7 @@ impl CoreLoop {
                 let _ = sender.send(self.core.create_save_state());
             }
             ThreadCommand::LoadSaveState(state) => {
+                self.finish_step(Some("a save state was loaded"));
                 self.core.load_save_state(&state);
             }
             ThreadCommand::SetPlaybackFrozen(paused) => {
@@ -2485,6 +2676,7 @@ impl CoreLoop {
                 unreachable!("handle_command(ThreadCommand::Close) should not happen")
             },
             ThreadCommand::AttachReplayPlayer { player, allow_mismatched, reply } => {
+                self.finish_step(Some("a replay was loaded"));
                 let r = self.core.attach_replay_player(player, allow_mismatched);
                 if r.is_ok() && !self.is_running() {
                     self.core.pause_timer();
@@ -2617,6 +2809,7 @@ impl CoreLoop {
                 }
             }
             ThreadCommand::AttachLiveSource { source, metadata, allow_mismatched, reply } => {
+                self.finish_step(Some("started following another player's game"));
                 let stats = source.stats().clone();
                 let r = self.core.attach_live_replay_source(source, &metadata, allow_mismatched);
                 if r.is_ok() {
@@ -2908,6 +3101,79 @@ mod tests {
 
         // The thread really is still there: a round trip still gets answered.
         assert!(core.create_save_state().is_some(), "the thread should still answer after refused marks");
+        assert!(core.is_alive());
+    }
+
+    fn step_and_wait(core: &ThreadedSuperShuckieCore, input: Option<Option<Input>>, frames: u64, reads: Vec<(u32, usize)>) -> Result<StepOutcome, String> {
+        let (sender, receiver) = channel();
+        core.step_frames(input, frames, reads, Box::new(move |r| { let _ = sender.send(r); }));
+        receiver.recv_timeout(Duration::from_secs(10)).expect("the step was answered")
+    }
+
+    /// A step pauses a running game, runs exactly its frames with its input (still held after),
+    /// reads memory after the last one, and says whether the game had been running.
+    #[test]
+    fn a_step_pauses_runs_exactly_its_frames_and_reads_after_the_last() {
+        let clock = crate::tests::FakeClock::new();
+        let core = ThreadedSuperShuckieCore::new(Box::new(crate::tests::FakePacedCore::new(clock, 16_667)));
+        assert!(!core.is_paused(), "a new core runs (its fake clock never lets a paced frame through)");
+
+        let a = Input { a: true, ..Input::default() };
+        let outcome = step_and_wait(&core, Some(Some(a)), 5, alloc::vec![(0x0200_0000, 4), (0x0900_0000, 2)]).expect("step");
+        assert_eq!(outcome, StepOutcome {
+            frame: 5,
+            frames_run: 5,
+            was_running: true,
+            cancelled: None,
+            // The fake core's memory is its frame counter.
+            reads: alloc::vec![Some(5u32.to_le_bytes().to_vec()), None]
+        });
+        assert!(core.is_paused(), "lockstep leaves the game paused");
+
+        let outcome = step_and_wait(&core, None, 3, Vec::new()).expect("step");
+        assert_eq!((outcome.frame, outcome.frames_run, outcome.was_running), (8, 3, false));
+        assert_eq!(core.get_emulated_frame_count(), 8);
+
+        // Zero frames: pause (already), set the input, read.
+        let outcome = step_and_wait(&core, Some(None), 0, alloc::vec![(0x0200_0000, 1)]).expect("step");
+        assert_eq!((outcome.frame, outcome.frames_run, outcome.reads), (8, 0, alloc::vec![Some(alloc::vec![8])]));
+    }
+
+    /// Starting the game ends a step early with the frames run so far, and a second step is
+    /// refused while one is running.
+    #[test]
+    fn starting_the_game_cancels_a_running_step() {
+        let clock = crate::tests::FakeClock::new();
+        let mut fake = crate::tests::FakePacedCore::new(clock, 16_667);
+        fake.frame_delay = Duration::from_millis(2);
+        let core = ThreadedSuperShuckieCore::new(Box::new(fake));
+
+        let (sender, receiver) = channel();
+        core.step_frames(None, MAX_STEP_FRAMES, Vec::new(), Box::new(move |r| { let _ = sender.send(r); }));
+
+        let waited = Instant::now();
+        while !core.is_paused() {
+            assert!(waited.elapsed() < Duration::from_secs(5), "the step never paused the game");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        let refused = step_and_wait(&core, None, 1, Vec::new());
+        assert_eq!(refused, Err(String::from("another step is still running")));
+
+        core.start();
+        let outcome = receiver.recv_timeout(Duration::from_secs(10)).expect("answered").expect("not refused");
+        assert!(outcome.cancelled.is_some(), "the step was cancelled");
+        assert!(outcome.frames_run > 0 && outcome.frames_run < MAX_STEP_FRAMES, "{} frames run", outcome.frames_run);
+        assert_eq!(outcome.frame, outcome.frames_run, "the game itself never got a paced frame");
+        assert!(!core.is_paused());
+    }
+
+    /// No game, no step: refused right away.
+    #[test]
+    fn stepping_without_a_game_is_refused() {
+        let core = ThreadedSuperShuckieCore::new(Box::new(crate::emulator::NullEmulatorCore));
+        assert!(step_and_wait(&core, None, 1, Vec::new()).is_err());
+        core.set_bot_input(Some(Input { a: true, ..Input::default() }));
         assert!(core.is_alive());
     }
 

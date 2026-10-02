@@ -122,6 +122,12 @@ pub struct SuperShuckieCore {
     /// This input is always applied.
     toggled_input: Option<Input>,
 
+    /// What an external program (a bot, over the external-commands server) holds, if anything.
+    ///
+    /// A layer of its own, so the bot and the keyboard never overwrite each other: the frontend
+    /// replaces [`Self::base_input`] wholesale on every key event.
+    bot_input: Option<Input>,
+
     /// Presses made via [`Self::press_for_frames`] that no frame has run with yet.
     ///
     /// They move to [`Self::timed_presses`] when [`Self::update_input`] next applies the input,
@@ -168,6 +174,9 @@ pub struct SuperShuckieCore {
     starting_milliseconds: TimestampMillis,
     total_milliseconds: TimestampMillis,
     paused_timer_at: Option<TimestampMillis>,
+    /// Microseconds [`Self::advance_paused_timer`] has been asked for beyond the whole
+    /// milliseconds it added to [`Self::paused_timer_at`].
+    paused_timer_remainder_micros: u64,
     game_speed: Speed,
     replay_playback_speed: Speed,
 
@@ -345,6 +354,7 @@ impl SuperShuckieCore {
             rapid_fire_input: None,
             writes: Vec::new(),
             toggled_input: None,
+            bot_input: None,
             pending_timed_presses: Vec::new(),
             timed_presses: Vec::new(),
             current_input: Default::default(),
@@ -376,6 +386,7 @@ impl SuperShuckieCore {
             replay_playback_stopped: false,
             replay_resume_point: (0, 0.into()),
             paused_timer_at: None,
+            paused_timer_remainder_micros: 0,
             replay_counters: None,
             core: emulator_core,
             timestamp_provider,
@@ -932,7 +943,29 @@ impl SuperShuckieCore {
 
     /// Pause the current timer.
     pub fn pause_timer(&mut self) {
+        // Pausing again while paused gives back the same reading (`total_milliseconds` is the
+        // last reading taken), so only a fresh pause starts a fresh sub-millisecond remainder.
+        if self.paused_timer_at.is_none() {
+            self.paused_timer_remainder_micros = 0;
+        }
         self.paused_timer_at = Some((self.total_milliseconds.0 + self.starting_milliseconds.0).into());
+    }
+
+    /// Move the paused timer forward by `micros`, carrying the part below a millisecond over to
+    /// the next call. Does nothing while the timer runs.
+    ///
+    /// Frames stepped while paused (see [`Self::run_stepped_frame`]) take their timestamps from
+    /// the paused timer, which is otherwise frozen: advancing it by a nominal frame per frame
+    /// stamps them as if they had run in real time, so a replay recorded that way plays back at
+    /// normal speed however long was spent between steps. [`Self::unpause_timer`] re-bases from
+    /// the advanced value, so readings stay monotone when the game runs again.
+    pub fn advance_paused_timer(&mut self, micros: u64) {
+        let Some(paused) = self.paused_timer_at else {
+            return
+        };
+        let total = self.paused_timer_remainder_micros + micros;
+        self.paused_timer_remainder_micros = total % 1000;
+        self.paused_timer_at = Some(paused.0.wrapping_add(total / 1000).into());
     }
 
     /// Unpause the current timer if it is currently paused.
@@ -947,6 +980,7 @@ impl SuperShuckieCore {
 
     fn restart_timer(&mut self) {
         self.paused_timer_at = None;
+        self.paused_timer_remainder_micros = 0;
         self.starting_milliseconds = self.timestamp_provider.get_timestamp_milliseconds().into();
         self.total_milliseconds = 0.into();
         self.total_frames = 0;
@@ -1082,7 +1116,7 @@ impl SuperShuckieCore {
     }
 
     /// Length of one frame at 1x speed on the loaded console, in microseconds.
-    fn nominal_frame_micros(&self) -> u64 {
+    pub fn nominal_frame_micros(&self) -> u64 {
         match self.core.replay_console_type() {
             // 4194304 Hz / 70224 cycles per frame = 59.7275 Hz (the GBA's refresh is the same)
             Some(ReplayConsoleType::GameBoy | ReplayConsoleType::SuperGameBoy2 | ReplayConsoleType::GameBoyColor | ReplayConsoleType::GameBoyAdvance) => 16_743,
@@ -1431,6 +1465,93 @@ impl SuperShuckieCore {
         self.toggled_input = input;
         // See `set_rapid_fire_input`.
         self.input_latched = false;
+    }
+
+    /// Set what an external program holds (`None` to release everything it holds), on top of
+    /// whatever else is held. Unlike [`Self::enqueue_input`] this is never replaced by the
+    /// keyboard, and unlike [`Self::set_toggled_input`] the frontend never touches it.
+    ///
+    /// Ignored while a replay is playing back (it owns the console; see [`Self::hard_reset`]).
+    pub fn set_bot_input(&mut self, input: Option<Input>) {
+        if self.is_playing_back() {
+            return
+        }
+        self.bot_input = input.filter(|i| !i.is_empty());
+        // See `set_rapid_fire_input`.
+        self.input_latched = false;
+    }
+
+    /// What an external program holds (see [`Self::set_bot_input`]).
+    #[inline]
+    pub fn bot_input(&self) -> Option<Input> {
+        self.bot_input
+    }
+
+    /// Read `len` bytes of console memory at `address`: from the core's listed memory regions
+    /// where they cover it, else through the core's own address decoding. `None` if unmapped.
+    pub fn read_memory(&self, address: u32, len: usize) -> Option<Vec<u8>> {
+        if let Some(slice) = crate::emulator::memory_slice(self.core.as_ref(), address, len) {
+            return Some(slice.to_vec())
+        }
+        let mut data = alloc::vec![0u8; len];
+        self.core.read_ram(address, &mut data).ok().map(|_| data)
+    }
+
+    /// Why a frame cannot be stepped right now (see [`Self::run_stepped_frame`]), or `Ok`.
+    ///
+    /// Stepping is refused while a replay or another player's game drives the console, while a
+    /// replay has run out, and while linked or held for a link: nothing runs then (see
+    /// [`Self::do_run_fn`]), so a step would never finish.
+    pub fn can_step(&self) -> Result<(), &'static str> {
+        if self.core.is_null() {
+            return Err("no game is loaded")
+        }
+        if self.is_following() {
+            return Err("following another player's game")
+        }
+        if self.is_playing_back() {
+            return Err("a replay is playing back")
+        }
+        if self.replay_stalled {
+            return Err("the replay has ended")
+        }
+        if self.is_link_frozen_any() {
+            return Err("linked (or connecting) to another console")
+        }
+        Ok(())
+    }
+
+    /// Step one whole frame while paused, unpaced and silent: the paused timer moves on by a
+    /// nominal frame first (see [`Self::advance_paused_timer`]), then the core runs until a frame
+    /// completes (one call on most cores, many slices on the Game Boy). `draw` says whether the
+    /// frame is drawn. Returns `Err` without running anything if [`Self::can_step`] refuses.
+    ///
+    /// A Game Boy core paused in the middle of a frame first finishes that one (also stamped a
+    /// nominal frame later), so the frame stepped here starts at a frame boundary and gets the
+    /// input set before it.
+    pub fn run_stepped_frame(&mut self, draw: bool) -> Result<(), &'static str> {
+        self.can_step()?;
+        if self.core.is_mid_frame() {
+            self.advance_paused_timer(self.nominal_frame_micros());
+            self.finish_current_frame();
+            self.can_step()?;
+        }
+        self.advance_paused_timer(self.nominal_frame_micros());
+        let before = self.total_frames;
+        while self.total_frames == before {
+            if draw {
+                self.run_unlocked();
+            }
+            else {
+                self.run_unlocked_hidden();
+            }
+            // A slice that did not complete the frame: keep going, unless something now stops
+            // frames from running at all (never spin on that).
+            if self.last_run.frames == 0 {
+                self.can_step()?;
+            }
+        }
+        Ok(())
     }
 
     /// Hold `input`'s buttons for exactly the next `frames` emulated frames, on top of whatever
@@ -1867,6 +1988,10 @@ impl SuperShuckieCore {
             new_input |= toggled_input
         }
 
+        if let Some(bot_input) = self.bot_input {
+            new_input |= bot_input
+        }
+
         self.timed_presses.append(&mut self.pending_timed_presses);
         for press in &self.timed_presses {
             new_input |= press.input;
@@ -2275,11 +2400,13 @@ impl SuperShuckieCore {
         self.total_frames = resume_frames;
     }
 
-    /// Reset the current input, including any timed presses still running or yet to run.
+    /// Reset the current input, including any timed presses still running or yet to run and
+    /// whatever an external program holds.
     pub fn reset_input(&mut self) {
         self.enqueue_input(Input::new());
         self.pending_timed_presses.clear();
         self.timed_presses.clear();
+        self.bot_input = None;
     }
 
     /// Minimum number of frames emulated after loading a keyframe when seeking.
@@ -2779,7 +2906,7 @@ mod std_timestamp_provider {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::emulator::ScreenData;
     use alloc::sync::Arc;
@@ -2791,10 +2918,10 @@ mod tests {
     /// A wall clock the test drives by hand, shared between the [`SuperShuckieCore`] and a fake
     /// paced core so both see the same time.
     #[derive(Clone)]
-    struct FakeClock(Arc<AtomicU64>);
+    pub(crate) struct FakeClock(Arc<AtomicU64>);
 
     impl FakeClock {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self(Arc::new(AtomicU64::new(0)))
         }
 
@@ -2848,7 +2975,9 @@ mod tests {
     /// `run` paces itself off a clock and reports `RunTime::NONE` on every pacing miss, exactly
     /// like the real paced cores, while `run_unlocked` always advances one frame. It never
     /// overrides `is_mid_frame` (stays the default `false`).
-    struct FakePacedCore {
+    pub(crate) struct FakePacedCore {
+        /// Wall-clock time every frame takes (to make a step last long enough to interrupt).
+        pub(crate) frame_delay: core::time::Duration,
         clock: FakeClock,
         period_micros: u64,
         last_frame_micros: u64,
@@ -2881,8 +3010,9 @@ mod tests {
     }
 
     impl FakePacedCore {
-        fn new(clock: FakeClock, period_micros: u64) -> Self {
+        pub(crate) fn new(clock: FakeClock, period_micros: u64) -> Self {
             Self {
+                frame_delay: core::time::Duration::ZERO,
                 stale_frames_after_load: 0,
                 stale_frames_left: 0,
                 stale_shown: false,
@@ -2935,6 +3065,9 @@ mod tests {
         }
 
         fn run_unlocked(&mut self) -> RunTime {
+            if !self.frame_delay.is_zero() {
+                std::thread::sleep(self.frame_delay);
+            }
             self.counter = self.counter.wrapping_add(1);
             self.counter_bytes = self.counter.to_le_bytes();
             self.frame_inputs.lock().unwrap().push(self.input_byte);
@@ -3008,7 +3141,7 @@ mod tests {
         }
 
         fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
-            into.push(input.a as u8);
+            into.push(input.a as u8 | (input.b as u8) << 1);
         }
 
         fn set_input_encoded(&mut self, input: &[u8]) {
@@ -3121,7 +3254,7 @@ mod tests {
         }
 
         fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
-            into.push(input.a as u8);
+            into.push(input.a as u8 | (input.b as u8) << 1);
         }
 
         fn set_input_encoded(&mut self, input: &[u8]) {
@@ -3433,6 +3566,212 @@ mod tests {
 
         assert!(!core.is_mid_frame());
         assert_eq!(core.total_frames(), 1);
+    }
+
+    /// The bot's input is a layer of its own: it is OR'd with the keyboard's, a key event (which
+    /// replaces the keyboard's input wholesale) does not clear it, and releasing it does not
+    /// release what the keyboard holds.
+    #[test]
+    fn bot_input_layers_with_keyboard_input_and_neither_clears_the_other() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        let a = Input { a: true, ..Input::default() };
+        let b = Input { b: true, ..Input::default() };
+
+        core.enqueue_input(a);
+        core.set_bot_input(Some(b));
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+
+        // The key is let go: the frontend sends the whole (now empty) keyboard state.
+        core.enqueue_input(Input::default());
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+
+        // The key is pressed again and the bot lets go of everything.
+        core.enqueue_input(a);
+        core.set_bot_input(None);
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+
+        // An empty bot input is the same as none.
+        core.enqueue_input(Input::default());
+        core.set_bot_input(Some(Input::default()));
+        assert_eq!(core.bot_input(), None);
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+
+        assert_eq!(log.lock().unwrap().as_slice(), [3, 2, 1, 0], "keyboard A = 1, bot B = 2");
+
+        // `reset_input` (a replay detached, playback stopped) releases the bot too.
+        core.set_bot_input(Some(b));
+        core.reset_input();
+        assert_eq!(core.bot_input(), None);
+    }
+
+    /// A step of N frames while paused advances the frame count by exactly N, every one of those
+    /// frames runs with the step's input, and the wall clock does not matter at all.
+    #[test]
+    fn stepped_frames_advance_exactly_and_run_with_the_bots_input() {
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+
+        run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        core.pause_timer();
+
+        core.set_bot_input(Some(Input { a: true, ..Input::default() }));
+        for _ in 0..7 {
+            core.run_stepped_frame(false).expect("step");
+        }
+        assert_eq!(core.total_frames(), 8);
+
+        core.set_bot_input(Some(Input { b: true, ..Input::default() }));
+        for _ in 0..3 {
+            core.run_stepped_frame(true).expect("step");
+        }
+        assert_eq!(core.total_frames(), 11);
+        assert!(core.last_frame_presented(), "a drawn step frame is presented");
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2]);
+    }
+
+    /// A replay recorded in lockstep, however long the bot thought between steps, has every
+    /// stepped frame stamped a nominal frame after the one before, stays monotone across the
+    /// switches to and from real time, and plays back frame for frame with the inputs recorded.
+    #[test]
+    fn lockstep_recording_is_stamped_at_normal_speed_and_plays_back_identically() {
+        const LIVE_BEFORE: u64 = 10;
+        const STEPPED: u64 = 30;
+        const LIVE_AFTER: u64 = 10;
+
+        let clock = FakeClock::new();
+        let fake_core = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let recorded_log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        core.start_recording_replay(metadata(final_buf.clone(), SharedSink::default())).expect("start recording");
+
+        for _ in 0..LIVE_BEFORE {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+
+        core.pause_timer();
+        for i in 0..STEPPED {
+            // The bot takes a whole second to think about every frame.
+            clock.advance(1_000_000);
+            core.set_bot_input(Some(Input { a: i % 3 == 0, b: i % 2 == 0, ..Input::default() }));
+            core.run_stepped_frame(i + 1 == STEPPED).expect("step");
+        }
+        core.set_bot_input(None);
+        core.unpause_timer();
+
+        for _ in 0..LIVE_AFTER {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        let total = LIVE_BEFORE + STEPPED + LIVE_AFTER;
+        assert_eq!(core.total_frames(), total);
+        assert!(core.poll_replay_recording_errors().is_empty(), "the recording hit an error");
+        assert_eq!(core.stop_recording_replay(), Some(true));
+        let recorded = recorded_log.lock().unwrap().clone();
+
+        let bytes = final_buf.0.lock().unwrap().clone();
+        let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse the recorded replay");
+        assert_eq!(player.get_total_frames(), total);
+        let mut deltas = Vec::new();
+        while let Some(packet) = player.next_packet().expect("read packet") {
+            if let Packet::NextFrame { timestamp_delta } = packet {
+                deltas.push(timestamp_delta.0);
+            }
+        }
+        assert_eq!(deltas.len() as u64, total);
+        let stepped = &deltas[LIVE_BEFORE as usize..(LIVE_BEFORE + STEPPED) as usize];
+        assert!(stepped.iter().all(|d| *d == 16 || *d == 17), "stepped frames are a nominal frame apart: {stepped:?}");
+        // 30 frames of 16.743 ms, carried to the millisecond.
+        assert_eq!(stepped.iter().sum::<u64>(), 502);
+        assert!(deltas.iter().all(|d| *d <= 17), "no frame carries the time spent between steps: {deltas:?}");
+
+        let (mut playback, playback_clock, played_log) = playback_core(&bytes);
+        while playback.total_frames() < total {
+            assert!(!playback.is_replay_stalled(), "playback stalled early at frame {}", playback.total_frames());
+            run_one_frame(&mut playback, &playback_clock, PERIOD_MICROS);
+        }
+        assert_eq!(played_log.lock().unwrap().as_slice(), recorded.as_slice());
+    }
+
+    /// A step that arrives while a Game Boy is paused in the middle of a frame finishes that
+    /// frame first (with the input it started with), then runs its own frames whole, every one
+    /// of them with the step's input.
+    #[test]
+    fn step_mid_frame_finishes_the_partial_frame_first_on_a_sliced_core() {
+        let fake_core = FakeSlicedCore::new(2);
+        let log = fake_core.frame_inputs.clone();
+        let mut core = SuperShuckieCore::new(Box::new(fake_core), Box::new(FakeClock::new()));
+
+        core.run_unlocked();
+        assert!(core.is_mid_frame());
+        core.pause_timer();
+
+        core.set_bot_input(Some(Input { a: true, ..Input::default() }));
+        for _ in 0..3 {
+            core.run_stepped_frame(false).expect("step");
+            assert!(!core.is_mid_frame(), "a step ends at a frame boundary");
+        }
+        assert_eq!(core.total_frames(), 4, "the partial frame, then three stepped frames");
+        assert_eq!(log.lock().unwrap().as_slice(), [0, 1, 1, 1]);
+    }
+
+    /// Stepping is refused, without running anything, while a replay plays back, while linked
+    /// or held for a link, and with no game.
+    #[test]
+    fn stepping_is_refused_when_nothing_can_run() {
+        let (bytes, _) = record_alternating_replay(8);
+        let (mut playback, _clock, _log) = playback_core(&bytes);
+        let before = playback.total_frames();
+        assert!(playback.can_step().is_err());
+        assert!(playback.run_stepped_frame(true).is_err());
+        assert_eq!(playback.total_frames(), before);
+        playback.set_bot_input(Some(Input { a: true, ..Input::default() }));
+        assert_eq!(playback.bot_input(), None, "the replay owns the console's input");
+
+        let clock = FakeClock::new();
+        let mut held = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        // What `link_hold` does on a console with a link port (the fake has none).
+        held.link_holding = true;
+        assert!(held.can_step().is_err());
+        assert!(held.run_stepped_frame(true).is_err());
+        assert_eq!(held.total_frames(), 0);
+        held.link_release();
+        assert!(held.can_step().is_ok());
+
+        let null = SuperShuckieCore::new(Box::new(crate::emulator::NullEmulatorCore), Box::new(FakeClock::new()));
+        assert!(null.can_step().is_err());
+    }
+
+    /// `advance_paused_timer` carries what is below a millisecond, does nothing while the timer
+    /// runs, and unpausing continues from the advanced reading.
+    #[test]
+    fn advancing_the_paused_timer_carries_the_remainder_and_stays_monotone() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        clock.advance(5_000);
+        core.advance_paused_timer(1_000_000);
+        assert_eq!(core.current_timer_millis().0, 5, "a running timer is not moved");
+
+        core.total_milliseconds = core.current_timer_millis();
+        core.pause_timer();
+        for _ in 0..3 {
+            core.advance_paused_timer(400);
+        }
+        assert_eq!(core.current_timer_millis().0, 6, "1.2 ms added, 0.2 ms carried");
+        core.advance_paused_timer(800);
+        assert_eq!(core.current_timer_millis().0, 7);
+
+        clock.advance(60_000_000);
+        core.total_milliseconds = core.current_timer_millis();
+        core.unpause_timer();
+        assert_eq!(core.current_timer_millis().0, 7, "the minute spent paused does not count");
+        clock.advance(3_000);
+        assert_eq!(core.current_timer_millis().0, 10);
     }
 
     /// (d) `start_recording_replay` on a core with no console type (the null core) must be

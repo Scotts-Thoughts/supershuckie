@@ -490,6 +490,18 @@ bool supershuckie_frontend_get_external_commands_enabled(const struct SuperShuck
 bool supershuckie_frontend_set_external_commands_enabled(struct SuperShuckieFrontendRaw *frontend, bool enabled, char *error, size_t error_len);
 
 /**
+ * Get whether an external program may play the game over the external-commands server (the bot
+ * routes /input, /press, /step, /read-memory and /screenshot). Off by default.
+ */
+bool supershuckie_frontend_get_bot_control_enabled(const struct SuperShuckieFrontendRaw *frontend);
+
+/**
+ * Allow or forbid bot control. Forbidding it releases whatever the bot holds and ends a step it is
+ * running.
+ */
+void supershuckie_frontend_set_bot_control_enabled(struct SuperShuckieFrontendRaw *frontend, bool enabled);
+
+/**
  * Return true if the emulator is currently manually paused.
  */
 bool supershuckie_frontend_is_paused(const struct SuperShuckieFrontendRaw *frontend);
