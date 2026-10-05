@@ -514,6 +514,8 @@ const char *supershuckie_frontend_get_recording_replay_file(const struct SuperSh
 /**
  * Create a save state of the given name, or null to use a default name.
  *
+ * If overwrite is true, an existing state with that name is replaced; otherwise an existing name is an error.
+ *
  * If true is returned, the name of the save state (besides the extension) will be written to result (ensure it is long enough).
  *
  * If false is returned, an error will be written.
@@ -521,7 +523,7 @@ const char *supershuckie_frontend_get_recording_replay_file(const struct SuperSh
  * Safety:
  * - result must not be null and must be at least result_len bytes long.
  */
-bool supershuckie_frontend_create_save_state(struct SuperShuckieFrontendRaw *frontend, const char *name, char *result, size_t result_len);
+bool supershuckie_frontend_create_save_state(struct SuperShuckieFrontendRaw *frontend, const char *name, bool overwrite, char *result, size_t result_len);
 
 /**
  * Load a save state of the given name.

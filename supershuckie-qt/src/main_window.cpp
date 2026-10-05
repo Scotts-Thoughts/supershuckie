@@ -968,7 +968,7 @@ void MainWindow::set_video_scale(std::uint8_t scale) {
 
 void MainWindow::make_save_state(const char *state) {
     char error[256];
-    auto success = supershuckie_frontend_create_save_state(this->frontend, state, error, sizeof(error));
+    auto success = supershuckie_frontend_create_save_state(this->frontend, state, true, error, sizeof(error));
     if(success) {
         char title[512];
         std::snprintf(title, sizeof(title), "Created state \"%s\"", error);

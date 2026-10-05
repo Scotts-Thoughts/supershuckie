@@ -95,7 +95,7 @@ fn main() {
     assert!(frontend.get_elapsed_milliseconds() > 0);
 
     // Live means the user's things work again: a save state can be loaded.
-    let state_name = frontend.create_save_state(Some("stopped")).expect("save state").to_string();
+    let state_name = frontend.create_save_state(Some("stopped"), true).expect("save state").to_string();
     let state_stem = state_name.rsplit_once('.').map(|(s, _)| s.to_owned()).unwrap_or(state_name);
     assert!(frontend.load_save_state_if_exists(&state_stem).expect("save states are loadable while stopped"));
 

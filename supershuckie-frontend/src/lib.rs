@@ -337,8 +337,11 @@ impl SuperShuckieFrontend {
     ///
     /// If `name` is set, that name will be used.
     ///
+    /// If `overwrite` is set and a state with that name exists, it is replaced (quick save slots);
+    /// otherwise an existing name is refused.
+    ///
     /// Returns the name of the save state if created.
-    pub fn create_save_state(&mut self, name: Option<&str>) -> Result<UTF8CString, UTF8CString> {
+    pub fn create_save_state(&mut self, name: Option<&str>, overwrite: bool) -> Result<UTF8CString, UTF8CString> {
         self.refuse_if_exporting()?;
         if let Some(n) = name {
             check_user_file_name(n)?;
@@ -350,6 +353,23 @@ impl SuperShuckieFrontend {
 
         let current_rom_name = self.get_current_rom_name().expect("no rom name when game is running in create_save_state");
         let save_states_dir = self.get_save_states_dir_for_rom(current_rom_name);
+
+        if let (Some(name), true) = (name, overwrite) {
+            let state = self.create_save_state_now().ok_or("The emulator did not produce a save state")?;
+            let filename = format!("{name}.{SAVE_STATE_EXTENSION}");
+            let path = save_states_dir.join(&filename);
+
+            // Write beside the slot and swap it in, so a failed write never destroys the old state.
+            let temp_path = save_states_dir.join(format!("{name}.{SAVE_STATE_EXTENSION}.partial"));
+            let written = std::fs::create_dir_all(&save_states_dir)
+                .and_then(|_| std::fs::write(&temp_path, &state))
+                .and_then(|_| std::fs::rename(&temp_path, &path));
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(format!("Can't write to {filename}: {e}").into())
+            }
+            return Ok(filename.into())
+        }
 
         let (mut file, filename, _) = self.load_file_or_make_generic(&save_states_dir, name, None, SAVE_STATE_EXTENSION)?;
 

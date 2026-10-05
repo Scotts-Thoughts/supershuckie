@@ -657,11 +657,12 @@ pub unsafe extern "C" fn supershuckie_frontend_get_recording_replay_file(
 pub unsafe extern "C" fn supershuckie_frontend_create_save_state(
     frontend: &mut SuperShuckieFrontend,
     name: *const c_char,
+    overwrite: bool,
     result: *mut u8,
     result_len: usize
 ) -> bool {
     let name = if !name.is_null() { Some(unsafe { CStr::from_ptr(name) }.to_str().expect("name not UTF-8")) } else { None };
-    let (success, msg) = match frontend.create_save_state(name) {
+    let (success, msg) = match frontend.create_save_state(name, overwrite) {
         Ok(n) => (true, n),
         Err(n) => (false, n)
     };
