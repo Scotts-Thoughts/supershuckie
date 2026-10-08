@@ -1,6 +1,7 @@
 pub mod util;
 pub mod settings;
 pub mod replay_convert;
+pub mod legacy_replay;
 pub mod memory_tools;
 pub mod bookmarks;
 pub mod play_together;
@@ -29,7 +30,7 @@ use supershuckie_core::emulator::{EmulatorCore, GameBoyColor, Input, Model, Part
 use supershuckie_core::{std_timestamp_provider, AudioOutput, ElapsedTimeStats, ReplayPlayerAttachError, Speed, SuperShuckieRapidFire, ThreadedSuperShuckieCore};
 use supershuckie_core::{ExportRange, ScreenLayout, VideoExportError, VideoExportHandle, VideoFrameSink};
 use supershuckie_frontend_webserver::{Stats, SuperShuckieServerCommand, SuperShuckieWebserver};
-use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat, RomBytes};
+use supershuckie_replay_recorder::replay_file::{blake3_hash_to_ascii, ReplayConsoleType, ReplayHeaderBlake3Hash, ReplayPatchFormat, RomBytes};
 use supershuckie_replay_recorder::{blake3_hash, ByteVec, SignedInteger, TimestampMillis, UnsignedInteger};
 use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
 use supershuckie_replay_recorder::replay_file::record::{ReplayFileRecorderSettings, ReplayFileWriteError, ResumeCropPolicy};
@@ -2099,7 +2100,35 @@ impl SuperShuckieFrontend {
             .map(|r| vec![r.final_replay_path.clone(), r.temp_replay_path.clone()])
             .unwrap_or_default();
 
-        let plan = replay_convert::plan_conversion(path, &exclude).map_err(UTF8CString::from)?;
+        // 3DS replays need their game's ROM: every loaded ROM is remembered by checksum.
+        let known_roms = &self.settings.play_together.known_roms;
+        let by_checksum = |checksum: &ReplayHeaderBlake3Hash| {
+            known_roms.get(&blake3_hash_to_ascii(*checksum)).map(|p| PathBuf::from(p.as_str())).filter(|p| p.is_file())
+        };
+        // Replays of the original Super Shuckie name their ROM by SHA-256: look through the
+        // remembered and recent Game Boy ROMs (hashed once each, and only if such a replay turns up).
+        let candidates: Vec<PathBuf> = known_roms
+            .values()
+            .chain(self.settings.recent_roms.recent_roms.iter())
+            .map(|p| PathBuf::from(p.as_str()))
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("gb") || e.eq_ignore_ascii_case("gbc")))
+            .collect();
+        let hashed: std::cell::RefCell<Option<Vec<([u8; 32], PathBuf)>>> = Default::default();
+        let by_sha256 = |sha: &[u8; 32]| {
+            let mut hashed = hashed.borrow_mut();
+            let hashed = hashed.get_or_insert_with(|| {
+                let mut seen = std::collections::BTreeSet::new();
+                candidates
+                    .iter()
+                    .filter(|p| seen.insert((*p).clone()))
+                    .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= 16 << 20))
+                    .filter_map(|p| std::fs::read(p).ok().map(|data| (legacy_replay::sha256(&data), p.clone())))
+                    .collect()
+            });
+            hashed.iter().find(|(h, _)| h == sha).map(|(_, p)| p.clone())
+        };
+        let roms = replay_convert::RomFinder { by_checksum: &by_checksum, by_sha256: &by_sha256 };
+        let plan = replay_convert::plan_conversion(path, &exclude, roms).map_err(UTF8CString::from)?;
         if plan.files.is_empty() {
             return Err(format!("Nothing to convert. {}", plan.describe()).into());
         }
@@ -2124,7 +2153,11 @@ impl SuperShuckieFrontend {
         let Some(plan) = self.pending_conversion_plan.take() else {
             return Err("No replay conversion was planned".into());
         };
-        self.current_conversion = Some(replay_convert::ConversionJob::start(plan, self.recorder_settings(), keep_backups));
+        let settings = replay_convert::ConversionSettings {
+            recorder: self.recorder_settings(),
+            frames_per_keyframe: self.settings.replay.frames_per_keyframe,
+        };
+        self.current_conversion = Some(replay_convert::ConversionJob::start(plan, settings, keep_backups));
         Ok(())
     }
 
@@ -3794,7 +3827,11 @@ fn open_replay_player(path: &Path, allow_some_corruption: bool) -> Result<Replay
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|e| format!("Failed to read replay:\n\n{e}"))?;
     let mut head = [0u8; 12];
-    let is_3ds = file.read_exact(&mut head).is_ok()
+    let read_head = file.read_exact(&mut head).is_ok();
+    if read_head && head.starts_with(legacy_replay::LEGACY_MAGIC) {
+        return Err("This replay was recorded with the original Super Shuckie. Convert it first with Replays > Convert to current format > Replay…".to_owned());
+    }
+    let is_3ds = read_head
         && u32::from_le_bytes(head[8..12].try_into().expect("4 bytes")) == ReplayConsoleType::Nintendo3DS as u32;
     let parsed = if is_3ds {
         // SAFETY: the file is opened read-only and a replay is not modified while it is open for

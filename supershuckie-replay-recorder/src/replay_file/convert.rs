@@ -138,15 +138,19 @@ pub struct VerifyReport {
 ///
 /// Fails if the file is too short, has the wrong signature, or a version this build cannot read.
 pub fn replay_file_version(path: &Path) -> Result<u32, String> {
+    Ok(read_replay_file_header(path)?.replay_version)
+}
+
+/// Read just the header of a replay file, checked like [`replay_file_version`] does.
+pub fn read_replay_file_header(path: &Path) -> Result<ReplayHeaderRaw, String> {
     use std::io::Read;
 
     let mut file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut header = [0u8; size_of::<ReplayHeaderBytes>()];
     file.read_exact(&mut header).map_err(|e| format!("cannot read the header of {}: {e}", path.display()))?;
-    let raw = ReplayHeaderRaw::from_bytes(&header);
+    let raw = *ReplayHeaderRaw::from_bytes(&header);
     raw.parse().map_err(|e| format!("{}: {e}", path.display()))?;
-    let version = raw.replay_version;
-    Ok(version)
+    Ok(raw)
 }
 
 fn map_file(path: &Path) -> Result<memmap2::Mmap, String> {

@@ -7,6 +7,8 @@
 //! [`ConversionJob::status`] for progress, may [`cancel`](ConversionJob::cancel), and reads the
 //! [`ConversionSummary`] when the job is [`finished`](ConversionJob::is_finished).
 
+use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,13 +16,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use supershuckie_replay_recorder::replay_file::convert::{
-    convert_replay_file, human_size, replay_file_version, verify_replay_files, ConvertError, ConvertOptions,
+    convert_replay_file, human_size, read_replay_file_header, verify_replay_files, ConvertError, ConvertOptions,
 };
 pub use supershuckie_replay_recorder::replay_file::convert::ConvertPhase;
 use supershuckie_replay_recorder::replay_file::record::ReplayFileRecorderSettings;
-use supershuckie_replay_recorder::replay_file::REPLAY_VERSION_CURRENT_ENCODING;
+use supershuckie_replay_recorder::replay_file::playback::ReplayFilePlayer;
+use supershuckie_replay_recorder::replay_file::{ReplayConsoleType, ReplayHeaderBlake3Hash, REPLAY_VERSION_CURRENT_ENCODING};
+
+use crate::legacy_replay::{import_legacy_replay, is_legacy_replay, read_legacy_header, LegacyImportOptions, LegacyImportReport};
 #[cfg(test)]
-use supershuckie_replay_recorder::replay_file::REPLAY_VERSION;
+use supershuckie_replay_recorder::replay_file::{convert::replay_file_version, REPLAY_VERSION};
 
 /// File extension of replays.
 const REPLAY_EXTENSION: &str = "replay";
@@ -28,7 +33,9 @@ const REPLAY_EXTENSION: &str = "replay";
 /// Suffix of the temporary output written next to a replay while it is being converted.
 const TEMP_SUFFIX: &str = ".v4-tmp.replay";
 
-/// Replays written more recently than this are assumed to be recordings in progress and skipped.
+/// Replays that were never closed and were written more recently than this are assumed to be
+/// recordings in progress (of another window, or a Play Together friend's) and skipped. A closed
+/// replay is finished whatever its age.
 const MIN_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// What a conversion would do, built from a file or folder before anything is touched.
@@ -46,6 +53,37 @@ pub struct ConversionPlan {
     pub skipped_recent: usize,
     /// Replays skipped because they are excluded (the recording in progress) or unreadable.
     pub skipped_unreadable: usize,
+    /// Replays of the original Super Shuckie skipped because the game they were recorded with
+    /// was not found (see [`RomFinder::by_sha256`]); their ROM names.
+    pub skipped_needs_rom: Vec<String>,
+    /// Nintendo 3DS replays whose game was found on this machine: replay -> ROM. A 3DS replay
+    /// recorded with ROM references needs its ROM to be read, and the output gets them too.
+    pub rom_paths: BTreeMap<PathBuf, PathBuf>,
+    /// Replays of the original Super Shuckie (see [`crate::legacy_replay`]) -> the ROM to import
+    /// them with. Also listed in [`Self::files`].
+    pub legacy: BTreeMap<PathBuf, PathBuf>,
+}
+
+/// How a plan finds the ROM files replays need.
+#[derive(Copy, Clone)]
+pub struct RomFinder<'a> {
+    /// By this app's ROM checksum (blake3).
+    pub by_checksum: &'a dyn Fn(&ReplayHeaderBlake3Hash) -> Option<PathBuf>,
+    /// By SHA-256 (how the original Super Shuckie identified a ROM).
+    pub by_sha256: &'a dyn Fn(&[u8; 32]) -> Option<PathBuf>,
+}
+
+fn no_rom_by_checksum(_: &ReplayHeaderBlake3Hash) -> Option<PathBuf> {
+    None
+}
+
+fn no_rom_by_sha256(_: &[u8; 32]) -> Option<PathBuf> {
+    None
+}
+
+impl RomFinder<'static> {
+    /// Finds nothing.
+    pub const NONE: RomFinder<'static> = RomFinder { by_checksum: &no_rom_by_checksum, by_sha256: &no_rom_by_sha256 };
 }
 
 impl ConversionPlan {
@@ -63,43 +101,95 @@ impl ConversionPlan {
             skipped.push(format!("{} already format v{REPLAY_VERSION_CURRENT_ENCODING} or newer", self.skipped_current));
         }
         if self.skipped_recent > 0 {
-            skipped.push(format!("{} written in the last 10 minutes", self.skipped_recent));
+            skipped.push(format!("{} still being written", self.skipped_recent));
         }
         if self.skipped_unreadable > 0 {
             skipped.push(format!("{} unreadable or in use", self.skipped_unreadable));
         }
+        if !self.skipped_needs_rom.is_empty() {
+            skipped.push(format!("{} from the original Super Shuckie whose game was not found", self.skipped_needs_rom.len()));
+        }
         if !skipped.is_empty() {
             text.push_str(&format!(" Skipped: {}.", skipped.join(", ")));
+        }
+        if !self.legacy.is_empty() {
+            text.push_str(&format!(
+                " {} {} from the original Super Shuckie and will be re-played on today's emulator, which takes a few minutes per hour of play.",
+                self.legacy.len(),
+                if self.legacy.len() == 1 { "is" } else { "are" }
+            ));
         }
         text
     }
 }
 
-/// Classify one replay file for the plan.
-fn plan_file(plan: &mut ConversionPlan, path: PathBuf, exclude: &[PathBuf]) {
+/// Why a replay is not part of a plan.
+enum Skip {
+    Excluded,
+    Recent,
+    Current,
+    Unreadable,
+    NeedsRom(String),
+}
+
+/// Classify one replay file for the plan. `explicit` (the user picked this very file) converts
+/// it even if it already is the current encoding: re-encoding a recent replay applies the current
+/// replay settings to it.
+fn plan_file(plan: &mut ConversionPlan, path: PathBuf, exclude: &[PathBuf], explicit: bool, roms: RomFinder<'_>) -> Option<Skip> {
+    let skip = classify_file(plan, path, exclude, explicit, roms)?;
+    match &skip {
+        Skip::Current => plan.skipped_current += 1,
+        Skip::Recent => plan.skipped_recent += 1,
+        Skip::Excluded | Skip::Unreadable => plan.skipped_unreadable += 1,
+        Skip::NeedsRom(name) => plan.skipped_needs_rom.push(name.clone()),
+    }
+    Some(skip)
+}
+
+fn classify_file(plan: &mut ConversionPlan, path: PathBuf, exclude: &[PathBuf], explicit: bool, roms: RomFinder<'_>) -> Option<Skip> {
     if exclude.iter().any(|e| e == &path) {
-        plan.skipped_unreadable += 1;
-        return;
+        return Some(Skip::Excluded);
     }
 
     let Ok(metadata) = std::fs::metadata(&path) else {
-        plan.skipped_unreadable += 1;
-        return;
+        return Some(Skip::Unreadable);
     };
 
-    if metadata.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age < MIN_AGE) {
-        plan.skipped_recent += 1;
-        return;
+    // A replay of the original Super Shuckie: imported with the game it was recorded with.
+    if is_legacy_replay(&path) {
+        let Ok(header) = read_legacy_header(&path) else {
+            return Some(Skip::Unreadable);
+        };
+        let Some(rom) = (roms.by_sha256)(&header.rom_sha256) else {
+            return Some(Skip::NeedsRom(header.rom_name));
+        };
+        plan.legacy.insert(path.clone(), rom);
+        plan.total_bytes += metadata.len();
+        plan.files.push(path);
+        return None;
     }
 
-    match replay_file_version(&path) {
-        Ok(version) if version >= REPLAY_VERSION_CURRENT_ENCODING => plan.skipped_current += 1,
-        Ok(_) => {
-            plan.total_bytes += metadata.len();
-            plan.files.push(path);
-        }
-        Err(_) => plan.skipped_unreadable += 1,
+    let Ok(header) = read_replay_file_header(&path) else {
+        return Some(Skip::Unreadable);
+    };
+
+    let closed = header.packet_stream_end().is_some();
+    if !closed && metadata.modified().ok().and_then(|m| m.elapsed().ok()).is_some_and(|age| age < MIN_AGE) {
+        return Some(Skip::Recent);
     }
+
+    if !explicit && header.replay_version >= REPLAY_VERSION_CURRENT_ENCODING {
+        return Some(Skip::Current);
+    }
+
+    if matches!(header.console_type.get(), Ok(ReplayConsoleType::Nintendo3DS)) {
+        if let Some(rom) = (roms.by_checksum)(&header.rom_checksum) {
+            plan.rom_paths.insert(path.clone(), rom);
+        }
+    }
+    plan.total_bytes += metadata.len();
+    plan.files.push(path);
+    None
 }
 
 fn is_replay_file(path: &Path) -> bool {
@@ -122,21 +212,26 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Build the plan for `path`: a single replay, or every `*.replay` under a folder (recursively).
 ///
-/// `exclude` lists files that must never be converted (the recording in progress).
-pub fn plan_conversion(path: &Path, exclude: &[PathBuf]) -> Result<ConversionPlan, String> {
+/// `exclude` lists files that must never be converted (the recording in progress). A single file is
+/// converted whatever its format version; a folder skips the replays that already are the current
+/// encoding. `roms` finds the ROM files 3DS replays and replays of the original Super Shuckie
+/// need.
+pub fn plan_conversion(path: &Path, exclude: &[PathBuf], roms: RomFinder<'_>) -> Result<ConversionPlan, String> {
     let mut plan = ConversionPlan { root: path.to_path_buf(), ..Default::default() };
 
     if path.is_file() {
         if !is_replay_file(path) {
             return Err(format!("{} is not a .replay file", path.display()));
         }
-        plan_file(&mut plan, path.to_path_buf(), exclude);
-        if plan.files.is_empty() {
-            return match (plan.skipped_current, plan.skipped_recent) {
-                (1, _) => Err(format!("{} is already format v{REPLAY_VERSION_CURRENT_ENCODING} or newer.", path.display())),
-                (_, 1) => Err(format!("{} was written in the last 10 minutes; if it is being recorded, stop the recording first.", path.display())),
-                _ => Err(format!("{} could not be read as a replay.", path.display())),
-            };
+        match plan_file(&mut plan, path.to_path_buf(), exclude, true, roms) {
+            None => (),
+            Some(Skip::Excluded) => return Err(format!("{} is being recorded; stop the recording first.", path.display())),
+            Some(Skip::Recent) => return Err(format!("{} is still being written (it was never closed and changed in the last 10 minutes); if it is being recorded, stop the recording first.", path.display())),
+            Some(Skip::NeedsRom(name)) => return Err(format!(
+                "{} was recorded with the original Super Shuckie, on a game that was not found ({name}). Open that game in Super Shuckie once, then convert the replay again.",
+                path.display()
+            )),
+            Some(Skip::Current) | Some(Skip::Unreadable) => return Err(format!("{} could not be read as a replay.", path.display())),
         }
     }
     else if path.is_dir() {
@@ -144,7 +239,7 @@ pub fn plan_conversion(path: &Path, exclude: &[PathBuf]) -> Result<ConversionPla
         walk(path, &mut files);
         files.sort();
         for file in files {
-            plan_file(&mut plan, file, exclude);
+            plan_file(&mut plan, file, exclude, false, roms);
         }
     }
     else {
@@ -177,6 +272,8 @@ pub struct ConvertedReplay {
     pub path: PathBuf,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// For a replay of the original Super Shuckie: how the import went.
+    pub legacy: Option<LegacyImportReport>,
 }
 
 /// Outcome of a [`ConversionJob`].
@@ -214,6 +311,17 @@ impl ConversionSummary {
         }
         text.push_str(&format!(" in {}:{:02}:{:02}.", seconds / 3600, (seconds / 60) % 60, seconds % 60));
 
+        let imported: Vec<&LegacyImportReport> = self.converted.iter().filter_map(|c| c.legacy.as_ref()).collect();
+        if !imported.is_empty() {
+            let checks: u64 = imported.iter().map(|r| r.checks).sum();
+            let resyncs: u64 = imported.iter().map(|r| r.resyncs).sum();
+            text.push_str(&format!(
+                "\n\n{} {} from the original Super Shuckie. Today's emulator drifted from the old recording at {resyncs} of its {checks} save states (every 4 seconds); at those points the old save state was loaded, so the replay can jump slightly there.",
+                imported.len(),
+                if imported.len() == 1 { "replay was imported" } else { "replays were imported" },
+            ));
+        }
+
         if self.kept_backups && !self.converted.is_empty() {
             text.push_str("\n\nThe originals were kept next to the converted files as .replay.bak files; delete them once you are happy with the results.");
         }
@@ -243,6 +351,24 @@ struct Shared {
     current_name: Mutex<String>,
 }
 
+/// How converted replays are written.
+#[derive(Clone, Debug)]
+pub struct ConversionSettings {
+    pub recorder: ReplayFileRecorderSettings,
+    /// Keyframe interval of imported replays of the original Super Shuckie (which are recorded
+    /// anew; converted replays keep theirs).
+    pub frames_per_keyframe: NonZeroU64,
+}
+
+impl From<ReplayFileRecorderSettings> for ConversionSettings {
+    fn from(recorder: ReplayFileRecorderSettings) -> Self {
+        Self { recorder, frames_per_keyframe: NonZeroU64::new(600).expect("non-zero") }
+    }
+}
+
+/// The Game Boy Color boot ROM recordings get (see `SuperShuckieFrontend::default_bios_for`).
+const CGB_BOOT_ROM: &[u8] = include_bytes!("../../bootrom/cgb/cgb_boot/cgb_boot_fast.bin");
+
 /// A conversion running on its own thread.
 pub struct ConversionJob {
     shared: Arc<Shared>,
@@ -252,7 +378,8 @@ pub struct ConversionJob {
 impl ConversionJob {
     /// Start converting every file in `plan` with `settings`, replacing each original after its
     /// verification passes (renamed to `<name>.replay.bak` when `keep_backups`).
-    pub fn start(plan: ConversionPlan, settings: ReplayFileRecorderSettings, keep_backups: bool) -> Self {
+    pub fn start(plan: ConversionPlan, settings: impl Into<ConversionSettings>, keep_backups: bool) -> Self {
+        let settings = settings.into();
         let shared = Arc::new(Shared {
             cancel: AtomicBool::new(false),
             finished: AtomicBool::new(false),
@@ -314,9 +441,9 @@ impl Drop for ConversionJob {
     }
 }
 
-fn run_job(shared: Arc<Shared>, plan: ConversionPlan, settings: ReplayFileRecorderSettings, keep_backups: bool) -> ConversionSummary {
+fn run_job(shared: Arc<Shared>, plan: ConversionPlan, settings: ConversionSettings, keep_backups: bool) -> ConversionSummary {
     let started = Instant::now();
-    let options = ConvertOptions { settings, allow_corruption: false, rom_path: None };
+    let base_options = ConvertOptions { settings: settings.recorder.clone(), allow_corruption: false, rom_path: None };
     let mut summary = ConversionSummary { planned: plan.files.len(), kept_backups: keep_backups, ..Default::default() };
 
     for (index, path) in plan.files.iter().enumerate() {
@@ -333,7 +460,14 @@ fn run_job(shared: Arc<Shared>, plan: ConversionPlan, settings: ReplayFileRecord
             *name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         }
 
-        match convert_one(&shared, path, &options, keep_backups) {
+        let result = match plan.legacy.get(path) {
+            Some(rom) => import_one(&shared, path, rom, &settings, keep_backups),
+            None => {
+                let options = ConvertOptions { rom_path: plan.rom_paths.get(path).cloned(), ..base_options.clone() };
+                convert_one(&shared, path, &options, keep_backups)
+            }
+        };
+        match result {
             Ok(converted) => summary.converted.push(converted),
             Err(ConvertError::Cancelled) => {
                 summary.cancelled = true;
@@ -362,7 +496,7 @@ fn convert_one(shared: &Shared, path: &Path, options: &ConvertOptions, keep_back
 
     let report = convert_replay_file(path, &temp, options, true, &mut progress)?;
 
-    if let Err(error) = verify_replay_files(path, &temp, options.settings.mask_transient_buffers, false, None, &mut progress) {
+    if let Err(error) = verify_replay_files(path, &temp, options.settings.mask_transient_buffers, false, options.rom_path.as_deref(), &mut progress) {
         let _ = std::fs::remove_file(&temp);
         return Err(match error {
             ConvertError::Cancelled => ConvertError::Cancelled,
@@ -375,7 +509,53 @@ fn convert_one(shared: &Shared, path: &Path, options: &ConvertOptions, keep_back
         return Err(ConvertError::Failed(message));
     }
 
-    Ok(ConvertedReplay { path: path.to_path_buf(), bytes_before: report.source.size, bytes_after: report.output_size })
+    Ok(ConvertedReplay { path: path.to_path_buf(), bytes_before: report.source.size, bytes_after: report.output_size, legacy: None })
+}
+
+/// Import, check and replace one replay of the original Super Shuckie.
+fn import_one(shared: &Shared, path: &Path, rom_path: &Path, settings: &ConversionSettings, keep_backup: bool) -> Result<ConvertedReplay, ConvertError> {
+    let rom = std::fs::read(rom_path).map_err(|e| format!("cannot read {}: {e}", rom_path.display()))?;
+    let bytes_before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let temp = temp_path(path);
+    let _ = std::fs::remove_file(&temp);
+
+    let options = LegacyImportOptions {
+        rom: &rom,
+        rom_filename: rom_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        bios: CGB_BOOT_ROM,
+        settings: settings.recorder.clone(),
+        frames_per_keyframe: settings.frames_per_keyframe,
+    };
+    shared.phase.store(0, Ordering::Relaxed);
+    let report = import_legacy_replay(path, &temp, &options, &mut |done, total| {
+        shared.done.store(done, Ordering::Relaxed);
+        shared.total.store(total, Ordering::Relaxed);
+        !shared.cancel.load(Ordering::Relaxed)
+    })?;
+
+    // The result must read back as a replay of the whole run.
+    shared.phase.store(1, Ordering::Relaxed);
+    let check = std::fs::read(&temp)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| ReplayFilePlayer::new(&bytes, false).map(|p| p.get_total_frames()).map_err(|e| format!("{e:?}")));
+    match check {
+        Ok(frames) if frames == report.frames => (),
+        Ok(frames) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(ConvertError::Failed(format!("the imported replay has {frames} frames instead of {}", report.frames)));
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            return Err(ConvertError::Failed(format!("the imported replay does not read back: {e}")));
+        }
+    }
+
+    let bytes_after = std::fs::metadata(&temp).map(|m| m.len()).unwrap_or(0);
+    if let Err(message) = replace_original(path, &temp, keep_backup) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(ConvertError::Failed(message));
+    }
+    Ok(ConvertedReplay { path: path.to_path_buf(), bytes_before, bytes_after, legacy: Some(report) })
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -482,14 +662,14 @@ mod tests {
 
         // A current file: convert one first.
         let current = replays.join("current.replay");
-        let job = ConversionJob::start(plan_conversion(&old, &[]).unwrap(), ReplayFileRecorderSettings::default(), false);
+        let job = ConversionJob::start(plan_conversion(&old, &[], RomFinder::NONE).unwrap(), ReplayFileRecorderSettings::default(), false);
         let summary = wait(job);
         assert_eq!(summary.converted.len(), 1);
         std::fs::copy(&old, &current).unwrap();
         age(&current);
         age(&old);
 
-        let plan = plan_conversion(&dir, &[excluded.clone()]).unwrap();
+        let plan = plan_conversion(&dir, &[excluded.clone()], RomFinder::NONE).unwrap();
         assert_eq!(plan.files, vec![temp_layout.clone()]);
         assert_eq!(plan.skipped_current, 2, "old (now converted) and current");
         assert_eq!(plan.skipped_recent, 1);
@@ -497,11 +677,27 @@ mod tests {
         assert!(plan.describe().starts_with("1 replay ("));
 
         // Single-file plans explain why nothing would be done.
-        assert!(plan_conversion(&current, &[]).unwrap_err().contains("already format v4 or newer"));
-        assert!(plan_conversion(&recent, &[]).unwrap_err().contains("last 10 minutes"));
-        assert!(plan_conversion(&junk, &[]).unwrap_err().contains("could not be read"));
-        assert!(plan_conversion(&replays.join("notes.txt"), &[]).is_err());
-        assert!(plan_conversion(&replays.join("missing.replay"), &[]).is_err());
+        assert!(plan_conversion(&recent, &[], RomFinder::NONE).unwrap_err().contains("last 10 minutes"));
+        assert!(plan_conversion(&excluded, &[excluded.clone()], RomFinder::NONE).unwrap_err().contains("being recorded"));
+
+        // A replay that was just recorded (closed, current format, written seconds ago) is
+        // re-encoded when picked on its own, and only skipped as current in a folder.
+        let fresh_dir = replays.join("fresh");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        let fresh = fresh_dir.join("fresh.replay");
+        std::fs::copy(&current, &fresh).unwrap();
+        std::fs::File::options().write(true).open(&fresh).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
+        let plan = plan_conversion(&fresh, &[], RomFinder::NONE).unwrap();
+        assert_eq!(plan.files, vec![fresh.clone()]);
+        let summary = wait(ConversionJob::start(plan, ReplayFileRecorderSettings::default(), false));
+        assert_eq!(summary.converted.len(), 1, "{summary:?}");
+        assert_eq!(replay_file_version(&fresh).unwrap(), REPLAY_VERSION);
+        let plan = plan_conversion(&fresh_dir, &[], RomFinder::NONE).unwrap();
+        assert!(plan.files.is_empty());
+        assert_eq!((plan.skipped_current, plan.skipped_recent), (1, 0));
+        assert!(plan_conversion(&junk, &[], RomFinder::NONE).unwrap_err().contains("could not be read"));
+        assert!(plan_conversion(&replays.join("notes.txt"), &[], RomFinder::NONE).is_err());
+        assert!(plan_conversion(&replays.join("missing.replay"), &[], RomFinder::NONE).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -522,7 +718,7 @@ mod tests {
         // An existing .bak must not be overwritten.
         std::fs::write(dir.join("a.replay.bak"), b"older backup").unwrap();
 
-        let plan = plan_conversion(&dir, &[]).unwrap();
+        let plan = plan_conversion(&dir, &[], RomFinder::NONE).unwrap();
         assert_eq!(plan.files.len(), 3);
 
         let job = ConversionJob::start(plan, ReplayFileRecorderSettings { max_frames_per_blob: 60, ..Default::default() }, true);
@@ -550,7 +746,7 @@ mod tests {
         let c = dir.join("c.replay");
         std::fs::write(&c, V3_SMALL_CLOSED).unwrap();
         age(&c);
-        let summary = wait(ConversionJob::start(plan_conversion(&c, &[]).unwrap(), ReplayFileRecorderSettings::default(), false));
+        let summary = wait(ConversionJob::start(plan_conversion(&c, &[], RomFinder::NONE).unwrap(), ReplayFileRecorderSettings::default(), false));
         assert_eq!(summary.converted.len(), 1);
         assert!(!dir.join("c.replay.bak").exists());
         assert_eq!(replay_file_version(&c).unwrap(), REPLAY_VERSION);
@@ -567,7 +763,7 @@ mod tests {
             age(f);
         }
 
-        let plan = plan_conversion(&dir, &[]).unwrap();
+        let plan = plan_conversion(&dir, &[], RomFinder::NONE).unwrap();
         let job = ConversionJob::start(plan, ReplayFileRecorderSettings::default(), true);
         job.cancel();
         let summary = wait(job);
@@ -583,6 +779,50 @@ mod tests {
         assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.path().to_string_lossy().ends_with(TEMP_SUFFIX)));
         assert!(summary.converted.len() + summary.failed.len() < 3 || summary.cancelled);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end on a real replay of the original Super Shuckie:
+    /// `LEGACY_REPLAY_E2E="<old.replay>|<rom>" cargo test --release -p supershuckie-frontend --lib legacy_import_end_to_end -- --ignored --nocapture`
+    /// (works on a copy; the original is never touched).
+    #[test]
+    #[ignore]
+    fn legacy_import_end_to_end() {
+        let spec = std::env::var("LEGACY_REPLAY_E2E").expect("LEGACY_REPLAY_E2E=<old.replay>|<rom>");
+        let (old, rom) = spec.split_once('|').expect("<old.replay>|<rom>");
+        let rom = PathBuf::from(rom);
+        let dir = temp_dir("legacy-e2e");
+        let copy = dir.join("old.replay");
+        std::fs::copy(old, &copy).unwrap();
+
+        let rom_sha = crate::legacy_replay::sha256(&std::fs::read(&rom).unwrap());
+        let by_sha256 = |sha: &[u8; 32]| (*sha == rom_sha).then(|| rom.clone());
+        let roms = RomFinder { by_sha256: &by_sha256, ..RomFinder::NONE };
+
+        // Without the ROM the plan explains what is missing.
+        let err = plan_conversion(&copy, &[], RomFinder::NONE).unwrap_err();
+        assert!(err.contains("original Super Shuckie"), "{err}");
+
+        let plan = plan_conversion(&copy, &[], roms).unwrap();
+        println!("{}", plan.describe());
+        assert_eq!(plan.legacy.len(), 1);
+        let job = ConversionJob::start(plan, ReplayFileRecorderSettings::default(), true);
+        let started = Instant::now();
+        while !job.is_finished() {
+            std::thread::sleep(Duration::from_secs(30));
+            let s = job.status();
+            println!("{:?} {}/{} after {:.0}s", s.phase, s.done, s.total, started.elapsed().as_secs_f64());
+        }
+        let summary = job.finish();
+        println!("{}", summary.describe());
+        assert_eq!(summary.converted.len(), 1, "{summary:?}");
+        assert_eq!(replay_file_version(&copy).unwrap(), REPLAY_VERSION);
+        assert!(crate::legacy_replay::is_legacy_replay(&dir.join("old.replay.bak")));
+
+        // The new replay plays back on a fresh core and ends where the import ended.
+        let bytes = std::fs::read(&copy).unwrap();
+        let player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        println!("{} frames, {} keyframes, {} bytes", player.get_total_frames(), player.all_keyframes().len(), bytes.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

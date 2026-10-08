@@ -1006,6 +1006,7 @@ dependencies = [
  "supershuckie-memory-tools",
  "supershuckie-play-together",
  "supershuckie-replay-recorder",
+ "zstd-sys",
 ]
 
 [[package]]
