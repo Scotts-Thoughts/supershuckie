@@ -32,6 +32,9 @@ pub mod live_replay;
 #[cfg(feature = "std")]
 pub mod link;
 
+#[cfg(feature = "std")]
+pub mod replay_sync;
+
 pub mod export;
 pub use export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 
@@ -1113,6 +1116,23 @@ impl SuperShuckieCore {
         }
 
         None
+    }
+
+    /// The last keyframe of the attached replay file at or before replay time `millis`, as
+    /// `(frame, replay time)`. `None` without a replay file, or when its first keyframe is later.
+    pub fn replay_keyframe_at_or_before_millis(&self, millis: u64) -> Option<(UnsignedInteger, u64)> {
+        let player = self.replay_player.as_ref()?;
+        let mut found = None;
+        for (&frame, metadata) in player.all_keyframes() {
+            let Some(at) = metadata.first().map(|m| m.elapsed_millis.0) else {
+                continue
+            };
+            if at > millis {
+                break
+            }
+            found = Some((frame, at));
+        }
+        found
     }
 
     /// Length of one frame at 1x speed on the loaded console, in microseconds.

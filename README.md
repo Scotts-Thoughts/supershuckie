@@ -175,6 +175,14 @@ port (55356 unless changed under **Settings → Poke-A-Byte → Port…**) and e
 next free port above it, which a single Poke-A-Byte reaches through its `/instances/<port>/`
 routes. See "Poke-A-Byte and friends' games" in [docs/play_together.md](docs/play_together.md).
 
+## Comparing replays
+
+Play other replays beside the loaded one, each in its own window, lined up by their start/stop
+timers (or by replay time when a replay has no timer): **Replays → Compare with another replay…**
+or **Compare with replay file…** (any game). The timeline drives them all, so pausing, stopping,
+seeking and speed changes keep every replay in step. See
+[docs/replay_compare.md](docs/replay_compare.md).
+
 ## Converting old replays
 
 Replays recorded before format v4 (September 2026) can be re-encoded offline into the current

@@ -7,5 +7,6 @@
 #include "memory.h"
 #include "bookmarks.h"
 #include "play_together.h"
+#include "replay_compare.h"
 
 #endif

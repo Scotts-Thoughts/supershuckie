@@ -42,6 +42,8 @@ class LandingWidget;
 class PlayTogetherController;
 class PeerWindow;
 class PlayTogetherDialog;
+class ReplayCompareController;
+class CompareWindow;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -74,6 +76,8 @@ class MainWindow: public QMainWindow {
     friend PlayTogetherController;
     friend PeerWindow;
     friend PlayTogetherDialog;
+    friend ReplayCompareController;
+    friend CompareWindow;
     
 public:
     MainWindow();
@@ -163,6 +167,11 @@ private:
     QAction *stop_playback;
     QAction *resume_playback;
     QAction *go_to_resume_point;
+    // Compared replays: other replays played beside the loaded one on the same timer; see
+    // replay_compare_controller.hpp.
+    QAction *compare_replay;
+    QAction *compare_replay_file;
+    QAction *stop_comparing_replays;
     QAction *export_video;
     QAction *convert_replay;
     QAction *convert_replay_folder;
@@ -291,6 +300,9 @@ private:
 
     // Play Together (playing alongside other players over the network); see play_together_controller.hpp.
     PlayTogetherController *play_together = nullptr;
+
+    // Replays compared with the loaded one; see replay_compare_controller.hpp.
+    ReplayCompareController *replay_compare = nullptr;
     QMenu *play_together_menu;
     QAction *pt_open;
     QAction *pt_leave;
@@ -398,6 +410,9 @@ private slots:
     void do_stop_playback();
     void do_resume_playback();
     void do_go_to_resume_point();
+    void do_compare_replay();
+    void do_compare_replay_file();
+    void do_stop_comparing_replays();
     void do_export_video();
     void do_convert_replay();
     void do_convert_replay_folder();

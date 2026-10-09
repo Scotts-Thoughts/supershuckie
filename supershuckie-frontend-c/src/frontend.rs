@@ -28,6 +28,8 @@ pub struct SuperShuckieFrontendCallbacksC {
     pub change_video_mode: Option<unsafe extern "C" fn(userdata: *mut c_void, screen_count: usize, screen_data: *const SuperShuckieScreenDataC, screen_scale: NonZeroU8)>,
     pub peer_refresh_screens: Option<unsafe extern "C" fn(userdata: *mut c_void, peer: u16, screen_count: usize, screen_data: *const *const u32)>,
     pub peer_change_video_mode: Option<unsafe extern "C" fn(userdata: *mut c_void, peer: u16, screen_count: usize, screen_data: *const SuperShuckieScreenDataC, screen_scale: NonZeroU8)>,
+    pub compare_refresh_screens: Option<unsafe extern "C" fn(userdata: *mut c_void, id: u16, screen_count: usize, screen_data: *const *const u32)>,
+    pub compare_change_video_mode: Option<unsafe extern "C" fn(userdata: *mut c_void, id: u16, screen_count: usize, screen_data: *const SuperShuckieScreenDataC, screen_scale: NonZeroU8)>,
 }
 
 impl SuperShuckieFrontendCallbacks for SuperShuckieFrontendCallbacksC {
@@ -82,6 +84,32 @@ impl SuperShuckieFrontendCallbacks for SuperShuckieFrontendCallbacksC {
         }
 
         unsafe { s(self.userdata, peer, screens.len().min(4), screens_buf.as_ptr(), scaling) };
+    }
+
+    fn compare_refresh_screens(&mut self, id: supershuckie_frontend::replay_compare::CompareId, screens: &[ScreenData]) {
+        let Some(s) = self.compare_refresh_screens else { return };
+
+        let mut screens_buf = [null(); 4];
+        for (index, screen) in screens.iter().enumerate().take(4) {
+            screens_buf[index] = screen.pixels.as_ptr();
+        }
+
+        unsafe { s(self.userdata, id, screens.len().min(4), screens_buf.as_ptr()) };
+    }
+
+    fn compare_change_video_mode(&mut self, id: supershuckie_frontend::replay_compare::CompareId, screens: &[ScreenInfo], scaling: NonZeroU8) {
+        let Some(s) = self.compare_change_video_mode else { return };
+
+        let mut screens_buf = [SuperShuckieScreenDataC { width: 0, height: 0, screen_data_encoding: ScreenDataEncoding::A8R8G8B8 }; 4];
+        for (index, screen) in screens.iter().enumerate().take(4) {
+            screens_buf[index] = SuperShuckieScreenDataC {
+                width: screen.width as u32,
+                height: screen.height as u32,
+                screen_data_encoding: screen.encoding
+            };
+        }
+
+        unsafe { s(self.userdata, id, screens.len().min(4), screens_buf.as_ptr(), scaling) };
     }
 }
 

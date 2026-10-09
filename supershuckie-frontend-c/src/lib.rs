@@ -11,3 +11,4 @@ pub mod control_settings;
 pub mod memory;
 pub mod bookmarks;
 pub mod play_together;
+pub mod replay_compare;

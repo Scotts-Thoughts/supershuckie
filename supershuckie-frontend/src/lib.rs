@@ -5,6 +5,7 @@ pub mod legacy_replay;
 pub mod memory_tools;
 pub mod bookmarks;
 pub mod play_together;
+pub mod replay_compare;
 pub mod bot;
 
 use std::cell::OnceCell;
@@ -255,6 +256,9 @@ pub struct SuperShuckieFrontend {
     /// [`Self::play_together_add_rom_candidates`]).
     play_together_rom_candidates: Vec<PathBuf>,
 
+    /// Replays played beside the loaded one (see [`replay_compare`]).
+    replay_compare: replay_compare::ReplayCompare,
+
     settings: Settings
 }
 
@@ -316,7 +320,8 @@ impl SuperShuckieFrontend {
             core_death_reported: false,
             settings_dirty: false,
             play_together: None,
-            play_together_rom_candidates: Vec::new()
+            play_together_rom_candidates: Vec::new(),
+            replay_compare: replay_compare::ReplayCompare::default()
         };
 
         // C4: startup never aborts on a bad/unreadable settings file; surface what happened
@@ -1686,6 +1691,7 @@ impl SuperShuckieFrontend {
             self.refresh_screen(false);
         }
         self.tick_play_together(&mut errors);
+        self.tick_replay_compare(&mut errors);
 
         let playing_back = self.core.is_playing_back();
         let recording = self.recording_replay_file.is_some();
@@ -3564,6 +3570,21 @@ pub trait SuperShuckieFrontendCallbacks {
     /// [`SuperShuckieFrontend::play_together_generation`], not a callback. Default: ignored.
     fn peer_change_video_mode(&mut self, peer: play_together::PeerId, screens: &[ScreenInfo], screen_scaling: NonZeroU8) {
         let _ = (peer, screens, screen_scaling);
+    }
+
+    /// Like [`Self::refresh_screens`], for a replay compared with the loaded one (see
+    /// [`replay_compare`]; that replay's screens mutex is held; do not call back in). Default:
+    /// ignored.
+    fn compare_refresh_screens(&mut self, id: replay_compare::CompareId, screens: &[ScreenData]) {
+        let _ = (id, screens);
+    }
+
+    /// Like [`Self::change_video_mode`], for a compared replay: called when it is added and
+    /// whenever its display scale changes (no lock is held; read-only getters may be called). A
+    /// replay that goes is noticed through [`SuperShuckieFrontend::replay_compare_generation`],
+    /// not a callback. Default: ignored.
+    fn compare_change_video_mode(&mut self, id: replay_compare::CompareId, screens: &[ScreenInfo], screen_scaling: NonZeroU8) {
+        let _ = (id, screens, screen_scaling);
     }
 }
 

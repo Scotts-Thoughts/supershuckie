@@ -480,7 +480,7 @@ pub fn utc_stamp() -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}.{m:02}.{s:02}")
 }
 
-fn emulator_type_for_console(console: ReplayConsoleType) -> Option<SuperShuckieEmulatorType> {
+pub(crate) fn emulator_type_for_console(console: ReplayConsoleType) -> Option<SuperShuckieEmulatorType> {
     match console {
         ReplayConsoleType::GameBoy => Some(SuperShuckieEmulatorType::GameBoy),
         ReplayConsoleType::SuperGameBoy2 => Some(SuperShuckieEmulatorType::GameBoySGB2),

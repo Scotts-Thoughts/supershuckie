@@ -22,6 +22,7 @@ add_library(supershuckie-cpp-static STATIC
     src/screen_canvas.cpp
     src/peer_window.cpp
     src/play_together_controller.cpp
+    src/replay_compare_controller.cpp
     src/play_together_dialog.cpp
     src/display_sync.cpp
     src/game_speed_dialog.cpp

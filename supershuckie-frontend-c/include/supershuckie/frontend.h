@@ -93,6 +93,21 @@ struct SuperShuckieFrontendCallbacks {
      * not a callback. May be NULL.
      */
     void (*peer_change_video_mode)(void *user_data, uint16_t peer, size_t screen_count, const struct SuperShuckieScreenData *screen_data, uint8_t scaling);
+
+    /**
+     * Compared replays: like refresh_screens, for a replay played beside the loaded one
+     * (identified by its id; see replay_compare.h). That replay's screens mutex is held, so this
+     * must NOT call back into the frontend. May be NULL.
+     */
+    void (*compare_refresh_screens)(void *user_data, uint16_t id, size_t screen_count, const uint32_t *const *pixels);
+
+    /**
+     * Compared replays: like change_video_mode, for a compared replay: called when it is added and
+     * whenever its display scale changes (no lock held; read-only getters may be called). A replay
+     * that goes is noticed through supershuckie_frontend_replay_compare_generation(), not a
+     * callback. May be NULL.
+     */
+    void (*compare_change_video_mode)(void *user_data, uint16_t id, size_t screen_count, const struct SuperShuckieScreenData *screen_data, uint8_t scaling);
 };
 
 /**

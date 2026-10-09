@@ -2,6 +2,7 @@
 use crate::link::{LinkFailure, LinkInbox, LinkPublisherFns, LinkRunOutcome, LinkSettings};
 use crate::live_replay::{FollowerStats, FollowerStatsSnapshot, LiveReplaySource};
 use crate::memory_monitor::{MemoryMonitorLocal, MemoryMonitorShared};
+use crate::replay_sync::ReplaySyncTarget;
 use crate::stream::{SnapshotRequestReason, StreamPublisherFns};
 use crate::export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 use crate::{std_timestamp_provider, AudioOutput, BookmarkAnchor, BookmarkAnchorError, ReplayPlayerAttachError, Speed};
@@ -180,6 +181,10 @@ pub struct ElapsedTimeStats {
     /// replay is stopped, the frame playback resumes from while `frames` keeps counting the live
     /// play (see `SuperShuckieCore::replay_position`). 0 without a replay.
     pub replay_frame: u32,
+
+    /// The replay time of `replay_frame` (the replay's own milliseconds; frozen at the resume
+    /// point while the replay is stopped, like `replay_frame`). 0 without a replay.
+    pub replay_milliseconds: u32,
 
     /// Incremented every time a newly drawn frame is published to `read_screens`. Frames that
     /// were emulated but not drawn (fast-forward) do not change it, so compare this rather than
@@ -361,6 +366,7 @@ impl ThreadedSuperShuckieCore {
                     memory_monitor: None,
                     follower: None,
                     follower_stats: follower_stats_thread,
+                    sync: None,
                     stream_errors,
                     follower_errors,
                     link_errors,
@@ -1071,6 +1077,17 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::SetCoarseSeekWhileFrozen(coarse));
     }
 
+    /// Drive the attached replay by `target` instead of by a clock (see [`crate::replay_sync`]),
+    /// or with `None` go back to normal. While synced the thread ignores the pause state: it
+    /// runs the replay up to the target's time as fast as it can, seeks when the target jumps,
+    /// and parks while it is there; set the target and then [`Self::wake`] the thread. Meant for
+    /// a core of [`CoreThreadRole::Follower`] with a replay file attached and audio off.
+    #[inline]
+    pub fn set_replay_sync_target(&self, target: Option<Arc<ReplaySyncTarget>>) {
+        let _ = self.send(ThreadCommand::SetReplaySyncTarget(target));
+        self.wake();
+    }
+
     /// See [`SuperShuckieCore::set_draw_fewer_frames_when_sped_up`].
     #[inline]
     pub fn set_draw_fewer_frames_when_sped_up(&self, fewer: bool) {
@@ -1290,6 +1307,7 @@ enum ThreadCommand {
     Pause(Sender<()>),
     SetPlaybackFrozen(bool),
     SetCoarseSeekWhileFrozen(bool),
+    SetReplaySyncTarget(Option<Arc<ReplaySyncTarget>>),
     SetDisplayClockOverride(Option<(Instant, Duration)>),
     SetDrawFewerFramesWhenSpedUp(bool),
     SetPokeABytePort(Option<u16>, Sender<Result<(), String>>),
@@ -1438,6 +1456,19 @@ fn extend_counter_map(from: &BTreeMap<String, SignedInteger>, into: &mut BTreeMa
     }
 }
 
+/// A synced core's bookkeeping (see [`CoreLoop::run_one_synced`]).
+struct SyncLoopState {
+    target: Arc<ReplaySyncTarget>,
+    /// The replay time of the frame before the current one, while known (not right after a
+    /// seek).
+    prev_millis: Option<i64>,
+    /// The target the last seek was made for.
+    seeked_for: Option<i64>,
+    /// How far the last frame moved the replay's time (milliseconds, at least 1).
+    last_delta: i64,
+    last_draw: Instant
+}
+
 /// Everything a core thread runs: the core, its housekeeping and its stats. Normally owned by
 /// its own thread ([`CoreThread`]); a follower's loop can be lent to the player's own thread for
 /// a link cable (see [`ThreadedSuperShuckieCore::lend`]).
@@ -1498,6 +1529,10 @@ struct CoreLoop {
     /// `run_one`.
     follower: Option<FollowerLoopState>,
     follower_stats: Arc<Mutex<Option<Arc<FollowerStats>>>>,
+
+    /// Set while the attached replay is driven by a target time (see [`crate::replay_sync`]);
+    /// `run_one_synced` runs instead of anything else.
+    sync: Option<SyncLoopState>,
 
     /// Problems the stream publisher reported, for the wrapper to take (see
     /// [`ThreadedSuperShuckieCore::get_stream_errors`]).
@@ -1633,7 +1668,11 @@ impl CoreThread {
             }
 
             let loop_ = self.loop_.as_deref_mut().expect("checked above");
-            if loop_.is_running() {
+            if loop_.sync.is_some() {
+                // Driven by its target, paused or not (see `run_one_synced`).
+                loop_.run_one_synced();
+            }
+            else if loop_.is_running() {
                 if !loop_.playback_frozen {
                     if loop_.follower.is_some() {
                         loop_.run_one_follower();
@@ -1997,6 +2036,114 @@ impl CoreLoop {
         }
     }
 
+    /// Longest one synced pass may run before the loop looks at commands again.
+    const SYNC_MAX_PASS: Duration = Duration::from_millis(8);
+
+    /// Longest a synced core parks while it is at its target (a new target wakes it sooner).
+    const SYNC_WAIT: Duration = Duration::from_millis(4);
+
+    /// A synced core this far (in replay milliseconds) behind its target seeks instead of
+    /// emulating the way there, if a keyframe saves at least [`Self::SYNC_SEEK_MIN_SKIP_FRAMES`].
+    const SYNC_SEEK_AHEAD_MILLIS: i64 = 3_000;
+    const SYNC_SEEK_MIN_SKIP_FRAMES: UnsignedInteger = 120;
+
+    /// While catching up, a synced core draws at most this often; the frame expected to reach
+    /// the target is always drawn.
+    const SYNC_DRAW_INTERVAL: Duration = Duration::from_millis(16);
+
+    /// Run a replay driven by a target time (see [`crate::replay_sync`]): run frames until the
+    /// replay's time reaches the target (the first frame at or after it is the one shown), seek
+    /// when the target went back past the previous frame or lies far ahead, park otherwise.
+    fn run_one_synced(&mut self) {
+        let Some(sync) = self.sync.as_ref() else {
+            return
+        };
+        let Some(target) = sync.target.get() else {
+            std::thread::park_timeout(Self::SYNC_WAIT);
+            return
+        };
+        if !self.core.has_replay_attached() || self.core.is_replay_playback_stopped() {
+            std::thread::park_timeout(Self::SYNC_WAIT);
+            return
+        }
+
+        let current = self.core.get_recording_milliseconds().0 as i64;
+        // Behind the target is always fine (it runs there); ahead is fine as long as no earlier
+        // frame reaches the target too. Right after a seek the previous frame's time is not
+        // known: the frame the seek landed on stands until the target goes back further.
+        let went_back = target < current && match sync.prev_millis {
+            Some(prev) => prev >= target,
+            None => sync.seeked_for.is_none_or(|t| target < t)
+        };
+        // (A replay that has ended has no keyframe past it: no need to look.)
+        let jump_ahead = !went_back && target - current > Self::SYNC_SEEK_AHEAD_MILLIS && !self.core.is_replay_stalled()
+            && self.core.replay_keyframe_at_or_before_millis(target.max(0) as u64)
+                .is_some_and(|(frame, _)| frame > self.core.total_frames().saturating_add(Self::SYNC_SEEK_MIN_SKIP_FRAMES));
+        if went_back || jump_ahead {
+            self.seek_synced(target);
+            return
+        }
+
+        if current >= target || self.core.is_replay_stalled() {
+            std::thread::park_timeout(Self::SYNC_WAIT);
+            return
+        }
+
+        let pass_started = Instant::now();
+        loop {
+            let Some(sync) = self.sync.as_ref() else { return };
+            let before = self.core.get_recording_milliseconds().0 as i64;
+            if before >= target || self.core.is_replay_stalled() || pass_started.elapsed() >= Self::SYNC_MAX_PASS {
+                break
+            }
+            // Draw the frame expected to reach the target, and one now and then on the way.
+            let draw = before + sync.last_delta >= target || sync.last_draw.elapsed() >= Self::SYNC_DRAW_INTERVAL;
+            let started = Instant::now();
+            let mut frames = 0;
+            // A sliced (Game Boy) core returns without a frame many times per frame.
+            while frames == 0 && !self.core.is_replay_stalled() && pass_started.elapsed() < Self::SYNC_MAX_PASS * 4 {
+                self.core.run_unlocked_presenting(draw);
+                frames = self.core.last_run_time().frames;
+            }
+            if frames == 0 {
+                break
+            }
+            self.emulated_frames.fetch_add(frames, Ordering::Relaxed);
+            self.frame_times.write().record(started.elapsed(), None);
+            let presented = self.core.last_frame_presented();
+            let after = self.core.get_recording_milliseconds().0 as i64;
+            if let Some(sync) = self.sync.as_mut() {
+                sync.prev_millis = Some(before);
+                sync.last_delta = (after - before).max(1);
+                if presented {
+                    sync.last_draw = Instant::now();
+                }
+            }
+            self.update_counters();
+        }
+    }
+
+    /// Put a synced replay on the first frame at or after `target` milliseconds, or as near as
+    /// a keyframe gets (the following passes run the rest of the way).
+    fn seek_synced(&mut self, target: i64) {
+        // A keyframe's own frame is reached by loading it and running a few frames from it (see
+        // `SuperShuckieCore::go_to_replay_frame`); from the first keyframe, frame 0 is cheaper.
+        let frame = match self.core.replay_keyframe_at_or_before_millis(target.max(0) as u64) {
+            Some((keyframe, _)) if keyframe > 0 => keyframe.saturating_add(SuperShuckieCore::POST_LOAD_FRAMES),
+            _ => 0
+        };
+        if let Err(e) = self.core.go_to_replay_frame(frame) {
+            self.playback_errors.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+        }
+        if let Some(sync) = self.sync.as_mut() {
+            sync.prev_millis = None;
+            sync.seeked_for = Some(target);
+            sync.last_draw = Instant::now();
+        }
+        self.force_refresh_screen_data();
+        self.update_counters();
+    }
+
     fn handle_stream_errors(&mut self) {
         let errors = self.core.poll_stream_errors();
         if !errors.is_empty() {
@@ -2165,6 +2312,7 @@ impl CoreLoop {
             frames: self.core.total_frames as u32,
             speed: self.core.game_speed,
             replay_frame: self.core.replay_position().0 as u32,
+            replay_milliseconds: self.core.replay_position().1.0 as u32,
             screen_generation: self.screen_generation,
             screen_frame: self.screen_frame as u32
         };
@@ -2661,6 +2809,15 @@ impl CoreLoop {
             }
             ThreadCommand::SetCoarseSeekWhileFrozen(coarse) => {
                 self.coarse_seek_while_frozen = coarse;
+            }
+            ThreadCommand::SetReplaySyncTarget(target) => {
+                self.sync = target.map(|target| SyncLoopState {
+                    target,
+                    prev_millis: None,
+                    seeked_for: None,
+                    last_delta: 16,
+                    last_draw: Instant::now()
+                });
             }
             ThreadCommand::SetDrawFewerFramesWhenSpedUp(fewer) => {
                 self.core.set_draw_fewer_frames_when_sped_up(fewer);

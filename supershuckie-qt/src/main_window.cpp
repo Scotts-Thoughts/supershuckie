@@ -45,6 +45,7 @@
 #include "bookmark_window.hpp"
 #include "landing_widget.hpp"
 #include "play_together_controller.hpp"
+#include "replay_compare_controller.hpp"
 
 #include <QProgressDialog>
 #include <QToolButton>
@@ -211,6 +212,8 @@ MainWindow::MainWindow(): QMainWindow() {
     callbacks.change_video_mode = MainWindow::on_change_video_mode;
     callbacks.peer_refresh_screens = PlayTogetherController::on_peer_refresh_screens;
     callbacks.peer_change_video_mode = PlayTogetherController::on_peer_change_video_mode;
+    callbacks.compare_refresh_screens = ReplayCompareController::on_compare_refresh_screens;
+    callbacks.compare_change_video_mode = ReplayCompareController::on_compare_change_video_mode;
 
     QString config_path;
 
@@ -335,6 +338,7 @@ MainWindow::MainWindow(): QMainWindow() {
     this->memory_tools->restore_windows();
 
     this->play_together = new PlayTogetherController(this);
+    this->replay_compare = new ReplayCompareController(this);
     this->pt_save_replays->setChecked(supershuckie_frontend_play_together_get_save_peer_replays(this->frontend));
     this->refresh_play_together_actions();
 
@@ -522,6 +526,9 @@ void MainWindow::tick() {
 
     if(this->play_together != nullptr) {
         this->play_together->tick();
+    }
+    if(this->replay_compare != nullptr) {
+        this->replay_compare->tick();
     }
 
     this->pause->setChecked(supershuckie_frontend_is_paused(this->frontend));
@@ -828,6 +835,25 @@ void MainWindow::set_up_replays_menu() {
     this->go_to_resume_point->setObjectName("go-to-resume-point");
     this->go_to_resume_point->setShortcut(QKeyCombination(Qt::ShiftModifier | Qt::ControlModifier, Qt::Key_J));
     connect(this->go_to_resume_point, SIGNAL(triggered()), this, SLOT(do_go_to_resume_point()));
+
+    this->replays_menu->addSeparator();
+
+    // Other replays played beside the loaded one, each in its own window, lined up by their
+    // start/stop timers; the timeline drives them all.
+    this->compare_replay = this->replays_menu->addAction("Compare with another replay…");
+    this->compare_replay->setObjectName("compare-replay");
+    this->compare_replay->setToolTip("Play another of this game's replays beside this one, synced to its timer");
+    connect(this->compare_replay, SIGNAL(triggered()), this, SLOT(do_compare_replay()));
+
+    this->compare_replay_file = this->replays_menu->addAction("Compare with replay file…");
+    this->compare_replay_file->setObjectName("compare-replay-file");
+    this->compare_replay_file->setToolTip("Play any replay file (any game) beside this one, synced to its timer");
+    connect(this->compare_replay_file, SIGNAL(triggered()), this, SLOT(do_compare_replay_file()));
+
+    this->stop_comparing_replays = this->replays_menu->addAction("Stop comparing replays");
+    this->stop_comparing_replays->setObjectName("stop-comparing-replays");
+    this->stop_comparing_replays->setEnabled(false);
+    connect(this->stop_comparing_replays, SIGNAL(triggered()), this, SLOT(do_stop_comparing_replays()));
 
     this->replays_menu->addSeparator();
 
@@ -1444,6 +1470,9 @@ void MainWindow::refresh_action_states() {
     this->stop_playback->setEnabled(false);
     this->resume_playback->setEnabled(false);
     this->go_to_resume_point->setEnabled(false);
+    this->compare_replay->setEnabled(false);
+    this->compare_replay_file->setEnabled(false);
+    this->stop_comparing_replays->setEnabled(this->frontend != nullptr && supershuckie_frontend_replay_compare_count(this->frontend) > 0);
     this->record_replay->setEnabled(game_loaded);
     this->resume_replay->setEnabled(game_loaded);
     this->export_video->setEnabled(game_loaded);
@@ -1531,6 +1560,8 @@ void MainWindow::refresh_action_states() {
             this->stop_playback->setEnabled(!replay_stopped);
             this->resume_playback->setEnabled(replay_stopped);
             this->go_to_resume_point->setEnabled(replay_stopped);
+            this->compare_replay->setEnabled(true);
+            this->compare_replay_file->setEnabled(true);
             this->set_game_boy_hardware_settings_enabled(false);
             break;
 
@@ -1919,6 +1950,9 @@ void MainWindow::closeEvent(QCloseEvent *event) {
             this->play_together->save_windows();
             supershuckie_frontend_play_together_leave(this->frontend);
         }
+        if(this->replay_compare != nullptr) {
+            this->replay_compare->save_windows();
+        }
         if(this->bookmark_window != nullptr) {
             supershuckie_frontend_set_custom_setting(this->frontend, BOOKMARK_WINDOW_STATE, this->bookmark_window->save_state().toUtf8().constData());
         }
@@ -2052,6 +2086,24 @@ void MainWindow::do_close_replay() {
     supershuckie_frontend_close_replay(this->frontend);
     this->set_title("Closed replay");
     this->refresh_action_states();
+}
+
+void MainWindow::do_compare_replay() {
+    if(this->replay_compare != nullptr) {
+        this->replay_compare->add_from_list();
+    }
+}
+
+void MainWindow::do_compare_replay_file() {
+    if(this->replay_compare != nullptr) {
+        this->replay_compare->add_from_file();
+    }
+}
+
+void MainWindow::do_stop_comparing_replays() {
+    if(this->replay_compare != nullptr) {
+        this->replay_compare->clear();
+    }
 }
 
 void MainWindow::do_stop_playback() {
