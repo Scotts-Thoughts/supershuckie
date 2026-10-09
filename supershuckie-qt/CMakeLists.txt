@@ -36,6 +36,7 @@ add_library(supershuckie-cpp-static STATIC
     src/replay_playback_controls.cpp
     src/nds_date_dialog.cpp
     src/gb_palette_dialog.cpp
+    src/screen_color_picker.cpp
     src/video_export_dialog.cpp
     src/audio_output.cpp
     src/memory_tools_controller.cpp
