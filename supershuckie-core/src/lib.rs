@@ -209,6 +209,11 @@ pub struct SuperShuckieCore {
     /// `WriteMemory` packets in played-back replays that could not be applied.
     replay_write_failures: u64,
 
+    /// Keyframes of played-back replays the console was put back on because it had parted ways
+    /// with the recording in state save states do not show (see
+    /// [`Self::replay_hidden_state_resyncs`]).
+    replay_hidden_state_resyncs: u64,
+
     /// Seeks whose walk had to be redone drawn because skipping drawing left the picture
     /// incomplete (see [`Self::replay_seek_redraws`]).
     replay_seek_redraws: u64,
@@ -400,6 +405,7 @@ impl SuperShuckieCore {
             run_serial: 0,
             state_epoch: 0,
             replay_write_failures: 0,
+            replay_hidden_state_resyncs: 0,
             replay_seek_redraws: 0,
             game_rom: None,
             rom_reads_scratch: Vec::new(),
@@ -710,6 +716,15 @@ impl SuperShuckieCore {
     #[inline]
     pub fn replay_write_failures(&self) -> u64 {
         self.replay_write_failures
+    }
+
+    /// How many times playback put the console back on a keyframe because it had parted ways
+    /// with the recording in state save states do not show (see
+    /// [`EmulatorCore::check_replay_keyframe`]; Nintendo DS: a console reset in a replay recorded
+    /// before save states carried the firmware, which booted differently here).
+    #[inline]
+    pub fn replay_hidden_state_resyncs(&self) -> u64 {
+        self.replay_hidden_state_resyncs
     }
 
     /// Run the emulator core for the shortest amount of time.
@@ -1182,8 +1197,12 @@ impl SuperShuckieCore {
                     if matches!(n, Packet::Keyframe { .. }) {
                         // The player is told not to copy states into packets (see
                         // `attach_replay_player`); read the reconstructed state directly.
+                        let state = player.current_keyframe_state();
                         if self.auto_resync_keyframes_in_replays {
-                            let state = player.current_keyframe_state();
+                            self.resync_from_keyframe(state);
+                        }
+                        else if self.core.check_replay_keyframe(state) {
+                            self.replay_hidden_state_resyncs += 1;
                             self.resync_from_keyframe(state);
                         }
                     }
@@ -1293,8 +1312,11 @@ impl SuperShuckieCore {
             return alloc::borrow::Cow::Borrowed(state)
         }
 
+        // The lengths may differ (a Nintendo DS keyframe from before states carried the firmware
+        // ends sooner); the ranges are found by walking the sections, so equal ranges are the same
+        // buffers at the same offsets in both.
         let live = self.core.create_save_state();
-        if live.len() != state.len() || transient_ranges(console, &live) != ranges {
+        if transient_ranges(console, &live) != ranges {
             return alloc::borrow::Cow::Borrowed(state)
         }
 
@@ -2736,6 +2758,8 @@ impl SuperShuckieCore {
             self.replay_stalled = true;
             return Err(format!("replay file is broken (cannot load the save state at frame {frame}): {e}"))
         }
+        // What an older keyframe does not carry, set up the way the recording most likely had it.
+        self.core.adopt_replay_keyframe();
         self.replay_keyframe_loaded = elapsed_frames;
         self.state_epoch = self.state_epoch.wrapping_add(1);
         // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
@@ -3026,7 +3050,14 @@ pub(crate) mod tests {
         frames_run: u64,
         stale_since: Option<u64>,
         /// `counter` after every frame run drawn, oldest first.
-        drawn: Arc<Mutex<Vec<u32>>>
+        drawn: Arc<Mutex<Vec<u32>>>,
+        /// Hidden state gone wrong, like a Nintendo DS reset booting on other firmware than the
+        /// recording's: the frame that makes `counter` this value adds 1000 to it, once.
+        diverge_at: Option<u32>,
+        /// Whether `check_replay_keyframe` reports the console differing from the keyframe.
+        check_keyframes: bool,
+        /// How many times `adopt_replay_keyframe` was called.
+        adopted: Arc<AtomicU64>
     }
 
     impl FakePacedCore {
@@ -3042,6 +3073,9 @@ pub(crate) mod tests {
                 frames_run: 0,
                 stale_since: None,
                 drawn: Arc::new(Mutex::new(Vec::new())),
+                diverge_at: None,
+                check_keyframes: false,
+                adopted: Arc::new(AtomicU64::new(0)),
                 clock,
                 period_micros,
                 last_frame_micros: 0,
@@ -3089,6 +3123,10 @@ pub(crate) mod tests {
                 std::thread::sleep(self.frame_delay);
             }
             self.counter = self.counter.wrapping_add(1);
+            if self.diverge_at == Some(self.counter) {
+                self.diverge_at = None;
+                self.counter = self.counter.wrapping_add(1000);
+            }
             self.counter_bytes = self.counter.to_le_bytes();
             self.frame_inputs.lock().unwrap().push(self.input_byte);
             self.stale_shown = self.stale_frames_left > 0;
@@ -3158,6 +3196,15 @@ pub(crate) mod tests {
 
         fn shows_stale_output(&self) -> bool {
             self.stale_shown
+        }
+
+        fn adopt_replay_keyframe(&mut self) -> bool {
+            self.adopted.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+
+        fn check_replay_keyframe(&mut self, state: &[u8]) -> bool {
+            self.check_keyframes && state != self.counter.to_le_bytes().as_slice()
         }
 
         fn encode_input(&self, input: Input, into: &mut Vec<u8>) {
@@ -4035,6 +4082,52 @@ pub(crate) mod tests {
         let player = ReplayFilePlayer::new(bytes, false).expect("parse the recorded replay");
         core.attach_replay_player(player, true).expect("attach");
         (core, clock, played_log)
+    }
+
+    /// Playback puts the console back on a keyframe it reaches when the core reports having
+    /// parted ways with the recording in state its save states do not show
+    /// (`EmulatorCore::check_replay_keyframe`: a Nintendo DS reset in a replay from before states
+    /// carried the firmware, which booted differently), and every keyframe it loads goes through
+    /// `EmulatorCore::adopt_replay_keyframe`. A core that does not report it plays on diverged.
+    #[test]
+    fn playback_resyncs_when_the_core_reports_hidden_state_diverging() {
+        const FRAMES: u64 = 60;
+        let clock = FakeClock::new();
+        let fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+        let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        let mut partial = metadata(final_buf.clone(), SharedSink::default());
+        partial.frames_per_keyframe = NonZeroU64::new(10).unwrap();
+        core.start_recording_replay(partial).expect("start recording");
+        for _ in 0..FRAMES {
+            run_one_frame(&mut core, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(core.stop_recording_replay(), Some(true));
+        let bytes = final_buf.0.lock().unwrap().clone();
+
+        let play = |check_keyframes: bool| -> (u32, u64, u64) {
+            let clock = FakeClock::new();
+            let mut fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+            fake.diverge_at = Some(25);
+            fake.check_keyframes = check_keyframes;
+            let adopted = fake.adopted.clone();
+            let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock.clone()));
+            core.attach_replay_player(ReplayFilePlayer::new(&bytes, false).expect("parse"), true).expect("attach");
+            while core.total_frames() < FRAMES && !core.is_replay_stalled() {
+                run_one_frame(&mut core, &clock, PERIOD_MICROS);
+            }
+            let counter = u32::from_le_bytes(core.create_save_state().try_into().expect("4 bytes"));
+            (counter, core.replay_hidden_state_resyncs(), adopted.load(Ordering::Relaxed))
+        };
+
+        let (counter, resyncs, adopted) = play(true);
+        assert_eq!(counter, FRAMES as u32, "playback must end where the recording did");
+        assert_eq!(resyncs, 1, "one resync, at the first keyframe after the divergence");
+        assert!(adopted >= 1, "the keyframe loaded on attach goes through adopt_replay_keyframe");
+
+        let (counter, resyncs, _) = play(false);
+        assert_eq!(counter, FRAMES as u32 + 1000, "without the report, playback stays diverged");
+        assert_eq!(resyncs, 0);
     }
 
     /// Sped up, how many frames are drawn follows the display's refresh rate, and moving the

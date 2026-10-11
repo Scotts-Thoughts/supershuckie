@@ -763,6 +763,12 @@ impl SuperShuckieFrontend {
         self.core.is_replay_playback_stopped()
     }
 
+    /// The name of the replay loaded for playback (playing or stopped), if any.
+    #[inline]
+    pub fn current_replay_name(&self) -> Option<&str> {
+        self.current_replay.as_ref().map(|n| n.as_str())
+    }
+
     /// Get the replay playback stats if a replay is loaded (playing or stopped).
     pub fn get_replay_playback_stats(&self) -> Option<SuperShuckieReplayTimes> {
         if !self.core.has_replay_attached() {

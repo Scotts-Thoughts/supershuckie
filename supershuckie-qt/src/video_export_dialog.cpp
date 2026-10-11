@@ -34,6 +34,14 @@ VideoExportDialog::VideoExportDialog(MainWindow *parent): QDialog(parent), paren
     for(const auto &replay : replays) {
         this->replay_box->addItem(QString::fromStdString(replay));
     }
+    // Start on the replay that is loaded, if any.
+    char current_replay[1024];
+    if(supershuckie_frontend_get_current_replay_name(parent->frontend, current_replay, sizeof(current_replay))) {
+        int index = this->replay_box->findText(QString::fromUtf8(current_replay));
+        if(index >= 0) {
+            this->replay_box->setCurrentIndex(index);
+        }
+    }
     layout->addWidget(this->replay_box, row, 1, 1, 2);
     row++;
 

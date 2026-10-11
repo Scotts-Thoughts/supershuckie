@@ -651,11 +651,20 @@ fn describe_diff(a: &[u8], b: &[u8]) -> String {
 /// identically), and before the padding fix bytes 5..8 of every entry were stack garbage. Each
 /// FIFO is rewritten as its occupied entries in order, positions zeroed, entry padding zeroed.
 fn states_match(console: ReplayConsoleType, live: &[u8], recorded: &[u8]) -> bool {
-    if live.len() != recorded.len() {
+    // A keyframe from before states carried Super Shuckie's SHUK section (melonds-rs/interface.cpp)
+    // is compared on the sections it has; the state header holds the total length.
+    let (live, recorded) = match (extra_section_start(live), extra_section_start(recorded)) {
+        (Some(x), None) => (&live[..x], recorded),
+        (None, Some(y)) => (live, &recorded[..y]),
+        _ => (live, recorded),
+    };
+    if live.len() != recorded.len() || live.len() < 16 {
         return false;
     }
     let mut a = live.to_vec();
     let mut b = recorded.to_vec();
+    a[8..12].fill(0);
+    b[8..12].fill(0);
     for r in transient_ranges(console, recorded) {
         a[r.clone()].fill(0);
         b[r].fill(0);
@@ -688,6 +697,14 @@ fn canonicalize_fifo(state: &mut [u8], at: usize, count: usize) {
     }
     state[at + 4..at + 12].fill(0);
     state[entries..end].copy_from_slice(&canonical);
+}
+
+/// Where the SHUK section Super Shuckie appends to every state starts, when `state` ends with one.
+fn extra_section_start(state: &[u8]) -> Option<usize> {
+    find_section(state, b"SHUK").filter(|&at| {
+        let len = u32::from_le_bytes([state[at + 4], state[at + 5], state[at + 6], state[at + 7]]) as usize;
+        at + len == state.len()
+    })
 }
 
 /// Offset of the melonDS save-state section with the given magic.

@@ -776,6 +776,12 @@ void supershuckie_frontend_go_to_replay_resume_point(struct SuperShuckieFrontend
 bool supershuckie_frontend_is_replay_playback_stopped(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
+ * Write the name of the replay loaded for playback (playing or stopped) to name and return true,
+ * or return false if no replay is loaded.
+ */
+bool supershuckie_frontend_get_current_replay_name(const struct SuperShuckieFrontendRaw *frontend, char *name, size_t name_len);
+
+/**
  * If there is a ROM running, return the name. Otherwise, return null.
  */
 const char *supershuckie_frontend_get_rom_name(const struct SuperShuckieFrontendRaw *frontend);

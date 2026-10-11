@@ -306,6 +306,25 @@ pub trait EmulatorCore: Send + 'static {
         false
     }
 
+    /// Replay playback just loaded one of the replay's keyframes. State the console keeps across
+    /// loads and resets that an older keyframe does not carry is set up here the way the
+    /// recording most likely had it (Nintendo DS: the firmware's Wi-Fi ID, which games write to
+    /// firmware that has none a moment into every boot). Returns whether anything changed.
+    /// Default: nothing to do.
+    fn adopt_replay_keyframe(&mut self) -> bool {
+        false
+    }
+
+    /// Replay playback reached `state`, one of the replay's keyframes, by playing rather than by
+    /// loading it. A core whose save states leave out state that the game can still read brings
+    /// it in line with a keyframe that carries it, and returns `true` when the console has parted
+    /// ways with the recording in a way nothing short of loading the keyframe makes up for
+    /// (Nintendo DS: a boot that found a Wi-Fi ID where the recording's wrote one, or the other
+    /// way round). Default: never.
+    fn check_replay_keyframe(&mut self, _state: &[u8]) -> bool {
+        false
+    }
+
     /// Encode the input.
     ///
     /// `into` can be assumed to be empty

@@ -1551,7 +1551,8 @@ void MainWindow::refresh_action_states() {
             // The game is the user's again while the replay is stopped; resuming playback seeks
             // back to the resume point whatever they did to it.
             this->reset_console->setEnabled(replay_stopped);
-            this->export_video->setEnabled(false);
+            // export_video stays enabled here: the export attaches the chosen replay itself (as
+            // choosing another replay does) and leaves it loaded.
             this->current_state->setText(replay_stopped ? "PLAYBACK STOPPED" : "PLAYBACK");
             this->current_state->show();
 

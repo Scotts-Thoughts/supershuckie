@@ -57,6 +57,23 @@ impl NintendoDS {
     ) {
         self.core.set_date(year, month, day, hour, minute, second);
     }
+
+    /// Diagnostics: emulator state that save states do not carry (see
+    /// [`melonds_rs::Core::debug_unsaved_state`]), named by
+    /// [`melonds_rs::DEBUG_UNSAVED_STATE_NAMES`].
+    pub fn debug_unsaved_state(&self) -> Vec<u32> {
+        self.core.debug_unsaved_state()
+    }
+
+    /// Diagnostics: the firmware flash image (see [`melonds_rs::Core::debug_firmware`]).
+    pub fn debug_firmware(&self) -> &[u8] {
+        self.core.debug_firmware()
+    }
+
+    /// Diagnostics: overwrite bytes of the firmware flash image.
+    pub fn debug_write_firmware(&mut self, offset: usize, data: &[u8]) {
+        self.core.debug_write_firmware(offset, data)
+    }
 }
 
 const DEFAULT_MICROSECONDS_PER_FRAME: u64 = 1000000 / 60;
@@ -228,6 +245,16 @@ impl EmulatorCore for NintendoDS {
 
     fn shows_stale_output(&self) -> bool {
         self.core.shows_discarded_geometry()
+    }
+
+    fn adopt_replay_keyframe(&mut self) -> bool {
+        self.core.adopt_replay_keyframe()
+    }
+
+    fn check_replay_keyframe(&mut self, state: &[u8]) -> bool {
+        // A keyframe's firmware settings are copied in as a matter of course; they only matter
+        // to the next boot. A boot that already went differently shows in the firmware access.
+        self.core.check_replay_keyframe(state).firmware_access_differs
     }
 
     fn encode_input(&self, input: Input, into: &mut Vec<u8>) {

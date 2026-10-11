@@ -1170,6 +1170,25 @@ pub extern "C" fn supershuckie_frontend_is_replay_playback_stopped(
     frontend.is_replay_playback_stopped()
 }
 
+/// Write the name of the replay loaded for playback (playing or stopped) to `name` and return
+/// true, or return false if no replay is loaded.
+///
+/// Safety: `name` must be at least `name_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_get_current_replay_name(
+    frontend: &SuperShuckieFrontend,
+    name: *mut u8,
+    name_len: usize
+) -> bool {
+    match frontend.current_replay_name() {
+        Some(n) => {
+            unsafe { write_error(n, name, name_len) };
+            true
+        }
+        None => false
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_get_replay_frame(
     frontend: &SuperShuckieFrontend

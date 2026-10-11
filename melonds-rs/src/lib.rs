@@ -41,10 +41,37 @@ unsafe extern "C" {
         minute: u8,
         second: u8
     );
+    fn melonds_rs_core_adopt_replay_keyframe(core: *mut MelonDSCoreHolderRaw) -> bool;
+    fn melonds_rs_core_check_replay_keyframe(core: *mut MelonDSCoreHolderRaw, data: *const u8, size: usize) -> u32;
+    fn melonds_rs_core_debug_unsaved_state(core: *mut MelonDSCoreHolderRaw, out: *mut u32, max: usize) -> usize;
+    fn melonds_rs_core_debug_firmware(core: *mut MelonDSCoreHolderRaw, length: *mut usize) -> *const u8;
+    fn melonds_rs_core_debug_write_firmware(core: *mut MelonDSCoreHolderRaw, offset: usize, data: *const u8, length: usize);
 }
+
+/// Names of the values [`Core::debug_unsaved_state`] returns, in order.
+pub const DEBUG_UNSAVED_STATE_NAMES: [&str; 24] = [
+    "ARM9.IRQ", "ARM7.IRQ", "ARM9.Halted", "ARM7.Halted",
+    "IME9", "IE9", "IF9", "IME7", "IE7", "IF7",
+    "DIVCNT", "DIV_NUMER.lo", "DIV_NUMER.hi", "DIV_DENOM.lo", "DIV_DENOM.hi",
+    "DIV_RESULT.lo", "DIV_RESULT.hi", "DIVREM.lo", "DIVREM.hi",
+    "SQRTCNT", "SQRT_RESULT", "SQRT_PARAM.lo", "SQRT_PARAM.hi",
+    "KEYINPUT",
+];
 
 pub struct Core {
     inner: *mut MelonDSCoreHolderRaw
+}
+
+/// What [`Core::check_replay_keyframe`] found.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplayKeyframeCheck {
+    /// The keyframe carries the firmware's settings and the console's differed; it now has the
+    /// keyframe's.
+    pub firmware_synced: bool,
+    /// The game used the firmware chip differently from the recording since they last matched
+    /// (a boot found a WFC ID where the recording's wrote one, or the other way round): only
+    /// loading the keyframe makes up for that.
+    pub firmware_access_differs: bool
 }
 
 /// Memory whose compiled JIT blocks [`Core::invalidate_jit`] can drop.
@@ -254,6 +281,53 @@ impl Core {
         second: u8
     ) {
         unsafe { melonds_rs_core_set_date(self.inner, year, month, day, hour, minute, second) }
+    }
+
+    /// Replay playback, right after loading one of the replay's keyframes: when the keyframe
+    /// predates save states carrying the firmware and was taken well after the game booted, give
+    /// the firmware a Nintendo WFC ID if it has none, as the recording console's had by then
+    /// (games write one a moment into every boot that finds none, so without it the replay's next
+    /// console reset goes differently). Returns whether the firmware changed.
+    #[inline]
+    pub fn adopt_replay_keyframe(&mut self) -> bool {
+        unsafe { melonds_rs_core_adopt_replay_keyframe(self.inner) }
+    }
+
+    /// Replay playback reached `state`, one of the replay's keyframes, by playing rather than by
+    /// loading it: copies the keyframe's firmware settings into the console when it carries them
+    /// and they differ, and compares how the game has used the firmware chip with the recording.
+    #[inline]
+    pub fn check_replay_keyframe(&mut self, state: &[u8]) -> ReplayKeyframeCheck {
+        let bits = unsafe { melonds_rs_core_check_replay_keyframe(self.inner, state.as_ptr(), state.len()) };
+        ReplayKeyframeCheck {
+            firmware_synced: bits & 1 != 0,
+            firmware_access_differs: bits & 2 != 0
+        }
+    }
+
+    /// Diagnostics: CPU-visible state that melonDS save states do not carry (the CPUs' IRQ
+    /// lines, the divider and square root units, the key input), named by
+    /// [`DEBUG_UNSAVED_STATE_NAMES`]. IME/IE/IF are included to check the IRQ lines against.
+    pub fn debug_unsaved_state(&self) -> Vec<u32> {
+        let mut out = alloc::vec![0u32; DEBUG_UNSAVED_STATE_NAMES.len()];
+        let n = unsafe { melonds_rs_core_debug_unsaved_state(self.inner, out.as_mut_ptr(), out.len()) };
+        out.truncate(n);
+        out
+    }
+
+    /// Diagnostics: the firmware flash image. Games can write to it; save states do not carry it.
+    pub fn debug_firmware(&self) -> &[u8] {
+        let mut length = 0usize;
+        let ptr = unsafe { melonds_rs_core_debug_firmware(self.inner, &mut length) };
+        if ptr.is_null() {
+            return &[];
+        }
+        unsafe { core::slice::from_raw_parts(ptr, length) }
+    }
+
+    /// Diagnostics: overwrite bytes of the firmware flash image (out-of-range bytes are dropped).
+    pub fn debug_write_firmware(&mut self, offset: usize, data: &[u8]) {
+        unsafe { melonds_rs_core_debug_write_firmware(self.inner, offset, data.as_ptr(), data.len()) }
     }
 
 }
