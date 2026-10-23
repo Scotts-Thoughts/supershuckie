@@ -44,7 +44,7 @@ a session; 0 means "none" or, as a target, "everyone".
 | 0x04 | PeerJoined | `participant ParticipantInfo` | host → clients |
 | 0x05 | PeerLeft | `peer_id u16, reason u32` | host → clients |
 | 0x06 | ResetAll | `race_id u32, countdown_millis u32` | host → clients |
-| 0x07 | SyncPause | `enabled bool, paused bool` | host → clients |
+| 0x07 | SyncPause | `enabled bool, paused bool, host_only bool` | host → clients |
 | 0x08 | Pause | `from u16, paused bool` | participant → host → others |
 | 0x10 | Stream | `from u16, first_frame u64, bytes bytes` | publisher → host → others |
 | 0x11 | Snapshot | `from u16, target u16, frame u64, elapsed_millis u64, input bytes, speed u16, counters vec<(string, i64)>, encoding u8, state_len u64, state bytes` | publisher → host → target(s) |
@@ -88,14 +88,16 @@ way.
 With sync pause on, one participant pausing pauses everyone, and unpausing likewise. The host's
 setting rules the session: it sends `SyncPause` right after `Welcome` (so a joiner adopts the
 session's pause state as it arrives) and again whenever the setting changes, with `paused` being
-the host's own pause state at that moment, which everyone adopts. `paused` is meaningless while
-`enabled` is false. A client that receives `SyncPause` from another client is a protocol error at
+the host's own pause state at that moment, which everyone adopts. `paused` and `host_only` are
+meaningless while `enabled` is false. With `host_only` set, only the host may pause: clients must
+not let their player pause or unpause, and the host drops any `Pause` a client sends. A client that receives `SyncPause` from another client is a protocol error at
 the host.
 
 A participant that pauses or unpauses sends `Pause` (a client leaves `from` as 0; the host fills
 it in, like `RequestSnapshot.requester`, at the same byte offset as `Stream.from`). The host
-relays it to everyone but the sender, only while sync pause is enabled; otherwise it is dropped
-without an error, since the client may not have heard that the setting changed. Nobody gets their
+relays it to everyone but the sender, only while sync pause is enabled (and, for a client's, not
+host-only); otherwise it is dropped without an error, since the client may not have heard that the
+setting changed. Nobody gets their
 own pause echoed back. There is no arbitration: the last `Pause` relayed wins, and a participant
 whose pause differs from the last state it adopted publishes it, so two players pausing at once
 simply both pause everyone. The race-start reset unpauses everyone by itself, without a `Pause`.
@@ -178,6 +180,7 @@ that sends `LinkSpeed` is a protocol error at the host.
 
 ### Version history
 
+- 6: `SyncPause.host_only`.
 - 5: `LinkSpeed`, `LinkStart.speed`.
 - 4: the link cable messages `0x30`–`0x37`; `Stream.bytes` may carry `SerialIn` (replay format 7).
 - 3: `SyncPause`, `Pause`, `StartState`, `Refused.reason` 7.

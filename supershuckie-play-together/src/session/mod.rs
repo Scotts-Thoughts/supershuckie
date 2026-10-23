@@ -86,6 +86,9 @@ pub enum SessionEvent {
         enabled: bool,
         /// The session's pause state to adopt (meaningful while `enabled`).
         paused: bool,
+        /// Whether only the host may pause (meaningful while `enabled`): our own pauses are not
+        /// relayed, so the frontend must not let the local player pause.
+        host_only: bool,
     },
     /// Client only: the host's game speed, which every linked pair in the session runs at.
     /// Arrives once on joining and again whenever the host's speed changes.
@@ -311,14 +314,16 @@ pub trait Session: Send + Sync {
     fn request_snapshot(&self, publisher: PeerId);
     /// Host only: everybody resets after `countdown`. The host gets the `ResetAll` event too.
     fn send_reset_all(&self, countdown: Duration) -> Result<u32, PlayTogetherError>;
-    /// Host only: set whether pausing is shared, and the pause state everyone adopts right now
-    /// (the host's own). Told to every client, and to each client as it joins.
-    fn set_sync_pause(&self, enabled: bool, paused: bool) -> Result<(), PlayTogetherError>;
+    /// Host only: set whether pausing is shared, whether only the host may pause (`host_only`,
+    /// meaningful while `enabled`), and the pause state everyone adopts right now (the host's
+    /// own). Told to every client, and to each client as it joins.
+    fn set_sync_pause(&self, enabled: bool, paused: bool, host_only: bool) -> Result<(), PlayTogetherError>;
     /// Host only: the host's game speed, which every linked pair runs at. Told to every client
     /// when it changes, and to each client as it joins.
     fn set_link_speed(&self, speed: Speed) -> Result<(), PlayTogetherError>;
     /// We paused (or unpaused) everyone. The host relays it to everyone else while sync pause is
-    /// enabled and drops it otherwise; nobody gets their own pause back.
+    /// enabled and drops it otherwise (and drops a client's while it is host-only); nobody gets
+    /// their own pause back.
     fn send_pause(&self, paused: bool) -> Result<(), PlayTogetherError>;
     /// Host only: set (or with `None` clear) the save state everyone's own game is loaded from.
     /// Sent to every client now and to each client as it joins; while one is set, a client whose

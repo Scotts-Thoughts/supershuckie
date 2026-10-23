@@ -227,9 +227,10 @@ void supershuckie_frontend_set_gbc_mode(struct SuperShuckieFrontendRaw *frontend
 uint32_t supershuckie_frontend_get_gbc_mode(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
- * Set whether or not the frontend is paused.
+ * Set whether or not the frontend is paused. Returns false (and changes nothing) while pausing is
+ * the Play Together host's alone (see supershuckie_frontend_play_together_pause_is_the_hosts).
  */
-void supershuckie_frontend_set_paused(struct SuperShuckieFrontendRaw *frontend, bool paused);
+bool supershuckie_frontend_set_paused(struct SuperShuckieFrontendRaw *frontend, bool paused);
 
 /**
  * Manually invoke the refresh screens callback even if no updates have occurred.

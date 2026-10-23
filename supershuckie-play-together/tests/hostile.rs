@@ -216,7 +216,7 @@ fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
     let host = bind_host("Host");
     let mut hl = Vec::new();
     wait_connected(&host, &mut hl);
-    host.set_sync_pause(true, false).unwrap();
+    host.set_sync_pause(true, false, false).unwrap();
     let (mut liar, liar_id) = Raw::handshake(host.local_addr(), "Liar");
     let (mut witness, witness_id) = Raw::handshake(host.local_addr(), "Witness");
     assert_eq!((liar_id, witness_id), (2, 3));
@@ -224,7 +224,7 @@ fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
     wait_joined(&host, &mut hl);
 
     // Each was told the setting right after its Welcome.
-    assert_eq!(witness.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: false }));
+    assert_eq!(witness.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: false, host_only: false }));
 
     // A spoofed sender is rewritten.
     liar.send(&Message::Pause { from: 3, paused: true });
@@ -244,7 +244,7 @@ fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
     }
     let (mut liar, _) = Raw::handshake(host.local_addr(), "Liar");
     wait_joined(&host, &mut hl);
-    liar.send(&Message::SyncPause { enabled: false, paused: false });
+    liar.send(&Message::SyncPause { enabled: false, paused: false, host_only: false });
     match liar.read_until(|m| matches!(m, Message::Error { .. })) {
         Some(Message::Error { text }) => assert!(text.contains("only the host"), "{text}"),
         other => panic!("{other:?}"),
@@ -256,7 +256,7 @@ fn only_the_host_sets_sync_pause_and_a_pause_carries_its_real_sender() {
     }
     // The setting survives the attempts: a newcomer still hears it, and the host's speed after it.
     let (mut late, _) = Raw::handshake(host.local_addr(), "Late");
-    assert_eq!(late.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: true }));
+    assert_eq!(late.read_until(|m| matches!(m, Message::SyncPause { .. })), Some(Message::SyncPause { enabled: true, paused: true, host_only: false }));
     assert_eq!(late.read_until(|m| matches!(m, Message::LinkSpeed { .. })), Some(Message::LinkSpeed { speed: Speed::default() }));
     host.set_link_speed(Speed::from_multiplier_float(3.0)).unwrap();
     assert_eq!(late.read_until(|m| matches!(m, Message::LinkSpeed { .. })), Some(Message::LinkSpeed { speed: Speed::from_multiplier_float(3.0) }));

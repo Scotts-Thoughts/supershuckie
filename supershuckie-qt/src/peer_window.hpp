@@ -3,11 +3,13 @@
 
 #include <QJsonObject>
 #include <QColor>
+#include <QPoint>
 #include <QWidget>
 #include <cstdint>
 #include <memory>
 
 class QLabel;
+class QVBoxLayout;
 struct SuperShuckieScreenData;
 
 namespace SuperShuckie64 {
@@ -63,14 +65,21 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    void moveEvent(QMoveEvent *event) override;
     void contextMenuEvent(QContextMenuEvent *event) override;
 
 private:
+    /** Take the name, ROM and colour from the participant's JSON (when they changed). */
+    void apply_identity(const QJsonObject &participant);
+
     PlayTogetherController *controller;
     std::uint16_t id;
     QString name;
     QString rom_name;
     QColor player_color;
+    QString color_name;
+    QVBoxLayout *frame_layout;
+    QWidget *strip;
     ScreenCanvas *screen;
     QLabel *name_label;
     QLabel *sync_label;
@@ -80,6 +89,10 @@ private:
     bool laid_out = false;
     bool linkable = false;
     bool link_peer = false;
+    bool identity_applied = false;
+    bool moved_by_user = false;
+    /** Where restore_geometry() (or the user, last) put the window. */
+    QPoint placed_at;
 };
 
 }

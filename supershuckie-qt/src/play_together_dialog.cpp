@@ -193,7 +193,8 @@ void PlayTogetherDialog::refresh(const QJsonObject &state) {
             QString sync_note;
             if(state["sync_pause"].toBool()) {
                 QString paused_by = state["paused_by"].toString().toHtmlEscaped();
-                sync_note = paused_by.isEmpty() ? QString(" — sync pause on") : QString(" — sync pause on, <b>paused by %1</b>").arg(paused_by);
+                QString mode = state["host_only_pause"].toBool() ? QString("only the host can pause") : QString("sync pause on");
+                sync_note = paused_by.isEmpty() ? QString(" — %1").arg(mode) : QString(" — %1, <b>paused by %2</b>").arg(mode, paused_by);
             }
             if(state["start_state"].toBool()) {
                 sync_note += host ? " — everyone starts from your save state" : " — everyone starts from the host's save state";

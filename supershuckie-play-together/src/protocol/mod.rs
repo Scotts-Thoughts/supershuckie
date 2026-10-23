@@ -26,7 +26,7 @@ use link::pair_hash_fields;
 use wire::{frame, Decoder, Encoder};
 
 /// The protocol version this crate speaks.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Longest display name, in bytes.
 pub const MAX_DISPLAY_NAME_BYTES: usize = 32;
@@ -306,9 +306,12 @@ pub enum Message {
         enabled: bool,
         /// Whether the session is paused right now (meaningful while `enabled`).
         paused: bool,
+        /// Whether only the host may pause (meaningful while `enabled`): clients cannot pause,
+        /// and the host drops any `Pause` they send.
+        host_only: bool,
     },
     /// A participant paused or unpaused everyone. Relayed by the host to everyone else only
-    /// while sync pause is enabled.
+    /// while sync pause is enabled (and, from a client, only while it is not host-only).
     Pause {
         /// Who (a client sends 0; the host fills it in before relaying).
         from: PeerId,
@@ -582,9 +585,10 @@ impl Message {
                     e.u32(*race_id);
                     e.u32(*countdown_millis);
                 }
-                Message::SyncPause { enabled, paused } => {
+                Message::SyncPause { enabled, paused, host_only } => {
                     e.bool(*enabled);
                     e.bool(*paused);
+                    e.bool(*host_only);
                 }
                 Message::Pause { from, paused } => {
                     e.u16(*from);
@@ -718,7 +722,7 @@ impl Message {
             TAG_PEER_JOINED => Message::PeerJoined { participant: decode_participant(&mut d)? },
             TAG_PEER_LEFT => Message::PeerLeft { peer_id: peer_id(&mut d)?, reason: LeaveReason::try_from(d.u32()?)? },
             TAG_RESET_ALL => Message::ResetAll { race_id: d.u32()?, countdown_millis: d.u32()? },
-            TAG_SYNC_PAUSE => Message::SyncPause { enabled: d.bool()?, paused: d.bool()? },
+            TAG_SYNC_PAUSE => Message::SyncPause { enabled: d.bool()?, paused: d.bool()?, host_only: d.bool()? },
             TAG_PAUSE => Message::Pause { from: d.u16()?, paused: d.bool()? },
             TAG_STREAM => Message::Stream {
                 from: peer_id(&mut d)?,

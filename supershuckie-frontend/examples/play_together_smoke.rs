@@ -211,6 +211,65 @@ fn check_sync_pause(players: &mut [Player]) -> bool {
         ok = false;
     }
 
+    // Host-only: a client cannot pause or unpause (its controls refuse, and a pause from
+    // anywhere else is put back), while the host's pause and unpause still reach everyone.
+    if players[1].frontend.set_play_together_host_only_pause(true).is_ok() {
+        println!("FAIL: a client could set host-only pause");
+        ok = false;
+    }
+    players[0].frontend.set_play_together_host_only_pause(true).expect("host sets host-only pause");
+    if !tick_until_all(players, wait, |p| p.frontend.get_play_together_host_only_pause()) {
+        println!("FAIL: the host's host-only pause setting did not reach everyone");
+        return false
+    }
+    let locked: Vec<bool> = players.iter().map(|p| p.frontend.play_together_pause_is_the_hosts()).collect();
+    if locked.iter().enumerate().any(|(i, &locked)| locked != (i != 0)) {
+        println!("FAIL: pause locks are {locked:?}, expected only the clients locked");
+        ok = false;
+    }
+    if players[1].frontend.set_paused_by_player(true) {
+        println!("FAIL: a client's pause control worked under host-only pause");
+        ok = false;
+    }
+    players[1].frontend.set_paused(true);
+    tick_all_for(players, Duration::from_millis(300));
+    if players.iter().any(|p| p.frontend.is_paused()) {
+        println!("FAIL: a client's pause stuck or spread under host-only pause: {:?}", players.iter().map(paused_state).collect::<Vec<_>>());
+        ok = false;
+    }
+    else {
+        println!("  host-only: a client's pause is refused and put back");
+    }
+    let started = Instant::now();
+    players[0].frontend.set_paused_by_player(true);
+    if tick_until_all(players, wait, |p| p.frontend.is_paused()) {
+        println!("  host-only: the host paused everyone in {} ms", started.elapsed().as_millis());
+    }
+    else {
+        println!("FAIL: under host-only pause the host's pause did not pause everyone: {:?}", players.iter().map(paused_state).collect::<Vec<_>>());
+        ok = false;
+    }
+    let last = players.len() - 1;
+    if players[last].frontend.set_paused_by_player(false) {
+        println!("FAIL: a client's unpause control worked under host-only pause");
+        ok = false;
+    }
+    tick_all_for(players, Duration::from_millis(300));
+    if !players.iter().all(|p| p.frontend.is_paused()) {
+        println!("FAIL: a client unpaused under host-only pause: {:?}", players.iter().map(paused_state).collect::<Vec<_>>());
+        ok = false;
+    }
+    players[0].frontend.set_paused_by_player(false);
+    if !tick_until_all(players, wait, |p| !p.frontend.is_paused()) {
+        println!("FAIL: under host-only pause the host's unpause did not unpause everyone: {:?}", players.iter().map(paused_state).collect::<Vec<_>>());
+        ok = false;
+    }
+    players[0].frontend.set_play_together_host_only_pause(false).expect("host clears host-only pause");
+    if !tick_until_all(players, wait, |p| !p.frontend.play_together_pause_is_the_hosts()) {
+        println!("FAIL: turning host-only pause off did not unlock the clients");
+        ok = false;
+    }
+
     // The host pauses, then turns the setting off while paused: everyone stays paused (the
     // setting going off changes nobody's state), and a pause is now local again.
     players[0].frontend.set_paused(true);

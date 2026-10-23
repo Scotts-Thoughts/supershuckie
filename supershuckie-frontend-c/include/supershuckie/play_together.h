@@ -32,6 +32,8 @@ struct SuperShuckieAudioOutputRaw;
  *     "save_peer_replays": true,
  *     "recording_peers": false,           (whether any friend's game is being written to a replay file here)
  *     "sync_pause": false,                (whether one player's pause pauses everyone: the host's setting in a session)
+ *     "host_only_pause": false,           (with sync pause: only the host can pause; the host's setting in a session)
+ *     "pause_locked": false,              (whether this player's pause controls do nothing: a client under host-only pause)
  *     "paused_by": "",                    (who paused everyone while sync pause holds the game paused: a name, "you", or empty)
  *     "start_state": false,               (whether the host's start state is set: everyone's game was loaded from it)
  *     "link": {                           (the link cable; see below)
@@ -113,6 +115,16 @@ uint32_t supershuckie_frontend_play_together_reset_countdown_ms(const struct Sup
  */
 bool supershuckie_frontend_play_together_get_sync_pause(const struct SuperShuckieFrontendRaw *frontend);
 bool supershuckie_frontend_play_together_set_sync_pause(struct SuperShuckieFrontendRaw *frontend, bool enabled, uint8_t *error, size_t error_len);
+
+/**
+ * Host-only pause (takes effect with sync pause on): only the host can pause, and the host's pause
+ * pauses everyone; the other players' pause controls do nothing (supershuckie_frontend_set_paused
+ * returns false). The host's setting applies to the whole session, like sync pause.
+ * `pause_is_the_hosts` says whether the local player's pause controls are locked right now.
+ */
+bool supershuckie_frontend_play_together_get_host_only_pause(const struct SuperShuckieFrontendRaw *frontend);
+bool supershuckie_frontend_play_together_set_host_only_pause(struct SuperShuckieFrontendRaw *frontend, bool enabled, uint8_t *error, size_t error_len);
+bool supershuckie_frontend_play_together_pause_is_the_hosts(const struct SuperShuckieFrontendRaw *frontend);
 
 /**
  * Start state: everyone starts from the host's save state. Setting it (host only) pauses the host's

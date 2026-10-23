@@ -162,8 +162,8 @@ pub unsafe extern "C" fn supershuckie_frontend_axis(
 pub unsafe extern "C" fn supershuckie_frontend_set_paused(
     frontend: &mut SuperShuckieFrontend,
     paused: bool
-) {
-    frontend.set_paused(paused);
+) -> bool {
+    frontend.set_paused_by_player(paused)
 }
 
 #[unsafe(no_mangle)]

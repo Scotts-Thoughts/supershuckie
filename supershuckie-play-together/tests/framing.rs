@@ -91,8 +91,9 @@ fn samples() -> Vec<Message> {
         Message::PeerLeft { peer_id: 3, reason: LeaveReason::TooSlow },
         Message::PeerLeft { peer_id: u16::MAX, reason: LeaveReason::HostLeft },
         Message::ResetAll { race_id: 7, countdown_millis: 3000 },
-        Message::SyncPause { enabled: true, paused: false },
-        Message::SyncPause { enabled: false, paused: true },
+        Message::SyncPause { enabled: true, paused: false, host_only: false },
+        Message::SyncPause { enabled: false, paused: true, host_only: false },
+        Message::SyncPause { enabled: true, paused: true, host_only: true },
         Message::Pause { from: 0, paused: true },
         Message::Pause { from: 3, paused: false },
         Message::Stream { from: 2, first_frame: 100, bytes: frames(3) },
@@ -168,7 +169,7 @@ fn wire_layout_matches_the_document() {
         ]
     );
     assert_eq!(Message::RequestSnapshot { requester: 0, target: 0x0102 }.encoded(), [5, 0, 0, 0, 0x13, 0, 0, 2, 1]);
-    assert_eq!(Message::SyncPause { enabled: true, paused: false }.encoded(), [3, 0, 0, 0, 0x07, 1, 0]);
+    assert_eq!(Message::SyncPause { enabled: true, paused: false, host_only: true }.encoded(), [4, 0, 0, 0, 0x07, 1, 0, 1]);
     // `from` sits right after the tag, like `Stream.from`: what the host overwrites when relaying.
     assert_eq!(Message::Pause { from: 0x0102, paused: true }.encoded(), [4, 0, 0, 0, 0x08, 2, 1, 1]);
     assert_eq!(Message::decode(&[0x08, 0, 0, 2]), Err(DecodeError::BadBool(2)));

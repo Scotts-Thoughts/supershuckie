@@ -922,7 +922,7 @@ impl SuperShuckieFrontend {
             }
 
             if pressed && self.settings.replay.auto_unpause_on_input && self.is_paused() {
-                self.set_paused(false);
+                self.set_paused_by_player(false);
             }
 
             match control.modifier {
@@ -990,7 +990,7 @@ impl SuperShuckieFrontend {
                     self.core.hard_reset();
                 }
                 Control::Pause => if pressed && self.is_game_running() {
-                    self.set_paused(!self.is_paused());
+                    self.set_paused_by_player(!self.is_paused());
                 }
                 Control::SwapScreens => if pressed {
                     self.set_swap_nds_screens(!self.get_swap_nds_screens());
@@ -1371,6 +1371,16 @@ impl SuperShuckieFrontend {
         else {
             self.core.start();
         }
+    }
+
+    /// Pause or unpause on the player's behalf (a pause control, a click, the command server).
+    /// Refused (returns `false`) while pausing is the Play Together host's alone.
+    pub fn set_paused_by_player(&mut self, paused: bool) -> bool {
+        if self.play_together_pause_is_the_hosts() {
+            return false
+        }
+        self.set_paused(paused);
+        true
     }
 
     /// Set whether or not the game is paused temporarily.
@@ -1866,8 +1876,7 @@ impl SuperShuckieFrontend {
                             let _ = t.send(false);
                         }
                         else {
-                            self.set_paused(paused);
-                            let _ = t.send(true);
+                            let _ = t.send(self.set_paused_by_player(paused));
                         }
                     }
                     SuperShuckieServerCommand::LoadReplay(t, replay) => {

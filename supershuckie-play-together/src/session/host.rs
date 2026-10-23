@@ -80,6 +80,7 @@ struct HostShared {
 struct SyncPauseState {
     enabled: bool,
     paused: bool,
+    host_only: bool,
 }
 
 #[derive(Default)]
@@ -636,16 +637,18 @@ impl HostShared {
     /// The `SyncPause` message describing the current setting and state.
     fn sync_pause_message(&self) -> Message {
         let state = self.sync_pause_state();
-        Message::SyncPause { enabled: state.enabled, paused: state.paused }
+        Message::SyncPause { enabled: state.enabled, paused: state.paused, host_only: state.host_only }
     }
 
-    /// Note the session's pause state (only while sync pause is enabled). Returns whether it is.
-    fn note_pause(&self, paused: bool) -> bool {
+    /// Note the session's pause state from `from` (only while sync pause is enabled, and only
+    /// from the host while it is host-only). Returns whether the pause counts.
+    fn note_pause(&self, from: PeerId, paused: bool) -> bool {
         let mut state = self.sync_pause.lock().unwrap_or_else(|e| e.into_inner());
-        if state.enabled {
+        let counts = state.enabled && (from == HOST_PEER_ID || !state.host_only);
+        if counts {
             state.paused = paused;
         }
-        state.enabled
+        counts
     }
 
     fn follow_slot(&self, peer: PeerId) -> Option<Arc<FollowSlot>> {
@@ -691,9 +694,9 @@ impl HostShared {
                 self.route_link(from, message, raw);
             }
             Message::Pause { paused, .. } => {
-                // Dropped while sync pause is off: the client may not have heard that it was
-                // turned off yet.
-                if self.note_pause(paused) {
+                // Dropped while sync pause is off or host-only: the client may not have heard
+                // that it was changed yet.
+                if self.note_pause(from, paused) {
                     stamp_peer_id(&mut raw, from);
                     let raw = Arc::new(raw);
                     for other in self.admitted_conns() {
@@ -986,12 +989,12 @@ impl Session for HostSession {
         Ok(race_id)
     }
 
-    fn set_sync_pause(&self, enabled: bool, paused: bool) -> Result<(), PlayTogetherError> {
+    fn set_sync_pause(&self, enabled: bool, paused: bool, host_only: bool) -> Result<(), PlayTogetherError> {
         if self.shared.left.load(Ordering::Acquire) {
             return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
         }
-        *self.shared.sync_pause.lock().unwrap_or_else(|e| e.into_inner()) = SyncPauseState { enabled, paused };
-        self.shared.broadcast(&Message::SyncPause { enabled, paused }, 0);
+        *self.shared.sync_pause.lock().unwrap_or_else(|e| e.into_inner()) = SyncPauseState { enabled, paused, host_only };
+        self.shared.broadcast(&Message::SyncPause { enabled, paused, host_only }, 0);
         Ok(())
     }
 
@@ -1008,7 +1011,7 @@ impl Session for HostSession {
         if self.shared.left.load(Ordering::Acquire) {
             return Err(PlayTogetherError::Disconnected(DisconnectReason::Left));
         }
-        if self.shared.note_pause(paused) {
+        if self.shared.note_pause(HOST_PEER_ID, paused) {
             self.shared.broadcast(&Message::Pause { from: HOST_PEER_ID, paused }, 0);
         }
         Ok(())

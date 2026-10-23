@@ -31,6 +31,11 @@ use crate::source::{console_names, geometry, layout_from_byte, open_replay, Repl
 /// does not throw the frames it already emulated away.
 const STEP_LIMIT: u64 = 240;
 
+/// A keyframe this far past the current position (or nearer) is stepped through rather than
+/// loaded: a load is a whole state to restore — on a Nintendo DS about as dear as several frames
+/// of emulation — and not worth it to skip a handful.
+const NEAR_KEYFRAME: u64 = 16;
+
 /// The channel is checked for a superseding request every this many hidden runs during a walk.
 const POLL_EVERY: u32 = 8;
 
@@ -67,6 +72,8 @@ struct Session {
     /// `total_frames()` whose picture the screens currently hold, if they hold a drawn one.
     drawn: Option<u64>,
     audio: Option<Arc<AudioOutput>>,
+    /// The recording's keyframes, in order: which one a seek would load (`position_drawn`).
+    keyframes: Vec<u64>,
 }
 
 /// What the command line asks of a serving instance.
@@ -224,6 +231,7 @@ impl Server {
                 Request::Run { id, from, to } => self.run(id, from, to)?,
                 Request::Audio { id, first_frame, frames } => self.audio(id, first_frame, frames)?,
                 Request::Memory { id, index, blocks } => self.memory(id, index, &blocks)?,
+                Request::Stats { id, index } => self.stats(id, index)?,
                 // A `Cancel` reaching here names a request that is no longer pending.
                 Request::Cancel { .. } => {}
                 Request::Close => return Ok(ExitCode::SUCCESS),
@@ -262,7 +270,7 @@ impl Server {
             }
         }
         Ok(self.pending.iter().any(|r| match r {
-            Request::Frame { .. } | Request::Run { .. } | Request::Memory { .. } | Request::Close => true,
+            Request::Frame { .. } | Request::Run { .. } | Request::Memory { .. } | Request::Stats { .. } | Request::Close => true,
             Request::Cancel { id: cancelled } => *cancelled == id,
             _ => false,
         }))
@@ -295,7 +303,7 @@ impl Server {
             sample_rate: AUDIO_SAMPLE_RATE,
             rom_ok,
             core_recorded: summary.core_recorded.clone(),
-            keyframes: summary.keyframes.clone(),
+            keyframes: cheap_pictures(&summary.keyframes, summary.frames),
             bookmarks: summary.bookmarks.clone(),
             crop: summary.crop,
             counters: summary.counters.clone(),
@@ -342,6 +350,7 @@ impl Server {
             fps: (info.fps_num, info.fps_den),
             drawn,
             audio: None,
+            keyframes: summary.keyframes.clone(),
         });
         Ok(info)
     }
@@ -515,6 +524,30 @@ impl Server {
         }
     }
 
+    /// `/stats` as the emulator reports it while this recording plays, once picture `index`
+    /// has been produced: positioned exactly as a `Memory` is, so the two for one picture cost
+    /// one walk. See [`stats_json`].
+    fn stats(&mut self, id: u32, index: u64) -> io::Result<()> {
+        if let Err(message) = self.usable() {
+            return self.reply(&Reply::Error { id, message });
+        }
+        if self.poll(id)? {
+            return self.reply(&Reply::Cancelled { id });
+        }
+        let frames = self.session.as_ref().map_or(0, |s| s.frames);
+        if index >= frames {
+            return self.reply(&Reply::Error { id, message: format!("frame {index} is past the end ({frames} frames)") });
+        }
+        match self.position_drawn(id, picture_of(index)) {
+            Ok(()) => {
+                let json = stats_json(self.core());
+                self.reply(&Reply::Stats { id, index, json })
+            }
+            Err(Stop::Superseded) => self.reply(&Reply::Cancelled { id }),
+            Err(Stop::Failed(message)) => self.reply(&Reply::Error { id, message }),
+        }
+    }
+
     /// Composite the screens and send them as picture `index` of request `id`.
     fn send_frame(&mut self, id: u32, index: u64) -> io::Result<()> {
         let session = self.session.as_ref().expect("checked by usable()");
@@ -542,7 +575,15 @@ impl Server {
         if cur == target && drawn == Some(target) {
             return Ok(());
         }
-        let load = !(cur < target && target - cur <= STEP_LIMIT);
+        // Stepped when near enough ahead — unless a keyframe lies well past where the core is on
+        // the way: loading it skips everything before it (at frame 5 with picture 244 wanted, 238
+        // frames emulated became 3).
+        let keyframe_ahead = {
+            let session = self.session.as_ref().expect("checked by usable()");
+            keyframe_at_or_before(&session.keyframes, target.saturating_sub(SuperShuckieCore::POST_LOAD_FRAMES))
+                .is_some_and(|k| k > cur + NEAR_KEYFRAME)
+        };
+        let load = !(cur < target && target - cur <= STEP_LIMIT) || keyframe_ahead;
         if load {
             self.load_keyframe_before(target)?;
         }
@@ -638,6 +679,32 @@ impl Server {
     }
 }
 
+/// The pictures that are cheap to draw — what `Info`'s keyframes are for: a client scrubbing
+/// asks for one of these in place of a frame far from any (docs/frame-server-protocol.md).
+///
+/// Not the keyframes' own frame numbers. A picture is drawn [`SuperShuckieCore::POST_LOAD_FRAMES`]
+/// or more frames after the keyframe it is reached from (see `position_drawn`), so the
+/// keyframe's own number is reached from the keyframe *before* it, a whole interval of emulation
+/// away: asking for "the keyframe" was the dearest picture there was (measured 2026-10-15, a
+/// Game Boy Color run with a keyframe every 120 frames: 97 ms a keyframe, against 1.4 ms a frame
+/// stepping). The picture that many frames after each keyframe is the cheap one.
+/// The last of `keyframes` (in order) at or before `frame`.
+fn keyframe_at_or_before(keyframes: &[u64], frame: u64) -> Option<u64> {
+    match keyframes.binary_search(&frame) {
+        Ok(i) => Some(keyframes[i]),
+        Err(0) => None,
+        Err(i) => Some(keyframes[i - 1]),
+    }
+}
+
+fn cheap_pictures(keyframes: &[u64], frames: u64) -> Vec<u64> {
+    keyframes
+        .iter()
+        .map(|k| k + SuperShuckieCore::POST_LOAD_FRAMES)
+        .filter(|p| *p < frames)
+        .collect()
+}
+
 /// How many frames must have been emulated for the screens to hold picture `index`.
 ///
 /// Picture 0 is the first frame ever drawn, which is the picture after one run: the same one the
@@ -684,5 +751,77 @@ mod gb_colors_tests {
         assert!(parse_gb_colors(&(twelve("FFFFFF") + ",FFFFFF")).unwrap_err().contains("twelve"));
         assert!(parse_gb_colors(&twelve("FFFFFF").replacen("FFFFFF", "blue", 1)).unwrap_err().contains("\"blue\""));
         assert!(parse_gb_colors(&twelve("FFFFFF").replacen("FFFFFF", "FFFFFFF", 1)).unwrap_err().contains("FFFFFFF"));
+    }
+}
+
+/// The live `/stats` fields a recording can answer, as of where `core` is in its replay
+/// (docs/external_commands.md; supershuckie-frontend builds the live endpoint the same way while
+/// a replay plays): the timer runs from the replay's start mark to its end mark, plus the offset
+/// the start was given, and is `null` without a start mark; the elapsed time is the recording's
+/// own clock, which keeps the pauses out and does not run faster at a higher speed; the counters
+/// are the replay's. The fields that describe a live session — speed, pause, fps — are left out.
+pub(crate) fn stats_json(core: &SuperShuckieCore) -> String {
+    let millis = core.get_recording_milliseconds().0 as u32;
+    let metadata = core.replay_player().map(|p| p.get_replay_metadata());
+    let start = metadata.and_then(|m| m.crop_start).map(|(_, t)| t.0 as u32);
+    let end = metadata.and_then(|m| m.crop_end).map(|(_, t)| t.0 as u32);
+    let offset = metadata.and_then(|m| m.timer_offset).map(|t| t.0 as u32);
+    serde_json::json!({
+        "time_start": start,
+        "time_end": end,
+        "time_offset": offset,
+        "time_current": timer(millis, start, end, offset),
+        "total_elapsed_time": millis,
+        "total_elapsed_frames": core.total_frames(),
+        "counters": core.get_replay_counters().cloned().unwrap_or_default(),
+    })
+    .to_string()
+}
+
+/// The timer at `millis` on the recording's clock: the frontend's arithmetic, saturating and
+/// wrapping exactly as it does, so a replay reads here what it reads in the app.
+fn timer(millis: u32, start: Option<u32>, end: Option<u32>, offset: Option<u32>) -> Option<u32> {
+    let start = start?;
+    let value = millis.saturating_sub(start);
+    let value = match end {
+        Some(end) => value.min(end.saturating_sub(start)),
+        None => value,
+    };
+    Some(value.wrapping_add(offset.unwrap_or(0)))
+}
+
+#[cfg(test)]
+mod cheap_picture_tests {
+    use super::{cheap_pictures, keyframe_at_or_before};
+
+    #[test]
+    fn the_keyframe_a_seek_loads_is_the_last_at_or_before() {
+        let k = [0, 120, 240];
+        assert_eq!(keyframe_at_or_before(&k, 241), Some(240));
+        assert_eq!(keyframe_at_or_before(&k, 240), Some(240));
+        assert_eq!(keyframe_at_or_before(&k, 239), Some(120));
+        assert_eq!(keyframe_at_or_before(&[10], 5), None);
+    }
+    use supershuckie_core::SuperShuckieCore;
+
+    #[test]
+    fn the_cheap_pictures_are_just_past_each_keyframe_and_inside_the_recording() {
+        let p = SuperShuckieCore::POST_LOAD_FRAMES;
+        assert_eq!(cheap_pictures(&[0, 120, 240], 1000), vec![p, 120 + p, 240 + p]);
+        assert_eq!(cheap_pictures(&[0, 998], 1000), vec![p], "none past the end");
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::timer;
+
+    #[test]
+    fn the_timer_runs_from_the_start_mark_to_the_end_mark_plus_the_offset() {
+        assert_eq!(timer(5_000, None, None, None), None, "no start mark, no timer");
+        assert_eq!(timer(5_000, Some(1_000), None, None), Some(4_000));
+        assert_eq!(timer(500, Some(1_000), None, None), Some(0), "before the start it reads zero");
+        assert_eq!(timer(9_000, Some(1_000), Some(3_000), None), Some(2_000), "held at the end mark");
+        assert_eq!(timer(5_000, Some(1_000), None, Some(60_000)), Some(64_000));
     }
 }

@@ -26,6 +26,7 @@ const TAG_AUDIO: u8 = 0x05;
 const TAG_CANCEL: u8 = 0x06;
 const TAG_CLOSE: u8 = 0x07;
 const TAG_MEMORY: u8 = 0x08;
+const TAG_STATS: u8 = 0x0A;
 
 // Reply tags (server -> client).
 const TAG_R_HELLO: u8 = 0x81;
@@ -35,6 +36,7 @@ const TAG_R_DONE: u8 = 0x84;
 const TAG_R_AUDIO: u8 = 0x85;
 const TAG_R_CANCELLED: u8 = 0x86;
 const TAG_R_MEMORY: u8 = 0x87;
+const TAG_R_STATS: u8 = 0x88;
 const TAG_R_ERROR: u8 = 0x8F;
 
 /// The most a `Memory` request may ask for in all: more than any console has, so a block list
@@ -54,6 +56,9 @@ pub enum Request {
     /// The bytes at `(address, length)` blocks of the source's memory once picture `index` has
     /// been produced: what a memory-reading tool sees of the state behind a frame.
     Memory { id: u32, index: u64, blocks: Vec<(u32, u32)> },
+    /// The timer, elapsed time and counters once picture `index` has been produced, as the
+    /// emulator's `/stats` endpoint reports them while the recording plays.
+    Stats { id: u32, index: u64 },
 }
 
 /// The `Info` reply's payload.
@@ -88,6 +93,8 @@ pub enum Reply {
     Cancelled { id: u32 },
     /// The blocks a `Memory` asked for, concatenated in the order asked.
     Memory { id: u32, index: u64, data: Vec<u8> },
+    /// A JSON object whose fields are `/stats`'s (docs/external_commands.md).
+    Stats { id: u32, index: u64, json: String },
     Error { id: u32, message: String },
 }
 
@@ -198,6 +205,11 @@ impl Request {
                     e.u32(*length);
                 }
             }
+            Request::Stats { id, index } => {
+                e.u8(TAG_STATS);
+                e.u32(*id);
+                e.u64(*index);
+            }
         });
     }
 
@@ -235,6 +247,7 @@ impl Request {
                 }
                 Request::Memory { id, index, blocks }
             }
+            TAG_STATS => Request::Stats { id: d.u32()?, index: d.u64()? },
             other => return Err(DecodeError::UnknownTag(other)),
         };
         d.finish()?;
@@ -330,6 +343,12 @@ impl Reply {
                 e.u64(*index);
                 e.out.extend_from_slice(data);
             }
+            Reply::Stats { id, index, json } => {
+                e.u8(TAG_R_STATS);
+                e.u32(*id);
+                e.u64(*index);
+                e.string(json);
+            }
             Reply::Error { id, message } => {
                 e.u8(TAG_R_ERROR);
                 e.u32(*id);
@@ -413,6 +432,7 @@ impl Reply {
                 let data = d.rest().to_vec();
                 Reply::Memory { id, index, data }
             }
+            TAG_R_STATS => Reply::Stats { id: d.u32()?, index: d.u64()?, json: d.string()? },
             TAG_R_ERROR => Reply::Error { id: d.u32()?, message: d.string()? },
             other => return Err(DecodeError::UnknownTag(other)),
         };

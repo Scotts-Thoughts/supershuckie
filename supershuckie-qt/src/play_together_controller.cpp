@@ -167,6 +167,19 @@ void PlayTogetherController::apply_state(const QJsonObject &state, bool roster_c
                 text += QString("· Link cable: connecting to %1 ").arg(link["peer_name"].toString());
             }
         }
+        // Who this player is, in their colour, so it matches the frame other players see.
+        QColor local_color(state["local_color_rgb"].toString());
+        QString local_color_name = state["local_color_name"].toString();
+        if(local_color.isValid()) {
+            text = QString("You: %1%2 · %3").arg(state["local_name"].toString(), local_color_name.isEmpty() ? QString() : QString(" (%1)").arg(local_color_name), text);
+            QString sheet = QString("QLabel { background-color: %1; color: %2; padding: 0px 6px; border-radius: 3px; }").arg(local_color.name(), PeerWindow::contrasting_text(local_color).name());
+            if(this->status_label->styleSheet() != sheet) {
+                this->status_label->setStyleSheet(sheet);
+            }
+        }
+        else if(!this->status_label->styleSheet().isEmpty()) {
+            this->status_label->setStyleSheet(QString());
+        }
         this->status_label->setText(text);
         this->status_label->show();
     }

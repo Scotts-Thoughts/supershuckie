@@ -169,6 +169,11 @@ pub struct PlayTogetherSettings {
     #[serde(default = "PlayTogetherSettings::DEFAULT_SYNC_PAUSE")]
     pub sync_pause: bool,
 
+    /// With sync pause on, only the host can pause: the host's pause pauses everyone, and the
+    /// other players' pause controls do nothing. The host's setting applies, like `sync_pause`.
+    #[serde(default)]
+    pub host_only_pause: bool,
+
     /// The link cable's input delay in frames: 0 picks it from the round-trip times, else this
     /// many at least (the larger of the two players' settings wins).
     #[serde(default)]
@@ -250,6 +255,7 @@ impl Default for PlayTogetherSettings {
             peer_video_scale: Self::DEFAULT_PEER_VIDEO_SCALE(),
             allow_nintendo_ds: Self::DEFAULT_ALLOW_NINTENDO_DS(),
             sync_pause: Self::DEFAULT_SYNC_PAUSE(),
+            host_only_pause: false,
             link_input_delay: 0,
             link_auto_accept: false,
             known_roms: BTreeMap::new()

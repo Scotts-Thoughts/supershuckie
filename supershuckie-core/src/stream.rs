@@ -102,7 +102,10 @@ pub enum SnapshotRequestReason {
     QueueOverflow,
 
     /// Packets went missing between the publisher and the follower.
-    Gap
+    Gap,
+
+    /// The last snapshot would not load here.
+    LoadFailed
 }
 
 impl core::fmt::Display for SnapshotRequestReason {
@@ -112,7 +115,8 @@ impl core::fmt::Display for SnapshotRequestReason {
             Self::HashMismatch => "desynced",
             Self::TooFarBehind => "too far behind",
             Self::QueueOverflow => "queue overflowed",
-            Self::Gap => "packets were lost"
+            Self::Gap => "packets were lost",
+            Self::LoadFailed => "their state would not load"
         })
     }
 }

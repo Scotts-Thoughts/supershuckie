@@ -292,6 +292,17 @@ impl LiveReplaySource {
         self.0.request_snapshot(&mut queue, reason, now);
     }
 
+    /// Drop everything queued and ignore what follows until the next snapshot, and ask for one
+    /// (the last snapshot would not load, so nothing after it can be played).
+    pub fn discard_until_snapshot(&self, reason: SnapshotRequestReason) {
+        let mut queue = self.0.queue.lock().unwrap_or_else(|p| p.into_inner());
+        queue.items.clear();
+        queue.frames_queued = 0;
+        queue.have_snapshot = false;
+        let now = Instant::now();
+        self.0.request_snapshot(&mut queue, reason, now);
+    }
+
     /// The counters this source updates.
     pub fn stats(&self) -> &Arc<FollowerStats> {
         &self.0.stats
@@ -413,8 +424,11 @@ pub struct FollowerState {
     /// A file recording asked for before there was a state to start it from.
     pending_recording: Option<PendingFollowerRecording>,
 
-    /// Problems that ended following (a snapshot that would not load).
-    errors: Vec<String>
+    /// Problems following (a snapshot that would not load).
+    errors: Vec<String>,
+
+    /// Snapshots in a row that would not load (only the first of a run is reported).
+    failed_loads: u32
 }
 
 impl SuperShuckieCore {
@@ -456,7 +470,8 @@ impl SuperShuckieCore {
             hash_suppressed_until: 0,
             last_input: InputBuffer::new(),
             pending_recording: None,
-            errors: Vec::new()
+            errors: Vec::new(),
+            failed_loads: 0
         });
         self.clear_audio();
         self.bump_state_epoch();
@@ -633,11 +648,19 @@ impl SuperShuckieCore {
     /// whatever was queued before it was already discarded by the feeder.
     fn apply_stream_snapshot(&mut self, metadata: &KeyframeMetadata, state: &[u8]) {
         if let Err(e) = self.core.load_save_state(state) {
+            // Not the end of following: whatever was queued after it is useless, but the next
+            // snapshot may well load (stalling here left the window blank for good).
             if let Some(f) = self.follower.as_mut() {
-                f.errors.push(alloc::format!("the other player's state could not be loaded: {e}"));
+                if f.failed_loads == 0 {
+                    f.errors.push(alloc::format!("the other player's state could not be loaded (asking for another): {e}"));
+                }
+                f.failed_loads = f.failed_loads.saturating_add(1);
+                f.source.discard_until_snapshot(SnapshotRequestReason::LoadFailed);
             }
-            self.replay_stalled = true;
             return
+        }
+        if let Some(f) = self.follower.as_mut() {
+            f.failed_loads = 0;
         }
         // Save states do not carry the buttons held; restore what the publisher had pressed.
         self.core.set_input_encoded(metadata.input.as_slice());

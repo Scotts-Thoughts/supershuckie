@@ -46,6 +46,10 @@ const MAX_ROM_BYTES: u64 = 64 << 20;
 /// Longest a snapshot request stays "in flight" for the status before it counts as unanswered.
 const SNAPSHOT_REQUEST_GRACE: Duration = Duration::from_secs(10);
 
+/// A follower with no picture yet asks again this often: the first request (or its answer) can
+/// be lost, and nothing else would ever ask, leaving their window blank for good.
+const FIRST_SNAPSHOT_RETRY: Duration = Duration::from_secs(3);
+
 /// A follower idles between frames whenever it has caught up; only a lull this long counts as
 /// "waiting" for the status (the other player paused, or the network is behind).
 const WAITING_AFTER: Duration = Duration::from_millis(400);
@@ -137,6 +141,8 @@ pub struct PeerInstance {
     snapshot_requested_at: Option<Instant>,
     /// When their game last advanced here.
     last_advance: Instant,
+    /// When their follower core was started (for how long it has gone without a picture).
+    started_at: Option<Instant>,
     /// Whether the window for this peer should be shown (the UI's hint; not persisted).
     pub window_hidden: bool,
     /// The UDP port their game is served to Poke-A-Byte on, while it is.
@@ -164,6 +170,8 @@ pub struct PlayTogetherSession {
     pending_reset: Option<(u32, Instant)>,
     /// Sync pause as the session has it: the host's setting (a client learns it from the host).
     sync_pause: bool,
+    /// Whether only the host may pause (meaningful while `sync_pause`): the host's setting.
+    host_only_pause: bool,
     /// The pause state the session last agreed on, while sync pause is on. The local game
     /// pausing or unpausing away from it is what gets published; adopting a remote pause moves
     /// it, so nothing echoes.
@@ -393,7 +401,9 @@ pub struct PeerView {
     /// Who they are linked with by cable (`null` when nobody).
     pub linked_with: Option<PeerId>,
     /// Whether a link cable could be plugged into their game right now.
-    pub can_link: bool
+    pub can_link: bool,
+    /// Seconds their game has been followed here without a picture yet (0 once one came).
+    pub no_picture_secs: u64
 }
 
 /// The session, for the UI.
@@ -416,6 +426,12 @@ pub struct PlayTogetherStateView {
     /// Whether one player's pause pauses everyone: the host's setting while in a session, the
     /// local setting (for hosting) otherwise.
     pub sync_pause: bool,
+    /// Whether only the host can pause (with `sync_pause`): the host's setting while in a
+    /// session, the local setting (for hosting) otherwise.
+    pub host_only_pause: bool,
+    /// Whether the local player's pause controls do nothing right now (a client while the host
+    /// has host-only pause on).
+    pub pause_locked: bool,
     /// Who paused everyone, while sync pause holds the game paused: a player's name, `"you"`,
     /// or empty.
     pub paused_by: String,
@@ -529,6 +545,8 @@ impl SuperShuckieFrontend {
                 save_peer_replays: self.settings.play_together.save_peer_replays,
                 recording_peers: false,
                 sync_pause: self.settings.play_together.sync_pause,
+                host_only_pause: self.settings.play_together.host_only_pause,
+                pause_locked: false,
                 paused_by: String::new(),
                 start_state: false,
                 link: LinkView::none(String::new()),
@@ -550,6 +568,8 @@ impl SuperShuckieFrontend {
             save_peer_replays: self.settings.play_together.save_peer_replays,
             recording_peers: s.peers.iter().any(|p| p.replay.is_some() && p.core.is_some()),
             sync_pause: s.sync_pause,
+            host_only_pause: s.host_only_pause,
+            pause_locked: self.play_together_pause_is_the_hosts(),
             paused_by: match s.paused_by {
                 Some(id) if s.sync_pause && s.synced_paused => if id == s.local_peer_id { String::from("you") } else { s.name_of(id) },
                 _ => String::new()
@@ -583,7 +603,11 @@ impl SuperShuckieFrontend {
                 window_hidden: p.window_hidden,
                 pokeabyte_port: p.pokeabyte_port,
                 linked_with: p.linked_with,
-                can_link
+                can_link,
+                no_picture_secs: match p.started_at {
+                    Some(at) if p.core.is_some() && p.last_follow.snapshots_applied == 0 => at.elapsed().as_secs(),
+                    _ => 0
+                }
             }}).collect(),
             errors: s.errors.clone()
         }
@@ -656,6 +680,7 @@ impl SuperShuckieFrontend {
             pending_requesters: Arc::new(Mutex::new(Vec::new())),
             pending_reset: None,
             sync_pause: false,
+            host_only_pause: false,
             synced_paused: false,
             paused_by: None,
             local_metadata,
@@ -813,10 +838,38 @@ impl SuperShuckieFrontend {
         Ok(())
     }
 
+    /// Whether only the host can pause (with sync pause on): the host's setting while in a
+    /// session, the local setting (used when hosting) otherwise.
+    pub fn get_play_together_host_only_pause(&self) -> bool {
+        match self.play_together.as_ref() {
+            Some(s) if s.role != PlayTogetherRole::Connecting => s.host_only_pause,
+            _ => self.settings.play_together.host_only_pause
+        }
+    }
+
+    /// Set whether only the host can pause (it takes effect with sync pause on). In a session
+    /// only the host can: the setting is told to every client.
+    pub fn set_play_together_host_only_pause(&mut self, enabled: bool) -> Result<(), UTF8CString> {
+        if self.play_together.as_ref().is_some_and(|s| s.role != PlayTogetherRole::Host) {
+            return Err("Only the host can change who may pause; it applies to everyone in the session.".into())
+        }
+        self.settings.play_together.host_only_pause = enabled;
+        self.mark_settings_dirty();
+        self.push_sync_pause_to_session();
+        Ok(())
+    }
+
+    /// Whether pausing is the host's alone right now: we are a client and the host has sync
+    /// pause on with host-only pause. The local player's pause controls do nothing then.
+    pub fn play_together_pause_is_the_hosts(&self) -> bool {
+        self.play_together.as_ref().is_some_and(|s| s.role == PlayTogetherRole::Client && s.sync_pause && s.host_only_pause)
+    }
+
     /// Host only: tell the session (and every client) the sync-pause setting, with the host's
     /// current pause state as the one everyone adopts.
     fn push_sync_pause_to_session(&mut self) {
         let enabled = self.settings.play_together.sync_pause;
+        let host_only = self.settings.play_together.host_only_pause;
         let paused = self.is_paused();
         let Some(s) = self.play_together.as_mut() else {
             return
@@ -825,10 +878,11 @@ impl SuperShuckieFrontend {
             return
         }
         s.sync_pause = enabled;
+        s.host_only_pause = host_only;
         s.synced_paused = paused;
         // Our id, not `local_peer_id`: right after binding, `Connected` has not been handled yet.
         s.paused_by = (enabled && paused).then_some(HOST_PEER_ID);
-        if let Err(e) = s.session.set_sync_pause(enabled, paused) {
+        if let Err(e) = s.session.set_sync_pause(enabled, paused, host_only) {
             s.note_error(format!("Could not set sync pause: {e}"));
         }
         s.bump();
@@ -1206,6 +1260,7 @@ impl SuperShuckieFrontend {
             video_scale: self.settings.play_together.peer_video_scale,
             snapshot_requested_at: None,
             last_advance: Instant::now(),
+            started_at: None,
             window_hidden: false,
             pokeabyte_port: None,
             feeder: None,
@@ -1297,6 +1352,7 @@ impl SuperShuckieFrontend {
                 peer.status = PeerStatus::Starting;
                 peer.status_text = note;
                 peer.snapshot_requested_at = Some(Instant::now());
+                peer.started_at = Some(Instant::now());
                 self.callbacks.peer_change_video_mode(peer_id, &infos, scale);
                 if serve_pokeabyte {
                     Self::serve_peer_to_pokeabyte(session, index, base_port, true);
@@ -1551,8 +1607,9 @@ impl SuperShuckieFrontend {
                 session.pending_reset = Some((race_id, deadline));
                 session.bump();
             }
-            SessionEvent::SyncPauseChanged { enabled, paused } => {
+            SessionEvent::SyncPauseChanged { enabled, paused, host_only } => {
                 session.sync_pause = enabled;
+                session.host_only_pause = host_only;
                 if enabled {
                     self.adopt_synced_pause(session, paused, HOST_PEER_ID);
                 }
@@ -1643,7 +1700,21 @@ impl SuperShuckieFrontend {
         // command server...) is published as a change from the state the session agreed on.
         // Read here once a tick rather than at every `set_paused`, so a pause-load-restore
         // sequence within one call is not two messages.
-        if session.sync_pause && session.role != PlayTogetherRole::Connecting {
+        //
+        // While pausing is the host's alone, a client's game is put back instead: the pause
+        // controls refuse already, this catches anything else that paused it (a replay load,
+        // starting a recording paused...).
+        if session.sync_pause && session.host_only_pause && session.role == PlayTogetherRole::Client {
+            let paused = self.is_paused();
+            if paused != session.synced_paused {
+                self.set_paused(session.synced_paused);
+                // Not while exporting, where pausing does nothing.
+                if self.is_paused() != paused {
+                    session.bump();
+                }
+            }
+        }
+        else if session.sync_pause && session.role != PlayTogetherRole::Connecting {
             let paused = self.is_paused();
             if paused != session.synced_paused {
                 session.synced_paused = paused;
@@ -1707,6 +1778,10 @@ impl SuperShuckieFrontend {
             if let Some(requests) = peer.snapshot_requests.as_ref() {
                 let mut asked = false;
                 while requests.try_recv().is_ok() {
+                    asked = true;
+                }
+                // No picture yet and the last ask went unanswered: ask again.
+                if follow.snapshots_applied == 0 && peer.snapshot_requested_at.is_none_or(|at| now.duration_since(at) >= FIRST_SNAPSHOT_RETRY) {
                     asked = true;
                 }
                 if asked {

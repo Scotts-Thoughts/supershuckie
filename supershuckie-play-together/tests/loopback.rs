@@ -206,9 +206,9 @@ fn sync_pause_is_the_hosts_setting_and_pauses_are_relayed_only_while_it_is_on() 
     let is_pause = |e: &SessionEvent| matches!(e, SessionEvent::PauseChanged { .. });
 
     // Joining tells a client the setting (off, to begin with).
-    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false });
-    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false });
-    assert!(matches!(a.set_sync_pause(true, false), Err(PlayTogetherError::NotHost)));
+    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false, host_only: false });
+    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: false, host_only: false });
+    assert!(matches!(a.set_sync_pause(true, false, false), Err(PlayTogetherError::NotHost)));
 
     // Off: a pause goes nowhere, and the host's own is not sent either.
     a.send_pause(true).unwrap();
@@ -218,9 +218,9 @@ fn sync_pause_is_the_hosts_setting_and_pauses_are_relayed_only_while_it_is_on() 
     assert_no_event(&a, &mut al, Duration::from_millis(100), "PauseChanged while off", is_pause);
 
     // On, with the host paused: everyone hears both.
-    host.set_sync_pause(true, true).unwrap();
-    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
-    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
+    host.set_sync_pause(true, true, false).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true, host_only: false });
+    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true, host_only: false });
 
     // A client's pause reaches the host and the other client, never the sender.
     a.send_pause(false).unwrap();
@@ -238,17 +238,67 @@ fn sync_pause_is_the_hosts_setting_and_pauses_are_relayed_only_while_it_is_on() 
     let mut cl = Vec::new();
     wait_connected(&c, &mut cl);
     wait_joined(&host, &mut hl);
-    assert_eq!(wait_for(&c, &mut cl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true });
+    assert_eq!(wait_for(&c, &mut cl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true, host_only: false });
 
     // Off again: everyone hears it, and pauses stop travelling.
-    host.set_sync_pause(false, true).unwrap();
+    host.set_sync_pause(false, true, false).unwrap();
     for (session, log) in [(&a as &dyn Session, &mut al), (&b, &mut bl), (&c, &mut cl)] {
-        assert_eq!(wait_for(session, log, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: true });
+        assert_eq!(wait_for(session, log, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: false, paused: true, host_only: false });
     }
     b.send_pause(false).unwrap();
     assert_no_event(&host, &mut hl, Duration::from_millis(300), "PauseChanged after turning off", is_pause);
     assert_no_event(&a, &mut al, Duration::from_millis(100), "PauseChanged after turning off", is_pause);
     assert_no_event(&c, &mut cl, Duration::from_millis(100), "PauseChanged after turning off", is_pause);
+}
+
+#[test]
+fn host_only_pause_relays_the_hosts_pauses_and_drops_the_clients() {
+    let _wd = watchdog(15, "host_only_pause_relays_the_hosts_pauses_and_drops_the_clients");
+    let host = bind_host("Host");
+    let a = connect_client(&host, "A");
+    let b = connect_client(&host, "B");
+    let (mut hl, mut al, mut bl) = (Vec::new(), Vec::new(), Vec::new());
+    let a_id = wait_connected(&a, &mut al);
+    wait_connected(&b, &mut bl);
+    wait_joined(&host, &mut hl);
+    wait_joined(&host, &mut hl);
+    let is_sync = |e: &SessionEvent| matches!(e, SessionEvent::SyncPauseChanged { .. });
+    let is_pause = |e: &SessionEvent| matches!(e, SessionEvent::PauseChanged { .. });
+    wait_for(&a, &mut al, "SyncPauseChanged", is_sync);
+    wait_for(&b, &mut bl, "SyncPauseChanged", is_sync);
+    assert!(matches!(a.set_sync_pause(true, false, true), Err(PlayTogetherError::NotHost)));
+
+    // Host-only: everyone hears it.
+    host.set_sync_pause(true, false, true).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: false, host_only: true });
+    assert_eq!(wait_for(&b, &mut bl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: false, host_only: true });
+
+    // A client's pause goes nowhere and does not change the session's state.
+    a.send_pause(true).unwrap();
+    assert_no_event(&host, &mut hl, Duration::from_millis(300), "client PauseChanged while host-only", is_pause);
+    assert_no_event(&b, &mut bl, Duration::from_millis(100), "client PauseChanged while host-only", is_pause);
+
+    // The host's pause reaches both clients.
+    host.send_pause(true).unwrap();
+    assert_eq!(wait_for(&a, &mut al, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: 1, paused: true });
+    assert_eq!(wait_for(&b, &mut bl, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: 1, paused: true });
+
+    // A client unpausing cannot undo it: a late joiner still arrives paused.
+    b.send_pause(false).unwrap();
+    let c = connect_client(&host, "C");
+    let mut cl = Vec::new();
+    wait_connected(&c, &mut cl);
+    wait_joined(&host, &mut hl);
+    assert_eq!(wait_for(&c, &mut cl, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true, host_only: true });
+    assert_no_event(&a, &mut al, Duration::from_millis(100), "client unpause while host-only", is_pause);
+
+    // Back to anyone-pauses: a client's pause travels again.
+    host.set_sync_pause(true, true, false).unwrap();
+    for (session, log) in [(&a as &dyn Session, &mut al), (&b, &mut bl), (&c, &mut cl)] {
+        assert_eq!(wait_for(session, log, "SyncPauseChanged", is_sync), SessionEvent::SyncPauseChanged { enabled: true, paused: true, host_only: false });
+    }
+    a.send_pause(false).unwrap();
+    assert_eq!(wait_for(&host, &mut hl, "PauseChanged", is_pause), SessionEvent::PauseChanged { from: a_id, paused: false });
 }
 
 #[test]

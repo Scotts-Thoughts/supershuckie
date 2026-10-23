@@ -3128,6 +3128,12 @@ void MainWindow::set_up_play_together_menu() {
     this->pt_sync_pause->setToolTip("When anyone pauses, everyone's game pauses; the host's setting applies to the whole session");
     connect(this->pt_sync_pause, SIGNAL(triggered()), this, SLOT(do_toggle_play_together_sync_pause()));
 
+    this->pt_host_only_pause = this->play_together_menu->addAction("Only the host can pause");
+    this->pt_host_only_pause->setObjectName("play-together-host-only-pause");
+    this->pt_host_only_pause->setCheckable(true);
+    this->pt_host_only_pause->setToolTip("With sync pause on, only the host can pause, and the host's pause pauses everyone; the others cannot pause");
+    connect(this->pt_host_only_pause, SIGNAL(triggered()), this, SLOT(do_toggle_play_together_host_only_pause()));
+
     this->pt_start_state = this->play_together_menu->addAction("Start from host's save state");
     this->pt_start_state->setObjectName("play-together-start-state");
     this->pt_start_state->setCheckable(true);
@@ -3221,6 +3227,13 @@ void MainWindow::refresh_play_together_actions() {
     this->pt_sync_pause->setChecked(supershuckie_frontend_play_together_get_sync_pause(this->frontend));
     this->pt_sync_pause->setEnabled(!active || host);
     this->pt_sync_pause->setText(active && !host ? "Sync pause (set by the host)" : "Sync pause");
+    this->pt_host_only_pause->setChecked(supershuckie_frontend_play_together_get_host_only_pause(this->frontend));
+    this->pt_host_only_pause->setEnabled((!active || host) && this->pt_sync_pause->isChecked());
+    this->pt_host_only_pause->setText(active && !host ? "Only the host can pause (set by the host)" : "Only the host can pause");
+    // A client under host-only pause cannot pause or unpause.
+    bool pause_locked = supershuckie_frontend_play_together_pause_is_the_hosts(this->frontend);
+    this->pause->setEnabled(!pause_locked);
+    this->pause->setText(pause_locked ? "Pause (host only)" : "Pause");
     this->pt_start_state->setChecked(supershuckie_frontend_play_together_get_start_state(this->frontend));
     this->pt_start_state->setEnabled(active && host);
     this->pt_reset_all->setText(this->pt_start_state->isChecked() ? "Restart everyone from the start state (race start)" : "Reset everyone (race start)");
@@ -3295,6 +3308,14 @@ void MainWindow::do_toggle_play_together_sync_pause() {
     char error[512] = {};
     if(!supershuckie_frontend_play_together_set_sync_pause(this->frontend, this->pt_sync_pause->isChecked(), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
         this->show_error("Sync pause", "%s", error);
+    }
+    this->refresh_play_together_actions();
+}
+
+void MainWindow::do_toggle_play_together_host_only_pause() {
+    char error[512] = {};
+    if(!supershuckie_frontend_play_together_set_host_only_pause(this->frontend, this->pt_host_only_pause->isChecked(), reinterpret_cast<uint8_t *>(error), sizeof(error))) {
+        this->show_error("Only the host can pause", "%s", error);
     }
     this->refresh_play_together_actions();
 }

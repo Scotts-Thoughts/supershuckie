@@ -399,7 +399,7 @@ Usage:
 ### play-together
 
 Get the Play Together session state as JSON: whether a session is active, this player's role and
-name, whether sync pause is on and who paused everyone, whether the host's start state is set, the
+name, whether sync pause is on (and whether only the host can pause) and who paused everyone, whether the host's start state is set, the
 link cable (`link`: its phase, the other end, the input delay, whether it is waiting), and one
 entry per other participant with their name, ROM, status, timer and counters, who they are linked
 with (`linked_with`), whether a cable could be plugged into their game (`can_link`), and
@@ -412,7 +412,7 @@ Usage:
 
 ```json
 {"active": true, "role": "host", "code": "192.168.1.7:30170", "local_name": "Scott", "local_peer_id": 1,
- "reset_countdown_ms": 0, "save_peer_replays": true, "recording_peers": false, "sync_pause": true, "paused_by": "Ash", "start_state": false,
+ "reset_countdown_ms": 0, "save_peer_replays": true, "recording_peers": false, "sync_pause": true, "host_only_pause": false, "pause_locked": false, "paused_by": "Ash", "start_state": false,
  "participants": [{"peer_id": 2, "name": "Ash", "rom_name": "Emerald", "console": "Game Boy Advance",
                    "status": "following", "status_text": "", "frames_behind": 2, "waiting": false,
                    "snapshots_applied": 1, "hash_mismatches": 0, "fps": 60.0, "elapsed_frames": 12345,
@@ -471,7 +471,8 @@ Usage:
 
 ### set-paused
 
-Set whether or not playback is paused.
+Set whether or not playback is paused. Fails while in a Play Together session whose host has
+**Only the host can pause** on (and you are not the host).
 
 Usage:
 

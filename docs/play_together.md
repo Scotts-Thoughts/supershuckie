@@ -71,6 +71,11 @@ session: it is what everyone sees in the menu, only the host can change it, and 
 makes everyone adopt the host's current pause state (a friend who joins while the session is
 paused arrives paused). Outside a session the toggle is your own setting, used when you host.
 
+With **Only the host can pause** on as well, the host's pause still pauses everyone, but nobody
+else can pause or unpause: their Pause menu item is greyed out ("Pause (host only)"), and pause
+hotkeys, screen clicks and the command server's `set-paused` do nothing. Like sync pause, this is
+the host's setting for the whole session.
+
 ## Link cable
 
 Two players in a session can plug a link cable between their games and trade or battle, in the

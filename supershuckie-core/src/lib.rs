@@ -4811,6 +4811,42 @@ pub(crate) mod tests {
         assert!(core.is_replay_waiting());
     }
 
+    /// A snapshot that will not load does not end following: what came after it is dropped,
+    /// another is asked for (reported once), and the next good one plays.
+    #[test]
+    fn follower_recovers_from_a_snapshot_that_will_not_load() {
+        let clock = FakeClock::new();
+        let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let stats = Arc::new(FollowerStats::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (feeder, source) = live_replay_channel(stats.clone(), tx);
+        core.attach_live_replay_source(source, &fake_gba_metadata(), false).expect("attach");
+
+        let mut bad = keyframe_packet(10, 0, 0);
+        if let Packet::Keyframe { state, .. } = &mut bad {
+            *state = ByteVec::from(&[1u8, 2, 3][..]);
+        }
+        feeder.push_packet(bad);
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        assert!(!core.is_replay_stalled(), "a bad snapshot must not stall the follower");
+        assert_eq!(stats.snapshots_applied.load(Ordering::Relaxed), 0);
+        assert_eq!(core.live_frames_available(), 0, "frames after the bad snapshot are dropped");
+        assert_eq!(rx.try_recv(), Ok(SnapshotRequestReason::LoadFailed));
+        assert_eq!(core.poll_follower_errors().len(), 1);
+
+        // Until the next snapshot, frames are not queued.
+        feeder.push_packet(next_frame_packet());
+        assert_eq!(core.live_frames_available(), 0);
+
+        feeder.push_packet(keyframe_packet(20, 5, 0));
+        feeder.push_packet(next_frame_packet());
+        core.run_unlocked_presenting(true);
+        assert_eq!(stats.snapshots_applied.load(Ordering::Relaxed), 1);
+        assert_eq!(core.total_frames(), 21);
+        assert!(core.poll_follower_errors().is_empty());
+    }
+
     /// A sync hash that differs asks for a snapshot once (rate-limited); one within the
     /// post-load window is ignored; one that matches is silent.
     #[test]

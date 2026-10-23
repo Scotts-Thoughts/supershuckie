@@ -137,6 +137,32 @@ pub unsafe extern "C" fn supershuckie_frontend_play_together_set_sync_pause(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_play_together_get_host_only_pause(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.get_play_together_host_only_pause()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn supershuckie_frontend_play_together_set_host_only_pause(
+    frontend: &mut SuperShuckieFrontend,
+    enabled: bool,
+    error: *mut u8,
+    error_len: usize
+) -> bool {
+    match frontend.set_play_together_host_only_pause(enabled) {
+        Ok(()) => true,
+        Err(e) => {
+            unsafe { write_error(e.as_str(), error, error_len) };
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn supershuckie_frontend_play_together_pause_is_the_hosts(frontend: &SuperShuckieFrontend) -> bool {
+    frontend.play_together_pause_is_the_hosts()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn supershuckie_frontend_play_together_get_start_state(frontend: &SuperShuckieFrontend) -> bool {
     frontend.get_play_together_start_state()
 }

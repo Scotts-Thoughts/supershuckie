@@ -308,6 +308,7 @@ private:
     QAction *pt_leave;
     QAction *pt_reset_all;
     QAction *pt_sync_pause;
+    QAction *pt_host_only_pause;
     QAction *pt_start_state;
     QAction *pt_show_windows;
     QAction *pt_save_replays;
@@ -472,6 +473,7 @@ private slots:
     void do_play_together_leave();
     void do_play_together_reset_all();
     void do_toggle_play_together_sync_pause();
+    void do_toggle_play_together_host_only_pause();
     void do_toggle_play_together_start_state();
     void do_play_together_show_windows();
     void do_play_together_unlink();

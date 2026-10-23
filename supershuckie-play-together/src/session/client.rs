@@ -337,7 +337,7 @@ impl ClientShared {
             Message::ResetAll { race_id, countdown_millis } => {
                 self.events.push(SessionEvent::ResetAll { race_id, deadline: Instant::now() + Duration::from_millis(u64::from(countdown_millis)) });
             }
-            Message::SyncPause { enabled, paused } => self.events.push(SessionEvent::SyncPauseChanged { enabled, paused }),
+            Message::SyncPause { enabled, paused, host_only } => self.events.push(SessionEvent::SyncPauseChanged { enabled, paused, host_only }),
             Message::LinkSpeed { speed } => self.events.push(SessionEvent::LinkSpeedChanged { speed }),
             Message::StartState(wire) => match wire.into_state() {
                 Ok(state) => self.events.push(SessionEvent::StartStateChanged { state }),
@@ -574,7 +574,7 @@ impl Session for ClientSession {
         Err(PlayTogetherError::NotHost)
     }
 
-    fn set_sync_pause(&self, _enabled: bool, _paused: bool) -> Result<(), PlayTogetherError> {
+    fn set_sync_pause(&self, _enabled: bool, _paused: bool, _host_only: bool) -> Result<(), PlayTogetherError> {
         Err(PlayTogetherError::NotHost)
     }
 

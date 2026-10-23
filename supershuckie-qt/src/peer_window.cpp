@@ -8,7 +8,11 @@
 #include <QContextMenuEvent>
 #include <QJsonObject>
 #include <QLabel>
+#include <QIcon>
 #include <QMenu>
+#include <QMoveEvent>
+#include <QPainter>
+#include <QPixmap>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <cmath>
@@ -35,44 +39,22 @@ PeerWindow::PeerWindow(PlayTogetherController *controller, std::uint16_t peer_id
     controller(controller),
     id(peer_id)
 {
-    this->name = participant["name"].toString();
-    this->rom_name = participant["rom_name"].toString();
-    this->player_color = QColor(participant["color_rgb"].toString());
-    this->setWindowTitle(QString("%1 — %2 — Play Together").arg(this->name, this->rom_name));
-
-    auto *layout = new QVBoxLayout(this);
-    layout->setSpacing(0);
-    // The player's colour frames the screen and fills the status strip, so whose window this is
-    // can be told from across the room.
-    if(this->player_color.isValid()) {
-        layout->setContentsMargins(4, 4, 4, 4);
-        QPalette frame = this->palette();
-        frame.setColor(QPalette::Window, this->player_color);
-        this->setPalette(frame);
-        this->setAutoFillBackground(true);
-    }
-    else {
-        layout->setContentsMargins(0, 0, 0, 0);
-    }
+    this->frame_layout = new QVBoxLayout(this);
+    this->frame_layout->setSpacing(0);
+    this->frame_layout->setContentsMargins(0, 0, 0, 0);
+    auto *layout = this->frame_layout;
 
     this->screen = new ScreenCanvas(this);
     this->screen->setFocusPolicy(Qt::NoFocus);
     layout->addWidget(this->screen, 0, Qt::AlignHCenter);
 
-    auto *strip = new QWidget(this);
+    this->strip = new QWidget(this);
+    auto *strip = this->strip;
     auto *strip_layout = new QHBoxLayout(strip);
     strip_layout->setContentsMargins(6, 2, 6, 2);
     strip_layout->setSpacing(10);
-    if(this->player_color.isValid()) {
-        QPalette tinted = strip->palette();
-        tinted.setColor(QPalette::Window, this->player_color);
-        tinted.setColor(QPalette::WindowText, contrasting_text(this->player_color));
-        strip->setPalette(tinted);
-        strip->setAutoFillBackground(true);
-    }
 
     this->name_label = new QLabel(strip);
-    this->name_label->setText(QString("<b>%1</b> · %2").arg(this->name.toHtmlEscaped(), this->rom_name.toHtmlEscaped()));
     strip_layout->addWidget(this->name_label);
 
     this->sync_label = new QLabel(strip);
@@ -90,6 +72,78 @@ PeerWindow::PeerWindow(PlayTogetherController *controller, std::uint16_t peer_id
     layout->setSizeConstraint(QLayout::SetFixedSize);
 
     this->update(participant, QJsonObject());
+}
+
+void PeerWindow::apply_identity(const QJsonObject &participant) {
+    // The window can be made before the player's details are readable (the first video mode
+    // arrives while the session is mid-update), so they are taken from every refresh.
+    if(participant.isEmpty()) {
+        return;
+    }
+    QString name = participant["name"].toString();
+    QString rom_name = participant["rom_name"].toString();
+    QColor color(participant["color_rgb"].toString());
+    QString color_name = participant["color_name"].toString();
+    if(this->identity_applied && name == this->name && rom_name == this->rom_name && color == this->player_color && color_name == this->color_name) {
+        return;
+    }
+    bool name_changed = name != this->name;
+    this->name = name;
+    this->rom_name = rom_name;
+    this->player_color = color;
+    this->color_name = color_name;
+    this->identity_applied = true;
+
+    QString who = this->name.isEmpty() ? QString("Friend") : this->name;
+    if(!this->color_name.isEmpty()) {
+        who += QString(" (%1)").arg(this->color_name);
+    }
+    this->setWindowTitle(this->rom_name.isEmpty()
+        ? QString("%1 — Play Together").arg(who)
+        : QString("%1 — %2 — Play Together").arg(who, this->rom_name));
+
+    // The player's colour frames the screen, fills the status strip and is the window's icon (title
+    // bar and taskbar), so whose window this is can be told from across the room.
+    if(this->player_color.isValid()) {
+        this->frame_layout->setContentsMargins(4, 4, 4, 4);
+        QPalette frame = this->palette();
+        frame.setColor(QPalette::Window, this->player_color);
+        this->setPalette(frame);
+        this->setAutoFillBackground(true);
+
+        QPalette tinted = this->strip->palette();
+        tinted.setColor(QPalette::Window, this->player_color);
+        tinted.setColor(QPalette::WindowText, contrasting_text(this->player_color));
+        this->strip->setPalette(tinted);
+        this->strip->setAutoFillBackground(true);
+
+        QPixmap swatch(32, 32);
+        swatch.fill(Qt::transparent);
+        QPainter painter(&swatch);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(contrasting_text(this->player_color), 2));
+        painter.setBrush(this->player_color);
+        painter.drawEllipse(QRectF(2, 2, 28, 28));
+        painter.end();
+        this->setWindowIcon(QIcon(swatch));
+    }
+    else {
+        this->frame_layout->setContentsMargins(0, 0, 0, 0);
+        this->setAutoFillBackground(false);
+        this->strip->setAutoFillBackground(false);
+    }
+
+    QString label = QString("<b>%1</b>").arg(who.toHtmlEscaped());
+    if(!this->rom_name.isEmpty()) {
+        label += QString(" · %1").arg(this->rom_name.toHtmlEscaped());
+    }
+    this->name_label->setText(label);
+
+    // Windows are remembered by player name: once it is known, go where this player's window was
+    // last left (unless the user has already moved this one).
+    if(name_changed && !this->name.isEmpty() && this->laid_out && !this->moved_by_user) {
+        this->restore_geometry();
+    }
 }
 
 PeerWindow::~PeerWindow() {
@@ -117,6 +171,7 @@ void PeerWindow::set_layout(unsigned screen_count, const SuperShuckieScreenData 
 }
 
 void PeerWindow::update(const QJsonObject &participant, const QJsonObject &link) {
+    this->apply_identity(participant);
     QString status = participant["status"].toString();
     QString status_text = participant["status_text"].toString();
     auto behind = static_cast<std::uint64_t>(participant["frames_behind"].toDouble());
@@ -158,6 +213,12 @@ void PeerWindow::update(const QJsonObject &participant, const QJsonObject &link)
     }
     else if(status == "starting") {
         sync = QString("Waiting for %1's game…").arg(this->name);
+        auto no_picture = static_cast<int>(participant["no_picture_secs"].toDouble());
+        if(no_picture >= 10) {
+            sync += QString(" still asking (%1 s)").arg(no_picture);
+            status_text = QString("%1's game has not arrived yet; it is asked for again every few seconds. If this lasts, %1 should check their own window for a Play Together error.%2")
+                .arg(this->name, status_text.isEmpty() ? QString() : QString("\n") + status_text);
+        }
     }
     else if(status == "waiting") {
         sync = QString("Waiting for %1…").arg(this->name);
@@ -242,7 +303,7 @@ bool PeerWindow::audio_on() const noexcept {
 
 void PeerWindow::save_geometry() {
     auto *frontend = this->controller->main_window()->frontend;
-    if(frontend == nullptr || !this->laid_out) {
+    if(frontend == nullptr || !this->laid_out || this->name.isEmpty()) {
         return;
     }
     auto geometry = this->geometry();
@@ -256,15 +317,27 @@ void PeerWindow::restore_geometry() {
     if(frontend == nullptr) {
         return;
     }
-    const char *xy = supershuckie_frontend_get_custom_setting(frontend, this->settings_key().toUtf8().constData());
+    const char *xy = this->name.isEmpty() ? nullptr : supershuckie_frontend_get_custom_setting(frontend, this->settings_key().toUtf8().constData());
     int x, y;
     if(xy != nullptr && std::sscanf(xy, "%d|%d", &x, &y) == 2) {
         // A remembered spot, unless another player's window already sits there.
         QPoint wanted(x, y);
-        this->move(this->controller->place_window(this, &wanted));
+        this->placed_at = this->controller->place_window(this, &wanted);
     }
     else {
-        this->move(this->controller->place_window(this));
+        this->placed_at = this->controller->place_window(this);
+    }
+    this->move(this->placed_at);
+}
+
+void PeerWindow::moveEvent(QMoveEvent *event) {
+    QWidget::moveEvent(event);
+    // Anywhere but where restore_geometry() put it is the user's doing: remember it at once, so
+    // it survives the program not closing cleanly.
+    if(this->isVisible() && this->pos() != this->placed_at) {
+        this->moved_by_user = true;
+        this->placed_at = this->pos();
+        this->save_geometry();
     }
 }
 
