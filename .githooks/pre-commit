@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Bumps the patch version on every commit (scripts/bump-version.sh) and adds the bump to the commit.
+# Enable once per clone with:   git config core.hooksPath .githooks
+# Skip for one commit with:     SHUCKIE_NO_BUMP=1 git commit ...
+set -euo pipefail
+
+[[ -n "${SHUCKIE_NO_BUMP:-}" ]] && exit 0
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+version_of() {
+    awk '/^\[/ { in_package = ($0 ~ /^\[workspace\.package\]/) }
+         in_package && /^version = "/ { split($0, part, "\""); print part[2]; exit }' | tr -d '\r'
+}
+
+# A version set by hand in this commit wins; don't bump on top of it.
+if git rev-parse --verify -q HEAD > /dev/null; then
+    staged="$(git show :Cargo.toml | version_of)"
+    committed="$(git show HEAD:Cargo.toml | version_of)"
+    [[ "$staged" != "$committed" ]] && exit 0
+fi
+
+# Staging the bump stages the whole file, so refuse rather than sweep in unrelated edits.
+for file in Cargo.toml Cargo.lock; do
+    if ! git diff --quiet --ignore-cr-at-eol -- "$file"; then
+        echo "pre-commit: $file has unstaged changes; stage them or commit with SHUCKIE_NO_BUMP=1" >&2
+        exit 1
+    fi
+done
+
+new="$(scripts/bump-version.sh)"
+git add Cargo.toml Cargo.lock
+echo "pre-commit: version bumped to $new"

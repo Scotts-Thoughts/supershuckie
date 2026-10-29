@@ -13,6 +13,10 @@ For Windows builds, refer to the [Releases] page.
 
 [Releases]: https://github.com/SnowyMouse/supershuckie/releases
 
+On Windows the **Updates** menu checks for new releases on start (this can be silenced), updates
+in place, and switches back to any earlier version; see [docs/updates.md](docs/updates.md), which
+also says how a release is published.
+
 We do not currently provide pre-built binaries for Linux or macOS. Refer to the
 build instructions if you are using either of these systems.
 

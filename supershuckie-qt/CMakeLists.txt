@@ -51,6 +51,19 @@ add_library(supershuckie-cpp-static STATIC
 
 set_property(TARGET supershuckie-cpp-static PROPERTY CXX_STANDARD 20)
 
+# The version shown in the title bar comes from [workspace.package] in the root Cargo.toml, the one
+# place it is set (scripts/bump-version.sh bumps it). Re-run configure whenever that file changes.
+set(SUPERSHUCKIE_CARGO_TOML "${CMAKE_SOURCE_DIR}/../Cargo.toml")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SUPERSHUCKIE_CARGO_TOML}")
+file(READ "${SUPERSHUCKIE_CARGO_TOML}" SUPERSHUCKIE_CARGO_TOML_TEXT)
+string(REGEX MATCH "\\[workspace\\.package\\][^[]*\nversion = \"([^\"]+)\"" _ "${SUPERSHUCKIE_CARGO_TOML_TEXT}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR "Could not find the [workspace.package] version in ${SUPERSHUCKIE_CARGO_TOML}")
+endif()
+set(SUPERSHUCKIE_VERSION "${CMAKE_MATCH_1}")
+message(STATUS "Super Shuckie version ${SUPERSHUCKIE_VERSION}")
+target_compile_definitions(supershuckie-cpp-static PRIVATE SUPERSHUCKIE_VERSION="${SUPERSHUCKIE_VERSION}")
+
 target_include_directories(supershuckie-cpp-static
     PRIVATE "${CMAKE_SOURCE_DIR}/../supershuckie-frontend-c/include"
 )
@@ -75,7 +88,10 @@ if(SUPERSHUCKIE_STATIC)
     # libraries, which -static cannot override. Repoint each imported target at the matching
     # static archive so nothing is pulled from a DLL. Their own transitive deps are supplied
     # by the --start-group block on the final executable below.
-    set(_SS_LIB "C:/msys64/ucrt64/lib")
+    # The MSYS2 environment's lib/ (C:/msys64/ucrt64/bin/g++.exe -> C:/msys64/ucrt64/lib), so
+    # the build also works where MSYS2 is installed elsewhere (the release workflow's runner).
+    get_filename_component(_SS_LIB "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_SS_LIB "${_SS_LIB}/../lib" ABSOLUTE)
     macro(_ss_repoint tgt archive)
         if(TARGET ${tgt})
             set_target_properties(${tgt} PROPERTIES
@@ -146,6 +162,17 @@ endif()
 if(${WIN32})
     # dwmapi: window frame theming. shlwapi: mGBA's vfs/config use PathIsRelativeW/PathRemoveFileSpecW.
     target_link_libraries(supershuckie-cpp-static PUBLIC dwmapi shlwapi)
+
+    # The Updates menu (docs/updates.md): GitHub releases of this repository, fetched with WinHTTP.
+    # The release workflow sets SUPERSHUCKIE_RELEASE_BUILD; any other build is "your own build".
+    set(SUPERSHUCKIE_UPDATE_REPO "Scotts-Thoughts/supershuckie" CACHE STRING "GitHub owner/repository whose releases the Updates menu offers")
+    option(SUPERSHUCKIE_RELEASE_BUILD "This exe is the one published by the release workflow" OFF)
+    target_sources(supershuckie-cpp-static PRIVATE src/update_controller.cpp src/update_http.cpp)
+    target_compile_definitions(supershuckie-cpp-static PRIVATE SUPERSHUCKIE_UPDATE_REPO="${SUPERSHUCKIE_UPDATE_REPO}")
+    if(SUPERSHUCKIE_RELEASE_BUILD)
+        target_compile_definitions(supershuckie-cpp-static PRIVATE SUPERSHUCKIE_RELEASE_BUILD)
+    endif()
+    target_link_libraries(supershuckie-cpp-static PUBLIC winhttp)
 endif()
 
 if(SUPERSHUCKIE_STATIC)

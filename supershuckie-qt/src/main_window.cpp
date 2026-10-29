@@ -1,5 +1,7 @@
-// FIXME: we need this to be somewhere else
-#define SUPERSHUCKIE_VERSION "0.5.0"
+// Set by CMakeLists.txt from the [workspace.package] version in the root Cargo.toml.
+#ifndef SUPERSHUCKIE_VERSION
+#error "SUPERSHUCKIE_VERSION is not defined; build through supershuckie-qt/CMakeLists.txt"
+#endif
 
 #include <cstdio>
 #include <cstdint>
@@ -46,6 +48,9 @@
 #include "landing_widget.hpp"
 #include "play_together_controller.hpp"
 #include "replay_compare_controller.hpp"
+#ifdef _WIN32
+#include "update_controller.hpp"
+#endif
 
 #include <QProgressDialog>
 #include <QToolButton>
@@ -339,6 +344,10 @@ MainWindow::MainWindow(): QMainWindow() {
 
     this->play_together = new PlayTogetherController(this);
     this->replay_compare = new ReplayCompareController(this);
+#ifdef _WIN32
+    this->updates = new UpdateController(this);
+    this->updates->check_on_launch();
+#endif
     this->pt_save_replays->setChecked(supershuckie_frontend_play_together_get_save_peer_replays(this->frontend));
     this->refresh_play_together_actions();
 

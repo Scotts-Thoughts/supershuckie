@@ -44,6 +44,7 @@ class PeerWindow;
 class PlayTogetherDialog;
 class ReplayCompareController;
 class CompareWindow;
+class UpdateController;
 
 std::vector<std::string> wrap_array_std(SuperShuckieStringArrayRaw *array);
 
@@ -78,6 +79,7 @@ class MainWindow: public QMainWindow {
     friend PlayTogetherDialog;
     friend ReplayCompareController;
     friend CompareWindow;
+    friend UpdateController;
     
 public:
     MainWindow();
@@ -303,6 +305,9 @@ private:
 
     // Replays compared with the loaded one; see replay_compare_controller.hpp.
     ReplayCompareController *replay_compare = nullptr;
+
+    // The Updates menu (Windows only); see update_controller.hpp.
+    UpdateController *updates = nullptr;
     QMenu *play_together_menu;
     QAction *pt_open;
     QAction *pt_leave;

@@ -1,1 +1,5 @@
 *.replay binary
+
+# Shell scripts and git hooks run under bash, which rejects CRLF.
+*.sh text eol=lf
+.githooks/* text eol=lf

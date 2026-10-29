@@ -22,6 +22,9 @@
 
 #include "main_window.hpp"
 #include "theme.hpp"
+#ifdef _WIN32
+#include "update_controller.hpp"
+#endif
 
 int main(int argc, char **argv) {
 #ifdef _WIN32
@@ -68,6 +71,11 @@ int main(int argc, char **argv) {
         result = app.exec();
     }
     SDL_Quit();
+
+#ifdef _WIN32
+    // A version switch chosen in the Updates menu happens now that nothing is running.
+    SuperShuckie64::UpdateController::finish_pending_install();
+#endif
 
     return result;
 }

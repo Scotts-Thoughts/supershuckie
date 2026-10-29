@@ -1,0 +1,136 @@
+# Builds and publishes a release when a version is pushed (docs/updates.md):
+#   - a tag named like v0.5.2, or
+#   - a commit whose message starts with the version, like "v0.5.2 - fixes for play together"
+#     (the newest commit of the push), or
+#   - "Run workflow" on the Actions tab with a version.
+# The GitHub release (tag v<version>) carries supershuckie.exe (stripped), which the app's Updates
+# menu downloads, supershuckie-<version>-win64.zip with the license texts for people, and
+# supershuckie-<version>-symbols.zip with the exe's symbols for debugging.
+name: Release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, like 0.5.2 (tagged v0.5.2 on the chosen branch's newest commit)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          MESSAGE: ${{ github.event.head_commit.message }}
+          INPUT: ${{ github.event.inputs.version }}
+        run: |
+          pattern='^[vV]?([0-9]+\.[0-9]+\.[0-9]+)([^0-9.]|$)'
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            candidate="$INPUT"
+          elif [[ "$REF_TYPE" == tag ]]; then
+            candidate="$REF_NAME"
+          else
+            candidate="$(printf '%s\n' "$MESSAGE" | head -n 1)"
+          fi
+          version=""
+          if [[ "$candidate" =~ $pattern ]]; then
+            version="${BASH_REMATCH[1]}"
+          fi
+          if [[ -z "$version" ]]; then
+            echo "No version to release in '$candidate'."
+          elif gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release v$version already exists; nothing to do."
+            version=""
+          else
+            echo "Releasing $version."
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.version != ''
+    runs-on: windows-2025
+    timeout-minutes: 300
+    # A tag and a commit naming the same version in one push start two runs; build it once.
+    concurrency:
+      group: release-v${{ needs.decide.outputs.version }}
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.decide.outputs.version }}
+    steps:
+      # The patches are LF and are applied with git apply; keep the checkout as committed.
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-make
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-libwebp
+            mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-rust
+            mingw-w64-ucrt-x86_64-python
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $msys = Join-Path "${{ steps.msys2.outputs.msys2-location }}" "ucrt64"
+          ./scripts/ci-build-release.ps1 -Version $env:VERSION -Msys $msys -Repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$GITHUB_SHA^" 2> /dev/null || true)"
+          {
+            # The commit message after its first line, then every commit since the last release.
+            git log -1 --format=%b "$GITHUB_SHA" | sed '/^Co-Authored-By:/d'
+            echo
+            if [[ -n "$previous" ]]; then
+              echo "## Changes since $previous"
+              git log --no-merges --format='- %s' "$previous..$GITHUB_SHA"
+            else
+              echo "Built from $GITHUB_SHA."
+            fi
+          } > notes.md
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Super Shuckie $VERSION" --notes-file notes.md \
+            dist-release/supershuckie.exe "dist-release/supershuckie-$VERSION-win64.zip" \
+            "dist-release/supershuckie-$VERSION-symbols.zip"
