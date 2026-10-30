@@ -107,6 +107,10 @@ if(SUPERSHUCKIE_STATIC)
     _ss_repoint(TIFF::TIFF libtiff.a)
     _ss_repoint(Libb2::Libb2 libb2.a)
     _ss_repoint(PCRE2::16BIT libpcre2-16.a)
+    # Qt 6.12 calls into OpenSSL's libcrypto even with the tls plugins left out (below), so
+    # link it in rather than import libcrypto-3-x64.dll. Qt's FindWrapOpenSSL adds ws2_32/crypt32.
+    _ss_repoint(OpenSSL::Crypto libcrypto.a)
+    _ss_repoint(OpenSSL::SSL libssl.a)
     if(TARGET WrapWebP::WrapWebP)
         set_target_properties(WrapWebP::WrapWebP PROPERTIES INTERFACE_LINK_LIBRARIES
             "${_SS_LIB}/libwebp.a;${_SS_LIB}/libwebpdemux.a;${_SS_LIB}/libwebpmux.a;${_SS_LIB}/libsharpyuv.a")
@@ -184,7 +188,7 @@ if(SUPERSHUCKIE_STATIC)
     # LINK_GROUP/RESCAN emits a --start-group/--end-group (surviving CMake de-duplication) so the
     # linker resolves the libs in any order. With -static, each plain name resolves to libNAME.a.
     target_link_libraries(supershuckie-cpp-static PUBLIC
-        "$<LINK_GROUP:RESCAN,freetype,harfbuzz,png16,z,jpeg,tiff,webp,webpdemux,webpmux,sharpyuv,b2,pcre2-16,pcre2-8,glib-2.0,graphite2,brotlidec,brotlicommon,bz2,intl,iconv,lzma,deflate,jbig,Lerc,zstd,rpcrt4,usp10>"
+        "$<LINK_GROUP:RESCAN,freetype,harfbuzz,png16,z,jpeg,tiff,webp,webpdemux,webpmux,sharpyuv,b2,pcre2-16,pcre2-8,glib-2.0,graphite2,brotlidec,brotlicommon,bz2,intl,iconv,lzma,deflate,jbig,Lerc,zstd,rpcrt4,usp10,bcrypt>"
     )
 endif()
 

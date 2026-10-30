@@ -100,7 +100,7 @@ $systemDllPrefixes = @(
     "NETAPI32", "ntdll", "ole32", "OLEAUT32", "RPCRT4", "SETUPAPI", "SHCORE",
     "SHELL32", "SHLWAPI", "USER32", "USERENV", "UxTheme", "VERSION", "WINMM",
     "WS2_32", "WTSAPI32", "bcryptprimitives", "bcrypt", "CRYPT32", "OPENGL32",
-    "WINHTTP", "IPHLPAPI", "PSAPI", "WINSPOOL", "mscms", "Secur32", "DNSAPI"
+    "WINHTTP", "IPHLPAPI", "PSAPI", "WINSPOOL", "mscms", "Secur32", "DNSAPI", "ncrypt"
 )
 $dllNames = & objdump -p $exe | Select-String "DLL Name:\s+(\S+)" |
     ForEach-Object { $_.Matches[0].Groups[1].Value } | Select-Object -Unique

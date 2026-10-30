@@ -55,6 +55,7 @@ MSYS2_PACKAGES = [
     ("gettext-runtime", "gettext-runtime", "LGPL-2.1-or-later (libintl)", "gettext runtime / libintl (used by GLib)"),
     ("libiconv", "libiconv", "LGPL-2.1-or-later", "GNU libiconv (used by GLib)"),
     ("brotli", "brotli", "MIT", "Brotli (used by FreeType)"),
+    ("openssl", "openssl", "Apache-2.0", "OpenSSL libcrypto (used by Qt)"),
     ("bzip2", "bzip2", "bzip2-1.0.6", "bzip2 (used by FreeType)"),
     ("gcc-libs", "gcc-libs", "GPL-3.0-or-later WITH GCC-exception-3.1", "GCC runtime libraries: libgcc, libstdc++ (statically linked)"),
     ("crt", "crt", "ZPL-2.1 AND public domain AND BSD AND LGPL (see COPYING.MinGW-w64-runtime.txt)", "mingw-w64 C runtime"),
