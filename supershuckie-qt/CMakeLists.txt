@@ -273,8 +273,11 @@ endif()
 if(SUPERSHUCKIE_STATIC)
     # A static Qt has no plugin DLLs to load at runtime, so the platform integration
     # plugin must be linked in and registered via Q_IMPORT_PLUGIN (qt6_import_plugins).
+    # No TLS backends: Qt 6.12's Gui links Qt Network, whose default plugins would bring the
+    # OpenSSL backend and with it an import of libcrypto-3-x64.dll. Nothing here uses Qt's
+    # networking (updates go through WinHTTP).
     if(${WIN32})
-        qt6_import_plugins(supershuckie INCLUDE Qt6::QWindowsIntegrationPlugin)
+        qt6_import_plugins(supershuckie INCLUDE Qt6::QWindowsIntegrationPlugin EXCLUDE_BY_TYPE tls)
     endif()
     # Statically link libgcc/libstdc++/winpthread so no MinGW runtime DLLs are needed.
     # --allow-multiple-definition: mgba bundles its own crc32, which also lives in zlib
