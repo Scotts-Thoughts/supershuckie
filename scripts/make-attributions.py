@@ -61,6 +61,16 @@ MSYS2_PACKAGES = [
     ("libwinpthread", "libwinpthread", "MIT AND BSD-3-Clause", "winpthreads (statically linked)"),
 ]
 
+# Packages MSYS2 has since split, used when the combined package's license directory is not
+# installed: GCC 16.2 replaced gcc-libs with libgcc + libstdc++ (+ cc-libs, which has no code
+# linked statically into the executable).
+MSYS2_SPLIT_PACKAGES = {
+    "gcc-libs": [
+        ("libgcc", "libgcc", "GPL-3.0-or-later WITH GCC-exception-3.1", "GCC runtime library libgcc (statically linked)"),
+        ("libstdc++", "libstdc++", "GPL-3.0-or-later WITH GCC-exception-3.1", "GNU C++ library libstdc++ (statically linked)"),
+    ],
+}
+
 # Bundled third-party files inside the melonDS submodule that must ship, as
 # (path relative to the submodule, name in the output directory).
 MELONDS_LICENSE_FILES = [
@@ -473,8 +483,15 @@ in third-party/.
     index.append(("Qt 6", qt_version, "LGPL-3.0-only (+ bundled third-party)", "qt/"))
 
     # Everything else from pacman.
+    packages = []
+    for package in MSYS2_PACKAGES:
+        short, subdir = package[0], package[1]
+        if not (share_licenses / subdir).is_dir() and short in MSYS2_SPLIT_PACKAGES:
+            packages.extend(MSYS2_SPLIT_PACKAGES[short])
+        else:
+            packages.append(package)
     lines = []
-    for short, subdir, license_id, description in MSYS2_PACKAGES:
+    for short, subdir, license_id, description in packages:
         src = share_licenses / subdir
         pkg_dst = out / "libraries" / subdir
         copy_tree_required(src, pkg_dst)
@@ -497,7 +514,7 @@ Notes required by some of these licenses:
   * This software is based in part on the work of the Independent JPEG Group.
     (libjpeg-turbo/, IJG license)
   * libgcc and libstdc++ are GPL-3.0 with the GCC Runtime Library Exception
-    (gcc-libs/COPYING.RUNTIME). GLib, libintl, libiconv, graphite2 are LGPL;
+    (COPYING.RUNTIME in gcc-libs/, or libgcc/ and libstdc++/). GLib, libintl, libiconv, graphite2 are LGPL;
     as with Qt, relinking is possible because SuperShuckie's full source is
     available (see ../supershuckie/NOTICE.txt).
 
