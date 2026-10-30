@@ -84,6 +84,10 @@ jobs:
           msystem: UCRT64
           update: true
           cache: true
+          # qt6-static's package lists none of the libraries its static Qt links against (only
+          # vulkan-loader), so name every one: Qt's own find_package needs (Wrap*) plus each
+          # archive in supershuckie-qt/CMakeLists.txt's static LINK_GROUP. A runner has nothing
+          # pulled in by other packages the way a local MSYS2 does.
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
@@ -91,8 +95,28 @@ jobs:
             mingw-w64-ucrt-x86_64-make
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-qt6-static
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-libb2
+            mingw-w64-ucrt-x86_64-pcre2
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-zstd
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-graphite2
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-gettext-runtime
+            mingw-w64-ucrt-x86_64-libiconv
+            mingw-w64-ucrt-x86_64-brotli
+            mingw-w64-ucrt-x86_64-bzip2
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
             mingw-w64-ucrt-x86_64-libwebp
             mingw-w64-ucrt-x86_64-libtiff
+            mingw-w64-ucrt-x86_64-libdeflate
+            mingw-w64-ucrt-x86_64-jbigkit
+            mingw-w64-ucrt-x86_64-lerc
+            mingw-w64-ucrt-x86_64-xz
             mingw-w64-ucrt-x86_64-sdl3
             mingw-w64-ucrt-x86_64-rust
             mingw-w64-ucrt-x86_64-python
