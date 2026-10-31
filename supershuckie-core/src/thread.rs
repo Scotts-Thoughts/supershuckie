@@ -198,7 +198,8 @@ pub struct ElapsedTimeStats {
 /// How long emulated frames are taking on the core thread, for diagnostics.
 ///
 /// Times cover the core's own work for one frame (emulation plus compositing), not the pacing
-/// wait. A frame is "over budget" when it took longer than the period the current speed allows.
+/// wait; except on the Game Boy, which waits inside its own steps, so its times are whole frames'
+/// (about the frame period while it keeps up). A frame is "over budget" when it took longer than the period the current speed allows.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FrameTimeStats {
     /// Duration of the most recent frame, in microseconds.
@@ -357,6 +358,8 @@ impl ThreadedSuperShuckieCore {
                     playback_frozen: false,
                     coarse_seek_while_frozen: true,
                     display_clock: DisplayClock::default(),
+                    stepped_mid_frame: false,
+                    frame_started: Instant::now(),
                     present_phase_error: None,
                     pending_exact_frame: None,
                     freezes: BTreeMap::new(),
@@ -1497,6 +1500,11 @@ struct CoreLoop {
     coarse_seek_while_frozen: bool,
     /// The display's refresh cycle; see [`CoreLoop::steer_present_phase`].
     display_clock: DisplayClock,
+    /// The last `run_one` stepped into the middle of a frame (a Game Boy runs one CPU instruction
+    /// per run); the next pass of the loop can skip the per-frame housekeeping.
+    stepped_mid_frame: bool,
+    /// When the frame being run began (see `run_one`).
+    frame_started: Instant,
     /// Smoothed distance of drawn frames' arrival from the target point of the refresh cycle,
     /// in seconds; see [`CoreLoop::steer_present_phase`].
     present_phase_error: Option<f64>,
@@ -1935,6 +1943,15 @@ impl CoreLoop {
     /// The between-runs work of a loop iteration: errors, seeks, screens, Poke-A-Byte, the RAM
     /// tools' monitor and the replay's stall flag.
     fn housekeeping(&mut self) {
+        // Mid-frame on a running Game Boy (about 14,000 passes per frame): everything below is
+        // per-frame work that waits for the frame to end anyway, so only a screen still waiting
+        // for the UI is retried. Doing all of it on every pass doubled the thread's CPU time and
+        // cost frames at 4x on slower machines.
+        if core::mem::take(&mut self.stepped_mid_frame) && self.is_running() && !self.playback_frozen {
+            self.update_queued_screens();
+            return
+        }
+
         self.handle_replay_recording_errors();
         self.handle_stream_errors();
         self.handle_follower_errors();
@@ -2168,17 +2185,23 @@ impl CoreLoop {
     /// Run the core once and, if it was not yet time for a frame, wait for most of the remaining
     /// interval instead of spinning through the loop (which burned a core at any speed).
     fn run_one(&mut self) {
-        let started = Instant::now();
+        // The clock is read once per frame, not once per Game Boy CPU instruction, so a Game
+        // Boy's frame time is the whole frame's, including the waits it paces itself with.
+        if !self.core.is_mid_frame() {
+            self.frame_started = Instant::now();
+        }
+        let run_serial = self.core.run_serial();
         self.core.run();
         let ran = self.core.last_run_time();
 
         if ran.frames > 0 {
             self.emulated_frames.fetch_add(ran.frames, Ordering::Relaxed);
-            self.frame_times.write().record(started.elapsed(), self.core.core.frame_period_microseconds());
+            self.frame_times.write().record(self.frame_started.elapsed(), self.core.core.frame_period_microseconds());
             self.update_counters();
             return;
         }
 
+        self.stepped_mid_frame = self.core.is_mid_frame() && self.core.run_serial() != run_serial;
         if self.core.is_replay_stalled() || self.core.is_mid_frame() {
             // Not a pacing wait (Game Boy mid-frame stepping, or nothing to run): keep going.
             return;
