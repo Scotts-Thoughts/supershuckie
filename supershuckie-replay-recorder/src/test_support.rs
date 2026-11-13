@@ -166,7 +166,7 @@ pub fn metadata_at(frame: u64) -> KeyframeMetadata {
 /// A `RegionDeltaKeyframe` packet encoding the change from `prev` to `cur` at `frame`.
 pub fn region_delta(frame: u64, prev: &[u8], cur: &[u8]) -> Packet {
     let d = crate::region_diff(prev, cur).unwrap();
-    Packet::RegionDeltaKeyframe { metadata: metadata_at(frame), state_len: cur.len() as u64, control: bv(&d.control), data: bv(&d.data) }
+    Packet::RegionDeltaKeyframe { metadata: metadata_at(frame), state_len: cur.len() as u64, control: bv(&d.control), rom_refs: ByteVec::new(), data: bv(&d.data) }
 }
 
 /// Keyframe metadata of any keyframe-class packet (a standalone copy of

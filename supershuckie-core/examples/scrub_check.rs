@@ -115,8 +115,12 @@ fn clock(frame: u64) -> String {
 
 /// Every keyframe's geometry state, plus whether its transient bytes are the previous keyframe's
 /// (i.e. masked: the banks are a stale copy).
-fn scan(bytes: &[u8]) -> BTreeMap<u64, (GeometryState, bool)> {
+fn scan(bytes: &[u8], rom: &[u8]) -> BTreeMap<u64, (GeometryState, bool)> {
     let mut player = ReplayFilePlayer::new(bytes, false).expect("parse replay");
+    // A format-v11 recording's keyframes may copy bytes from the ROM.
+    if player.wants_rom() {
+        player.set_rom(std::sync::Arc::new(rom.to_vec()));
+    }
     player.set_keyframe_states_wanted(false);
     let mut out = BTreeMap::new();
     let mut previous_transient: Option<Vec<u8>> = None;
@@ -170,9 +174,10 @@ fn main() {
         }
     }
 
+    let rom = std::fs::read(&rom_path).expect("read rom");
     let bytes = std::fs::read(&replay_path).expect("read replay");
     let t = Instant::now();
-    let keyframes = scan(&bytes);
+    let keyframes = scan(&bytes, &rom);
     let masked = keyframes.values().filter(|(_, m)| *m).count();
     println!("{replay_path}: {} keyframes ({masked} with stale 3D banks), scanned in {:.1} s", keyframes.len(), t.elapsed().as_secs_f64());
 
@@ -202,8 +207,11 @@ fn main() {
         .collect();
     assert!(!pick.is_empty(), "no keyframe matches");
 
-    let rom = std::fs::read(&rom_path).expect("read rom");
     let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse replay");
+    // A format-v11 recording's keyframes may copy bytes from the ROM.
+    if player.wants_rom() {
+        player.set_rom(std::sync::Arc::new(rom.to_vec()));
+    }
     player.enable_threading();
     let nds = NintendoDS::new_from_rom(&rom, None, std_timestamp_provider(), false).expect("load ROM");
     let mut core = SuperShuckieCore::new(Box::new(nds), std_timestamp_provider());

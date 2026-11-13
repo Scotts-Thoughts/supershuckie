@@ -12,8 +12,8 @@ use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 use alloc::vec;
 use crate::replay_file::bookmark_section::{decode_bookmark_section, BookmarkSectionError};
-use crate::replay_file::stored_keyframe::{split_payload_v8, split_payload_v9, RomBytes};
-use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION, REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES, REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM};
+use crate::replay_file::stored_keyframe::{splice_rom_copies, split_payload_v8, split_payload_v9, RomBytes};
+use crate::replay_file::{ReplayConsoleType, ReplayFileMetadata, ReplayHeaderBytes, ReplayHeaderRaw, REPLAY_VERSION_BOOKMARK_SECTION, REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES, REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM, REPLAY_VERSION_NINTENDO_DS_ROM_REFERENCES};
 use crate::util::decompress_into_with_prefix;
 use crate::{apply_diff_in_place, apply_region_diff_in_place, BookmarkMetadata, BookmarkTable, ByteVec, KeyframeMetadata, Packet, PacketDiscriminator, PacketIO, PacketReadError, TimestampMillis, UnsignedInteger};
 use crate::util::{decompress_data, launder_reference, region_diff_touches, BlobDecoder};
@@ -133,6 +133,8 @@ struct ChainState {
     resizing: bool,
     /// 3DS files (`StoredKeyframe`): see [`StoredBuffers`].
     stored: StoredBuffers,
+    /// The data stream of a ROM-referencing region delta, rebuilt here (kept for its allocation).
+    spliced: Vec<u8>,
 }
 
 /// A `StoredKeyframe` of a 3DS file (see `ReplayFilePlayer::stored_keyframes`).
@@ -212,13 +214,25 @@ pub struct ReplayThumbnail {
 }
 
 fn is_keyframe_class(packet: &Packet) -> bool {
-    matches!(packet, Packet::Keyframe { .. } | Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. })
+    matches!(packet, Packet::Keyframe { .. } | Packet::RomKeyframe { .. } | Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. })
+}
+
+/// Whether `packet` is a keyframe that stands on its own in a chain of blob or top-level
+/// packets (a chain starts with one, and deltas after it build on it).
+fn is_full_keyframe(packet: &Packet) -> bool {
+    matches!(packet, Packet::Keyframe { .. } | Packet::RomKeyframe { .. })
+}
+
+/// The same by a packet's first byte.
+fn is_full_keyframe_discriminator(byte: Option<&u8>) -> bool {
+    byte == Some(&(PacketDiscriminator::Keyframe as u8)) || byte == Some(&(PacketDiscriminator::KeyframeRom as u8))
 }
 
 /// Keyframe metadata of any keyframe-class packet.
 fn keyframe_metadata(packet: &Packet) -> Option<&KeyframeMetadata> {
     match packet {
         Packet::Keyframe { metadata, .. }
+        | Packet::RomKeyframe { metadata, .. }
         | Packet::DeltaKeyframe { metadata, .. }
         | Packet::RegionDeltaKeyframe { metadata, .. }
         | Packet::StoredKeyframe { metadata, .. } => Some(metadata),
@@ -228,7 +242,7 @@ fn keyframe_metadata(packet: &Packet) -> Option<&KeyframeMetadata> {
 
 impl ChainState {
     fn new(resizing: bool) -> Self {
-        Self { list: None, last_applied: None, state: Vec::new(), folds: 0, resizing, stored: StoredBuffers::default() }
+        Self { list: None, last_applied: None, state: Vec::new(), folds: 0, resizing, stored: StoredBuffers::default(), spliced: Vec::new() }
     }
 
     /// The materialised state of the last folded keyframe.
@@ -262,11 +276,24 @@ impl ChainState {
     /// Fold `packet`, which sits at `position` of `list`, into the chain (a no-op for
     /// non-keyframe packets). `predecessor_held` is [`Self::holds_predecessor_of`] for that
     /// position; a delta whose predecessor is not held cannot be applied. 3DS keyframes are folded
-    /// by `ReplayFilePlayer::fold_stored` instead.
-    fn fold(&mut self, list: ListId, position: usize, packet: &Packet, predecessor_held: bool) -> Result<(), ReplayFileReadError> {
+    /// by `ReplayFilePlayer::fold_stored` instead. `rom` is the game's ROM, which a delta that
+    /// copies from it needs.
+    fn fold(&mut self, list: ListId, position: usize, packet: &Packet, predecessor_held: bool, rom: Option<&[u8]>) -> Result<(), ReplayFileReadError> {
         match packet {
             Packet::Keyframe { state, .. } => {
                 self.set_full(list, position, state.as_slice());
+            },
+
+            Packet::RomKeyframe { state_len, rom_refs, data, .. } => {
+                splice_rom_copies(rom_refs.as_slice(), data.as_slice(), rom, &mut self.spliced)
+                    .map_err(|explanation| ReplayFileReadError::BrokenPacket { explanation })?;
+                if u64::try_from(self.spliced.len()).ok() != Some(*state_len) {
+                    return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Owned(format!("ROM-referencing keyframe rebuilds to {} bytes, not its {state_len}", self.spliced.len())) });
+                }
+                self.stored.current = None;
+                core::mem::swap(&mut self.state, &mut self.spliced);
+                self.list = Some(list);
+                self.last_applied = Some(position);
             },
 
             Packet::DeltaKeyframe { diff, .. } => {
@@ -280,7 +307,7 @@ impl ChainState {
                 self.folds += 1;
             },
 
-            Packet::RegionDeltaKeyframe { state_len, control, data, .. } => {
+            Packet::RegionDeltaKeyframe { state_len, control, rom_refs, data, .. } => {
                 if !predecessor_held {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe is not preceded by a keyframe in its chain") });
                 }
@@ -294,7 +321,15 @@ impl ChainState {
                     }
                     self.state.resize(wanted, 0);
                 }
-                if !apply_region_diff_in_place(self.state.as_mut_slice(), control.as_slice(), data.as_slice()) {
+                let data = if rom_refs.is_empty() {
+                    data.as_slice()
+                }
+                else {
+                    splice_rom_copies(rom_refs.as_slice(), data.as_slice(), rom, &mut self.spliced)
+                        .map_err(|explanation| ReplayFileReadError::BrokenPacket { explanation })?;
+                    self.spliced.as_slice()
+                };
+                if !apply_region_diff_in_place(self.state.as_mut_slice(), control.as_slice(), data) {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("region delta keyframe is malformed") });
                 }
                 self.last_applied = Some(position);
@@ -400,7 +435,7 @@ impl DecodedBlob {
         }
         self.ensure_decoded(compressed, 1)?;
         let offsets = self.keyframe_offsets.as_deref().expect("just scanned");
-        if offsets.first() != Some(&0) || self.raw.first() != Some(&(PacketDiscriminator::Keyframe as u8)) {
+        if offsets.first() != Some(&0) || !is_full_keyframe_discriminator(self.raw.first()) {
             return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("first packet in a blob was not a keyframe") });
         }
         Ok(offsets)
@@ -432,7 +467,7 @@ impl DecodedBlob {
     /// decodes up to it if needed).
     fn is_full_keyframe_at(&mut self, compressed: &[u8], offset: usize) -> Result<bool, ReplayFileReadError> {
         self.ensure_decoded(compressed, offset + 1)?;
-        Ok(self.raw.get(offset) == Some(&(PacketDiscriminator::Keyframe as u8)))
+        Ok(is_full_keyframe_discriminator(self.raw.get(offset)))
     }
 
     /// Whether a keyframe-class packet lies strictly between byte offsets `a` and `b`. Requires
@@ -573,7 +608,7 @@ impl ReplayFilePlayer {
         let mut have_top_level_keyframe = false;
         for (packet_index, packet) in all_packets.iter().enumerate() {
             match packet {
-                Packet::Keyframe { .. } | Packet::StoredKeyframe { level: 0, .. } => have_top_level_keyframe = true,
+                Packet::Keyframe { .. } | Packet::RomKeyframe { .. } | Packet::StoredKeyframe { level: 0, .. } => have_top_level_keyframe = true,
                 Packet::CompressedBlob { .. } => have_top_level_keyframe = false,
                 Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. } if !have_top_level_keyframe => {
                     if allow_some_corruption {
@@ -599,7 +634,7 @@ impl ReplayFilePlayer {
                     return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("Replay starts with a compressed blob with no keyframes") })
                 }
             }
-            Packet::Keyframe { .. } | Packet::StoredKeyframe { level: 0, .. } => {},
+            Packet::Keyframe { .. } | Packet::RomKeyframe { .. } | Packet::StoredKeyframe { level: 0, .. } => {},
             _ => return Err(ReplayFileReadError::InvalidReplayFile { explanation: Cow::Borrowed("Replay does not start with a keyframe") })
         }
 
@@ -684,6 +719,7 @@ impl ReplayFilePlayer {
                     }
                 },
                 Packet::Keyframe { metadata, .. }
+                | Packet::RomKeyframe { metadata, .. }
                 | Packet::DeltaKeyframe { metadata, .. }
                 | Packet::RegionDeltaKeyframe { metadata, .. } => {
                     add_keyframe!(metadata);
@@ -798,18 +834,20 @@ impl ReplayFilePlayer {
         self.threading = true;
     }
 
-    /// Give the player the game's ROM file. Format-v9 Nintendo 3DS replays copy bytes from it
-    /// into their keyframes (see `stored_keyframe`); without it, seeking to such a keyframe
-    /// fails. The ROM must be the one the header's checksum names.
+    /// Give the player the game's ROM file. Format-v9 Nintendo 3DS replays and format-v11
+    /// Nintendo DS replays copy bytes from it into their keyframes (see `stored_keyframe`);
+    /// without it, reading such a keyframe fails. The ROM must be the one the header's checksum
+    /// names.
     pub fn set_rom(&mut self, rom: RomBytes) {
         self.rom = Some(rom);
     }
 
     /// Whether this file needs [`Self::set_rom`] to materialise its keyframes (a format-v9
-    /// Nintendo 3DS file; whether a given keyframe actually copies from the ROM is only known
-    /// once it is decoded).
+    /// Nintendo 3DS file or a format-v11 Nintendo DS file; whether a given keyframe actually
+    /// copies from the ROM is only known once it is decoded).
     pub fn wants_rom(&self) -> bool {
-        !self.stored_keyframes.is_empty() && self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES
+        (!self.stored_keyframes.is_empty() && self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES)
+            || (self.replay_file_metadata.console_type == ReplayConsoleType::NintendoDS && self.header_raw.replay_version >= REPLAY_VERSION_NINTENDO_DS_ROM_REFERENCES)
     }
 
     /// Choose whether the [`Packet::Keyframe`] returned for a delta keyframe carries a copy of
@@ -953,7 +991,7 @@ impl ReplayFilePlayer {
     pub fn keyframe_is_stored_full(&mut self, keyframe_frames_index: UnsignedInteger) -> Result<bool, ReplaySeekError> {
         let (list, target) = self.locate_keyframe(keyframe_frames_index)?;
         match list {
-            ListId::TopLevel => Ok(matches!(self.all_uncompressed_packets[target], Packet::Keyframe { .. } | Packet::StoredKeyframe { level: 0, .. })),
+            ListId::TopLevel => Ok(matches!(self.all_uncompressed_packets[target], Packet::Keyframe { .. } | Packet::RomKeyframe { .. } | Packet::StoredKeyframe { level: 0, .. })),
             ListId::Blob(top_index) => {
                 let packets = self.all_uncompressed_packets.clone();
                 let compressed = blob_compressed_data(&packets, top_index);
@@ -1055,7 +1093,7 @@ impl ReplayFilePlayer {
                 if matches!(packets[target], Packet::StoredKeyframe { .. }) {
                     return self.fast_forward_stored_chain(target);
                 }
-                let Some(restart) = packets[..=target].iter().rposition(|p| matches!(p, Packet::Keyframe { .. })) else {
+                let Some(restart) = packets[..=target].iter().rposition(is_full_keyframe) else {
                     return Err(ReplayFileReadError::BrokenPacket { explanation: Cow::Borrowed("delta keyframe with no full keyframe before it") })
                 };
 
@@ -1268,7 +1306,8 @@ impl ReplayFilePlayer {
             return Ok(());
         }
         let held = self.chain.holds_predecessor_of(list, index, |a, b| packets[a + 1..b].iter().any(is_keyframe_class));
-        self.chain.fold(list, index, packet, held)
+        let rom = self.rom.as_ref().map(|rom| (**rom).as_ref());
+        self.chain.fold(list, index, packet, held, rom)
     }
 
     /// Parse the packet at byte `offset` of the blob at `top_index`, fold it into the chain if it
@@ -1286,7 +1325,8 @@ impl ReplayFilePlayer {
             // A repeated seek to the same delta finds it already folded.
             if !self.chain.is_at(list, offset) {
                 let held = self.chain.holds_predecessor_of(list, offset, |a, b| blob.keyframe_between(a, b));
-                self.chain.fold(list, offset, &packet, held)?;
+                let rom = self.rom.as_ref().map(|rom| (**rom).as_ref());
+                self.chain.fold(list, offset, &packet, held, rom)?;
             }
         }
 
@@ -1501,9 +1541,10 @@ impl ReplayFilePlayer {
     /// delta. `owned` is the packet when it was parsed out of a blob; a top-level packet is
     /// referenced in place.
     fn hand_out(&mut self, list: ListId, position: usize, owned: Option<Packet>, packets: &Arc<Vec<Packet>>) -> Result<&Packet, ReplayFileReadError> {
+        // (Or a full keyframe that is not stored whole: it is materialised the same way.)
         let is_delta = match owned.as_ref() {
-            Some(packet) => matches!(packet, Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. }),
-            None => matches!(packets[position], Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. }),
+            Some(packet) => matches!(packet, Packet::RomKeyframe { .. } | Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. }),
+            None => matches!(packets[position], Packet::RomKeyframe { .. } | Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. }),
         };
 
         // (`position` indexes `packets` only for a top-level packet; in a blob it is a byte offset.)
@@ -1527,7 +1568,7 @@ impl ReplayFilePlayer {
         if is_delta {
             debug_assert!(self.chain.is_at(list, position), "delta handed out without being folded");
             let metadata = match owned {
-                Some(Packet::DeltaKeyframe { metadata, .. }) | Some(Packet::RegionDeltaKeyframe { metadata, .. }) | Some(Packet::StoredKeyframe { metadata, .. }) => metadata,
+                Some(Packet::RomKeyframe { metadata, .. }) | Some(Packet::DeltaKeyframe { metadata, .. }) | Some(Packet::RegionDeltaKeyframe { metadata, .. }) | Some(Packet::StoredKeyframe { metadata, .. }) => metadata,
                 _ => keyframe_metadata(&packets[position]).expect("checked above").clone()
             };
             let state = if self.keyframe_states_wanted {
@@ -1901,8 +1942,8 @@ mod tests {
     #[test]
     fn malformed_deltas_fail_cleanly() {
         let s0 = pseudo_random_bytes(1, 64);
-        let bad_control = Packet::RegionDeltaKeyframe { metadata: metadata_at(1), state_len: 64, control: bv(&[0, 30]), data: bv(&[0; 120]) };
-        let bad_len = Packet::RegionDeltaKeyframe { metadata: metadata_at(2), state_len: 65, control: bv(&[]), data: bv(&[]) };
+        let bad_control = Packet::RegionDeltaKeyframe { metadata: metadata_at(1), state_len: 64, control: bv(&[0, 30]), rom_refs: ByteVec::new(), data: bv(&[0; 120]) };
+        let bad_len = Packet::RegionDeltaKeyframe { metadata: metadata_at(2), state_len: 65, control: bv(&[]), rom_refs: ByteVec::new(), data: bv(&[]) };
         let bad_v3 = Packet::DeltaKeyframe { metadata: metadata_at(3), diff: vec![(64u64 << 32) | 1] };
 
         for bad in [bad_control, bad_len, bad_v3] {

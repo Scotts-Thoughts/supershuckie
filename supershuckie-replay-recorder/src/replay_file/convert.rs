@@ -18,8 +18,9 @@ use alloc::vec::Vec;
 use crate::keyframe_masks::transient_ranges;
 use crate::replay_file::playback::ReplayFilePlayer;
 use crate::replay_file::record::{
-    build_reencoded_recorder, NullReplayFileSink, ReplayFileRecorderSettings, ReplayResumeError,
+    build_reencoded_recorder_adding_keyframes, NullReplayFileSink, ReplayFileRecorderSettings, ReplayResumeError,
 };
+pub use crate::replay_file::record::AddedKeyframes;
 use crate::replay_file::playback::ReplayFileReadError;
 use crate::replay_file::{ReplayConsoleType, ReplayHeaderBytes, ReplayHeaderRaw, RomBytes};
 use crate::util::launder_reference;
@@ -38,11 +39,20 @@ pub struct ConvertOptions {
     /// with it the output's keyframes copy what they can from it (see
     /// `ReplayFileRecorder::set_rom_reads_unknown`); a player of the output then needs it too.
     pub rom_path: Option<PathBuf>,
+
+    /// Keep only keyframes at least this many frames apart (`0`: all of them). A replay is
+    /// deterministic, so keyframes are only shortcuts for seeking: an archived recording can do
+    /// with far fewer than it was made with (measured 2026-11-11: a Nintendo DS file's delta
+    /// chain is a third smaller with a keyframe every 8 seconds instead of 2, and a Nintendo
+    /// 3DS file is three quarters dense keyframes). Seeking in the output emulates further from
+    /// its sparser keyframes; the app's seek index makes up for that around frames already
+    /// visited on every console but the 3DS.
+    pub keyframe_spacing: UnsignedInteger,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
-        Self { settings: ReplayFileRecorderSettings::default(), allow_corruption: false, rom_path: None }
+        Self { settings: ReplayFileRecorderSettings::default(), allow_corruption: false, rom_path: None, keyframe_spacing: 0 }
     }
 }
 
@@ -241,6 +251,21 @@ pub fn convert_replay_file(
     overwrite: bool,
     progress: ProgressFn<'_>,
 ) -> Result<ConvertReport, ConvertError> {
+    convert_replay_file_adding_keyframes(input, output, options, overwrite, None, progress)
+}
+
+/// [`convert_replay_file`], putting keyframes into the output where the source has none (see
+/// [`AddedKeyframes`]): for a recording that was thinned with
+/// [`ConvertOptions::keyframe_spacing`] and should seek quickly again. Everything else is
+/// carried over as it is; [`verify_replay_files_with_added_keyframes`] checks that.
+pub fn convert_replay_file_adding_keyframes(
+    input: &Path,
+    output: &Path,
+    options: &ConvertOptions,
+    overwrite: bool,
+    added: Option<&mut AddedKeyframes<'_>>,
+    progress: ProgressFn<'_>,
+) -> Result<ConvertReport, ConvertError> {
     if same_file(input, output) {
         return Err(ConvertError::Failed("input and output must be different files".into()));
     }
@@ -269,7 +294,7 @@ pub fn convert_replay_file(
     // or deleted by a failure in between.
     let tmp_path = output.with_extension("replay.tmp");
     let tmp_file = File::create(&tmp_path).map_err(|e| format!("cannot create {}: {e}", tmp_path.display()))?;
-    let result = write_reencoded(&mut player, tmp_file, options, rom, progress);
+    let result = write_reencoded(&mut player, tmp_file, options, rom, added, progress);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -289,15 +314,18 @@ fn write_reencoded(
     output_file: File,
     options: &ConvertOptions,
     rom: Option<RomBytes>,
+    added: Option<&mut AddedKeyframes<'_>>,
     progress: ProgressFn<'_>,
 ) -> Result<(u64, UnsignedInteger), ConvertError> {
     let sink = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
-    let (mut recorder, info) = build_reencoded_recorder(
+    let (mut recorder, info) = build_reencoded_recorder_adding_keyframes(
         player,
         options.settings.clone(),
         options.allow_corruption,
         rom,
+        options.keyframe_spacing,
+        added,
         sink,
         NullReplayFileSink,
         &mut |frames, total| progress(ConvertPhase::Converting, frames, total),
@@ -393,6 +421,49 @@ pub fn verify_replay_files(
     rom_path: Option<&Path>,
     progress: ProgressFn<'_>,
 ) -> Result<VerifyReport, ConvertError> {
+    verify_replay_files_inner(input, output, masked, allow_corruption, rom_path, false, false, progress)
+}
+
+/// [`verify_replay_files`] for an output written with [`convert_replay_file_adding_keyframes`]:
+/// the output must have every keyframe of the input, identical, and may have more; everything
+/// else in the stream must be the same. (What the added keyframes hold is the emulator's word;
+/// seeking to frames after them and comparing with the input is how to check it.)
+pub fn verify_replay_files_with_added_keyframes(
+    input: &Path,
+    output: &Path,
+    masked: bool,
+    allow_corruption: bool,
+    rom_path: Option<&Path>,
+    progress: ProgressFn<'_>,
+) -> Result<VerifyReport, ConvertError> {
+    verify_replay_files_inner(input, output, masked, allow_corruption, rom_path, false, true, progress)
+}
+
+/// [`verify_replay_files`] for an output written with [`ConvertOptions::keyframe_spacing`] when
+/// `thinned`: the output's keyframes must then be some of the input's (the first among them),
+/// each identical to the input's on its frame, and everything else in the stream the same.
+pub fn verify_replay_files_thinned(
+    input: &Path,
+    output: &Path,
+    masked: bool,
+    allow_corruption: bool,
+    rom_path: Option<&Path>,
+    thinned: bool,
+    progress: ProgressFn<'_>,
+) -> Result<VerifyReport, ConvertError> {
+    verify_replay_files_inner(input, output, masked, allow_corruption, rom_path, thinned, false, progress)
+}
+
+fn verify_replay_files_inner(
+    input: &Path,
+    output: &Path,
+    masked: bool,
+    allow_corruption: bool,
+    rom_path: Option<&Path>,
+    thinned: bool,
+    added: bool,
+    progress: ProgressFn<'_>,
+) -> Result<VerifyReport, ConvertError> {
     let started = Instant::now();
     let input_map = alloc::sync::Arc::new(map_file(input)?);
     let output_map = alloc::sync::Arc::new(map_file(output)?);
@@ -404,7 +475,21 @@ pub fn verify_replay_files(
     check_eq("total milliseconds", source.get_total_milliseconds(), result.get_total_milliseconds())?;
     check_eq("header metadata", source.get_replay_metadata(), result.get_replay_metadata())?;
     check_eq("patch data", source.get_patch_data(), result.get_patch_data())?;
-    check_eq("keyframe frames", source.all_keyframes().keys().collect::<Vec<_>>(), result.all_keyframes().keys().collect::<Vec<_>>())?;
+    let kept: alloc::collections::BTreeSet<UnsignedInteger> = result.all_keyframes().keys().copied().collect();
+    if thinned {
+        if let Some(extra) = kept.iter().find(|frame| !source.all_keyframes().contains_key(frame)) {
+            return Err(format!("output has a keyframe at frame {extra} that the source does not").into());
+        }
+        check_eq("first keyframe", source.all_keyframes().keys().next(), result.all_keyframes().keys().next())?;
+    }
+    else if added {
+        if let Some(missing) = source.all_keyframes().keys().find(|frame| !kept.contains(frame)) {
+            return Err(format!("output lacks the source's keyframe at frame {missing}").into());
+        }
+    }
+    else {
+        check_eq("keyframe frames", source.all_keyframes().keys().collect::<Vec<_>>(), result.all_keyframes().keys().collect::<Vec<_>>())?;
+    }
     check_eq("bookmarks", source.bookmark_table(), result.bookmark_table())?;
     if let Some(error) = result.bookmark_section_error() {
         return Err(format!("output: the bookmark section is unusable: {error}").into());
@@ -436,8 +521,20 @@ pub fn verify_replay_files(
     loop {
         // SAFETY (both): see `next_non_bookmark_packet`; each packet is only used until the next
         // `next_packet` call on its player, which is the next iteration.
-        let a = next_non_bookmark_packet(&mut source, &mut source_input).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
-        let b = next_non_bookmark_packet(&mut result, &mut result_input).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        let mut a = next_non_bookmark_packet(&mut source, &mut source_input).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        // A keyframe the output left out: the source's next packet is the one to compare.
+        while thinned && let Some(Packet::Keyframe { metadata, .. }) = a && !kept.contains(&metadata.elapsed_frames) {
+            a = next_non_bookmark_packet(&mut source, &mut source_input).map_err(|e| format!("source: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        }
+        let mut b = next_non_bookmark_packet(&mut result, &mut result_input).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        // A keyframe the output added: its next packet is the one to compare. (Materialised
+        // above like every other, so one that does not decode is still found.)
+        while added && let Some(Packet::Keyframe { metadata, .. }) = b && !source.all_keyframes().contains_key(&metadata.elapsed_frames) {
+            if metadata.elapsed_frames != frames {
+                return Err(format!("output: the added keyframe after frame {frames} says it is at frame {}", metadata.elapsed_frames).into());
+            }
+            b = next_non_bookmark_packet(&mut result, &mut result_input).map_err(|e| format!("output: read error after packet {packets} (frame {frames}): {e:?}"))?.map(|p| unsafe { launder_reference(p) });
+        }
 
         let (a, b) = match (a, b) {
             (None, None) => break,
@@ -519,7 +616,7 @@ mod tests {
 
         assert_eq!(replay_file_version(&input).unwrap(), 3);
 
-        let options = ConvertOptions { settings: ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() }, allow_corruption: false, rom_path: None };
+        let options = ConvertOptions { settings: ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() }, allow_corruption: false, rom_path: None, keyframe_spacing: 0 };
         let mut phases = Vec::new();
         let report = convert_replay_file(&input, &output, &options, false, &mut |phase, done, total| {
             phases.push((phase, done, total));

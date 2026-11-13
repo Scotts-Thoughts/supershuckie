@@ -985,6 +985,21 @@ impl ThreadedSuperShuckieCore {
         let _ = self.send(ThreadCommand::AutoResyncKeyframesInReplay(resync));
     }
 
+    /// How much memory the snapshots of a replay being played may use (see
+    /// [`SuperShuckieCore::set_replay_seek_index_budget`]).
+    #[inline]
+    pub fn set_replay_seek_index_budget(&self, bytes: usize) {
+        let _ = self.send(ThreadCommand::SetReplaySeekIndexBudget(bytes));
+    }
+
+    /// Have background emulators fill the seek index of the replay that is attached (see
+    /// [`SuperShuckieCore::set_replay_seek_prefill`]). Keep a
+    /// [`ReplaySeekPrefill::monitor`](crate::ReplaySeekPrefill::monitor) to watch them.
+    #[inline]
+    pub fn set_replay_seek_prefill(&self, prefill: Option<crate::ReplaySeekPrefill>) {
+        let _ = self.send(ThreadCommand::SetReplaySeekPrefill(prefill));
+    }
+
     /// Give the core the game's ROM file for the replays it records from now on (see
     /// [`SuperShuckieCore::set_game_rom`]).
     #[inline]
@@ -1368,6 +1383,8 @@ enum ThreadCommand {
     IgnoreSpeedChangesInReplay(bool),
     AutoResyncKeyframesInReplay(bool),
     SetGameRom(Option<supershuckie_replay_recorder::replay_file::RomBytes>),
+    SetReplaySeekIndexBudget(usize),
+    SetReplaySeekPrefill(Option<crate::ReplaySeekPrefill>),
     SetAudioOutput(Option<Arc<AudioOutput>>),
     SetAudioEnabled(bool),
     SetAudioMuteWhenSpedUp(bool),
@@ -2930,6 +2947,12 @@ impl CoreLoop {
             ThreadCommand::SetGameRom(rom) => {
                 self.core.set_game_rom(rom)
             },
+            ThreadCommand::SetReplaySeekPrefill(prefill) => {
+                self.core.set_replay_seek_prefill(prefill)
+            },
+            ThreadCommand::SetReplaySeekIndexBudget(bytes) => {
+                self.core.set_replay_seek_index_budget(bytes)
+            },
             ThreadCommand::SetAudioOutput(output) => {
                 self.core.set_audio_output(output)
             },
@@ -3157,8 +3180,11 @@ fn system_display_clock() -> Option<(Instant, Duration)> {
 
 /// The opposite of [`mark_thread_latency_sensitive`]: a follower of another player's game may
 /// run on an efficiency core and yields to the player's own game whenever both want the CPU.
+#[cfg(not(windows))]
+pub(crate) fn mark_thread_background() {}
+
 #[cfg(windows)]
-fn mark_thread_background() {
+pub(crate) fn mark_thread_background() {
     const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
 
     #[link(name = "kernel32")]

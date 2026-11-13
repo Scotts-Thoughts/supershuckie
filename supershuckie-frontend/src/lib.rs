@@ -213,6 +213,13 @@ pub struct SuperShuckieFrontend {
 
     last_replay_and_frame: Option<(UTF8CString, u32)>,
 
+    /// Watches the background emulators filling the loaded replay's seek index, if there are
+    /// any (see [`Self::start_replay_seek_prefill`]).
+    seek_prefill: Option<supershuckie_core::ReplaySeekPrefillMonitor>,
+    /// Held while this program is the one filling the loaded replay's seek index file (see
+    /// `supershuckie_core::ReplaySeekIndexFile::try_lock_for_filling`).
+    seek_fill_lock: Option<supershuckie_core::ReplaySeekIndexFillLock>,
+
     /// In-progress video export, if any (owned here so the C/Qt layer just polls/cancels).
     current_export: Option<VideoExportHandle>,
 
@@ -308,6 +315,8 @@ impl SuperShuckieFrontend {
             last_read_replay_stats: None,
             bios_override: None,
             last_replay_and_frame: None,
+            seek_prefill: None,
+            seek_fill_lock: None,
             current_replay: None,
             current_export: None,
             pending_conversion_plan: None,
@@ -672,8 +681,81 @@ impl SuperShuckieFrontend {
         self.current_replay = Some(name.into());
         self.last_replay_and_frame = None;
         self.bookmarks.set_playback(loaded_bookmarks, bookmark_table);
+        self.start_replay_seek_prefill(&replay_file, expected_type);
 
         Ok(true)
+    }
+
+    /// Have extra emulators fill the seek index of the replay just attached in the background
+    /// (see `supershuckie_core::ReplaySeekPrefill` and the `seek_index_prefill_workers`
+    /// setting). Nintendo DS only: its seeks are the ones that cost (2-3 ms an emulated frame,
+    /// up to a keyframe interval of them), and its emulator is cheap to make more of.
+    fn start_replay_seek_prefill(&mut self, replay_file: &Path, emulator_type: SuperShuckieEmulatorType) {
+        self.seek_prefill = None;
+        self.seek_fill_lock = None;
+        let mut workers = self.settings.replay.seek_index_prefill_workers.min(16) as usize;
+        let disk_megabytes = self.settings.replay.seek_index_disk_megabytes as u64;
+        if (workers == 0 && disk_megabytes == 0) || self.settings.replay.seek_index_megabytes == 0 || emulator_type != SuperShuckieEmulatorType::NintendoDS {
+            return
+        }
+        let Some(rom) = self.loaded_rom_data.clone() else {
+            return
+        };
+        // One copy of the file for all of them.
+        let Ok(bytes) = std::fs::read(replay_file) else {
+            return
+        };
+        // The index is kept in a file between sessions (outside the user directory, which may
+        // be a synced folder), shared with the frame servers a video editor runs for the same
+        // recording. Only one program walks the replay for it; the others read what it writes.
+        let index_file = (disk_megabytes > 0).then(supershuckie_core::default_replay_seek_index_directory).flatten()
+            .filter(|directory| std::fs::create_dir_all(directory).is_ok())
+            .map(|directory| supershuckie_core::ReplaySeekIndexFile::in_directory(&directory, &bytes, Some(rom.as_slice()), disk_megabytes.saturating_mul(1 << 20)));
+        if let Some(file) = index_file.as_ref() {
+            self.seek_fill_lock = file.try_lock_for_filling();
+            if self.seek_fill_lock.is_none() {
+                workers = 0;
+            }
+        }
+        if workers == 0 && index_file.is_none() {
+            return
+        }
+        let bytes: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes);
+        let date = self.get_nds_date().get_cleaned();
+        let makers = (0..workers).map(|_| {
+            let (rom, bytes) = (rom.clone(), bytes.clone());
+            Box::new(move || {
+                let mut player = ReplayFilePlayer::new_shared(bytes, true).map_err(|e| format!("cannot read the replay: {e:?}"))?;
+                player.enable_threading();
+                if player.wants_rom() {
+                    player.set_rom(rom.clone());
+                }
+                // Replays are not played with the JIT (see `assert_replays_available`).
+                let mut core = Box::new(
+                    NintendoDS::new_from_rom(rom.as_slice(), None, std_timestamp_provider(), false)
+                        .map_err(|e| format!("melonDS rejected the ROM: {e}"))?
+                );
+                core.set_date(date.year, date.month, date.day, date.hour, date.minute, date.second);
+                Ok((core as Box<dyn EmulatorCore>, player))
+            }) as supershuckie_core::ReplaySeekPrefillWorker
+        }).collect();
+        let prefill = supershuckie_core::ReplaySeekPrefill::start_with_file(makers, index_file);
+        self.seek_prefill = Some(prefill.monitor());
+        self.core.set_replay_seek_prefill(Some(prefill));
+    }
+
+    /// How far the background emulators filling the loaded replay's seek index have got, as
+    /// `(keyframe intervals walked, keyframe intervals in the replay, workers still running)`.
+    /// `None` when there are none (no replay, not a Nintendo DS one, or the setting is 0).
+    pub fn replay_seek_prefill_progress(&self) -> Option<(usize, usize, usize)> {
+        let stats = self.seek_prefill.as_ref().filter(|m| !m.stopped())?.stats();
+        Some((stats.intervals_done, stats.intervals_total, stats.workers_running))
+    }
+
+    /// Whether the loaded replay's seek index is whole: every stretch of it has snapshots, made
+    /// by the background emulators just now or read from the index's file.
+    pub fn replay_seek_index_filled(&self) -> bool {
+        self.seek_prefill.as_ref().is_some_and(|m| !m.stopped() && m.all_walked())
     }
 
     /// Close (unload) the loaded replay, if any, whether it is playing or stopped. Live play
@@ -692,6 +774,8 @@ impl SuperShuckieFrontend {
         };
 
         self.finish_replay_bookmarks();
+        self.seek_prefill = None;
+        self.seek_fill_lock = None;
 
         // "Continue last replay" goes back to where the replay was, which for a stopped replay is
         // its resume point rather than wherever live play has got to since.
@@ -1192,11 +1276,14 @@ impl SuperShuckieFrontend {
         let rom_data = self.loaded_rom_data.as_ref().expect("reload_rom_in_place with no loaded rom");
         let core = self.make_new_core(rom_data, save_file_data, emulator_type)?;
         self.switch_core(ThreadedSuperShuckieCore::new(core));
-        // 3DS replays store what the game read from its ROM as references to the file.
-        if emulator_type == SuperShuckieEmulatorType::Nintendo3DS {
+        // 3DS replays store what the game read from its ROM as references to the file, and so
+        // do DS replays unless the setting is off.
+        if emulator_type == SuperShuckieEmulatorType::Nintendo3DS
+            || (emulator_type == SuperShuckieEmulatorType::NintendoDS && self.settings.replay.rom_references) {
             let rom: Option<RomBytes> = self.loaded_rom_data.clone().map(|rom| rom as RomBytes);
             self.core.set_game_rom(rom);
         }
+        self.core.set_replay_seek_index_budget((self.settings.replay.seek_index_megabytes as usize).saturating_mul(1 << 20));
         Ok(())
     }
 
@@ -1691,6 +1778,13 @@ impl SuperShuckieFrontend {
         // report a failure to.
         for e in self.core.take_playback_errors() {
             errors += &format!("- REPLAY PLAYBACK ERROR: {e}\n");
+        }
+
+        // A background emulator that could not start only costs seek speed; say so once.
+        if let Some(monitor) = self.seek_prefill.as_ref() {
+            for e in monitor.take_errors() {
+                errors += &format!("- A background emulator that speeds up seeking in this replay stopped: {e}\n");
+            }
         }
 
         if !self.core.is_alive() && !self.core_death_reported {

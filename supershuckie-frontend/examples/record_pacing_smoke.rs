@@ -138,9 +138,13 @@ fn measure(frontend: &mut SuperShuckieFrontend, name: &'static str, seconds: f64
     }
 }
 
-fn count_packets(path: &std::path::Path) -> (u64, BTreeMap<&'static str, u64>, f64, u64) {
+fn count_packets(path: &std::path::Path, rom: &std::path::Path) -> (u64, BTreeMap<&'static str, u64>, f64, u64) {
     let bytes = std::fs::read(path).expect("read the recording");
     let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse the recording");
+    // A Nintendo DS recording's keyframes may copy bytes from the ROM.
+    if player.wants_rom() {
+        player.set_rom(std::sync::Arc::new(std::fs::read(rom).expect("read the ROM")));
+    }
     player.set_keyframe_states_wanted(false);
     let total = player.get_total_frames();
     println!("{}: v{}, {} frames, {} keyframes, {} bytes", path.display(), player.get_replay_version(), total, player.all_keyframes().len(), bytes.len());
@@ -161,6 +165,7 @@ fn count_packets(path: &std::path::Path) -> (u64, BTreeMap<&'static str, u64>, f
             Packet::Bookmark { .. } => "Bookmark",
             Packet::BookmarkTable { .. } => "BookmarkTable",
             Packet::Keyframe { .. } => "Keyframe",
+            Packet::RomKeyframe { .. } => "RomKeyframe",
             Packet::DeltaKeyframe { .. } => "DeltaKeyframe",
             Packet::RegionDeltaKeyframe { .. } => "RegionDeltaKeyframe",
             Packet::CompressedBlob { .. } => "CompressedBlob",
@@ -268,7 +273,7 @@ fn main() {
     phases.push(measure(&mut frontend, "live again", seconds, |_| false));
 
     let replay_path = frontend.get_replays_dir_for_current_rom().expect("replays dir").join(format!("{name}.replay"));
-    let (total, counts, per_frame, max_per_frame) = count_packets(&replay_path);
+    let (total, counts, per_frame, max_per_frame) = count_packets(&replay_path, &rom);
     for (name, count) in &counts {
         println!("  {name:<20} {count}");
     }
@@ -294,6 +299,11 @@ fn main() {
     let playback = measure(&mut frontend, "playback", playback_budget, |f| f.is_paused() && f.get_replay_frame() >= stats.total_frames.saturating_sub(1));
     let end_frame = frontend.get_replay_frame();
     println!("playback ended at replay frame {end_frame} of {} (paused={}, state={:?})", stats.total_frames, frontend.is_paused(), frontend.get_replay_state());
+    // The background emulators filling the seek index (Nintendo DS replays only).
+    match frontend.replay_seek_prefill_progress() {
+        Some((done, total, running)) => println!("seek index prefill: {done} of {total} keyframe intervals walked, {running} workers still running"),
+        None => println!("seek index prefill: none")
+    }
     if end_frame + 1 < stats.total_frames {
         println!("FAIL: playback stopped {} frames before the end of the recording", stats.total_frames - end_frame);
         failed = true;

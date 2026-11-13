@@ -311,6 +311,12 @@ pub enum PacketDiscriminator {
     /// Describes a keyframe with a region diff (format v4)
     RegionDeltaKeyframe = 0xF7,
 
+    /// A region diff keyframe whose data copies bytes from the game's ROM (Nintendo DS format v11)
+    RegionDeltaKeyframeRom = 0xEE,
+
+    /// A full keyframe whose state copies bytes from the game's ROM (Nintendo DS format v11)
+    KeyframeRom = 0xED,
+
     /// Snapshot of the replay's bookmark table (format v5)
     BookmarkTable = 0xF8,
 
@@ -411,8 +417,10 @@ impl Packet {
             Packet::Bookmark { .. } => PacketDiscriminator::Bookmark as u8,
             Packet::BookmarkTable { .. } => PacketDiscriminator::BookmarkTable as u8,
             Packet::Keyframe { .. } => PacketDiscriminator::Keyframe as u8,
+            Packet::RomKeyframe { .. } => PacketDiscriminator::KeyframeRom as u8,
             Packet::DeltaKeyframe { .. } => PacketDiscriminator::DeltaKeyframe as u8,
-            Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframe as u8,
+            Packet::RegionDeltaKeyframe { rom_refs, .. } if rom_refs.is_empty() => PacketDiscriminator::RegionDeltaKeyframe as u8,
+            Packet::RegionDeltaKeyframe { .. } => PacketDiscriminator::RegionDeltaKeyframeRom as u8,
             Packet::CompressedBlob { keyframe_offsets, .. } if keyframe_offsets.is_empty() => PacketDiscriminator::CompressedBlob as u8,
             Packet::CompressedBlob { .. } => PacketDiscriminator::IndexedCompressedBlob as u8,
             Packet::IncrementCounter { .. } => PacketDiscriminator::IncrementCounter as u8,
@@ -497,10 +505,20 @@ impl PacketIO<'_> for Packet {
                 commands.extend(diff.write_packet_instructions());
             },
 
-            Packet::RegionDeltaKeyframe { metadata, state_len, control, data } => {
+            Packet::RomKeyframe { metadata, state_len, rom_refs, data } => {
+                commands.extend(metadata.write_packet_instructions());
+                commands.extend(state_len.write_packet_instructions());
+                commands.extend(rom_refs.write_packet_instructions());
+                commands.extend(data.write_packet_instructions());
+            },
+
+            Packet::RegionDeltaKeyframe { metadata, state_len, control, rom_refs, data } => {
                 commands.extend(metadata.write_packet_instructions());
                 commands.extend(state_len.write_packet_instructions());
                 commands.extend(control.write_packet_instructions());
+                if !rom_refs.is_empty() {
+                    commands.extend(rom_refs.write_packet_instructions());
+                }
                 commands.extend(data.write_packet_instructions());
             },
 
@@ -602,12 +620,41 @@ impl PacketIO<'_> for Packet {
             PacketDiscriminator::WriteMemoryVar => Ok(Packet::WriteMemory { address: UnsignedInteger::read_all(from, version)?, data: ByteVec::read_all(from, version)? }),
             PacketDiscriminator::Keyframe => Ok(Packet::Keyframe { metadata: KeyframeMetadata::read_all(from, version)?, state: ByteVec::read_all(from, version)? }),
             PacketDiscriminator::DeltaKeyframe => Ok(Packet::DeltaKeyframe { metadata: KeyframeMetadata::read_all(from, version)?, diff: Vec::read_all(from, version)? }),
+            PacketDiscriminator::KeyframeRom => {
+                let packet = Packet::RomKeyframe {
+                    metadata: KeyframeMetadata::read_all(from, version)?,
+                    state_len: UnsignedInteger::read_all(from, version)?,
+                    rom_refs: ByteVec::read_all(from, version)?,
+                    data: ByteVec::read_all(from, version)?
+                };
+                // Without references it is a plain keyframe, which has its own encoding.
+                match &packet {
+                    Packet::RomKeyframe { rom_refs, .. } if rom_refs.is_empty() => Err(PacketReadError::ParseFail { explanation: Cow::Borrowed("ROM-referencing keyframe has no references") }),
+                    _ => Ok(packet)
+                }
+            },
             PacketDiscriminator::RegionDeltaKeyframe => Ok(Packet::RegionDeltaKeyframe {
                 metadata: KeyframeMetadata::read_all(from, version)?,
                 state_len: UnsignedInteger::read_all(from, version)?,
                 control: ByteVec::read_all(from, version)?,
+                rom_refs: ByteVec::new(),
                 data: ByteVec::read_all(from, version)?
             }),
+            PacketDiscriminator::RegionDeltaKeyframeRom => {
+                let packet = Packet::RegionDeltaKeyframe {
+                    metadata: KeyframeMetadata::read_all(from, version)?,
+                    state_len: UnsignedInteger::read_all(from, version)?,
+                    control: ByteVec::read_all(from, version)?,
+                    rom_refs: ByteVec::read_all(from, version)?,
+                    data: ByteVec::read_all(from, version)?
+                };
+                // An empty reference list is written with the plain discriminator; accepting it
+                // here would make two encodings of one packet.
+                match &packet {
+                    Packet::RegionDeltaKeyframe { rom_refs, .. } if rom_refs.is_empty() => Err(PacketReadError::ParseFail { explanation: Cow::Borrowed("ROM-referencing delta keyframe has no references") }),
+                    _ => Ok(packet)
+                }
+            },
             PacketDiscriminator::StoredKeyframe => {
                 let metadata = KeyframeMetadata::read_all(from, version)?;
                 let level = u8::read_all(from, version)?;
@@ -792,13 +839,20 @@ mod tests {
             metadata: metadata.clone(),
             state_len: 19_000_000,
             control: bv(&[0x85, 0x02, 0x03, 0x00, 0x01]),
+            rom_refs: ByteVec::new(),
             data: bv(&[7u8; 16]),
         };
         assert_eq!(serialize(&packet)[0], PacketDiscriminator::RegionDeltaKeyframe as u8);
         assert_eq!(round_trip(&packet, REPLAY_VERSION), packet);
 
+        // With ROM references (Nintendo DS format v11): its own discriminator, and the list
+        // survives.
+        let with_rom = Packet::RegionDeltaKeyframe { metadata: metadata.clone(), state_len: 64, control: bv(&[0, 16]), rom_refs: bv(&[4, 8, 60]), data: bv(&[1, 2, 3, 4]) };
+        assert_eq!(serialize(&with_rom)[0], PacketDiscriminator::RegionDeltaKeyframeRom as u8);
+        assert_eq!(round_trip(&with_rom, REPLAY_VERSION), with_rom);
+
         // Empty streams (a keyframe identical to its predecessor) survive too.
-        let empty = Packet::RegionDeltaKeyframe { metadata, state_len: 0, control: bv(&[]), data: bv(&[]) };
+        let empty = Packet::RegionDeltaKeyframe { metadata, state_len: 0, control: bv(&[]), rom_refs: ByteVec::new(), data: bv(&[]) };
         assert_eq!(round_trip(&empty, REPLAY_VERSION), empty);
     }
 
@@ -856,7 +910,7 @@ mod tests {
             Packet::Bookmark { metadata: BookmarkMetadata { name: "b".into(), elapsed_frames: 1, elapsed_millis: 2.into() } },
             Packet::Keyframe { metadata: metadata.clone(), state: bv(&[3; 33]) },
             Packet::DeltaKeyframe { metadata: metadata.clone(), diff: vec![0, 1 << 32 | 5, u64::MAX] },
-            Packet::RegionDeltaKeyframe { metadata: metadata.clone(), state_len: 33, control: bv(&[0, 1]), data: bv(&[1, 2, 3, 4]) },
+            Packet::RegionDeltaKeyframe { metadata: metadata.clone(), state_len: 33, control: bv(&[0, 1]), rom_refs: ByteVec::new(), data: bv(&[1, 2, 3, 4]) },
             Packet::CompressedBlob {
                 keyframes: vec![metadata.clone()],
                 keyframe_offsets: vec![],
@@ -898,7 +952,7 @@ mod tests {
 
     #[test]
     fn unknown_discriminator_is_a_parse_failure() {
-        let mut slice: &[u8] = &[0xEE, 0, 0];
+        let mut slice: &[u8] = &[0xEC, 0, 0];
         assert!(matches!(Packet::read_all(&mut slice, REPLAY_VERSION), Err(PacketReadError::ParseFail { .. })));
     }
 

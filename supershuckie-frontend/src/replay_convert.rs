@@ -182,7 +182,9 @@ fn classify_file(plan: &mut ConversionPlan, path: PathBuf, exclude: &[PathBuf], 
         return Some(Skip::Current);
     }
 
-    if matches!(header.console_type.get(), Ok(ReplayConsoleType::Nintendo3DS)) {
+    // Their keyframes copy what they can from the game's ROM (and a source that already does
+    // cannot be read without it).
+    if matches!(header.console_type.get(), Ok(ReplayConsoleType::Nintendo3DS | ReplayConsoleType::NintendoDS)) {
         if let Some(rom) = (roms.by_checksum)(&header.rom_checksum) {
             plan.rom_paths.insert(path.clone(), rom);
         }
@@ -443,7 +445,7 @@ impl Drop for ConversionJob {
 
 fn run_job(shared: Arc<Shared>, plan: ConversionPlan, settings: ConversionSettings, keep_backups: bool) -> ConversionSummary {
     let started = Instant::now();
-    let base_options = ConvertOptions { settings: settings.recorder.clone(), allow_corruption: false, rom_path: None };
+    let base_options = ConvertOptions { settings: settings.recorder.clone(), allow_corruption: false, rom_path: None, keyframe_spacing: 0 };
     let mut summary = ConversionSummary { planned: plan.files.len(), kept_backups: keep_backups, ..Default::default() };
 
     for (index, path) in plan.files.iter().enumerate() {

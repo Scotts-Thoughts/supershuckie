@@ -56,9 +56,53 @@ picture `n` is what the run that produced it emitted; `Audio` requests return in
 * The frame already on the screens is answered without emulating.
 * A frame up to 240 ahead is reached by stepping: hidden runs (no drawing) up to the frame before
   it, then one drawn run.
-* Anything else loads the nearest keyframe at least three frames before the target
-  (`SuperShuckieCore::go_to_replay_keyframe`, the first half of `go_to_replay_frame`) and steps
-  from there.
+* Anything else loads the nearest keyframe at least three frames before the target and steps
+  from there, or a snapshot from the core's seek index when one is nearer
+  (`SuperShuckieCore::go_to_replay_seek_start`).
+
+The seek index (every console but the 3DS): every walk leaves a snapshot behind every 15 frames
+(every 60 once it has run on for 8 seconds, which is playback or an export passing through), kept
+in memory as a compressed diff against the recording's keyframe, 128 MiB at most per served
+recording (`SUPERSHUCKIE_SEEK_INDEX_MB` in the server's environment changes that; `0` turns the
+index off), least recently used keyframe interval dropped first. A later request near a frame already visited then starts
+from the snapshot: stepping back a frame, or coming back to where the playhead was, emulates a
+handful of frames instead of up to two seconds of them. Measured on Nintendo DS recordings
+(2026-11-11, `seek_index_check`): 30-70 ms a step back against 90-220 ms, and the frame served is
+the same one, state and picture.
+
+The index of a Nintendo DS recording is also filled ahead of the requests and kept between
+sessions:
+
+* It lives in a file in the local cache directory the app uses too
+  (`%LOCALAPPDATA%\SuperShuckie\seek-index` on Windows), named after a fingerprint of the
+  recording and the game. A server that opens a recording reads the file first, so a recording
+  walked once (by the app or by any server) is never walked again by the same build.
+  `SUPERSHUCKIE_SEEK_INDEX_DIR` puts the files elsewhere (empty or `off`: no files),
+  `SUPERSHUCKIE_SEEK_INDEX_DISK_MB` limits what they may take together (4096; the ones used
+  longest ago are deleted; `0`: no files).
+* What the file lacks is walked by one more emulator with the same game on a background thread
+  (below normal priority), nearest the last frame asked for first, about 500 frames a second.
+  `SUPERSHUCKIE_SEEK_PREFILL_WORKERS=<n>` changes how many (`0`: none; without a file the
+  default is none). It holds another copy of the game in memory until the recording is walked.
+* Of all the programs that have the same recording open (an editor runs several servers per
+  recording, and the app may have it open as well), only one runs workers: the one that got
+  the file's fill lock (`<fingerprint>.filling` next to it). It writes the file about once a
+  minute while it fills and when it is done; the others look at the file every few seconds and
+  read it again when it has changed.
+
+With the index filled the first request into a stretch is as cheap as a return to it (measured
+2026-11-11 on Pokemon Platinum: 35 ms a random seek against 80 ms).
+
+The pictures `Info` names as cheap (`keyframes`) are six frames past each keyframe, not three: a
+Nintendo DS keyframe leaves the 3D engine's geometry out, a game drawing 3D at 30 fps has rebuilt
+it four or five frames on, and a picture asked for sooner has to be drawn again from the keyframe
+before. On Pokémon Platinum keyframe + 3 cost 390-470 ms and keyframe + 5 23 ms.
+
+A Nintendo DS recording of format v11 stores what the game loaded from its cartridge as
+references into the ROM; the server hands the ROM it was opened with to the replay's reader, so
+nothing changes for a client. A server built before v11 refuses such a file ("Unrecognized replay
+format version 11"), so the editor needs the server from the same build as the emulator that
+made the recording, as after every format change.
 
 `Memory` asks for the state behind a picture rather than the picture: `(address, length)` blocks
 of the core's memory once picture `n` has been produced, read exactly as the live Poke-A-Byte

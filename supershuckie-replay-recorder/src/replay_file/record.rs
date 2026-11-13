@@ -33,8 +33,8 @@ use std::{
     fs::File
 };
 use alloc::collections::BTreeMap;
-use crate::keyframe_masks::apply_masks;
-use crate::replay_file::stored_keyframe::{encode_payload_v9, merge_ranges, RomBytes, RomIndex};
+use crate::keyframe_masks::{apply_masks, transient_ranges};
+use crate::replay_file::stored_keyframe::{build_whole_rom_index, encode_payload_v9, merge_ranges, split_rom_copies, whole_rom_index, RomBytes, RomIndex, SharedRomIndex};
 use crate::util::{compress_data_with_prefix, compress_data_with_state_prefix, compress_small_data_with_prefix, region_diff_resizing};
 use alloc::sync::Arc;
 
@@ -74,6 +74,23 @@ pub struct ReplayFileRecorder<Final: ReplayFileSink, Temp: ReplayFileSink> {
     /// Look for ROM copies in the whole ROM rather than in what was read (see
     /// [`Self::set_rom_reads_unknown`]).
     rom_reads_unknown: bool,
+    /// Nintendo DS files: the index of the whole ROM that delta keyframes look their changed
+    /// bytes up in, built when the first delta needs it (`Some(None)`: nothing to index).
+    whole_rom_index: Option<SharedRomIndex>,
+    /// Whether a keyframe waits for the whole-ROM index when it is still being built (`false`
+    /// only for the keyframe a new recording starts with, which is written on the caller's
+    /// thread and is stored whole instead).
+    wait_for_rom_index: bool,
+    /// The regenerated output buffers (see [`crate::keyframe_masks`]) of the previous keyframe as
+    /// the emulator had them, whatever the file stores for them; `None` when they are not known
+    /// (no keyframe yet, or one whose buffers were stale already).
+    last_true_transients: Option<Vec<u8>>,
+    /// See [`Self::next_keyframe_has_stale_transients`].
+    next_keyframe_transients_stale: bool,
+    /// See [`Self::set_minimum_keyframe_spacing`].
+    minimum_keyframe_spacing: UnsignedInteger,
+    /// Keyframes written so far.
+    keyframes_written: u64,
     header: ReplayHeaderRaw,
 
     counters: BTreeMap<String, SignedInteger>,
@@ -309,6 +326,24 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         final_sink: Final,
         temp_sink: Temp
     ) -> Result<ReplayFileRecorder<Final, Temp>, ReplayFileWriteError> {
+        Self::new_with_metadata_and_rom(replay_file_metadata, patch_data, settings, starting_timestamp, starting_input, starting_speed, initial_keyframe_state, None, final_sink, temp_sink)
+    }
+
+    /// [`Self::new_with_metadata`] with the game's ROM known from the start ([`Self::set_rom`]),
+    /// so that the first keyframe can copy from it too (a Nintendo DS file's; see
+    /// [`Packet::RomKeyframe`]).
+    pub fn new_with_metadata_and_rom(
+        replay_file_metadata: ReplayFileMetadata,
+        patch_data: ByteVec,
+        settings: ReplayFileRecorderSettings,
+        starting_timestamp: TimestampMillis,
+        starting_input: InputBuffer,
+        starting_speed: Speed,
+        initial_keyframe_state: ByteVec,
+        rom: Option<RomBytes>,
+        final_sink: Final,
+        temp_sink: Temp
+    ) -> Result<ReplayFileRecorder<Final, Temp>, ReplayFileWriteError> {
         let mut recorder = Self::new_blank(
             replay_file_metadata,
             patch_data,
@@ -318,11 +353,19 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             final_sink,
             temp_sink
         )?;
+        if let Some(rom) = rom {
+            recorder.set_rom(rom);
+        }
 
-        recorder.insert_keyframe(
+        // On the caller's thread (the emulator's): if the ROM's index is not there yet, this
+        // one keyframe is stored whole rather than have the emulator wait for it.
+        recorder.wait_for_rom_index = false;
+        let inserted = recorder.insert_keyframe(
             initial_keyframe_state,
             starting_timestamp
-        )?;
+        );
+        recorder.wait_for_rom_index = true;
+        inserted?;
 
         Ok(recorder)
     }
@@ -394,6 +437,12 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
             stored: (metadata.console_type.get_or_default() == ReplayConsoleType::Nintendo3DS).then(StoredKeyframes::default),
             rom: None,
             rom_reads_unknown: false,
+            whole_rom_index: None,
+            wait_for_rom_index: true,
+            last_true_transients: None,
+            next_keyframe_transients_stale: false,
+            minimum_keyframe_spacing: 0,
+            keyframes_written: 0,
             header: metadata,
             last_state_to_diff: None,
             recycled_state: None,
@@ -681,6 +730,15 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
     ///
     /// Returns the frame index the keyframe is on.
     pub fn insert_keyframe_with(&mut self, state: ByteVec, elapsed_millis: TimestampMillis, encoding: KeyframeEncoding) -> Result<u64, ReplayFileWriteError> {
+        // A keyframe too soon after the last one written is left out (see
+        // `set_minimum_keyframe_spacing`); one a keyframe bookmark relies on never is.
+        if self.minimum_keyframe_spacing > 0 && encoding == KeyframeEncoding::Auto && self.keyframes_written > 0
+            && self.elapsed_frames.saturating_sub(self.last_keyframe_frames) < self.minimum_keyframe_spacing {
+            self.assert_not_closed()?;
+            self.next_keyframe_transients_stale = false;
+            return Ok(self.elapsed_frames)
+        }
+        self.keyframes_written += 1;
         if self.stored.is_some() {
             return self.insert_stored_keyframe(state, elapsed_millis, encoding);
         }
@@ -714,29 +772,69 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
 
         let mut state = state;
         let mut masked = Vec::new();
+        let console = self.header.console_type.get_or_default();
+
+        // The regenerated output buffers as the emulator has them now, unless the caller said
+        // they are a stale copy already (a keyframe rebuilt from another replay).
+        let stale_input = core::mem::take(&mut self.next_keyframe_transients_stale);
+        let transient = if self.settings.mask_transient_buffers { transient_ranges(console, state.as_slice()) } else { Vec::new() };
+        let true_transients: Option<Vec<u8>> = (!stale_input && !transient.is_empty()).then(|| {
+            let mut bytes = Vec::with_capacity(transient.iter().map(|r| r.len()).sum());
+            for range in &transient {
+                bytes.extend_from_slice(&state.as_slice()[range.clone()]);
+            }
+            bytes
+        });
+        // The game has not redrawn them since the keyframe before (a static 3D scene, a menu over
+        // one, silence): a seek cannot count on the game rebuilding them within a few frames, so
+        // this keyframe keeps them. That is free once the chain holds them, since they are
+        // unchanged, and it is what lets a reader show the picture straight after loading it.
+        let keep_transients = true_transients.is_some() && true_transients == self.last_true_transients;
+        self.last_true_transients = true_transients;
+
         // Only the 3DS core's raw states vary in length from one keyframe to the next (Azahar
         // serialises variable-size kernel bookkeeping); its deltas diff over the common prefix
         // plus a tail run and the player resizes to `state_len` before applying. Every other
         // console's states are fixed-size, and a length change there still means a full keyframe,
         // exactly as before.
-        let resizing = self.header.console_type.get_or_default() == ReplayConsoleType::Nintendo3DS;
-        let delta = match self.last_state_to_diff.as_ref() {
+        let resizing = console == ReplayConsoleType::Nintendo3DS;
+        let delta = match self.last_state_to_diff.as_mut() {
             Some(previous) if encoding == KeyframeEncoding::Auto && (previous.len() == state.len() || resizing) => {
-                if self.settings.mask_transient_buffers && previous.len() == state.len() {
-                    masked = apply_masks(self.header.console_type.get_or_default(), previous.as_slice(), state.as_mut_slice());
+                let same_len = previous.len() == state.len();
+                if self.settings.mask_transient_buffers && same_len && !keep_transients {
+                    masked = apply_masks(console, previous.as_slice(), state.as_mut_slice());
+                }
+                // A reader tells a keyframe with exact buffers from one that left them stale by
+                // whether its delta touches them (`ReplayFilePlayer::
+                // current_keyframe_has_stale_transients`), so one that keeps them always rewrites
+                // their first whole word, changed or not: the previous state's copy of it is
+                // made to differ for the diff.
+                let forced = (keep_transients && same_len).then(|| transient[0].start.div_ceil(4) * 4).filter(|at| at + 4 <= transient[0].end);
+                if let Some(at) = forced {
+                    previous.as_mut_slice()[at] ^= 0xFF;
                 }
                 let diff = region_diff_resizing(previous.as_slice(), state.as_slice());
+                if let Some(at) = forced {
+                    previous.as_mut_slice()[at] ^= 0xFF;
+                }
                 (diff.encoded_len() < state.len()).then_some(diff)
             },
             _ => None
         };
 
         if let Some(diff) = delta {
+            // Nintendo DS: what the game loaded from its cartridge since the keyframe before is
+            // stored as references into the ROM (see `Packet::RegionDeltaKeyframe`).
+            let (rom_refs, data) = match self.rom_copies_in(console, &diff.data) {
+                Some(copies) if !copies.is_empty() => split_rom_copies(&diff.data, &copies),
+                _ => (Vec::new(), diff.data)
+            };
             self.write_packet_data(&Packet::RegionDeltaKeyframe {
                 metadata,
                 state_len: u64::try_from(state.len()).expect("state length exceeds u64"),
                 control: ByteVec::Heap(diff.control),
-                data: ByteVec::Heap(diff.data)
+                rom_refs: ByteVec::Heap(rom_refs),
+                data: ByteVec::Heap(data)
             })?;
         }
         else {
@@ -749,10 +847,24 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
                     state[range.clone()].copy_from_slice(original);
                 }
             }
-            self.write_packet_data(&Packet::Keyframe {
-                metadata,
-                state: state.clone()
-            })?;
+            // Nintendo DS: a full keyframe holds everything the game has loaded from its
+            // cartridge so far, which is stored as references into the ROM as a delta's is
+            // (see `Packet::RomKeyframe`).
+            match self.rom_copies_in(console, state.as_slice()) {
+                Some(copies) if !copies.is_empty() => {
+                    let (rom_refs, data) = split_rom_copies(state.as_slice(), &copies);
+                    self.write_packet_data(&Packet::RomKeyframe {
+                        metadata,
+                        state_len: u64::try_from(state.len()).expect("state length exceeds u64"),
+                        rom_refs: ByteVec::Heap(rom_refs),
+                        data: ByteVec::Heap(data)
+                    })?;
+                },
+                _ => self.write_packet_data(&Packet::Keyframe {
+                    metadata,
+                    state: state.clone()
+                })?
+            }
         }
 
         // The next delta is taken against the state exactly as the player will reconstruct it
@@ -768,6 +880,43 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         }
 
         Ok(self.elapsed_frames)
+    }
+
+    /// Leave out every keyframe that comes less than `frames` frames after the last one written
+    /// (`0`, the default, keeps them all). For re-encoding a recording with fewer keyframes than
+    /// it was made with: a replay is deterministic, so a keyframe is only ever a shortcut for a
+    /// seek, and the frames after a keyframe that was left out are reached from the one before
+    /// it. Keyframes that keyframe bookmarks rely on ([`KeyframeEncoding::Full`]) are always
+    /// written.
+    pub fn set_minimum_keyframe_spacing(&mut self, frames: UnsignedInteger) {
+        self.minimum_keyframe_spacing = frames;
+    }
+
+    /// Say that the state handed to the next [`Self::insert_keyframe`] holds a stale copy of the
+    /// console's regenerated output buffers (see [`crate::keyframe_masks`]) rather than what the
+    /// emulator had: a keyframe rebuilt from another replay whose delta left them out
+    /// (`ReplayFilePlayer::current_keyframe_has_stale_transients`). Such a keyframe never counts
+    /// as keeping them, however much it looks like the one before.
+    pub fn next_keyframe_has_stale_transients(&mut self, stale: bool) {
+        self.next_keyframe_transients_stale = stale;
+    }
+
+    /// The copies of ROM bytes in a Nintendo DS delta keyframe's data stream; `None` when the
+    /// file's console does not store them or no ROM was given ([`Self::set_rom`]).
+    fn rom_copies_in(&mut self, console: ReplayConsoleType, data: &[u8]) -> Option<Vec<crate::replay_file::stored_keyframe::RomCopy>> {
+        if console != ReplayConsoleType::NintendoDS {
+            return None;
+        }
+        let rom = self.rom.as_ref()?;
+        let rom: &[u8] = (**rom).as_ref();
+        let shared = self.whole_rom_index.get_or_insert_with(|| whole_rom_index(self.rom.as_ref().expect("checked above")));
+        let index = if self.wait_for_rom_index {
+            build_whole_rom_index(shared, rom)
+        }
+        else {
+            shared.get()?.as_ref()
+        };
+        index.map(|index| index.find_copies(rom, data))
     }
 
     /// The Nintendo 3DS keyframe: one zstd frame written straight to both sinks after a
@@ -989,6 +1138,36 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         }
     }
 
+    /// A timeline picture that is JPEG already (another replay's; see [`Self::thumbnail`]),
+    /// stored as it is: `top` and `bottom` are `(width, height, JPEG)`. Encoding it again would
+    /// lose a little more of it every time a file is converted. `Ok(false)` (and nothing
+    /// written) when this file does not store JPEG pictures; give [`Self::thumbnail`] the
+    /// pixels then.
+    pub fn thumbnail_as_jpeg(&mut self, top: (u32, u32, &[u8]), bottom: (u32, u32, &[u8])) -> Result<bool, ReplayFileWriteError> {
+        self.assert_not_closed()?;
+        if self.stored.is_none() || self.settings.stored_thumbnail_jpeg_quality == 0 {
+            return Ok(false)
+        }
+        let packet = Packet::Thumbnail {
+            elapsed_frames: self.elapsed_frames,
+            top_width: top.0.into(),
+            top_height: top.1.into(),
+            bottom_width: bottom.0.into(),
+            bottom_height: bottom.1.into(),
+            top: ByteVec::Heap(top.2.to_vec()),
+            bottom: ByteVec::Heap(bottom.2.to_vec()),
+            against_previous: false,
+            jpeg: true
+        };
+        self.write_packet_data(&packet)?;
+        if let Some(stored) = self.stored.as_mut() {
+            // A lossless picture after this one starts its own group.
+            stored.thumbnails_in_group = 0;
+            stored.thumbnail = None;
+        }
+        Ok(true)
+    }
+
     /// A picture of both screens for the timeline to show while it is dragged (Nintendo 3DS
     /// files; see [`Packet::Thumbnail`]). `top` and `bottom` are `(width, height, RGB565 pixels)`.
     ///
@@ -1066,11 +1245,19 @@ impl<Final: ReplayFileSink, Temp: ReplayFileSink> ReplayFileRecorder<Final, Temp
         Ok(())
     }
 
-    /// Give the recorder the game's ROM file, so that 3DS keyframes can copy what the game read
-    /// from it (see [`Self::rom_reads`]) instead of storing those bytes. A player of the file
-    /// then needs the same ROM (`ReplayFilePlayer::set_rom`).
+    /// Give the recorder the game's ROM file, so that Nintendo 3DS keyframes can copy what the
+    /// game read from it (see [`Self::rom_reads`]) and Nintendo DS delta keyframes whatever of it
+    /// they hold, instead of storing those bytes. A player of the file then needs the same ROM
+    /// (`ReplayFilePlayer::set_rom`).
     pub fn set_rom(&mut self, rom: RomBytes) {
+        // The index a Nintendo DS file's keyframes are looked up in is built in the background
+        // from now, so that it is most likely there when the first delta keyframe comes.
+        #[cfg(feature = "std")]
+        if self.header.console_type.get_or_default() == ReplayConsoleType::NintendoDS {
+            crate::replay_file::prepare_rom_references(&rom);
+        }
         self.rom = Some(rom);
+        self.whole_rom_index = None;
     }
 
     /// Look for ROM copies anywhere in the ROM given to [`Self::set_rom`], not only in the ranges
@@ -2045,6 +2232,233 @@ mod tests {
 
     /// With masks on, a GBA chain must reconstruct every keyframe exactly outside the m4a PCM
     /// buffer and with the chain restart's bytes inside it; with masks off, exactly everywhere.
+    /// A keyframe whose regenerated output buffers are what the keyframe before had (the game
+    /// did not redraw them) keeps them, and the player reports it as exact; one that follows a
+    /// change leaves them out as before, and so does one rebuilt from a stale state.
+    #[test]
+    fn unchanged_transient_buffers_are_kept_and_reported_exact() {
+        use crate::keyframe_masks::transient_ranges;
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::ReplayConsoleType;
+
+        let base = pseudo_random_bytes(0x6BB, 0x61000 + 1024);
+        let sound_info = 0x19000 + 0x6380;
+        // Which PCM buffer each keyframe has: it changes up to 2, stands still to 5, changes at
+        // 6 and stands still again.
+        let pcm_of = [0u64, 1, 2, 2, 2, 2, 6, 6, 6];
+        let state_at = |frame: usize| -> Vec<u8> {
+            let mut s = base.clone();
+            s[0..4].copy_from_slice(&0x0100_000Au32.to_le_bytes());
+            s[0x19000 + 0x7FF0..0x19000 + 0x7FF4].copy_from_slice(&0x0300_6380u32.to_le_bytes());
+            s[sound_info..sound_info + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
+            let pcm = pseudo_random_bytes(2000 + pcm_of[frame], 0xC60);
+            s[sound_info + 0x350..sound_info + 0x350 + 0xC60].copy_from_slice(&pcm);
+            s[100 + frame * 8] = frame as u8;
+            s
+        };
+        let metadata = ReplayFileMetadata { console_type: ReplayConsoleType::GameBoyAdvance, ..make_metadata() };
+        let range = transient_ranges(ReplayConsoleType::GameBoyAdvance, &state_at(0))[0].clone();
+
+        let record = |stale_from: usize| -> Vec<u8> {
+            let mut recorder = ReplayFileRecorder::new_with_metadata(
+                metadata.clone(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)), Vec::<u8>::new(), Vec::<u8>::new()
+            ).unwrap();
+            for frame in 1..pcm_of.len() {
+                recorder.next_frame((frame as u64 * 16).into()).unwrap();
+                recorder.next_keyframe_has_stale_transients(frame >= stale_from);
+                recorder.insert_keyframe(bv(&state_at(frame)), (frame as u64 * 16).into()).unwrap();
+            }
+            recorder.close().unwrap().0
+        };
+
+        // Recorded live: exact wherever the buffer is the one the keyframe before had.
+        let bytes = record(usize::MAX);
+        let exact = [true, false, false, true, true, true, false, true, true];
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        for frame in (0..pcm_of.len()).rev().chain(0..pcm_of.len()) {
+            player.go_to_keyframe(frame as u64).unwrap();
+            let Some(Packet::Keyframe { state, .. }) = player.next_packet().unwrap() else { panic!("no keyframe at {frame}") };
+            let state = state.as_slice().to_vec();
+            let recorded = state_at(frame);
+            assert_eq!(&state[..range.start], &recorded[..range.start], "frame {frame}: before the range");
+            assert_eq!(&state[range.end..], &recorded[range.end..], "frame {frame}: after the range");
+            assert_eq!(player.current_keyframe_has_stale_transients(), !exact[frame], "frame {frame}: stale");
+            if exact[frame] {
+                assert_eq!(&state[range.clone()], &recorded[range.clone()], "frame {frame}: an exact keyframe holds the buffer itself");
+            }
+        }
+
+        // The same states from frame 3 on declared stale (rebuilt from another replay): none of
+        // them is taken for exact, although each looks like the one before.
+        let bytes = record(3);
+        let mut player = ReplayFilePlayer::new(&bytes, false).unwrap();
+        for frame in 1..pcm_of.len() {
+            player.go_to_keyframe(frame as u64).unwrap();
+            player.next_packet().unwrap();
+            assert!(player.current_keyframe_has_stale_transients(), "frame {frame}: declared stale");
+        }
+
+        // Keeping an unchanged buffer costs next to nothing.
+        let unmasked = {
+            let unmasked_settings = ReplayFileRecorderSettings { mask_transient_buffers: false, ..settings(0, usize::MAX) };
+            let mut r = ReplayFileRecorder::new_with_metadata(
+                metadata.clone(), ByteVec::new(), unmasked_settings, 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)), Vec::<u8>::new(), Vec::<u8>::new()
+            ).unwrap();
+            for frame in 1..pcm_of.len() {
+                r.next_frame((frame as u64 * 16).into()).unwrap();
+                r.insert_keyframe(bv(&state_at(frame)), (frame as u64 * 16).into()).unwrap();
+            }
+            r.close().unwrap().0
+        };
+        assert!(record(usize::MAX).len() < unmasked.len(), "kept buffers must not cost more than storing every one");
+    }
+
+    /// Nintendo DS delta keyframes store what they hold of the ROM as references: the file is
+    /// version 11 and smaller, reads back exactly with the ROM and not at all without it.
+    #[test]
+    fn nintendo_ds_deltas_copy_from_the_rom() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::{ReplayConsoleType, RomBytes, REPLAY_VERSION_NINTENDO_DS};
+
+        const KEYFRAMES: usize = 6;
+        let rom: Arc<Vec<u8>> = Arc::new(pseudo_random_bytes(77, 400_000));
+        let base = pseudo_random_bytes(78, 200_000);
+        // Each keyframe has loaded another 6000 bytes of the ROM somewhere and changed a counter.
+        let state_at = |frame: usize| -> Vec<u8> {
+            let mut s = base.clone();
+            for f in 1..=frame {
+                let from = 10_000 + f * 50_000 + 4 * f;
+                s[f * 20_000..f * 20_000 + 6000].copy_from_slice(&rom[from..from + 6000]);
+            }
+            s[64] = frame as u8;
+            s
+        };
+        let metadata = ReplayFileMetadata { console_type: ReplayConsoleType::NintendoDS, ..make_metadata() };
+
+        let record = |with_rom: bool| -> Vec<u8> {
+            let mut recorder = ReplayFileRecorder::new_with_metadata(
+                metadata.clone(), ByteVec::new(), settings(0, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)), Vec::<u8>::new(), Vec::<u8>::new()
+            ).unwrap();
+            if with_rom {
+                recorder.set_rom(rom.clone() as RomBytes);
+            }
+            for frame in 1..=KEYFRAMES {
+                recorder.next_frame((frame as u64 * 16).into()).unwrap();
+                recorder.insert_keyframe(bv(&state_at(frame)), (frame as u64 * 16).into()).unwrap();
+            }
+            recorder.close().unwrap().0
+        };
+
+        let plain = record(false);
+        let referenced = record(true);
+        assert_eq!(u32::from_le_bytes(referenced[4..8].try_into().unwrap()), REPLAY_VERSION_NINTENDO_DS);
+        assert!(referenced.len() + KEYFRAMES * 5000 < plain.len(), "{} bytes with references, {} without", referenced.len(), plain.len());
+
+        let check = |bytes: &[u8], give_rom: bool| -> Result<(), String> {
+            let mut player = ReplayFilePlayer::new(bytes, false).unwrap();
+            assert!(player.wants_rom());
+            if give_rom {
+                player.set_rom(rom.clone() as RomBytes);
+            }
+            for frame in (0..=KEYFRAMES).rev() {
+                player.go_to_keyframe(frame as u64).map_err(|e| format!("{e:?}"))?;
+                match player.next_packet().map_err(|e| format!("{e:?}"))? {
+                    Some(Packet::Keyframe { state, .. }) => assert_eq!(state.as_slice(), state_at(frame).as_slice(), "frame {frame}"),
+                    other => panic!("no keyframe at {frame}: {other:?}")
+                }
+            }
+            Ok(())
+        };
+        check(&referenced, true).unwrap();
+        check(&plain, false).unwrap();
+        check(&plain, true).unwrap();
+        let error = check(&referenced, false).unwrap_err();
+        assert!(error.contains("ROM"), "{error}");
+    }
+
+    /// Nintendo DS full keyframes (a chain restart, a keyframe bookmark's) store what they hold
+    /// of the ROM as references too, in blobs and at the top level, and read back exactly.
+    #[test]
+    fn nintendo_ds_full_keyframes_copy_from_the_rom() {
+        use crate::replay_file::playback::ReplayFilePlayer;
+        use crate::replay_file::{ReplayConsoleType, RomBytes};
+
+        const KEYFRAMES: usize = 9;
+        let rom: Arc<Vec<u8>> = Arc::new(pseudo_random_bytes(77, 400_000));
+        // The first keyframe of a recording only copies from the ROM when the ROM's index is
+        // there already (it does not wait for it): here it is.
+        let shared_rom: RomBytes = rom.clone();
+        build_whole_rom_index(&whole_rom_index(&shared_rom), &rom);
+        let base = pseudo_random_bytes(78, 200_000);
+        // Every state holds 40,000 bytes of the ROM; each keyframe changes a little besides.
+        let state_at = |frame: usize| -> Vec<u8> {
+            let mut s = base.clone();
+            s[30_000..70_000].copy_from_slice(&rom[123_456..163_456]);
+            s[64] = frame as u8;
+            s[100_000 + frame * 10..100_000 + frame * 10 + 4].fill(frame as u8);
+            s
+        };
+        let metadata = ReplayFileMetadata { console_type: ReplayConsoleType::NintendoDS, ..make_metadata() };
+
+        // Blobs of three keyframes (each starts with a full one), then one chain in which
+        // every third keyframe is forced full.
+        for (name, blob_frames, force_full) in [("blobs", 3u64, false), ("forced", 0, true)] {
+            let record = |with_rom: bool| -> Vec<u8> {
+                let mut recorder = ReplayFileRecorder::new_with_metadata_and_rom(
+                    metadata.clone(), ByteVec::new(), settings(blob_frames, usize::MAX), 0u64.into(), ib(&[0]), Speed::default(), bv(&state_at(0)),
+                    with_rom.then(|| shared_rom.clone()), Vec::<u8>::new(), Vec::<u8>::new()
+                ).unwrap();
+                for frame in 1..=KEYFRAMES {
+                    recorder.next_frame((frame as u64 * 16).into()).unwrap();
+                    let encoding = if force_full && frame % 3 == 0 { KeyframeEncoding::Full } else { KeyframeEncoding::Auto };
+                    recorder.insert_keyframe_with(bv(&state_at(frame)), (frame as u64 * 16).into(), encoding).unwrap();
+                }
+                recorder.close().unwrap().0
+            };
+            let plain = record(false);
+            let referenced = record(true);
+            // Four full keyframes (the first among them), each 40,000 incompressible bytes
+            // shorter. (Within one blob the compressor finds a
+            // full keyframe's bytes in the one before, with or without the ROM.)
+            if !force_full {
+                assert!(referenced.len() + 4 * 35_000 < plain.len(), "{name}: {} bytes with references, {} without", referenced.len(), plain.len());
+            }
+
+            let check = |bytes: &[u8], give_rom: bool| -> Result<(), String> {
+                let mut player = ReplayFilePlayer::new(bytes, false).unwrap();
+                if give_rom {
+                    player.set_rom(rom.clone() as RomBytes);
+                }
+                // Backwards (every seek restarts its chain), then straight through.
+                for frame in (0..=KEYFRAMES).rev() {
+                    player.go_to_keyframe(frame as u64).map_err(|e| format!("{e:?}"))?;
+                    match player.next_packet().map_err(|e| format!("{e:?}"))? {
+                        Some(Packet::Keyframe { state, .. }) => assert_eq!(state.as_slice(), state_at(frame).as_slice(), "{name}: frame {frame}"),
+                        other => panic!("{name}: no keyframe at {frame}: {other:?}")
+                    }
+                }
+                player.go_to_keyframe(0).map_err(|e| format!("{e:?}"))?;
+                let mut seen = 0;
+                while let Some(packet) = player.next_packet().map_err(|e| format!("{e:?}"))? {
+                    if let Packet::Keyframe { state, metadata } = packet {
+                        assert_eq!(state.as_slice(), state_at(metadata.elapsed_frames as usize).as_slice(), "{name}: frame {} in passing", metadata.elapsed_frames);
+                        seen += 1;
+                    }
+                }
+                assert_eq!(seen, KEYFRAMES + 1, "{name}");
+                Ok(())
+            };
+            check(&referenced, true).unwrap();
+            check(&plain, true).unwrap();
+            let error = check(&referenced, false).unwrap_err();
+            assert!(error.contains("ROM"), "{name}: {error}");
+            let mut player = ReplayFilePlayer::new(&referenced, false).unwrap();
+            player.set_rom(rom.clone() as RomBytes);
+            assert!(player.keyframe_is_stored_full(6).unwrap(), "{name}");
+            assert!(!player.keyframe_is_stored_full(5).unwrap(), "{name}");
+        }
+    }
+
     #[test]
     fn transient_buffer_masks_are_applied_per_chain() {
         use crate::keyframe_masks::transient_ranges;
@@ -2876,6 +3290,25 @@ mod tests {
                 (a >> 11).abs_diff(b >> 11) as u64 + ((a >> 5) & 63).abs_diff((b >> 5) & 63) as u64 + (a & 31).abs_diff(b & 31) as u64
             }).sum();
             assert!(error / (64 * 32) <= 6, "picture {i}: average error {} per pixel", error / (64 * 32));
+        }
+
+        // Converting the file carries the JPEGs over as they are (encoding one again would lose
+        // a little more each time), unless the output is to hold lossless pictures.
+        let reencode = |settings: ReplayFileRecorderSettings| -> Vec<u8> {
+            let mut source = ReplayFilePlayer::new(&closed, false).unwrap();
+            let (mut recorder, _) = build_reencoded_recorder(&mut source, settings, false, None, 0, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+            recorder.close().unwrap().0
+        };
+        let again = reencode(ReplayFileRecorderSettings::default());
+        let converted = ReplayFilePlayer::new(&again, false).unwrap();
+        let carried: Vec<&Packet> = converted.all_uncompressed_packets().iter().filter(|p| matches!(p, Packet::Thumbnail { .. })).collect();
+        assert_eq!(carried, thumbnails);
+        let lossless = reencode(ReplayFileRecorderSettings { stored_thumbnail_jpeg_quality: 0, ..Default::default() });
+        let converted = ReplayFilePlayer::new(&lossless, false).unwrap();
+        assert_eq!(converted.all_uncompressed_packets().iter().filter(|p| matches!(p, Packet::Thumbnail { jpeg: false, .. })).count(), 5);
+        for i in 0..5u64 {
+            let (was, is) = (player.thumbnail_at_or_before((i + 1) * 60).unwrap(), converted.thumbnail_at_or_before((i + 1) * 60).unwrap());
+            assert_eq!((was.frame, &was.top, &was.bottom), (is.frame, &is.top, &is.bottom), "picture {i}");
         }
     }
 

@@ -334,6 +334,11 @@ impl SuperShuckieFrontend {
             }
         };
 
+        // A Nintendo DS replay's keyframes may copy bytes from the game file.
+        if player.wants_rom() {
+            player.set_rom(rom.clone());
+        }
+
         let bios = self.compute_builtin_bios_override(metadata.bios_checksum).unwrap_or_else(|| self.default_bios_for(emulator_type));
         let core = self.make_new_core_with_bios(&rom, None, emulator_type, bios, false).map_err(|e| CompareAddError::Failed(e.to_string()))?;
         let mut core = ThreadedSuperShuckieCore::new_with_role(core, CoreThreadRole::Follower);
@@ -341,6 +346,7 @@ impl SuperShuckieFrontend {
         core.set_audio_enabled(false);
         core.set_audio_output(None);
         core.set_auto_resync_keyframes_in_replay(self.settings.replay.auto_resync_keyframes_in_replays);
+        core.set_replay_seek_index_budget((self.settings.replay.seek_index_megabytes as usize).saturating_mul(1 << 20));
         if matches!(emulator_type, SuperShuckieEmulatorType::GameBoy | SuperShuckieEmulatorType::GameBoyColor | SuperShuckieEmulatorType::GameBoySGB2) {
             core.set_gb_palette_override(self.settings.game_boy_settings.custom_colors.palette_override());
         }

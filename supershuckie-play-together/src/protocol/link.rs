@@ -252,6 +252,7 @@ fn forbidden_link_kind(packet: &Packet) -> Option<&'static str> {
         Packet::IncrementCounter { .. } => Some("IncrementCounter"),
         Packet::SerialIn { .. } => Some("SerialIn"),
         Packet::Keyframe { .. } => Some("Keyframe"),
+        Packet::RomKeyframe { .. } => Some("RomKeyframe"),
         Packet::DeltaKeyframe { .. } => Some("DeltaKeyframe"),
         Packet::RegionDeltaKeyframe { .. } => Some("RegionDeltaKeyframe"),
         Packet::StoredKeyframe { .. } => Some("StoredKeyframe"),

@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use supershuckie_replay_recorder::replay_file::convert::{
-    convert_replay_file, human_duration, human_size, verify_replay_files, ConvertError, ConvertOptions, ConvertPhase,
+    convert_replay_file, human_duration, human_size, verify_replay_files_thinned, ConvertError, ConvertOptions, ConvertPhase,
 };
 use supershuckie_replay_recorder::replay_file::record::{
     ReplayFileRecorderSettings, DEFAULT_MAX_FRAMES_PER_BLOB, DEFAULT_MINIMUM_UNCOMPRESSED_BYTES_PER_BLOB,
@@ -37,7 +37,7 @@ use supershuckie_replay_recorder::replay_file::record::{
 const USAGE: &str = "\
 usage: supershuckie-replay-convert <in.replay> <out.replay> [options]
 
-Re-encodes a replay (format v2 to v6) into the current format (v6).
+Re-encodes a replay (format v2 and later) into the current format (v7; Nintendo DS v11, Nintendo 3DS v10).
 
 options:
   --level <n>          zstd compression level (default 9)
@@ -50,6 +50,14 @@ options:
   --rom <file>         Nintendo 3DS replays: the game's ROM file. Needed to read a v9 source;
                        with it the output's keyframes copy what they can from the ROM (and
                        playing the output needs the ROM, which the app always has)
+  --keyframe-frames <n>  keep only keyframes at least <n> frames apart (default 0: all of them).
+                       For archiving: a replay is deterministic, so keyframes are only shortcuts
+                       for seeking, and a seek in the output emulates further from the ones left.
+                       Recordings have one every 120 frames (2 s; Nintendo 3DS every 240).
+                       The `replay_rehydrate` example of supershuckie-core puts them back
+                       (it needs the game: an emulator plays the file to make them)
+  --rom <file> also:   Nintendo DS replays: the output's keyframes copy what they hold of the
+                       ROM (11-18% smaller; playing it needs the ROM, which the app always has)
   --keyframe-levels <a,b>  Nintendo 3DS replays: a level-1 keyframe every <b> keyframes, a full
                        one every <a> level-1 keyframes (default 30,15: with a recording's 8-s
                        keyframes, every 2 minutes and every 60)
@@ -76,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
     let mut force = false;
     let mut rom_path = None;
     let mut levels = (30u32, 15u32);
+    let mut keyframe_spacing = 0u64;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -95,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
             "--allow-corruption" => allow_corruption = true,
             "--force" => force = true,
             "--rom" => rom_path = Some(PathBuf::from(value("--rom")?)),
+            "--keyframe-frames" => keyframe_spacing = value("--keyframe-frames")?.parse().map_err(|e| format!("--keyframe-frames: {e}"))?,
             "--keyframe-levels" => {
                 let text = value("--keyframe-levels")?;
                 let (a, b) = text.split_once(',').ok_or("--keyframe-levels: expected <a>,<b>")?;
@@ -120,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
         },
         allow_corruption,
         rom_path,
+        keyframe_spacing,
     };
 
     Ok(Args { input, output, options, verify, force })
@@ -187,7 +198,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     if args.verify {
         let mut reporter = ProgressReporter::new();
-        let verified = verify_replay_files(&args.input, &args.output, args.options.settings.mask_transient_buffers, args.options.allow_corruption, args.options.rom_path.as_deref(), &mut |phase, done, total| reporter.report(phase, done, total))
+        let verified = verify_replay_files_thinned(&args.input, &args.output, args.options.settings.mask_transient_buffers, args.options.allow_corruption, args.options.rom_path.as_deref(), args.options.keyframe_spacing > 0, &mut |phase, done, total| reporter.report(phase, done, total))
             .map_err(|e| format!("VERIFY FAILED: {e}"))?;
         eprintln!();
         eprintln!(

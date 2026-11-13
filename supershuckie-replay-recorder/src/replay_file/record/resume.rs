@@ -145,7 +145,7 @@ pub fn build_resumed_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
     let seed = bookmarks.unwrap_or_else(|| source.bookmark_table().clone()).truncated_to(target);
 
     let end_mode = target == total;
-    let resume_info = prime_and_refeed(&mut recorder, source, start_frame, target, end_mode, seed, &mut |_, _| true)?;
+    let resume_info = prime_and_refeed(&mut recorder, source, start_frame, target, end_mode, seed, None, &mut |_, _| true)?;
 
     Ok((recorder, resume_info))
 }
@@ -173,11 +173,51 @@ const VERBATIM_COPY_MINIMUM_VERSION: u32 = 3;
 /// `rom` (Nintendo 3DS replays): the game's ROM, which the output's keyframes then copy from
 /// wherever they can (the source does not record what the game read, so the whole ROM is
 /// searched; see [`ReplayFileRecorder::set_rom_reads_unknown`]).
+///
+/// `keyframe_spacing`: leave out the source's keyframes that come sooner than this many frames
+/// after the last one kept (`0` keeps them all; see
+/// [`ReplayFileRecorder::set_minimum_keyframe_spacing`]).
 pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
     source: &mut ReplayFilePlayer,
     settings: ReplayFileRecorderSettings,
     tolerate_read_errors: bool,
     rom: Option<crate::replay_file::RomBytes>,
+    keyframe_spacing: UnsignedInteger,
+    final_sink: FS,
+    temp_sink: TS,
+    progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
+) -> Result<(ReplayFileRecorder<FS, TS>, ResumeInfo), ReplayResumeError> {
+    build_reencoded_recorder_adding_keyframes(source, settings, tolerate_read_errors, rom, keyframe_spacing, None, final_sink, temp_sink, progress)
+}
+
+/// Keyframes to put into a re-encoded replay where its source has none: the opposite of
+/// leaving keyframes out (`keyframe_spacing`), for a recording that was thinned for the archive
+/// and is to be worked on again.
+///
+/// A replay file cannot make them itself: a keyframe is the emulator's state, so whoever asks
+/// for them brings an emulator playing the same source (see `SuperShuckieCore`), which is what
+/// `supplier` wraps.
+pub struct AddedKeyframes<'a> {
+    /// A keyframe is added once this many frames have passed since the last one written
+    /// (unless the source has one of its own on that frame).
+    pub spacing: UnsignedInteger,
+    /// The emulator's state after exactly the given number of frames of the source have been
+    /// emulated, as a keyframe of a recording holds it; `Ok(None)` when it cannot be taken at
+    /// that frame (the next frame is asked for instead), `Err` to give up. It is asked for
+    /// ascending frames only.
+    pub supplier: &'a mut dyn FnMut(UnsignedInteger) -> Result<Option<Vec<u8>>, String>,
+    /// How many keyframes were added.
+    pub added: u64,
+}
+
+/// [`build_reencoded_recorder`], adding keyframes the source lacks (see [`AddedKeyframes`]).
+pub fn build_reencoded_recorder_adding_keyframes<FS: ReplayFileSink, TS: ReplayFileSink>(
+    source: &mut ReplayFilePlayer,
+    settings: ReplayFileRecorderSettings,
+    tolerate_read_errors: bool,
+    rom: Option<crate::replay_file::RomBytes>,
+    keyframe_spacing: UnsignedInteger,
+    added: Option<&mut AddedKeyframes<'_>>,
     final_sink: FS,
     temp_sink: TS,
     progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
@@ -191,7 +231,10 @@ pub fn build_reencoded_recorder<FS: ReplayFileSink, TS: ReplayFileSink>(
         recorder.set_rom(rom);
         recorder.set_rom_reads_unknown(true);
     }
-    let info = prime_and_refeed(&mut recorder, source, 0, total, tolerate_read_errors, seed, progress)?;
+    recorder.set_minimum_keyframe_spacing(keyframe_spacing);
+    let info = prime_and_refeed(&mut recorder, source, 0, total, tolerate_read_errors, seed, added, progress)?;
+    // What is recorded after the re-fed part (a resume) keeps every keyframe again.
+    recorder.set_minimum_keyframe_spacing(0);
 
     Ok((recorder, info))
 }
@@ -322,9 +365,12 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     target: UnsignedInteger,
     tolerate_read_errors: bool,
     bookmarks: BookmarkTable,
+    mut added: Option<&mut AddedKeyframes<'_>>,
     progress: &mut dyn FnMut(UnsignedInteger, UnsignedInteger) -> bool,
 ) -> Result<ResumeInfo, ReplayResumeError> {
     let anchors: BTreeSet<UnsignedInteger> = bookmarks.keyframe_anchor_frames().collect();
+    // Frames the source has keyframes of its own on: none is added there.
+    let source_keyframes: BTreeSet<UnsignedInteger> = if added.is_some() { source.all_keyframes().keys().copied().collect() } else { BTreeSet::new() };
     let encoding_for = |frame: UnsignedInteger| if anchors.contains(&frame) { KeyframeEncoding::Full } else { KeyframeEncoding::Auto };
 
     // `start_frame` (from `copy_completed_blobs_before_boundary`) is the frame of the boundary
@@ -367,6 +413,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
     // frame); frame 0 is always exact.
     recorder.prime_for_resume(&kf0);
     recorder.seed_bookmark_table(bookmarks);
+    recorder.next_keyframe_has_stale_transients(source.current_keyframe_has_stale_transients());
     recorder
         .insert_keyframe_with(state0, kf0.elapsed_millis, encoding_for(kf0.elapsed_frames))
         .map_err(ReplayResumeError::Write)?;
@@ -376,6 +423,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
 
     let mut running_ms: u64 = kf0.elapsed_millis.0;
     let mut cur_frames: u64 = kf0.elapsed_frames;
+    let mut last_keyframe: u64 = kf0.elapsed_frames;
     let mut cur_input: InputBuffer = kf0.input.clone();
     let mut cur_speed: Speed = kf0.speed;
     // Counters are cumulative in keyframe metadata, so the boundary keyframe already reflects every
@@ -394,10 +442,13 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             WriteMemory(u64, ByteVec),
             ResetConsole,
             LoadSaveState(ByteVec),
-            Keyframe(ByteVec, TimestampMillis, UnsignedInteger),
+            /// State, time, frame, and whether the source left its regenerated output buffers stale.
+            Keyframe(ByteVec, TimestampMillis, UnsignedInteger, bool),
             IncrementCounter(String, i64),
             SerialIn(ByteVec),
             Thumbnail(UnsignedInteger),
+            /// Frame, then the top and bottom screens as (width, height, JPEG).
+            ThumbnailJpeg(UnsignedInteger, (u32, u32, ByteVec), (u32, u32, ByteVec)),
             Skip,
         }
 
@@ -418,11 +469,16 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 }
                 Packet::ResetConsole => Action::ResetConsole,
                 Packet::LoadSaveState { state } => Action::LoadSaveState(state.clone()),
-                // Timeline pictures are decoded and stored again (the recorder regroups them).
+                // Timeline pictures are decoded and stored again (the recorder regroups them),
+                // except JPEG ones, which go over as they are.
+                Packet::Thumbnail { elapsed_frames, jpeg: true, top_width, top_height, bottom_width, bottom_height, top, bottom, .. } => {
+                    let size = |n: &UnsignedInteger| u32::try_from(*n).unwrap_or(0);
+                    Action::ThumbnailJpeg(*elapsed_frames, (size(top_width), size(top_height), top.clone()), (size(bottom_width), size(bottom_height), bottom.clone()))
+                },
                 Packet::Thumbnail { elapsed_frames, .. } => Action::Thumbnail(*elapsed_frames),
                 Packet::Bookmark { .. } | Packet::BookmarkTable { .. } => Action::Skip,
                 Packet::Keyframe { metadata, state } => {
-                    Action::Keyframe(state.clone(), metadata.elapsed_millis, metadata.elapsed_frames)
+                    Action::Keyframe(state.clone(), metadata.elapsed_millis, metadata.elapsed_frames, false)
                 }
                 Packet::IncrementCounter { name, delta } => {
                     Action::IncrementCounter(name.clone(), *delta)
@@ -430,6 +486,7 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                 Packet::SerialIn { data } => Action::SerialIn(data.clone()),
                 Packet::NoOp => Action::Skip,
                 Packet::DeltaKeyframe { .. }
+                | Packet::RomKeyframe { .. }
                 | Packet::RegionDeltaKeyframe { .. }
                 | Packet::StoredKeyframe { .. }
                 | Packet::CompressedBlob { .. } => {
@@ -449,6 +506,13 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             }
         };
 
+        // A keyframe the source rebuilt from a delta that left its regenerated output buffers out
+        // holds a stale copy of them; the recorder must not take that for a static scene.
+        let action = match action {
+            Action::Keyframe(state, millis, frame, _) => Action::Keyframe(state, millis, frame, source.current_keyframe_has_stale_transients()),
+            other => other
+        };
+
         match action {
             Action::Stop => break,
             Action::NextFrame(delta) => {
@@ -459,6 +523,28 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                     .next_frame(running_ms.into())
                     .map_err(ReplayResumeError::Write)?;
                 cur_frames += 1;
+
+                // A keyframe the source lacks goes where a recording puts one: after the frame,
+                // before anything of the next.
+                if let Some(added) = added.as_deref_mut()
+                    && added.spacing > 0
+                    && cur_frames < target
+                    && cur_frames.saturating_sub(last_keyframe) >= added.spacing
+                    && !source_keyframes.contains(&cur_frames)
+                {
+                    let state = (added.supplier)(cur_frames).map_err(|e| ReplayResumeError::BadSource { explanation: Cow::Owned(alloc::format!("no keyframe could be made at frame {cur_frames}: {e}")) })?;
+                    if let Some(state) = state {
+                        recorder.next_keyframe_has_stale_transients(false);
+                        recorder
+                            .insert_keyframe_with(ByteVec::Heap(state), running_ms.into(), KeyframeEncoding::Auto)
+                            .map_err(ReplayResumeError::Write)?;
+                        last_keyframe = cur_frames;
+                        added.added += 1;
+                        if !progress(cur_frames, target) {
+                            return Err(ReplayResumeError::Cancelled);
+                        }
+                    }
+                }
             }
             Action::SetInput(data) => {
                 recorder
@@ -483,7 +569,9 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
                     .load_save_state(state)
                     .map_err(ReplayResumeError::Write)?;
             }
-            Action::Keyframe(state, elapsed_millis, frame) => {
+            Action::Keyframe(state, elapsed_millis, frame, stale) => {
+                last_keyframe = frame;
+                recorder.next_keyframe_has_stale_transients(stale);
                 recorder
                     .insert_keyframe_with(state, elapsed_millis, encoding_for(frame))
                     .map_err(ReplayResumeError::Write)?;
@@ -500,6 +588,17 @@ fn prime_and_refeed<FS: ReplayFileSink, TS: ReplayFileSink>(
             }
             Action::SerialIn(data) => {
                 recorder.serial_in(data).map_err(ReplayResumeError::Write)?;
+            }
+            Action::ThumbnailJpeg(frame, top, bottom) => {
+                let kept = recorder
+                    .thumbnail_as_jpeg((top.0, top.1, top.2.as_slice()), (bottom.0, bottom.1, bottom.2.as_slice()))
+                    .map_err(ReplayResumeError::Write)?;
+                // The output does not store JPEG pictures: the pixels, then.
+                if !kept && let Some(picture) = source.thumbnail_at_or_before(frame).filter(|p| p.frame == frame) {
+                    recorder
+                        .thumbnail((picture.top.0, picture.top.1, &picture.top.2), (picture.bottom.0, picture.bottom.1, &picture.bottom.2))
+                        .map_err(ReplayResumeError::Write)?;
+                }
             }
             Action::Thumbnail(frame) => {
                 // An undecodable picture is left out; the timeline shows the one before it.
@@ -888,7 +987,7 @@ mod tests {
         let single_blob = ReplayFileRecorderSettings { minimum_uncompressed_bytes_per_blob: usize::MAX, max_frames_per_blob: 0, ..small_settings() };
 
         let mut player = ReplayFilePlayer::new(&source, false).unwrap();
-        let (mut recorder, _) = build_reencoded_recorder(&mut player, single_blob.clone(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, single_blob.clone(), false, None, 0, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (reencoded, _) = recorder.close().unwrap();
 
         let mut feed = ReplayFilePlayer::new(&source, false).unwrap();
@@ -903,6 +1002,122 @@ mod tests {
             assert_eq!(*player.bookmark_table(), table, "{name}");
             assert!(player.keyframe_is_stored_full(10).unwrap(), "{name}");
         }
+    }
+
+    /// Re-encoding with a keyframe spacing keeps only keyframes that far apart, plus the ones
+    /// keyframe bookmarks rely on, each with the state the source has on its frame, and loses
+    /// no frame.
+    #[test]
+    fn reencoding_can_leave_keyframes_out() {
+        let mut table = BookmarkTable::new();
+        table.insert(bookmark("fast", 15 + crate::KEYFRAME_BOOKMARK_LEAD_FRAMES, true));
+        let source = build_source_with_bookmarks(0, &table);
+        let mut original = ReplayFilePlayer::new(&source, false).unwrap();
+        let all: Vec<u64> = original.all_keyframes().keys().copied().collect();
+
+        let mut player = ReplayFilePlayer::new(&source, false).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, None, 12, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (thinned, _) = recorder.close().unwrap();
+
+        let mut out = ReplayFilePlayer::new(&thinned, false).unwrap();
+        let kept: Vec<u64> = out.all_keyframes().keys().copied().collect();
+        assert!(kept.len() < all.len(), "kept {kept:?} of {all:?}");
+        assert!(kept.iter().all(|k| all.contains(k)), "kept {kept:?} of {all:?}");
+        assert_eq!(kept[0], all[0]);
+        assert!(kept.contains(&15), "the keyframe a bookmark relies on stays: {kept:?}");
+        assert!(kept.windows(2).all(|w| w[1] - w[0] >= 12 || w[1] == 15), "at least 12 frames apart: {kept:?}");
+        assert_eq!(out.get_total_frames(), original.get_total_frames());
+        assert_eq!(out.get_total_milliseconds(), original.get_total_milliseconds());
+        assert_eq!(*out.bookmark_table(), table);
+
+        for &frame in &kept {
+            original.go_to_keyframe(frame).unwrap();
+            let Some(Packet::Keyframe { state, .. }) = original.next_packet().unwrap() else { panic!("source keyframe {frame}") };
+            let expected = state.as_slice().to_vec();
+            out.go_to_keyframe(frame).unwrap();
+            let Some(Packet::Keyframe { state, .. }) = out.next_packet().unwrap() else { panic!("output keyframe {frame}") };
+            assert_eq!(state.as_slice(), expected.as_slice(), "frame {frame}");
+        }
+    }
+
+    /// Re-encoding can put keyframes back where the source has none: the states come from
+    /// whoever asks (an emulator playing the source), go in after the frame they belong to with
+    /// the input and time of that moment, and leave everything else as it was.
+    #[test]
+    fn reencoding_can_put_keyframes_back() {
+        let mut table = BookmarkTable::new();
+        table.insert(bookmark("fast", 15 + crate::KEYFRAME_BOOKMARK_LEAD_FRAMES, true));
+        let source = build_source_with_bookmarks(0, &table);
+        let mut player = ReplayFilePlayer::new(&source, false).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, None, 12, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (thinned, _) = recorder.close().unwrap();
+
+        let mut sparse = ReplayFilePlayer::new(&thinned, false).unwrap();
+        let kept: Vec<u64> = sparse.all_keyframes().keys().copied().collect();
+        let total = sparse.get_total_frames();
+        sparse.go_to_keyframe(0).unwrap();
+        let Some(Packet::Keyframe { state, .. }) = sparse.next_packet().unwrap() else { panic!("first keyframe") };
+        let state_len = state.len();
+        // What the "emulator" says the state after `frame` frames is.
+        let made = |frame: u64| -> Vec<u8> { (0..state_len).map(|i| (i as u64 * 7 + frame * 13) as u8).collect() };
+
+        let mut asked: Vec<u64> = Vec::new();
+        let mut supplier = |frame: u64| -> Result<Option<Vec<u8>>, String> {
+            asked.push(frame);
+            // One frame it cannot take a state at: the next is asked for.
+            Ok((frame != 4).then(|| made(frame)))
+        };
+        let mut added = AddedKeyframes { spacing: 4, supplier: &mut supplier, added: 0 };
+        let mut player = ReplayFilePlayer::new(&thinned, false).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder_adding_keyframes(&mut player, small_settings(), false, None, 0, Some(&mut added), Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let added_count = added.added;
+        let (dense, _) = recorder.close().unwrap();
+
+        let mut out = ReplayFilePlayer::new(&dense, false).unwrap();
+        let now: Vec<u64> = out.all_keyframes().keys().copied().collect();
+        assert!(kept.iter().all(|k| now.contains(k)), "{kept:?} are all still in {now:?}");
+        let new: Vec<u64> = now.iter().copied().filter(|k| !kept.contains(k)).collect();
+        assert_eq!(new.len() as u64, added_count);
+        assert_eq!(new, asked.iter().copied().filter(|f| *f != 4).collect::<Vec<_>>(), "one keyframe for every state supplied");
+        assert!(asked.windows(2).all(|w| w[0] < w[1]), "asked in order: {asked:?}");
+        assert_eq!(&asked[..2], &[4, 5], "the frame that gave nothing is followed by the next");
+        assert!(asked.iter().all(|f| !kept.contains(f) && *f < total), "never where the source has one, never at the end: {asked:?}");
+        assert!(now.windows(2).all(|w| w[1] - w[0] <= 5), "no gap longer than the spacing (plus the frame that gave nothing): {now:?}");
+        assert_eq!(out.get_total_frames(), total);
+        assert_eq!(out.get_total_milliseconds(), sparse.get_total_milliseconds());
+        assert_eq!(*out.bookmark_table(), table);
+
+        // The source's keyframes are what they were, the added ones what was supplied, and an
+        // added keyframe carries the time of its frame.
+        for &frame in &now {
+            out.go_to_keyframe(frame).unwrap();
+            let Some(Packet::Keyframe { state, metadata }) = out.next_packet().unwrap() else { panic!("output keyframe {frame}") };
+            let (state, millis) = (state.as_slice().to_vec(), metadata.elapsed_millis);
+            assert_eq!(metadata.elapsed_frames, frame);
+            if kept.contains(&frame) {
+                sparse.go_to_keyframe(frame).unwrap();
+                let Some(Packet::Keyframe { state: expected, .. }) = sparse.next_packet().unwrap() else { panic!("source keyframe {frame}") };
+                assert_eq!(state.as_slice(), expected.as_slice(), "frame {frame}");
+            }
+            else {
+                assert_eq!(state, made(frame), "frame {frame}");
+                assert_eq!(millis.0, source_time_at(&thinned, frame), "frame {frame}: time");
+            }
+        }
+
+        // Frame for frame the same stream otherwise.
+        let stream = |bytes: &[u8]| -> Vec<Packet> {
+            let mut player = ReplayFilePlayer::new(bytes, false).unwrap();
+            player.go_to_keyframe(0).unwrap();
+            let mut packets = Vec::new();
+            while let Some(packet) = player.next_packet().unwrap() {
+                if !matches!(packet, Packet::Keyframe { .. } | Packet::Bookmark { .. } | Packet::BookmarkTable { .. }) {
+                    packets.push(packet.clone());
+                }
+            }
+            packets
+        };
+        assert_eq!(stream(&dense), stream(&thinned));
     }
 
     #[test]
@@ -1016,6 +1231,7 @@ mod tests {
                 ReplayFileRecorderSettings { max_frames_per_blob: 70, ..Default::default() },
                 false,
                 None,
+                0,
                 Vec::<u8>::new(),
                 NullReplayFileSink,
                 &mut |done, total| {
@@ -1066,7 +1282,7 @@ mod tests {
         let (source, _) = recorder.close().unwrap();
 
         let mut player = ReplayFilePlayer::new(&source, false).unwrap();
-        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, _) = build_reencoded_recorder(&mut player, small_settings(), false, None, 0, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
 
         let out = ReplayFilePlayer::new(&bytes, false).unwrap();
@@ -1090,7 +1306,7 @@ mod tests {
         let intact_total = player.get_total_frames();
         assert!(intact_total < TOTAL_FRAMES);
 
-        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, None, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
+        let (mut recorder, info) = build_reencoded_recorder(&mut player, small_settings(), false, None, 0, Vec::<u8>::new(), NullReplayFileSink, &mut |_, _| true).unwrap();
         let (bytes, _) = recorder.close().unwrap();
         assert_eq!(info.elapsed_frames, intact_total);
         assert_eq!(ReplayFilePlayer::new(&bytes, false).unwrap().get_total_frames(), intact_total);
@@ -1107,6 +1323,7 @@ mod tests {
             small_settings(),
             false,
             None,
+            0,
             Vec::<u8>::new(),
             NullReplayFileSink,
             &mut |_, _| {

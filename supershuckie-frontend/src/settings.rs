@@ -465,6 +465,37 @@ pub struct ReplaySettings {
     /// DS drag at about 20 ms per step instead of up to 300 ms. Default true.
     #[serde(default = "ReplaySettings::SNAP_TIMELINE_DRAG_TO_KEYFRAMES")]
     pub snap_timeline_drag_to_keyframes: bool,
+
+    /// Nintendo DS recordings: store what the game loaded from its cartridge as references into
+    /// the ROM file instead of the bytes themselves (11-18% smaller files; measured 2026-11-11).
+    /// Playing such a replay needs the ROM, which the app has whenever it plays one. Default true.
+    #[serde(default = "ReplaySettings::ROM_REFERENCES")]
+    pub rom_references: bool,
+
+    /// How much memory (MiB) a replay being played may use for its seek index: snapshots taken
+    /// every few frames as a seek or a frame-by-frame walk passes, so that going back to a frame
+    /// near one already visited loads the snapshot instead of emulating again from the
+    /// recording's own keyframe (2 seconds apart). 0 turns it off. Default 256.
+    #[serde(default = "ReplaySettings::SEEK_INDEX_MEGABYTES")]
+    pub seek_index_megabytes: u32,
+
+    /// How many extra emulators fill the seek index of a Nintendo DS replay in the background
+    /// while it is loaded, starting around the playhead, so that the first seek into a part of
+    /// the replay is as quick as a return to it (about 35 ms instead of 80-300). Each one holds
+    /// another copy of the game in memory (the size of the ROM and then some) and uses a
+    /// processor core at below normal priority until the replay is walked or the index is full.
+    /// 0 turns it off. Default 2.
+    #[serde(default = "ReplaySettings::SEEK_INDEX_PREFILL_WORKERS")]
+    pub seek_index_prefill_workers: u32,
+
+    /// How much disk space (MiB) the seek indexes of Nintendo DS replays may use between
+    /// sessions. A filled index is written to the local cache folder
+    /// (`%LOCALAPPDATA%\SuperShuckie\seek-index` on Windows; never the user folder, which may
+    /// be synced) and read back the next time the same replay is opened, here or by a frame
+    /// server, so the replay is only walked once. About 25-90 MB an hour of recording; the
+    /// indexes used longest ago are deleted first. 0 turns it off. Default 4096.
+    #[serde(default = "ReplaySettings::SEEK_INDEX_DISK_MEGABYTES")]
+    pub seek_index_disk_megabytes: u32,
 }
 
 impl Default for ReplaySettings {
@@ -483,7 +514,11 @@ impl Default for ReplaySettings {
             auto_resync_keyframes_in_replays: Self::AUTO_RESYNC_KEYFRAMES_IN_REPLAYS(),
             disable_save_states_when_recording: Self::DISABLE_SAVE_STATES_WHEN_RECORDING(),
             disable_speed_changes_when_recording: Self::DISABLE_SPEED_CHANGES_WHEN_RECORDING(),
-            snap_timeline_drag_to_keyframes: Self::SNAP_TIMELINE_DRAG_TO_KEYFRAMES()
+            snap_timeline_drag_to_keyframes: Self::SNAP_TIMELINE_DRAG_TO_KEYFRAMES(),
+            rom_references: Self::ROM_REFERENCES(),
+            seek_index_megabytes: Self::SEEK_INDEX_MEGABYTES(),
+            seek_index_prefill_workers: Self::SEEK_INDEX_PREFILL_WORKERS(),
+            seek_index_disk_megabytes: Self::SEEK_INDEX_DISK_MEGABYTES()
         }
     }
 }
@@ -507,6 +542,10 @@ impl ReplaySettings {
     const DISABLE_SAVE_STATES_WHEN_RECORDING: fn() -> bool = || false;
     const DISABLE_SPEED_CHANGES_WHEN_RECORDING: fn() -> bool = || false;
     const SNAP_TIMELINE_DRAG_TO_KEYFRAMES: fn() -> bool = || true;
+    const ROM_REFERENCES: fn() -> bool = || true;
+    const SEEK_INDEX_MEGABYTES: fn() -> u32 = || 256;
+    const SEEK_INDEX_PREFILL_WORKERS: fn() -> u32 = || 2;
+    const SEEK_INDEX_DISK_MEGABYTES: fn() -> u32 = || 4096;
 
     /// `max_recording_blob_minutes` as a frame count. The cap is coarse by design, so a nominal
     /// 60 fps is used for every console.

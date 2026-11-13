@@ -302,6 +302,10 @@ fn main() {
         let t = Instant::now();
         let bytes = std::fs::read(path).expect("read replay");
         let mut p = ReplayFilePlayer::new(&bytes, true).expect("parse replay");
+        // A format-v11 recording's keyframes may copy bytes from the ROM.
+        if p.wants_rom() {
+            p.set_rom(std::sync::Arc::new(rom.to_vec()));
+        }
         println!(
             "replay {path}: v{}, {} frames, {} keyframes, parsed in {:.0} ms",
             p.get_replay_version(),

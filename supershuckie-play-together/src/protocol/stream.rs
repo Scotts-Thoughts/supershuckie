@@ -56,6 +56,7 @@ fn forbidden_kind(packet: &Packet) -> Option<&'static str> {
         | Packet::IncrementCounter { .. }
         | Packet::SerialIn { .. } => None,
         Packet::Keyframe { .. } => Some("Keyframe"),
+        Packet::RomKeyframe { .. } => Some("RomKeyframe"),
         Packet::DeltaKeyframe { .. } => Some("DeltaKeyframe"),
         Packet::RegionDeltaKeyframe { .. } => Some("RegionDeltaKeyframe"),
         Packet::StoredKeyframe { .. } => Some("StoredKeyframe"),

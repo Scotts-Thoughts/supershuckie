@@ -38,6 +38,20 @@ pub mod replay_sync;
 pub mod export;
 pub use export::{ExportRange, ScreenLayout, VideoExportError, VideoFrameSink};
 
+mod seek_index;
+
+#[cfg(feature = "std")]
+mod seek_prefill;
+
+#[cfg(feature = "std")]
+mod seek_store;
+
+#[cfg(feature = "std")]
+pub use seek_prefill::{ReplaySeekPrefill, ReplaySeekPrefillMonitor, ReplaySeekPrefillStats, ReplaySeekPrefillWorker};
+
+#[cfg(feature = "std")]
+pub use seek_store::{default_replay_seek_index_directory, ReplaySeekIndexFile, ReplaySeekIndexFillLock};
+
 pub use supershuckie_replay_recorder::Speed;
 
 #[cfg(feature = "std")]
@@ -196,6 +210,28 @@ pub struct SuperShuckieCore {
 
     /// Frame of the replay keyframe the last seek loaded (see `seek_in_replay`).
     replay_keyframe_loaded: UnsignedInteger,
+
+    /// Snapshots of the attached replay taken as it is walked through, which later seeks start
+    /// from (see [`Self::set_replay_seek_index_budget`]).
+    seek_index: Option<seek_index::SeekIndex>,
+    /// Frame of the recorded keyframe the replay cursor passed last: what a snapshot taken now
+    /// is stored against.
+    seek_segment: UnsignedInteger,
+    /// Whether the run in progress is an unpaced one (a seek, an export, the frame server):
+    /// only those take snapshots, so paced playback never pays for one.
+    unpaced_run: bool,
+    /// Buffers of the seek index: the state being captured or rebuilt.
+    seek_state: Vec<u8>,
+    /// Emulators walking the attached replay in the background to fill the seek index (see
+    /// [`Self::set_replay_seek_prefill`]).
+    #[cfg(feature = "std")]
+    seek_prefill: Option<ReplaySeekPrefill>,
+    /// Where the attached replay's seek index is kept between sessions, if anywhere, and the
+    /// write of it going on.
+    #[cfg(feature = "std")]
+    seek_index_file: Option<seek_store::TrackedFile>,
+    #[cfg(feature = "std")]
+    seek_index_saver: seek_store::SeekIndexSaver,
 
     /// What the last `run`/`run_unlocked` reported.
     last_run: RunTime,
@@ -401,6 +437,16 @@ impl SuperShuckieCore {
             ignore_speed_changes_in_replays: false,
             auto_resync_keyframes_in_replays: false,
             replay_keyframe_loaded: 0,
+            seek_index: Some(seek_index::SeekIndex::new(Self::DEFAULT_SEEK_INDEX_BUDGET)),
+            seek_segment: 0,
+            unpaced_run: false,
+            seek_state: Vec::new(),
+            #[cfg(feature = "std")]
+            seek_prefill: None,
+            #[cfg(feature = "std")]
+            seek_index_file: None,
+            #[cfg(feature = "std")]
+            seek_index_saver: Default::default(),
             last_run: RunTime::NONE,
             run_serial: 0,
             state_epoch: 0,
@@ -747,6 +793,7 @@ impl SuperShuckieCore {
         if !skip && !shown && !thumbnail {
             self.core.set_picture_wanted(false);
         }
+        self.unpaced_run = false;
         self.do_run_fn(EmulatorCore::run, true);
     }
 
@@ -756,7 +803,9 @@ impl SuperShuckieCore {
     /// dropped.
     pub fn run_unlocked(&mut self) {
         self.core.set_skip_drawing(false);
+        self.unpaced_run = true;
         self.do_run_fn(EmulatorCore::run_unlocked, false);
+        self.unpaced_run = false;
     }
 
     /// Frames before a frame that will be looked at which must be run drawn, not hidden, for its
@@ -775,7 +824,9 @@ impl SuperShuckieCore {
     /// a target frame in slices they can abandon between.
     pub fn run_unlocked_hidden(&mut self) {
         self.core.set_skip_drawing(true);
+        self.unpaced_run = true;
         self.do_run_fn(EmulatorCore::run_unlocked, false);
+        self.unpaced_run = false;
     }
 
     /// Like [`Self::run_unlocked`], but the samples the frame produces reach the audio output
@@ -788,7 +839,9 @@ impl SuperShuckieCore {
     #[cfg(feature = "std")]
     pub fn run_unlocked_audible(&mut self) {
         self.core.set_skip_drawing(false);
+        self.unpaced_run = true;
         self.do_run_fn(EmulatorCore::run_unlocked, true);
+        self.unpaced_run = false;
     }
 
     /// Run unlocked for the shortest amount of time, drawing the frame only if `draw`, with its
@@ -1194,6 +1247,10 @@ impl SuperShuckieCore {
                 },
                 Ok(Some(n)) => {
                     let next_frame = matches!(n, Packet::NextFrame { .. });
+                    if let Packet::Keyframe { metadata, .. } = n {
+                        // Snapshots taken from here on follow this keyframe.
+                        self.seek_segment = metadata.elapsed_frames;
+                    }
                     if matches!(n, Packet::Keyframe { .. }) {
                         // The player is told not to copy states into packets (see
                         // `attach_replay_player`); read the reconstructed state directly.
@@ -1266,7 +1323,7 @@ impl SuperShuckieCore {
             }
             // The player materialises every delta variant into a Keyframe before handing it out;
             // these arms are unreachable in practice.
-            Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. } => {},
+            Packet::RomKeyframe { .. } | Packet::DeltaKeyframe { .. } | Packet::RegionDeltaKeyframe { .. } | Packet::StoredKeyframe { .. } => {},
             // Timeline pictures: the player serves them on request (`replay_thumbnail`).
             Packet::Thumbnail { .. } => {},
             Packet::CompressedBlob { .. } => unreachable!("compressed blob"),
@@ -1292,6 +1349,9 @@ impl SuperShuckieCore {
     fn resync_from_keyframe(&mut self, state: &[u8]) {
         let state = self.splice_live_transient_buffers(state);
         let _ = self.core.load_save_state(&state);
+        if let Some(index) = self.seek_index.as_mut() {
+            index.walk_restarted();
+        }
     }
 
     /// Copy the emulator's own regenerated output buffers (melonDS 3D vertex/polygon banks, mGBA
@@ -1337,6 +1397,16 @@ impl SuperShuckieCore {
         self.last_run = *time;
         self.run_serial = self.run_serial.wrapping_add(1);
         self.do_frame_timekeeping(time);
+        #[cfg(feature = "std")]
+        if time.frames != 0 && let Some(prefill) = self.seek_prefill.as_ref() && !self.replay_playback_stopped {
+            prefill.set_focus(self.total_frames);
+            // Once a second or so, so that what the workers make does not pile up outside the
+            // index's budget while the replay just plays.
+            if self.total_frames % 64 == 0 {
+                self.absorb_seek_prefill();
+            }
+        }
+        self.take_seek_snapshot_if_due(time);
         self.push_keyframe_if_needed(time);
         self.push_thumbnail_if_needed(time);
         self.service_stream(time);
@@ -1663,7 +1733,11 @@ impl SuperShuckieCore {
         self.core.set_input_encoded(&initial_input_data);
         self.restart_timer();
 
-        let recorder = NonBlockingReplayFileRecorder::new(ReplayFileRecorder::new_with_metadata(
+        // A Nintendo DS recording's first keyframe copies from the ROM like every later one. (A
+        // Nintendo 3DS recorder gets its ROM together with the list of what the game has read
+        // from it; see `attach_rom_to_recorder`.)
+        let rom_from_the_start = self.game_rom.clone().filter(|_| console_type == ReplayConsoleType::NintendoDS);
+        let recorder = NonBlockingReplayFileRecorder::new(ReplayFileRecorder::new_with_metadata_and_rom(
             ReplayFileMetadata {
                 console_type,
                 rom_name: partial_replay_record_metadata.rom_name,
@@ -1685,6 +1759,7 @@ impl SuperShuckieCore {
             ByteVec::Heap(initial_input_data),
             initial_speed,
             initial_state,
+            rom_from_the_start,
             partial_replay_record_metadata.final_file,
             partial_replay_record_metadata.temp_file
         )?);
@@ -2357,6 +2432,7 @@ impl SuperShuckieCore {
         // Writes still queued for the end of a frame belong to the live session, not the replay.
         self.writes.clear();
         self.replay_player = Some(player);
+        self.reset_seek_index();
         self.replay_counters = Some(BTreeMap::new());
         self.replay_stalled = false;
         self.replay_frame_pending = false;
@@ -2428,6 +2504,7 @@ impl SuperShuckieCore {
         self.input_latched = false;
         self.replay_playback_stopped = false;
         self.replay_player = None;
+        self.reset_seek_index();
         self.replay_counters = None;
         self.reset_input();
         self.clear_audio();
@@ -2511,6 +2588,8 @@ impl SuperShuckieCore {
     ///
     /// Errors as [`Self::go_to_replay_frame`] does.
     pub fn go_to_replay_frame_coarse(&mut self, frame: UnsignedInteger) -> Result<(), String> {
+        // What the background emulators made since the last step counts for where this one lands.
+        self.seek_prefill_before_seek(frame);
         let frame = self.coarse_replay_frame(frame);
         let keyframe_hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
         let desired = frame.saturating_sub(1);
@@ -2533,7 +2612,9 @@ impl SuperShuckieCore {
 
     /// The frame to hand [`Self::go_to_replay_frame`] instead of `frame` for a coarse seek: the
     /// nearest frame at or before `frame` that a seek reaches by loading a keyframe and emulating
-    /// only [`Self::POST_LOAD_FRAMES`] past it. A timeline being dragged asks for these, since
+    /// only [`Self::POST_LOAD_FRAMES`] past it, or by loading a snapshot of the seek index and
+    /// emulating only its lead (so where the index is filled a drag steps every quarter of a
+    /// second instead of every keyframe). A timeline being dragged asks for these, since
     /// emulating up to a whole keyframe interval per drag step costs more than the seek itself
     /// (about 2 ms per Nintendo DS frame); the exact frame is sought once the drag ends.
     ///
@@ -2543,10 +2624,19 @@ impl SuperShuckieCore {
             return frame
         };
         let hint = frame.saturating_sub(Self::POST_LOAD_FRAMES);
-        match p.all_keyframes().range(..=hint).next_back() {
+        let from_keyframe = match p.all_keyframes().range(..=hint).next_back() {
             Some((&keyframe, _)) => keyframe.saturating_add(Self::POST_LOAD_FRAMES).min(frame),
-            None => frame
+            None => return frame
+        };
+        match self.replay_seek_point_for(frame) {
+            Some(point) => from_keyframe.max(point.frame.saturating_add(Self::seek_point_lead(point)).min(frame)),
+            None => from_keyframe
         }
+    }
+
+    /// How many frames after `point` the first frame a seek shows from it is.
+    fn seek_point_lead(point: seek_index::SeekPoint) -> UnsignedInteger {
+        if point.stale { Self::SEEK_POINT_STALE_LEAD_FRAMES } else { Self::SEEK_POINT_LEAD_FRAMES }
     }
 
     fn go_to_replay_frame_inner(&mut self, frame: UnsignedInteger, desired: UnsignedInteger, settle: SeekSettle) -> Result<(), String> {
@@ -2579,11 +2669,29 @@ impl SuperShuckieCore {
             return Ok(())
         }
 
-        self.load_replay_keyframe_at_or_before(frame)?;
-        self.run_replay_to_complete_picture(desired)?;
+        // A snapshot taken on an earlier walk through here, if one is near enough before the
+        // target: the same frame from a handful of emulated frames instead of up to a keyframe
+        // interval of them. A drag step (coarse) asks for a frame right after a keyframe or
+        // right after a snapshot (see `coarse_replay_frame`).
+        self.seek_prefill_before_seek(desired.saturating_add(1));
+        let mut from_snapshot = false;
+        if self.load_replay_seek_point_for(desired.saturating_add(1)) {
+            self.run_replay_to_complete_picture(desired)?;
+            if !self.core.shows_stale_output() {
+                return Ok(())
+            }
+            // The snapshot left out more than the game rebuilt by the target: the long way for
+            // an exact seek, a few frames further on for a drag step.
+            from_snapshot = settle == SeekSettle::Coarse;
+        }
 
-        if !self.core.shows_stale_output() {
-            return Ok(())
+        if !from_snapshot {
+            self.load_replay_keyframe_at_or_before(frame)?;
+            self.run_replay_to_complete_picture(desired)?;
+
+            if !self.core.shows_stale_output() {
+                return Ok(())
+            }
         }
 
         let keyframe = self.replay_keyframe_loaded;
@@ -2674,7 +2782,16 @@ impl SuperShuckieCore {
 
     /// Give the core the game's ROM file: every replay recorded from now on (a Nintendo 3DS one)
     /// stores what its keyframes copy from it as references (see `ReplayFileRecorder::set_rom`).
+    ///
+    /// For a Nintendo DS game this also starts building, on a thread of its own, the table a
+    /// recorder looks keyframe bytes up in (a fifth of a second and 34 MB for a 128 MB game), so
+    /// that it is there when a recording starts: the keyframe a recording starts with, which is
+    /// written on this thread, only copies from the ROM when it is.
     pub fn set_game_rom(&mut self, rom: Option<RomBytes>) {
+        #[cfg(feature = "std")]
+        if let Some(rom) = rom.as_ref() && self.core.replay_console_type() == Some(ReplayConsoleType::NintendoDS) {
+            supershuckie_replay_recorder::replay_file::prepare_rom_references(rom);
+        }
         self.game_rom = rom;
     }
 
@@ -2713,7 +2830,14 @@ impl SuperShuckieCore {
 
     /// Position the player at the nearest keyframe at or before `frame`, load its state and
     /// restore everything recorded alongside it. No frame is run.
-    fn load_replay_keyframe_at_or_before(&mut self, mut frame: UnsignedInteger) -> Result<(), String> {
+    fn load_replay_keyframe_at_or_before(&mut self, frame: UnsignedInteger) -> Result<(), String> {
+        self.position_replay_at_keyframe(frame, None)
+    }
+
+    /// [`Self::load_replay_keyframe_at_or_before`], or with `point` (a snapshot of the seek index
+    /// that follows that keyframe) the same with the snapshot's state loaded instead of the
+    /// keyframe's and the replay's cursor moved on to the snapshot's frame.
+    fn position_replay_at_keyframe(&mut self, mut frame: UnsignedInteger, point: Option<seek_index::SeekPoint>) -> Result<(), String> {
         let Some(p) = self.replay_player.as_mut() else {
             return Err(String::from("no replay is attached"))
         };
@@ -2746,21 +2870,51 @@ impl SuperShuckieCore {
         let counters = metadata.counters.iter().map(|c| (c.name.clone(), c.value)).collect();
         let input = metadata.input.clone();
 
-        // A masked delta keyframe's regenerated output buffers are its chain restart's; the
-        // emulator must not show them (see `transient_ranges`).
-        let loaded = if p.current_keyframe_has_stale_transients() {
-            self.core.load_save_state_with_stale_output(p.current_keyframe_state())
-        }
-        else {
-            self.core.load_save_state(p.current_keyframe_state())
+        let loaded = match point {
+            // A masked delta keyframe's regenerated output buffers are its chain restart's; the
+            // emulator must not show them (see `transient_ranges`).
+            None => {
+                let loaded = if p.current_keyframe_has_stale_transients() {
+                    self.core.load_save_state_with_stale_output(p.current_keyframe_state())
+                }
+                else {
+                    self.core.load_save_state(p.current_keyframe_state())
+                };
+                if loaded.is_ok() {
+                    // What an older keyframe does not carry, set up the way the recording most
+                    // likely had it.
+                    self.core.adopt_replay_keyframe();
+                }
+                if let Some(index) = self.seek_index.as_mut() {
+                    index.walk_restarted();
+                }
+                loaded
+            },
+            // A snapshot is the keyframe's state with one diff applied, and a state this build's
+            // emulator made itself.
+            Some(point) => {
+                let console = self.core.replay_console_type().unwrap_or_default();
+                self.seek_state.clear();
+                self.seek_state.extend_from_slice(p.current_keyframe_state());
+                let rebuilt = point.keyframe == elapsed_frames
+                    && self.seek_index.as_mut().is_some_and(|index| index.materialise(console, point, &mut self.seek_state));
+                if !rebuilt {
+                    Err(String::from("the snapshot is gone"))
+                }
+                else if point.stale {
+                    self.core.load_save_state_with_stale_output(&self.seek_state)
+                }
+                else {
+                    self.core.load_save_state(&self.seek_state)
+                }
+            }
         };
         if let Err(e) = loaded {
             self.replay_stalled = true;
             return Err(format!("replay file is broken (cannot load the save state at frame {frame}): {e}"))
         }
-        // What an older keyframe does not carry, set up the way the recording most likely had it.
-        self.core.adopt_replay_keyframe();
         self.replay_keyframe_loaded = elapsed_frames;
+        self.seek_segment = elapsed_frames;
         self.state_epoch = self.state_epoch.wrapping_add(1);
         // Save states do not carry the buttons held (melonDS leaves KeyInput alone), and the
         // next ChangeInput packet may be far away, so restore the input recorded with the
@@ -2777,8 +2931,334 @@ impl SuperShuckieCore {
         self.replay_playback_speed = speed;
         self.clear_audio();
 
+        // On to the snapshot's frame: what the replay did on the way is in the snapshot's state
+        // already, so its packets are only read for what the core itself keeps track of.
+        if let Some(point) = point {
+            let mut input = input;
+            let Some(mut player) = self.replay_player.take() else {
+                return Err(String::from("no replay is attached"))
+            };
+            let mut failed = None;
+            while self.total_frames < point.frame {
+                match player.next_packet() {
+                    Ok(Some(Packet::NextFrame { timestamp_delta })) => {
+                        self.total_milliseconds = self.total_milliseconds.0.wrapping_add(timestamp_delta.0).into();
+                        self.total_frames += 1;
+                    },
+                    Ok(Some(Packet::ChangeInput { data })) => input = data.clone(),
+                    Ok(Some(Packet::ChangeSpeed { speed })) => self.replay_playback_speed = *speed,
+                    Ok(Some(Packet::IncrementCounter { name, delta })) => {
+                        let (name, delta) = (name.clone(), *delta);
+                        self.change_replay_counter_map(&name, delta);
+                    },
+                    // Link traffic is queued in the console's port, which a save state does not
+                    // carry over: such a stretch is walked from its keyframe.
+                    Ok(Some(Packet::SerialIn { .. })) => failed = Some("link traffic before the snapshot"),
+                    // The interval's own keyframe again (a bookmark's full keyframe shares its
+                    // frame) is fine; a later one means the snapshot is not where it should be.
+                    Ok(Some(Packet::Keyframe { metadata, .. })) if metadata.elapsed_frames != elapsed_frames => failed = Some("a keyframe before the snapshot"),
+                    Ok(Some(_)) => {},
+                    Ok(None) => failed = Some("the replay ends before the snapshot"),
+                    Err(_) => failed = Some("the replay is unreadable before the snapshot")
+                }
+                if failed.is_some() {
+                    break
+                }
+            }
+            self.replay_player = Some(player);
+            if let Some(why) = failed {
+                self.replay_stalled = true;
+                return Err(format!("cannot start from the snapshot at frame {}: {why}", point.frame))
+            }
+            self.core.set_input_encoded(input.as_slice());
+            self.frames_since_last_keyframe = point.frame - elapsed_frames;
+        }
+
         self.match_replay_playback_speed();
         Ok(())
+    }
+
+    /// Default memory budget of the seek index (see [`Self::set_replay_seek_index_budget`]).
+    pub const DEFAULT_SEEK_INDEX_BUDGET: usize = 256 << 20;
+
+    /// How many frames before the frame it will show a seek loads an exact snapshot of the seek
+    /// index, like [`Self::POST_LOAD_FRAMES`] for a keyframe.
+    const SEEK_POINT_LEAD_FRAMES: u64 = Self::POST_LOAD_FRAMES;
+
+    /// The same for a snapshot that left the regenerated output buffers out: a Nintendo DS game
+    /// drawing 3D at 30 fps has rebuilt them four or five frames on (measured on Pokemon
+    /// Platinum, 2026-11-11: a seek to keyframe + 3 lands on stale output most of the time,
+    /// to + 5 practically never).
+    const SEEK_POINT_STALE_LEAD_FRAMES: u64 = 6;
+
+    /// How much memory the snapshots of an attached replay may use (see `seek_index`): every
+    /// unpaced walk through a replay (a seek, an export, a frame server stepping) leaves a
+    /// snapshot every few frames, and a later seek to a frame near one starts from it instead of
+    /// from the recording's keyframe. `0` turns it off and drops what is held. The snapshots
+    /// belong to the attached replay and go when it is detached.
+    pub fn set_replay_seek_index_budget(&mut self, bytes: usize) {
+        match self.seek_index.as_ref() {
+            Some(index) if index.budget() == bytes => {},
+            _ => self.seek_index = (bytes > 0).then(|| seek_index::SeekIndex::new(bytes))
+        }
+        #[cfg(feature = "std")]
+        if bytes == 0 {
+            self.seek_prefill = None;
+        }
+    }
+
+    /// `(snapshots held, bytes held, snapshots taken, snapshots loaded)` of the seek index; for
+    /// measurements.
+    pub fn replay_seek_index_stats(&self) -> (usize, usize, u64, u64) {
+        self.seek_index.as_ref().map_or((0, 0, 0, 0), |index| (index.len(), index.used(), index.taken, index.loaded))
+    }
+
+    /// How many of the seek index's snapshots came from background emulators (see
+    /// [`Self::set_replay_seek_prefill`]) rather than this emulator's own walks; for measurements.
+    pub fn replay_seek_index_adopted(&self) -> u64 {
+        self.seek_index.as_ref().map_or(0, |index| index.adopted)
+    }
+
+    /// Forget every snapshot (they belong to the replay that was attached), after writing them
+    /// to the index's file if it has one and lacks enough of them.
+    fn reset_seek_index(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            self.absorb_seek_prefill();
+            self.save_seek_index(true);
+            self.seek_index_file = None;
+            self.seek_index_saver.reset();
+        }
+        if let Some(index) = self.seek_index.as_mut() {
+            index.clear();
+        }
+        self.seek_segment = 0;
+        // Whoever was filling it was walking that replay.
+        #[cfg(feature = "std")]
+        {
+            self.seek_prefill = None;
+        }
+    }
+
+    /// Have background emulators fill the seek index of the attached replay (see
+    /// [`ReplaySeekPrefill`]): `prefill`'s workers must be walking the replay that is attached
+    /// now, and are stopped when it is detached or another is attached. `None` stops the ones
+    /// there are; what they made so far stays.
+    ///
+    /// When `prefill` keeps the index in a file ([`ReplaySeekPrefill::start_with_file`]), this
+    /// emulator writes it there: once the workers have finished, every minute or so while they
+    /// work, and when the replay is detached. It also reads the file again when another program
+    /// with the same recording open has written it.
+    #[cfg(feature = "std")]
+    pub fn set_replay_seek_prefill(&mut self, prefill: Option<ReplaySeekPrefill>) {
+        self.absorb_seek_prefill();
+        self.seek_prefill = prefill.filter(|_| self.replay_player.is_some() && self.seek_index_applies());
+        if let Some(prefill) = self.seek_prefill.as_ref() {
+            prefill.set_focus(self.total_frames);
+            self.seek_index_file = prefill.file().cloned();
+            self.seek_index_saver.saved_finished = false;
+        }
+        self.absorb_seek_prefill();
+    }
+
+    /// Wait until the seek index's file, if one is being written, is whole; for tools and tests.
+    #[cfg(feature = "std")]
+    pub fn wait_for_replay_seek_index_file(&mut self) {
+        self.seek_index_saver.wait();
+    }
+
+    /// Write the seek index to its file if it has one and the file lacks enough of what the
+    /// index holds: with `closing` (the replay is going away) a fiftieth of it, otherwise
+    /// everything once the background emulators are done, and before that (or without any)
+    /// whenever a few hundred snapshots are new, a minute apart at least.
+    #[cfg(feature = "std")]
+    fn save_seek_index(&mut self, closing: bool) {
+        /// Seconds between writes while the index is still being filled.
+        const SECONDS_BETWEEN_WRITES: u64 = 60;
+        /// New snapshots a write is worth while the index is still being filled.
+        const WORTH_WRITING: u64 = 256;
+        /// Seconds between looks at the file for what another program wrote.
+        const SECONDS_BETWEEN_LOOKS: u64 = 5;
+
+        let (Some(file), Some(index)) = (self.seek_index_file.as_ref(), self.seek_index.as_ref()) else {
+            return
+        };
+        let saver = &mut self.seek_index_saver;
+        // What another program put there comes in first: a write only ever replaces a file
+        // with fewer snapshots, and should not be one that lacks what the file has.
+        if !closing && !saver.busy() && saver.last_look.is_none_or(|at| at.elapsed().as_secs() >= SECONDS_BETWEEN_LOOKS) {
+            saver.last_look = Some(std::time::Instant::now());
+            if self.seek_prefill.as_ref().is_some_and(|p| p.read_file_if_changed()) {
+                return
+            }
+        }
+        let new = index.changes.saturating_sub(saver.saved_changes);
+        if new == 0 {
+            return
+        }
+        // The background emulators have walked what there was to walk: time to write it all.
+        let finished = self.seek_prefill.as_ref().is_some_and(|p| p.finished() && p.stats().frames_walked > 0);
+        let due = if closing {
+            new >= (index.len() as u64 / 50).max(32)
+        }
+        else if saver.busy() {
+            false
+        }
+        else if finished && !saver.saved_finished {
+            true
+        }
+        else {
+            new >= WORTH_WRITING && saver.last.is_none_or(|last| last.elapsed().as_secs() >= SECONDS_BETWEEN_WRITES)
+        };
+        if !due {
+            return
+        }
+        // Whole when everything was walked (or read) and nothing has been dropped since, or
+        // when nothing was dropped and the file read was whole already.
+        let complete = index.evictions == 0 && self.seek_prefill.as_ref().is_some_and(|p| p.all_walked());
+        saver.saved_changes = index.changes;
+        saver.saved_finished |= finished;
+        saver.save(file.clone(), index.all_points(), complete);
+    }
+
+    /// What the background emulators filling the seek index have done; `None` without any.
+    #[cfg(feature = "std")]
+    pub fn replay_seek_prefill_stats(&self) -> Option<ReplaySeekPrefillStats> {
+        self.seek_prefill.as_ref().map(|p| p.stats())
+    }
+
+    /// Why background emulators filling the seek index gave up, if any did (each reported once).
+    #[cfg(feature = "std")]
+    pub fn take_replay_seek_prefill_errors(&mut self) -> Vec<String> {
+        self.seek_prefill.as_ref().map(|p| p.take_errors()).unwrap_or_default()
+    }
+
+    /// Put the snapshots the background emulators have made since the last time into the seek
+    /// index, and tell them how full it is.
+    #[cfg(feature = "std")]
+    fn absorb_seek_prefill(&mut self) {
+        let (Some(prefill), Some(index)) = (self.seek_prefill.as_ref(), self.seek_index.as_mut()) else {
+            return
+        };
+        for (keyframe, frame, point, new) in prefill.take_ready() {
+            index.adopt(keyframe, frame, point, new);
+        }
+        prefill.report_index(index.used(), index.budget());
+        self.save_seek_index(false);
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn absorb_seek_prefill(&mut self) {}
+
+    /// A seek is about to show `target`: pick up what the background emulators have made, and
+    /// have them work near it from now on.
+    fn seek_prefill_before_seek(&mut self, target: UnsignedInteger) {
+        #[cfg(feature = "std")]
+        if let Some(prefill) = self.seek_prefill.as_ref() {
+            prefill.set_focus(target);
+        }
+        #[cfg(not(feature = "std"))]
+        let _ = target;
+        self.absorb_seek_prefill();
+    }
+
+    /// Make this the emulator of a [`ReplaySeekPrefill`] worker: every snapshot its walks take
+    /// goes to `export` instead of into an index of its own.
+    #[cfg(feature = "std")]
+    pub(crate) fn export_seek_snapshots(&mut self, export: seek_index::PointExport) {
+        let mut index = seek_index::SeekIndex::new(usize::MAX);
+        index.set_export(export);
+        self.seek_index = Some(index);
+    }
+
+    /// Whether this core's replays get a seek index: every console whose state is cheap to take
+    /// (the Nintendo 3DS's is 150 MB and its keyframes are not plain states).
+    fn seek_index_applies(&self) -> bool {
+        self.seek_index.is_some()
+            && !matches!(self.core.replay_console_type(), None | Some(ReplayConsoleType::Nintendo3DS | ReplayConsoleType::Unknown))
+    }
+
+    /// The snapshot a seek that will show `target` should start from, if the seek index has one
+    /// nearer than the recording's keyframe.
+    fn replay_seek_point_for(&self, target: UnsignedInteger) -> Option<seek_index::SeekPoint> {
+        if !self.seek_index_applies() {
+            return None
+        }
+        let player = self.replay_player.as_ref()?;
+        let hint = target.saturating_sub(Self::POST_LOAD_FRAMES);
+        let (&keyframe, _) = player.all_keyframes().range(..=hint).next_back()?;
+        self.seek_index.as_ref()?.start_for(keyframe, target, Self::SEEK_POINT_LEAD_FRAMES, Self::SEEK_POINT_STALE_LEAD_FRAMES)
+    }
+
+    /// Load the snapshot [`Self::replay_seek_point_for`] names for `target`. `false` (with
+    /// nothing a keyframe load does not put right) when there is none or it cannot be used.
+    fn load_replay_seek_point_for(&mut self, target: UnsignedInteger) -> bool {
+        let Some(point) = self.replay_seek_point_for(target) else {
+            return false
+        };
+        self.position_replay_at_keyframe(point.keyframe, Some(point)).is_ok()
+    }
+
+    /// The frame a seek that will show `target` starts emulating from: a snapshot of the seek
+    /// index if one is near enough before it, else the recording's keyframe. `None` without a
+    /// replay or a keyframe to start from.
+    pub fn replay_seek_start_frame(&self, target: UnsignedInteger) -> Option<UnsignedInteger> {
+        if let Some(point) = self.replay_seek_point_for(target) {
+            return Some(point.frame)
+        }
+        let hint = target.saturating_sub(Self::POST_LOAD_FRAMES);
+        self.replay_player.as_ref()?.all_keyframes().range(..=hint).next_back().map(|(&frame, _)| frame)
+    }
+
+    /// [`Self::go_to_replay_keyframe`] for a seek that will show `target`, starting from a
+    /// snapshot of the seek index instead when one is nearer (see
+    /// [`Self::replay_seek_start_frame`]). Afterwards [`Self::total_frames`] is the frame loaded
+    /// (returned) and nothing has been drawn; the caller steps on from there and checks
+    /// [`Self::shows_stale_output`] as after a keyframe.
+    pub fn go_to_replay_seek_start(&mut self, target: UnsignedInteger) -> Result<UnsignedInteger, String> {
+        if self.replay_player.is_none() {
+            return Err(String::from("no replay is attached"))
+        }
+        self.seek_prefill_before_seek(target);
+        if !self.load_replay_seek_point_for(target) {
+            self.load_replay_keyframe_at_or_before(target.saturating_sub(Self::POST_LOAD_FRAMES))?;
+        }
+        Ok(self.total_frames)
+    }
+
+    /// Take a snapshot for the seek index if the frame just run is one it wants (see
+    /// `seek_index`): only on unpaced runs of a replay that is driving the emulator.
+    fn take_seek_snapshot_if_due(&mut self, time: &RunTime) {
+        if time.frames == 0 || !self.unpaced_run || self.replay_stalled || self.replay_playback_stopped || !self.seek_index_applies() {
+            return
+        }
+        #[cfg(feature = "std")]
+        if self.follower.is_some() {
+            return
+        }
+        let Some(player) = self.replay_player.as_ref() else {
+            return
+        };
+        let Some(index) = self.seek_index.as_mut() else {
+            return
+        };
+        index.frame_run(time.frames);
+
+        let keyframe = self.seek_segment;
+        let frame = self.total_frames;
+        if self.core.is_mid_frame() {
+            return
+        }
+        let next_keyframe = player.all_keyframes().range(keyframe.saturating_add(1)..).next().map(|(&f, _)| f);
+        if !index.wants(keyframe, frame, next_keyframe) {
+            return
+        }
+        let Some(console) = self.core.replay_console_type() else {
+            return
+        };
+        let buffers_known = !self.core.shows_stale_output();
+        self.core.create_save_state_into(&mut self.seek_state);
+        index.insert(console, keyframe, frame, player.current_keyframe_state(), self.seek_state.as_mut_slice(), buffers_known);
     }
 
     /// Get any errors for the replay writes.
@@ -2807,6 +3287,19 @@ impl SuperShuckieCore {
     fn match_replay_playback_speed(&mut self) {
         if !self.ignore_speed_changes_in_replays {
             self.set_speed(self.replay_playback_speed);
+        }
+    }
+}
+
+/// An emulator that goes away with a replay still attached (the program is closing) writes the
+/// replay's seek index to its file first, as detaching the replay would have; the write is
+/// waited for when the fields are dropped.
+#[cfg(feature = "std")]
+impl Drop for SuperShuckieCore {
+    fn drop(&mut self) {
+        if self.replay_player.is_some() && self.seek_index_file.is_some() {
+            self.absorb_seek_prefill();
+            self.save_seek_index(true);
         }
     }
 }
@@ -4272,6 +4765,299 @@ pub(crate) mod tests {
         assert_eq!((core.total_frames(), core.replay_keyframe_loaded()), (23, 20));
         core.go_to_replay_frame_coarse(29).expect("coarse seek");
         assert_eq!((core.total_frames(), core.replay_keyframe_loaded()), (23, 20));
+    }
+
+    /// A seek leaves snapshots behind (the seek index), and a later seek near one starts from it:
+    /// it lands on the same frame, with the same state, clock and input as a seek that walked
+    /// from the recording's keyframe, and playback goes on identically from there.
+    #[test]
+    fn seeks_start_from_snapshots_earlier_walks_left_and_land_the_same() {
+        const FRAMES: u64 = 600;
+        let clock = FakeClock::new();
+        let mut recorder = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        recorder.start_recording_replay(PartialReplayRecordMetadata {
+            frames_per_keyframe: NonZeroU64::new(120).unwrap(),
+            ..metadata(final_buf.clone(), SharedSink::default())
+        }).expect("start recording");
+        for i in 0..FRAMES {
+            recorder.enqueue_input(Input { a: (i / 7) % 2 == 0, b: (i / 5) % 3 == 0, ..Input::default() });
+            run_one_frame(&mut recorder, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(recorder.stop_recording_replay(), Some(true));
+        let bytes = final_buf.0.lock().unwrap().clone();
+
+        let playback = |budget: usize| {
+            let clock = FakeClock::new();
+            let fake = FakePacedCore::new(clock.clone(), PERIOD_MICROS);
+            let log = fake.frame_inputs.clone();
+            let mut core = SuperShuckieCore::new(Box::new(fake), Box::new(clock));
+            core.set_replay_seek_index_budget(budget);
+            core.attach_replay_player(ReplayFilePlayer::new(&bytes, false).expect("parse"), true).expect("attach");
+            (core, log)
+        };
+        let (mut indexed, indexed_log) = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let (mut plain, plain_log) = playback(0);
+
+        // The first seek walks from keyframe 240 and leaves a snapshot every 15 frames.
+        indexed.go_to_replay_frame(330).expect("seek");
+        let (held, _, taken, loaded) = indexed.replay_seek_index_stats();
+        assert_eq!((held, taken, loaded), (6, 6, 0), "snapshots at 255, 270, 285, 300, 315 and 330");
+        assert_eq!(plain.replay_seek_index_stats(), (0, 0, 0, 0));
+
+        for target in [320u64, 271, 258, 330, 359, 243, 316] {
+            let before = indexed.replay_seek_index_stats().3;
+            indexed.go_to_replay_frame(target).expect("seek with the index");
+            plain.go_to_replay_frame(target).expect("seek without it");
+            let from_snapshot = indexed.replay_seek_index_stats().3 > before;
+            assert_eq!(from_snapshot, target >= 258, "frame {target}: a snapshot at least POST_LOAD_FRAMES before it");
+            assert_eq!(indexed.total_frames(), target);
+            assert_eq!(indexed.create_save_state(), plain.create_save_state(), "frame {target}: state");
+            assert_eq!(indexed.get_recording_milliseconds().0, plain.get_recording_milliseconds().0, "frame {target}: clock");
+            assert_eq!(indexed.get_replay_counters(), plain.get_replay_counters(), "frame {target}: counters");
+
+            // Playing on from there runs the same inputs.
+            indexed_log.lock().unwrap().clear();
+            plain_log.lock().unwrap().clear();
+            for _ in 0..40 {
+                indexed.run_unlocked();
+                plain.run_unlocked();
+            }
+            assert_eq!(indexed.total_frames(), plain.total_frames());
+            assert_eq!(*indexed_log.lock().unwrap(), *plain_log.lock().unwrap(), "frame {target}: the inputs played after it");
+            assert_eq!(indexed.create_save_state(), plain.create_save_state(), "frame {target}: state 40 frames on");
+        }
+
+        // A timeline being dragged steps from snapshot to snapshot where there are any, and from
+        // keyframe to keyframe where there are none.
+        for (asked, lands) in [(300u64, 288u64), (302, 288), (303, 303), (257, 243), (258, 258), (130, 123)] {
+            assert_eq!(indexed.coarse_replay_frame(asked), lands, "a drag to {asked}");
+            assert_eq!(plain.coarse_replay_frame(asked), asked.saturating_sub(3) / 120 * 120 + 3, "a drag to {asked} without the index");
+            let before = indexed.replay_seek_index_stats().3;
+            indexed.go_to_replay_frame_coarse(asked).expect("coarse seek");
+            plain.go_to_replay_frame(lands).expect("seek without it");
+            assert_eq!(indexed.total_frames(), lands);
+            assert_eq!(indexed.replay_seek_index_stats().3 > before, lands % 120 != 3, "a drag to {asked}: from a snapshot");
+            assert_eq!(indexed.create_save_state(), plain.create_save_state(), "a drag to {asked}: state");
+            assert_eq!(indexed.get_recording_milliseconds().0, plain.get_recording_milliseconds().0, "a drag to {asked}: clock");
+        }
+
+        // Detaching the replay drops its snapshots.
+        indexed.detach_replay_player();
+        assert_eq!(indexed.replay_seek_index_stats(), (0, 0, 0, 0));
+    }
+
+    /// Background emulators walk the replay and hand their snapshots over: seeks into parts the
+    /// emulator itself never walked start from them and land exactly where plain seeks do.
+    #[test]
+    fn seeks_start_from_snapshots_background_emulators_made() {
+        const FRAMES: u64 = 1500;
+        let clock = FakeClock::new();
+        let mut recorder = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        recorder.start_recording_replay(PartialReplayRecordMetadata {
+            frames_per_keyframe: NonZeroU64::new(120).unwrap(),
+            ..metadata(final_buf.clone(), SharedSink::default())
+        }).expect("start recording");
+        for i in 0..FRAMES {
+            recorder.enqueue_input(Input { a: (i / 7) % 2 == 0, b: (i / 5) % 3 == 0, ..Input::default() });
+            run_one_frame(&mut recorder, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(recorder.stop_recording_replay(), Some(true));
+        let bytes = alloc::sync::Arc::new(final_buf.0.lock().unwrap().clone());
+
+        let playback = |budget: usize| {
+            let clock = FakeClock::new();
+            let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock));
+            core.set_replay_seek_index_budget(budget);
+            core.attach_replay_player(ReplayFilePlayer::new(bytes.as_slice(), false).expect("parse"), true).expect("attach");
+            core
+        };
+        let mut filled = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let mut plain = playback(0);
+
+        let workers: Vec<ReplaySeekPrefillWorker> = (0..2).map(|_| {
+            let bytes = bytes.clone();
+            Box::new(move || {
+                let clock = FakeClock::new();
+                let core: Box<dyn EmulatorCore> = Box::new(FakePacedCore::new(clock, PERIOD_MICROS));
+                Ok((core, ReplayFilePlayer::new(bytes.as_slice(), false).map_err(|e| format!("{e:?}"))?))
+            }) as ReplaySeekPrefillWorker
+        }).collect();
+        let prefill = ReplaySeekPrefill::start(workers);
+        let monitor = prefill.monitor();
+        filled.set_replay_seek_prefill(Some(prefill));
+        let waited = std::time::Instant::now();
+        while monitor.stats().workers_running > 0 {
+            assert!(waited.elapsed() < std::time::Duration::from_secs(60), "the workers never finished: {:?}", monitor.stats());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(monitor.take_errors(), Vec::<String>::new());
+        let stats = monitor.stats();
+        assert_eq!(stats.intervals_done, stats.intervals_total);
+        assert!(stats.intervals_total >= 12, "{stats:?}");
+        assert!(stats.frames_walked >= FRAMES - 120, "{stats:?}");
+
+        // Nothing has been walked by `filled` itself beyond its attach, yet every seek far enough
+        // past a keyframe finds a snapshot.
+        for target in [700u64, 1333, 250, 1499, 487, 961, 123, 130] {
+            let (_, _, taken_before, loaded_before) = filled.replay_seek_index_stats();
+            filled.go_to_replay_frame(target).expect("seek with the workers' snapshots");
+            plain.go_to_replay_frame(target).expect("seek without");
+            let (_, _, _, loaded) = filled.replay_seek_index_stats();
+            // The keyframe a seek to it loads is the last one at least POST_LOAD_FRAMES before
+            // it; the first snapshot after that one is 15 frames on.
+            let past_keyframe = target - (target - SuperShuckieCore::POST_LOAD_FRAMES) / 120 * 120;
+            assert_eq!(loaded > loaded_before, past_keyframe >= 15 + SuperShuckieCore::POST_LOAD_FRAMES, "frame {target}: {past_keyframe} frames past its keyframe");
+            assert_eq!(filled.replay_seek_index_stats().2, taken_before, "frame {target}: nothing left for it to snapshot itself");
+            assert_eq!(filled.total_frames(), target);
+            assert_eq!(filled.create_save_state(), plain.create_save_state(), "frame {target}: state");
+            assert_eq!(filled.get_recording_milliseconds().0, plain.get_recording_milliseconds().0, "frame {target}: clock");
+            assert_eq!(filled.get_replay_counters(), plain.get_replay_counters(), "frame {target}: counters");
+            for _ in 0..30 {
+                filled.run_unlocked();
+                plain.run_unlocked();
+            }
+            assert_eq!(filled.create_save_state(), plain.create_save_state(), "frame {target}: state 30 frames on");
+        }
+        assert!(filled.replay_seek_index_adopted() >= 80, "{}", filled.replay_seek_index_adopted());
+
+        // Detaching the replay stops the workers' owner and drops what they made.
+        filled.detach_replay_player();
+        assert!(monitor.stopped());
+        assert!(filled.replay_seek_prefill_stats().is_none());
+        assert_eq!(filled.replay_seek_index_stats(), (0, 0, 0, 0));
+    }
+
+    /// The seek index is written to a file once the background emulators have filled it, and the
+    /// next emulator to open the same recording starts from the file: nothing is walked again,
+    /// no worker even makes an emulator, and seeks land where plain seeks do.
+    #[test]
+    fn the_seek_index_comes_back_from_its_file() {
+        const FRAMES: u64 = 1500;
+        let clock = FakeClock::new();
+        let mut recorder = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock.clone()));
+        let final_buf = SharedSink::default();
+        recorder.start_recording_replay(PartialReplayRecordMetadata {
+            frames_per_keyframe: NonZeroU64::new(120).unwrap(),
+            ..metadata(final_buf.clone(), SharedSink::default())
+        }).expect("start recording");
+        for i in 0..FRAMES {
+            recorder.enqueue_input(Input { a: (i / 7) % 2 == 0, b: (i / 5) % 3 == 0, ..Input::default() });
+            run_one_frame(&mut recorder, &clock, PERIOD_MICROS);
+        }
+        assert_eq!(recorder.stop_recording_replay(), Some(true));
+        let bytes = alloc::sync::Arc::new(final_buf.0.lock().unwrap().clone());
+
+        let directory = std::env::temp_dir().join(format!("supershuckie-seek-file-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let file = ReplaySeekIndexFile::in_directory(&directory, bytes.as_slice(), None, 0);
+
+        let playback = |budget: usize| {
+            let clock = FakeClock::new();
+            let mut core = SuperShuckieCore::new(Box::new(FakePacedCore::new(clock.clone(), PERIOD_MICROS)), Box::new(clock));
+            core.set_replay_seek_index_budget(budget);
+            core.attach_replay_player(ReplayFilePlayer::new(bytes.as_slice(), false).expect("parse"), true).expect("attach");
+            core
+        };
+        let emulators_made = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let workers = |count: usize| -> Vec<ReplaySeekPrefillWorker> {
+            (0..count).map(|_| {
+                let (bytes, made) = (bytes.clone(), emulators_made.clone());
+                Box::new(move || {
+                    made.fetch_add(1, Ordering::Relaxed);
+                    let clock = FakeClock::new();
+                    let core: Box<dyn EmulatorCore> = Box::new(FakePacedCore::new(clock, PERIOD_MICROS));
+                    Ok((core, ReplayFilePlayer::new(bytes.as_slice(), false).map_err(|e| format!("{e:?}"))?))
+                }) as ReplaySeekPrefillWorker
+            }).collect()
+        };
+        let wait = |monitor: &ReplaySeekPrefillMonitor| {
+            let waited = std::time::Instant::now();
+            while monitor.loading() || monitor.stats().workers_running > 0 {
+                assert!(waited.elapsed() < std::time::Duration::from_secs(60), "never finished: {:?}", monitor.stats());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+
+        // First session: two workers fill the index; the next seek picks it up and writes it.
+        let mut first = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let prefill = ReplaySeekPrefill::start_with_file(workers(2), Some(file.clone()));
+        let monitor = prefill.monitor();
+        first.set_replay_seek_prefill(Some(prefill));
+        wait(&monitor);
+        assert!(monitor.all_walked());
+        assert_eq!(emulators_made.load(Ordering::Relaxed), 2);
+        first.go_to_replay_frame(700).expect("seek");
+        first.wait_for_replay_seek_index_file();
+        let held = first.replay_seek_index_stats().0;
+        assert!(held >= 80, "{held}");
+        assert_eq!(seek_store::peek(&file), Some(seek_store::Header { complete: true, points: held as u64 }));
+        let written = std::fs::metadata(&file.path).unwrap().modified().unwrap();
+        // Closing the replay does not write the same thing again.
+        first.detach_replay_player();
+        drop(first);
+        assert_eq!(std::fs::metadata(&file.path).unwrap().modified().unwrap(), written);
+
+        // Second session: everything comes from the file.
+        emulators_made.store(0, Ordering::Relaxed);
+        let mut second = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let mut plain = playback(0);
+        let prefill = ReplaySeekPrefill::start_with_file(workers(2), Some(file.clone()));
+        let monitor = prefill.monitor();
+        second.set_replay_seek_prefill(Some(prefill));
+        wait(&monitor);
+        assert!(monitor.all_walked());
+        assert_eq!(emulators_made.load(Ordering::Relaxed), 0, "nothing was left to walk");
+        assert_eq!(monitor.take_errors(), Vec::<String>::new());
+        for target in [700u64, 1333, 250, 1499, 487] {
+            second.go_to_replay_frame(target).expect("seek with the file's snapshots");
+            plain.go_to_replay_frame(target).expect("seek without");
+            assert_eq!(second.total_frames(), target);
+            assert_eq!(second.create_save_state(), plain.create_save_state(), "frame {target}: state");
+            assert_eq!(second.get_recording_milliseconds().0, plain.get_recording_milliseconds().0, "frame {target}: clock");
+        }
+        let (held_again, _, taken, loaded) = second.replay_seek_index_stats();
+        // Of the five, 700 and 1499 are far enough past their keyframes for a snapshot.
+        assert_eq!((held_again, taken, loaded), (held, 0, 2));
+        drop(second);
+
+        // Third session: a file that lacks some intervals (here: written by an emulator that
+        // only walked a little itself, without workers) has only those walked.
+        std::fs::remove_file(&file.path).unwrap();
+        let mut alone = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let prefill = ReplaySeekPrefill::start_with_file(Vec::new(), Some(file.clone()));
+        let monitor = prefill.monitor();
+        alone.set_replay_seek_prefill(Some(prefill));
+        wait(&monitor);
+        assert!(!monitor.all_walked());
+        for target in [359u64, 110, 599, 839, 1079] {
+            alone.go_to_replay_frame(target).expect("seek");
+        }
+        // Each walk left the seven snapshots of its keyframe interval. That is too little to be
+        // written while the replay is open, and enough when it closes (here: the emulator goes
+        // away with the replay still attached, as when the program is closed).
+        alone.wait_for_replay_seek_index_file();
+        assert_eq!(seek_store::peek(&file), None);
+        drop(alone);
+        assert_eq!(seek_store::peek(&file), Some(seek_store::Header { complete: false, points: 35 }));
+
+        let mut fourth = playback(SuperShuckieCore::DEFAULT_SEEK_INDEX_BUDGET);
+        let prefill = ReplaySeekPrefill::start_with_file(workers(1), Some(file.clone()));
+        let monitor = prefill.monitor();
+        fourth.set_replay_seek_prefill(Some(prefill));
+        wait(&monitor);
+        assert!(monitor.all_walked());
+        assert_eq!(emulators_made.load(Ordering::Relaxed), 1);
+        let stats = monitor.stats();
+        assert_eq!(stats.intervals_done, stats.intervals_total);
+        assert!((FRAMES - 5 * 120 - 20..=FRAMES - 5 * 120).contains(&stats.frames_walked), "the five intervals the file had were not walked: {stats:?}");
+        fourth.go_to_replay_frame(700).expect("seek");
+        fourth.wait_for_replay_seek_index_file();
+        assert_eq!(seek_store::peek(&file), Some(seek_store::Header { complete: true, points: held as u64 }));
+        drop(fourth);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// Stopping a replay keeps it attached but hands the emulator to the user: their input is

@@ -62,8 +62,27 @@ pub const REPLAY_VERSION_NINTENDO_3DS_STALE_VRAM: u32 = 10;
 /// `stored_keyframe`): the reference state as prefix, and ROM references.
 pub const REPLAY_VERSION_NINTENDO_3DS_ROM_REFERENCES: u32 = 9;
 
+/// Format version of Nintendo DS files. Files of the Game Boy family keep writing
+/// [`REPLAY_VERSION`] and are byte for byte unchanged.
+///
+/// * v11: a full keyframe may copy bytes from the game's ROM too (discriminator 0xED,
+///   [`Packet::RomKeyframe`](crate::Packet::RomKeyframe); added 2026-11-11, before any v11 file
+///   left the machine it was made on).
+/// * v11: a `RegionDeltaKeyframe` may copy bytes from the game's ROM (discriminator 0xEE; see
+///   [`Packet::RegionDeltaKeyframe`](crate::Packet::RegionDeltaKeyframe)): 40-55% of the main
+///   RAM a DS game changes between two keyframes is data it just loaded from its cartridge,
+///   which a player always has. A player of such a file needs the ROM
+///   (`ReplayFilePlayer::set_rom`). Everything else is format v7. A delta keyframe whose
+///   regenerated output buffers are exact (the 3D scene did not change since the keyframe
+///   before) rewrites one word of them, which is how a reader tells it from one that left them
+///   stale; that needs no format change and v7 readers understand it.
+pub const REPLAY_VERSION_NINTENDO_DS: u32 = 11;
+
+/// First Nintendo DS format version whose delta keyframes may copy bytes from the game's ROM.
+pub const REPLAY_VERSION_NINTENDO_DS_ROM_REFERENCES: u32 = 11;
+
 /// Newest format version this build reads.
-pub const REPLAY_VERSION_MAX_SUPPORTED: u32 = REPLAY_VERSION_NINTENDO_3DS;
+pub const REPLAY_VERSION_MAX_SUPPORTED: u32 = REPLAY_VERSION_NINTENDO_DS;
 
 /// First format version with [`ReplayHeaderRaw::packet_stream_end`] and a bookmark section.
 pub const REPLAY_VERSION_BOOKMARK_SECTION: u32 = 5;
@@ -334,7 +353,11 @@ impl ReplayFileMetadata {
 
         Ok(ReplayHeaderRaw {
             signature_start: SIGNATURE_START,
-            replay_version: if self.console_type == ReplayConsoleType::Nintendo3DS { REPLAY_VERSION_NINTENDO_3DS } else { REPLAY_VERSION },
+            replay_version: match self.console_type {
+                ReplayConsoleType::Nintendo3DS => REPLAY_VERSION_NINTENDO_3DS,
+                ReplayConsoleType::NintendoDS => REPLAY_VERSION_NINTENDO_DS,
+                _ => REPLAY_VERSION
+            },
             console_type: MaybeEnum::new(self.console_type),
             rom_name: into_str_bytes(&self.rom_name, "rom_name")?,
             rom_filename: into_str_bytes(&self.rom_filename, "rom_filename")?,

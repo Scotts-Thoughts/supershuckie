@@ -12,14 +12,14 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
 use supershuckie_core::emulator::{EmulatorCore, GameBoyAdvance, GameBoyColor, GbPaletteOverride, Model, NintendoDS, AUDIO_SAMPLE_RATE};
 use supershuckie_core::export::{composite_screens, output_geometry};
-use supershuckie_core::{std_timestamp_provider, AudioOutput, ScreenLayout, SuperShuckieCore};
+use supershuckie_core::{default_replay_seek_index_directory, std_timestamp_provider, AudioOutput, ReplaySeekIndexFile, ReplaySeekIndexFillLock, ReplaySeekPrefill, ReplaySeekPrefillWorker, ScreenLayout, SuperShuckieCore};
 use supershuckie_replay_recorder::blake3_hash;
 use supershuckie_replay_recorder::replay_file::ReplayConsoleType;
 
@@ -36,8 +36,67 @@ const STEP_LIMIT: u64 = 240;
 /// of emulation — and not worth it to skip a handful.
 const NEAR_KEYFRAME: u64 = 16;
 
+/// How far after a keyframe the picture named as cheap to draw is (see [`cheap_pictures`]).
+///
+/// Not [`SuperShuckieCore::POST_LOAD_FRAMES`], the least a seek emulates past a keyframe: a
+/// Nintendo DS keyframe leaves the 3D engine's geometry out, a game drawing 3D at 30 fps has
+/// rebuilt it four or five frames on, and a picture asked for sooner is drawn again from the
+/// keyframe before (`position_drawn`). Measured on Pokemon Platinum (2026-11-11, `seek_e2e`):
+/// keyframe + 3 costs 390-470 ms, + 4 32 ms, + 5 23 ms, + 6 30 ms.
+const CHEAP_PICTURE_FRAMES: u64 = 6;
+
 /// The channel is checked for a superseding request every this many hidden runs during a walk.
 const POLL_EVERY: u32 = 8;
+
+/// Memory (MiB) one served recording's seek index may use unless `SUPERSHUCKIE_SEEK_INDEX_MB`
+/// says otherwise (`0` turns the index off). Half the app's default: an editor runs several
+/// servers at once (a reader, a spare, one for sound, one for memory).
+const DEFAULT_SEEK_INDEX_MB: usize = 128;
+
+/// The seek index budget in bytes (see [`DEFAULT_SEEK_INDEX_MB`]).
+fn seek_index_budget() -> usize {
+    std::env::var("SUPERSHUCKIE_SEEK_INDEX_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SEEK_INDEX_MB)
+        .saturating_mul(1 << 20)
+}
+
+/// How many background emulators fill a served Nintendo DS recording's seek index ahead of the
+/// requests (`supershuckie_core::ReplaySeekPrefill`): `SUPERSHUCKIE_SEEK_PREFILL_WORKERS` in
+/// the server's environment, else one when the index is kept in a file (`with_file`) and none
+/// when it is not. Each is another emulator with the game loaded (the size of the ROM and then
+/// some) until the recording is walked. An editor runs several servers per recording; with a
+/// file only the one that holds the file's fill lock runs any, and the others read what it
+/// writes.
+fn seek_prefill_workers(with_file: bool) -> usize {
+    std::env::var("SUPERSHUCKIE_SEEK_PREFILL_WORKERS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(with_file as usize)
+        .min(16)
+}
+
+/// Where seek indexes are kept between sessions and how much room they may take there:
+/// `SUPERSHUCKIE_SEEK_INDEX_DIR` in the server's environment (empty or `off`: nowhere), else the
+/// app's own cache directory so that both share them, and `SUPERSHUCKIE_SEEK_INDEX_DISK_MB`
+/// (4096 unless it says otherwise; `0`: nowhere).
+fn seek_index_directory() -> Option<(PathBuf, u64)> {
+    let megabytes = std::env::var("SUPERSHUCKIE_SEEK_INDEX_DISK_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(4096);
+    if megabytes == 0 {
+        return None;
+    }
+    let directory = match std::env::var_os("SUPERSHUCKIE_SEEK_INDEX_DIR") {
+        Some(value) if value.is_empty() || value == "off" => return None,
+        Some(value) => PathBuf::from(value),
+        None => default_replay_seek_index_directory()?,
+    };
+    std::fs::create_dir_all(&directory).ok()?;
+    Some((directory, megabytes.saturating_mul(1 << 20)))
+}
 
 /// Human-readable server name for `Hello`.
 pub fn server_name() -> String {
@@ -72,8 +131,9 @@ struct Session {
     /// `total_frames()` whose picture the screens currently hold, if they hold a drawn one.
     drawn: Option<u64>,
     audio: Option<Arc<AudioOutput>>,
-    /// The recording's keyframes, in order: which one a seek would load (`position_drawn`).
-    keyframes: Vec<u64>,
+    /// Held while this server is the program filling the recording's seek index file. After
+    /// `core`, which writes the file when it goes.
+    _fill_lock: Option<ReplaySeekIndexFillLock>,
 }
 
 /// What the command line asks of a serving instance.
@@ -312,6 +372,7 @@ impl Server {
         (info.fps_num, info.fps_den) = crate::source::frame_rate(summary.console);
         (info.width, info.height) = geometry(summary.console, layout);
 
+        let mut fill_lock = None;
         let core = if rom_ok {
             let mut emulator = build_core(summary.console, &rom_bytes)?;
             // Only how a Game Boy game is drawn; a core for another console ignores it.
@@ -325,8 +386,43 @@ impl Server {
             // at; the recorded speed only ever paced the original session.
             core.set_audio_mute_when_sped_up(false);
             core.set_ignore_speed_changes_in_replays(true);
+            core.set_replay_seek_index_budget(seek_index_budget());
             player.enable_threading();
+            // A Nintendo DS recording's keyframes may copy bytes from the game file.
+            let rom_shared = Arc::new(rom_bytes.clone());
+            if player.wants_rom() {
+                player.set_rom(rom_shared.clone());
+            }
             core.attach_replay_player(player, true).map_err(|e| format!("cannot attach the replay: {e:?}"))?;
+            if summary.console == ReplayConsoleType::NintendoDS && seek_index_budget() > 0 {
+                // The index's file, shared with the app and the other servers of this recording.
+                let index_file = seek_index_directory().and_then(|(directory, budget)| {
+                    let replay_bytes = std::fs::read(replay).ok()?;
+                    Some(ReplaySeekIndexFile::in_directory(&directory, &replay_bytes, Some(&rom_bytes), budget))
+                });
+                let mut workers = seek_prefill_workers(index_file.is_some());
+                if let Some(file) = index_file.as_ref() {
+                    fill_lock = file.try_lock_for_filling();
+                    if fill_lock.is_none() {
+                        workers = 0;
+                    }
+                }
+                let console = summary.console;
+                let makers = (0..workers).map(|_| {
+                    let (rom, replay) = (rom_shared.clone(), replay.to_path_buf());
+                    Box::new(move || {
+                        let mut player = open_replay(&replay)?;
+                        player.enable_threading();
+                        if player.wants_rom() {
+                            player.set_rom(rom.clone());
+                        }
+                        Ok((build_core(console, &rom)?, player))
+                    }) as ReplaySeekPrefillWorker
+                }).collect();
+                if workers > 0 || index_file.is_some() {
+                    core.set_replay_seek_prefill(Some(ReplaySeekPrefill::start_with_file(makers, index_file)));
+                }
+            }
             if let Some((w, h)) = output_geometry(core.get_core().get_screens(), layout) {
                 (info.width, info.height) = (w, h);
             }
@@ -350,7 +446,7 @@ impl Server {
             fps: (info.fps_num, info.fps_den),
             drawn,
             audio: None,
-            keyframes: summary.keyframes.clone(),
+            _fill_lock: fill_lock,
         });
         Ok(info)
     }
@@ -578,11 +674,8 @@ impl Server {
         // Stepped when near enough ahead — unless a keyframe lies well past where the core is on
         // the way: loading it skips everything before it (at frame 5 with picture 244 wanted, 238
         // frames emulated became 3).
-        let keyframe_ahead = {
-            let session = self.session.as_ref().expect("checked by usable()");
-            keyframe_at_or_before(&session.keyframes, target.saturating_sub(SuperShuckieCore::POST_LOAD_FRAMES))
-                .is_some_and(|k| k > cur + NEAR_KEYFRAME)
-        };
+        // The same goes for a snapshot the core kept from an earlier walk (its seek index).
+        let keyframe_ahead = self.core().replay_seek_start_frame(target).is_some_and(|start| start > cur + NEAR_KEYFRAME);
         let load = !(cur < target && target - cur <= STEP_LIMIT) || keyframe_ahead;
         if load {
             self.load_keyframe_before(target)?;
@@ -641,13 +734,15 @@ impl Server {
         self.step_hidden_to(id, target)
     }
 
-    /// Load the keyframe `go_to_replay_frame` would for a seek to `target`: at least
-    /// `POST_LOAD_FRAMES` before it so regenerated buffers are rebuilt before anything is shown.
+    /// Load what `go_to_replay_frame` would start from for a seek to `target`: a snapshot the
+    /// core kept from an earlier walk when one is near enough before it, else the keyframe at
+    /// least `POST_LOAD_FRAMES` before it so regenerated buffers are rebuilt before anything is
+    /// shown.
     fn load_keyframe_before(&mut self, target: u64) -> Result<(), Stop> {
         let session = self.session.as_mut().expect("checked by usable()");
         session.drawn = None;
         let core = session.core.as_mut().expect("checked by usable()");
-        core.go_to_replay_keyframe(target.saturating_sub(SuperShuckieCore::POST_LOAD_FRAMES))
+        core.go_to_replay_seek_start(target)
             .map(|_| ())
             .map_err(Stop::Failed)
     }
@@ -689,6 +784,7 @@ impl Server {
 /// Game Boy Color run with a keyframe every 120 frames: 97 ms a keyframe, against 1.4 ms a frame
 /// stepping). The picture that many frames after each keyframe is the cheap one.
 /// The last of `keyframes` (in order) at or before `frame`.
+#[cfg(test)]
 fn keyframe_at_or_before(keyframes: &[u64], frame: u64) -> Option<u64> {
     match keyframes.binary_search(&frame) {
         Ok(i) => Some(keyframes[i]),
@@ -700,7 +796,7 @@ fn keyframe_at_or_before(keyframes: &[u64], frame: u64) -> Option<u64> {
 fn cheap_pictures(keyframes: &[u64], frames: u64) -> Vec<u64> {
     keyframes
         .iter()
-        .map(|k| k + SuperShuckieCore::POST_LOAD_FRAMES)
+        .map(|k| k + CHEAP_PICTURE_FRAMES)
         .filter(|p| *p < frames)
         .collect()
 }
@@ -806,7 +902,8 @@ mod cheap_picture_tests {
 
     #[test]
     fn the_cheap_pictures_are_just_past_each_keyframe_and_inside_the_recording() {
-        let p = SuperShuckieCore::POST_LOAD_FRAMES;
+        let p = super::CHEAP_PICTURE_FRAMES;
+        assert!(p >= SuperShuckieCore::POST_LOAD_FRAMES, "a cheap picture is reached from its own keyframe");
         assert_eq!(cheap_pictures(&[0, 120, 240], 1000), vec![p, 120 + p, 240 + p]);
         assert_eq!(cheap_pictures(&[0, 998], 1000), vec![p], "none past the end");
     }

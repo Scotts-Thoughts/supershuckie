@@ -105,6 +105,19 @@ pub enum Packet {
         state: ByteVec
     },
 
+    /// A full keyframe whose state copies bytes from the game's ROM (Nintendo DS format v11,
+    /// discriminator 0xED): the state is `data` with the copies `rom_refs` names spliced in,
+    /// encoded as in a [`Packet::RegionDeltaKeyframe`], and is `state_len` bytes long. Like a
+    /// [`Packet::Keyframe`] it stands on its own (a chain may start with one). The player
+    /// materialises it, so readers only ever see [`Packet::Keyframe`]; it needs the ROM to.
+    #[allow(missing_docs)]
+    RomKeyframe {
+        metadata: KeyframeMetadata,
+        state_len: UnsignedInteger,
+        rom_refs: ByteVec,
+        data: ByteVec
+    },
+
     /// Adds a diffed keyframe so the replay can be scanned faster (format v2/v3 encoding).
     ///
     /// The player materialises these into regular keyframes on demand using
@@ -122,11 +135,18 @@ pub enum Packet {
     /// The player materialises it on demand (see `playback::ChainState`), so readers only ever
     /// see [`Packet::Keyframe`]. `state_len` is the length of the materialised state and lets the
     /// reader validate the delta before applying it.
+    ///
+    /// With `rom_refs` not empty (Nintendo DS format v11, discriminator 0xEE) the diff's data
+    /// stream is `data` with copies of the game's ROM spliced in: `rom_refs` is a sequence of
+    /// LEB128 triples `(bytes of data before this copy, ROM offset as a zigzag delta from the end
+    /// of the previous copy, length)`, exactly as in a Nintendo 3DS v9 keyframe (see
+    /// `replay_file::stored_keyframe`), and a reader needs the ROM to materialise the keyframe.
     #[allow(missing_docs)]
     RegionDeltaKeyframe {
         metadata: KeyframeMetadata,
         state_len: UnsignedInteger,
         control: ByteVec,
+        rom_refs: ByteVec,
         data: ByteVec
     },
 

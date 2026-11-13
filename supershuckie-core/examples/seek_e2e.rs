@@ -41,6 +41,10 @@ fn main() {
 
     let t = Instant::now();
     let mut player = ReplayFilePlayer::new(&bytes, false).expect("parse replay");
+    // A format-v11 recording's keyframes may copy bytes from the ROM.
+    if player.wants_rom() {
+        player.set_rom(std::sync::Arc::new(rom.to_vec()));
+    }
     player.enable_threading();
     let keyframes: Vec<u64> = player.all_keyframes().keys().copied().collect();
     let total = player.get_total_frames();
@@ -79,7 +83,7 @@ fn main() {
 
     // 2. emulate-to-target cost: warm seeks to keyframe + offset.
     println!("\n[2] warm seeks to keyframe + offset (same blob), offset cost = emulation after the state load");
-    for &offset in &[post, 30, 60, 119] {
+    for &offset in &[post, 4, 5, 6, 8, 12, 30, 60, 119] {
         let mut v = Vec::new();
         for _ in 0..(seeks / 3).max(3) {
             // A keyframe well inside the current blob region: hop forward a little each time.

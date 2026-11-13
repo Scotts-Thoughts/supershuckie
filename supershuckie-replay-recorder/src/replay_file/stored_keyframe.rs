@@ -96,6 +96,21 @@ pub(crate) fn split_payload_v8(payload: &[u8]) -> Result<(&[u8], &[u8]), &'stati
 /// The v9 payload of a region diff whose `data` contains `copies` (sorted, non-overlapping, each
 /// inside `data` and equal to the ROM bytes it names).
 pub(crate) fn encode_payload_v9(control: &[u8], data: &[u8], copies: &[RomCopy]) -> Vec<u8> {
+    let (refs, literal) = split_rom_copies(data, copies);
+
+    let mut payload = Vec::with_capacity(16 + control.len() + refs.len() + literal.len());
+    payload.extend_from_slice(&(control.len() as u64).to_le_bytes());
+    payload.extend_from_slice(&(refs.len() as u64).to_le_bytes());
+    payload.extend_from_slice(control);
+    payload.extend_from_slice(&refs);
+    payload.extend_from_slice(&literal);
+    payload
+}
+
+/// Take `copies` (sorted, non-overlapping, each inside `data` and equal to the ROM bytes it
+/// names) out of a diff's data stream: the reference list (LEB128 triples, see the module
+/// documentation) and the bytes that are left. [`splice_rom_copies`] puts them back.
+pub(crate) fn split_rom_copies(data: &[u8], copies: &[RomCopy]) -> (Vec<u8>, Vec<u8>) {
     let mut refs = Vec::with_capacity(copies.len() * 8);
     let mut literal = Vec::with_capacity(data.len());
     let mut data_pos = 0usize;
@@ -110,14 +125,42 @@ pub(crate) fn encode_payload_v9(control: &[u8], data: &[u8], copies: &[RomCopy])
         rom_pos = copy.rom_offset + copy.len as u64;
     }
     literal.extend_from_slice(&data[data_pos..]);
+    (refs, literal)
+}
 
-    let mut payload = Vec::with_capacity(16 + control.len() + refs.len() + literal.len());
-    payload.extend_from_slice(&(control.len() as u64).to_le_bytes());
-    payload.extend_from_slice(&(refs.len() as u64).to_le_bytes());
-    payload.extend_from_slice(control);
-    payload.extend_from_slice(&refs);
-    payload.extend_from_slice(&literal);
-    payload
+/// Rebuild a diff's data stream into `out` (its allocation is reused): `literal` with the ROM
+/// copies `refs` names spliced in. `rom` may be `None` only when there are no copies.
+pub(crate) fn splice_rom_copies(refs: &[u8], literal: &[u8], rom: Option<&[u8]>, out: &mut Vec<u8>) -> Result<(), Cow<'static, str>> {
+    out.clear();
+    if refs.is_empty() {
+        out.extend_from_slice(literal);
+        return Ok(());
+    }
+    let Some(rom) = rom else {
+        return Err(Cow::Borrowed("this keyframe copies data from the game's ROM, which the player was not given"));
+    };
+    let mut refs = refs;
+    let mut literal = literal;
+    let mut rom_pos = 0u64;
+    while !refs.is_empty() {
+        let (Some(gap), Some(delta), Some(len)) = (read_leb128(&mut refs), read_leb128(&mut refs), read_leb128(&mut refs)) else {
+            return Err(Cow::Borrowed("delta keyframe ROM references are malformed"));
+        };
+        let gap = usize::try_from(gap).map_err(|_| Cow::Borrowed("delta keyframe ROM reference does not fit"))?;
+        let len = usize::try_from(len).map_err(|_| Cow::Borrowed("delta keyframe ROM reference does not fit"))?;
+        let (before, rest) = literal.split_at_checked(gap).ok_or(Cow::Borrowed("delta keyframe ROM reference points past its literal data"))?;
+        out.extend_from_slice(before);
+        literal = rest;
+        let start = rom_pos.wrapping_add(unzigzag(delta) as u64);
+        let bytes = usize::try_from(start).ok()
+            .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+            .and_then(|(start, end)| rom.get(start..end))
+            .ok_or(Cow::Borrowed("delta keyframe copies bytes from outside the ROM (is it the right game file?)"))?;
+        out.extend_from_slice(bytes);
+        rom_pos = start + len as u64;
+    }
+    out.extend_from_slice(literal);
+    Ok(())
 }
 
 /// The parts of a v9 payload.
@@ -140,36 +183,7 @@ impl PayloadV9<'_> {
     /// Rebuild the diff's data stream into `out` (its allocation is reused): `literal` with the
     /// ROM copies spliced in. `rom` may be `None` only when there are no copies.
     pub(crate) fn data_into(&self, rom: Option<&[u8]>, out: &mut Vec<u8>) -> Result<(), Cow<'static, str>> {
-        out.clear();
-        if self.refs.is_empty() {
-            out.extend_from_slice(self.literal);
-            return Ok(());
-        }
-        let Some(rom) = rom else {
-            return Err(Cow::Borrowed("this 3DS keyframe copies data from the game's ROM, which the player was not given"));
-        };
-        let mut refs = self.refs;
-        let mut literal = self.literal;
-        let mut rom_pos = 0u64;
-        while !refs.is_empty() {
-            let (Some(gap), Some(delta), Some(len)) = (read_leb128(&mut refs), read_leb128(&mut refs), read_leb128(&mut refs)) else {
-                return Err(Cow::Borrowed("3DS delta ROM references are malformed"));
-            };
-            let gap = usize::try_from(gap).map_err(|_| Cow::Borrowed("3DS delta ROM reference does not fit"))?;
-            let len = usize::try_from(len).map_err(|_| Cow::Borrowed("3DS delta ROM reference does not fit"))?;
-            let (before, rest) = literal.split_at_checked(gap).ok_or(Cow::Borrowed("3DS delta ROM reference points past its literal data"))?;
-            out.extend_from_slice(before);
-            literal = rest;
-            let start = rom_pos.wrapping_add(unzigzag(delta) as u64);
-            let bytes = usize::try_from(start).ok()
-                .and_then(|start| start.checked_add(len).map(|end| (start, end)))
-                .and_then(|(start, end)| rom.get(start..end))
-                .ok_or(Cow::Borrowed("3DS delta copies bytes from outside the ROM (is it the right game file?)"))?;
-            out.extend_from_slice(bytes);
-            rom_pos = start + len as u64;
-        }
-        out.extend_from_slice(literal);
-        Ok(())
+        splice_rom_copies(self.refs, self.literal, rom, out)
     }
 }
 
@@ -249,6 +263,49 @@ pub(crate) struct RomIndex {
     stride: u64,
     filter: Vec<u64>,
     filter_shift: u32,
+}
+
+/// The [`RomIndex`] of a whole ROM, shared by every recorder that is given that ROM: it takes a
+/// fifth of a second and 34 MB to build for a 128 MB game, which no recording should pay twice
+/// (or wait for on the emulator's thread; see [`prepare_rom_references`]). `None` inside when
+/// the ROM has nothing to index.
+pub(crate) type SharedRomIndex = Arc<spin::Once<Option<RomIndex>>>;
+
+/// The whole-ROM indexes there are, by the ROM they belong to. An entry goes when its ROM has.
+static WHOLE_ROM_INDEXES: spin::Mutex<Vec<(alloc::sync::Weak<dyn AsRef<[u8]> + Send + Sync>, SharedRomIndex)>> = spin::Mutex::new(Vec::new());
+
+/// The shared whole-ROM index of `rom` (the same allocation, not merely the same bytes), built
+/// or not; see [`build_whole_rom_index`].
+pub(crate) fn whole_rom_index(rom: &RomBytes) -> SharedRomIndex {
+    let mut all = WHOLE_ROM_INDEXES.lock();
+    all.retain(|(owner, _)| owner.strong_count() > 0);
+    if let Some((_, index)) = all.iter().find(|(owner, _)| core::ptr::addr_eq(owner.as_ptr(), Arc::as_ptr(rom))) {
+        return index.clone()
+    }
+    let index = SharedRomIndex::default();
+    all.push((Arc::downgrade(rom), index.clone()));
+    index
+}
+
+/// Build `index` (of `rom`) unless it is built already, waiting for whoever is building it.
+pub(crate) fn build_whole_rom_index<'a>(index: &'a SharedRomIndex, rom: &[u8]) -> Option<&'a RomIndex> {
+    index.call_once(|| RomIndex::build(rom, &[(0, rom.len() as u64)])).as_ref()
+}
+
+/// Start building what a recorder needs to find copies of `rom` in a Nintendo DS game's
+/// keyframes, on a thread of its own, so that the recorder does not have to when its first
+/// keyframe comes. A recorder given a ROM does this itself; calling it earlier (when a recording
+/// is likely) only moves the work forward.
+#[cfg(feature = "std")]
+pub fn prepare_rom_references(rom: &RomBytes) {
+    let index = whole_rom_index(rom);
+    if index.is_completed() {
+        return
+    }
+    let rom = rom.clone();
+    let _ = std::thread::Builder::new().name(alloc::string::String::from("rom-index")).spawn(move || {
+        build_whole_rom_index(&index, (*rom).as_ref());
+    });
 }
 
 impl RomIndex {
