@@ -121,7 +121,7 @@ A program can play the game through the bot routes: [input](#input),
 [press](#press), [step](#step), [read-memory](#read-memory) and
 [screenshot](#screenshot). They are off by default. Turn on both
 **Settings › Enable external commands** and **Settings › Allow bot control**;
-until then every bot route answers `403`.
+until then every bot route but [screenshot](#screenshot) answers `403`.
 
 There are two ways to play, and a bot can switch between them at any time:
 
@@ -461,9 +461,14 @@ Arguments:
 
 ### screenshot
 
-Bot control: the current picture as a PNG. Consoles with two screens are
-stacked top screen first, in the console's own order (the "swap screens"
-setting is ignored).
+The current picture as a PNG, at the console's own resolution (160x144 for
+the Game Boy, 240x160 for the Game Boy Advance, 256x384 for the Nintendo DS).
+Consoles with two screens are stacked top screen first, in the console's own
+order (the "swap screens" setting is ignored), with no gap.
+
+Unlike the other bot routes it only reads, so it needs only **Enable external
+commands**, not **Allow bot control**. The STP overlay uses it for its game
+screenshot. Answers `409` when no game is loaded or a video export is running.
 
 Usage:
 

@@ -10,8 +10,9 @@
 //!
 //! What the bot holds is a layer of its own in the core (see `SuperShuckieCore::set_bot_input`),
 //! so it and the keyboard never overwrite each other; both are recorded into replays and published
-//! to Play Together like any other input. Every route is refused unless the user turned bot control
-//! on (Settings › Allow bot control), which is off by default.
+//! to Play Together like any other input. Every route but `/screenshot` is refused unless the user
+//! turned bot control on (Settings › Allow bot control), which is off by default. `/screenshot` only
+//! reads the picture, so it needs only external commands.
 
 use std::num::NonZeroU64;
 use std::sync::mpsc::Sender;
@@ -54,7 +55,9 @@ impl SuperShuckieFrontend {
         let refuse = |status: u16, error: &str| {
             let _ = reply.send(Err((status, format!("failed ({error})"))));
         };
-        if !self.settings.bot_control.enabled {
+        // `/screenshot` only looks, so external commands alone allow it (the STP overlay's game
+        // screenshot uses it); everything that plays the game needs bot control.
+        if !self.settings.bot_control.enabled && !matches!(request, BotRequest::Screenshot) {
             return refuse(403, "bot control is off; turn on Settings > Allow bot control");
         }
         if !self.is_game_running() {

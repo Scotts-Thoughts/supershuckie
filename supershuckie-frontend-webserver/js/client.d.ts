@@ -146,7 +146,7 @@ export class SuperShuckieClient {
     read_memory(address: number, length: number): Promise<{ address: number, data: string }>
 
     /**
-     * The screens as a PNG (stacked top to bottom)
+     * The screens as a PNG (stacked top to bottom). Needs only external commands, not bot control.
      */
     screenshot(): Promise<Blob>
 }
